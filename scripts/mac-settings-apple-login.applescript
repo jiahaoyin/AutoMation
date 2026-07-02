@@ -1,5 +1,6 @@
 -- macOS 15 (Sequoia)：系统设置 → Apple Account 登录填表
--- 凭证通过环境变量传入：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
+-- 流程：先填「电子邮件或电话号码」→ 等待下方出现密码框 → 填密码 → 继续
+-- 凭证：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
 
 on loginPageMarkers()
 	return {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录", "密码", "Password"}
@@ -113,18 +114,6 @@ on clickSidebarAppleAccount(procRef, targetW)
 	return false
 end clickSidebarAppleAccount
 
-on elementText(e, attrName)
-	try
-		tell application "System Events"
-			if attrName is "description" then return description of e
-			if attrName is "title" then return title of e
-			if attrName is "value" then return value of e
-		end tell
-	on error
-		return ""
-	end try
-end elementText
-
 on isSidebarSearchField(tf)
 	tell application "System Events"
 		try
@@ -133,10 +122,6 @@ on isSidebarSearchField(tf)
 		end try
 		try
 			set d to title of tf
-			if d contains "搜索" or d contains "Search" or d contains "search" then return true
-		end try
-		try
-			set d to value of attribute "AXRoleDescription" of tf
 			if d contains "搜索" or d contains "Search" or d contains "search" then return true
 		end try
 	end tell
@@ -177,56 +162,88 @@ on loginFormInputFields(targetW)
 	return found
 end loginFormInputFields
 
-on clickInputLabelInWindow(targetW, labelTexts)
+on fieldMatchesMarkers(tf, markers)
 	tell application "System Events"
-		repeat with lbl in labelTexts
+		repeat with marker in markers
 			try
-				click (first static text of targetW whose value is lbl)
-				return true
+				if description of tf contains marker then return true
 			end try
 			try
-				repeat with e in entire contents of targetW
-					try
-						if value of e is lbl then
-							click e
-							return true
-						end if
-					end try
-				end repeat
+				if title of tf contains marker then return true
+			end try
+			try
+				set ph to value of attribute "AXPlaceholderValue" of tf
+				if ph contains marker then return true
 			end try
 		end repeat
 	end tell
 	return false
-end clickInputLabelInWindow
+end fieldMatchesMarkers
 
-on typeIntoFocusedField(textValue, useKeystroke)
+on clickElementContaining(targetW, fragment)
 	tell application "System Events"
-		delay 0.2
-		if useKeystroke then
-			keystroke textValue
-		else
+		repeat with e in entire contents of targetW
 			try
-				keystroke "a" using command down
-				delay 0.1
+				if value of e contains fragment then
+					click e
+					return true
+				end if
 			end try
-			keystroke textValue
-		end if
+			try
+				if name of e contains fragment then
+					click e
+					return true
+				end if
+			end try
+		end repeat
 	end tell
-end typeIntoFocusedField
+	return false
+end clickElementContaining
 
-on typeByLabelInWindow(targetW, textValue, useKeystroke, labelTexts)
-	if not my clickInputLabelInWindow(targetW, labelTexts) then
-		error "未找到输入标签: " & (labelTexts as text)
+on findEmailFieldInWindow(targetW)
+	set markers to {"电子邮件或电话号码", "Email or phone", "Email or Phone", "电子邮件", "email"}
+	set fields to my loginFormInputFields(targetW)
+	repeat with tf in fields
+		if my fieldMatchesMarkers(tf, markers) then return tf
+	end repeat
+	if (count of fields) > 0 then return item 1 of fields
+	return missing value
+end findEmailFieldInWindow
+
+on findPasswordFieldInWindow(targetW, appleId)
+	set markers to {"密码", "Password"}
+	set fields to my loginFormInputFields(targetW)
+	repeat with tf in fields
+		if my fieldMatchesMarkers(tf, markers) then return tf
+	end repeat
+	if (count of fields) >= 2 then return item 2 of fields
+	if (count of fields) = 1 then
+		try
+			tell application "System Events"
+				set tf to item 1 of fields
+				set v to value of tf
+				if v is "" or v is not appleId then return tf
+			end tell
+		end try
 	end if
-	delay 0.35
-	my typeIntoFocusedField(textValue, useKeystroke)
-	return true
-end typeByLabelInWindow
+	return missing value
+end findPasswordFieldInWindow
+
+on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
+	repeat maxWaitSec times
+		set pw to my findPasswordFieldInWindow(targetW, appleId)
+		if pw is not missing value then return pw
+		if my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password") then
+			set pw to my findPasswordFieldInWindow(targetW, appleId)
+			if pw is not missing value then return pw
+		end if
+		delay 1
+	end repeat
+	return missing value
+end waitForPasswordFieldInWindow
 
 on typeIntoField(tf, textValue, useKeystroke)
-	if my isSidebarSearchField(tf) then
-		error "拒绝向侧边栏搜索框输入"
-	end if
+	if my isSidebarSearchField(tf) then error "拒绝向侧边栏搜索框输入"
 	tell application "System Events"
 		click tf
 		delay 0.25
@@ -246,21 +263,50 @@ on typeIntoField(tf, textValue, useKeystroke)
 	end tell
 end typeIntoField
 
+on typeIntoFocusedField(textValue, useKeystroke)
+	tell application "System Events"
+		delay 0.2
+		if useKeystroke then
+			keystroke textValue
+		else
+			keystroke textValue
+		end if
+	end tell
+end typeIntoFocusedField
+
 on fillEmailInWindow(targetW, appleId)
-	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
-	my typeByLabelInWindow(targetW, appleId, false, emailLabels)
-	return true
+	set tf to my findEmailFieldInWindow(targetW)
+	if tf is not missing value then
+		my typeIntoField(tf, appleId, false)
+		return true
+	end if
+	if my clickElementContaining(targetW, "电子邮件或电话号码") then
+		my typeIntoFocusedField(appleId, false)
+		return true
+	end if
+	if my clickElementContaining(targetW, "电子邮件") then
+		my typeIntoFocusedField(appleId, false)
+		return true
+	end if
+	error "未找到邮箱输入框（电子邮件或电话号码）"
 end fillEmailInWindow
 
-on fillPasswordInWindow(targetW, applePassword)
-	set passLabels to {"密码", "Password"}
-	my typeByLabelInWindow(targetW, applePassword, true, passLabels)
-	return true
+on fillPasswordInWindow(targetW, appleId, applePassword)
+	set tf to my findPasswordFieldInWindow(targetW, appleId)
+	if tf is not missing value then
+		my typeIntoField(tf, applePassword, true)
+		return true
+	end if
+	if my clickElementContaining(targetW, "密码") then
+		my typeIntoFocusedField(applePassword, true)
+		return true
+	end if
+	if my clickElementContaining(targetW, "Password") then
+		my typeIntoFocusedField(applePassword, true)
+		return true
+	end if
+	error "未找到密码输入框"
 end fillPasswordInWindow
-
-on isPasswordFieldVisible(targetW)
-	return my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password")
-end isPasswordFieldVisible
 
 on searchFieldContains(targetW, textValue)
 	tell application "System Events"
@@ -325,29 +371,32 @@ on run argv
 				set targetW to my findLoginWindow(it)
 			end if
 
+			-- 阶段 1：填写邮箱（电子邮件或电话号码）
 			my fillEmailInWindow(targetW, appleId)
-			delay 0.8
+			delay 1.5
 
-			if my isPasswordFieldVisible(targetW) then
-				my fillPasswordInWindow(targetW, applePassword)
-				my verifyPasswordNotInSearch(targetW, applePassword)
-				delay 0.8
-				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
-					key code 36
-				end if
-			else
+			-- 阶段 2：等待账号下方出现密码框；若未出现则点「继续」后再等
+			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 6)
+			if passField is missing value then
 				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
 					key code 36
 				end if
 				delay 2.5
 				set targetW to my findLoginWindow(it)
-				my fillPasswordInWindow(targetW, applePassword)
-				my verifyPasswordNotInSearch(targetW, applePassword)
-				delay 0.8
-				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
-					if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
-						key code 36
-					end if
+				set passField to my waitForPasswordFieldInWindow(targetW, appleId, 15)
+			end if
+
+			if passField is not missing value then
+				my typeIntoField(passField, applePassword, true)
+			else
+				my fillPasswordInWindow(targetW, appleId, applePassword)
+			end if
+			my verifyPasswordNotInSearch(targetW, applePassword)
+
+			delay 0.8
+			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
+				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
+					key code 36
 				end if
 			end if
 		end tell
