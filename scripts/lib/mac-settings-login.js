@@ -33,14 +33,24 @@ export async function fillMacSettingsAppleLogin(creds) {
       // 辅助功能引导可能停在「隐私→辅助功能」页，填表前强制切回 Apple 登录页
       openAppleAccountSettings();
       await sleep(3500);
-      // 单独激活一次，触发「自动化」授权弹窗（若尚未允许 Terminal 控制系统设置）
+      // 单独激活 + 探测 System Events，触发「自动化」授权弹窗
       try {
         await execFileAsync("osascript", [
           "-e",
           'tell application "System Settings" to activate',
+          "-e",
+          'delay 0.8',
+          "-e",
+          'tell application "System Events" to tell process "System Settings" to get name of window 1',
         ]);
-        await sleep(1200);
-      } catch {
+        await sleep(800);
+      } catch (err) {
+        const msg = String(err?.stderr ?? err?.message ?? err);
+        if (/-1743|not authorized|未授权|自动化/.test(msg)) {
+          throw new Error(
+            "缺少自动化权限：请在 系统设置 → 隐私与安全性 → 自动化 中允许当前终端 App 控制「系统设置」，然后重试。"
+          );
+        }
         console.warn(
           "[Mac 设置] 提示: 若填表失败，请在 系统设置 → 隐私与安全性 → 自动化 中允许 Terminal 控制「系统设置」"
         );

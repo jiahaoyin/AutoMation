@@ -142,14 +142,15 @@ on elementClassName(e)
 	end try
 end elementClassName
 
+-- 仅按 AX 类型识别输入框；勿按 description 匹配（「电子邮件或电话号码」是静态标签，set value 无效）
 on isInputElement(e)
 	set c to my elementClassName(e)
-	if c is in {"text field", "text area", "combo box"} then return true
-	set desc to my elementDescription(e)
-	if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话", "Phone"}) then return true
-	if my textContainsAny(desc, {"密码", "Password"}) then return true
-	return false
+	return c is in {"text field", "text area", "combo box"}
 end isInputElement
+
+on deepInputFieldsOfWindow(targetW)
+	return my allInputFields(targetW)
+end deepInputFieldsOfWindow
 
 on allInputFields(targetW)
 	set found to {}
@@ -377,9 +378,14 @@ on mainPaneContainsAppleId(targetW, appleId)
 end mainPaneContainsAppleId
 
 on emailFillSucceeded(targetW, appleId)
-	if my continueButtonEnabled(targetW) then return true
-	if my windowContainsAppleId(targetW, appleId) then return true
-	if my mainPaneContainsAppleId(targetW, appleId) then return true
+	repeat with tf in my deepInputFieldsOfWindow(targetW)
+		if my isSidebarSearchField(tf) then
+			-- skip sidebar search
+		else
+			set v to my fieldValue(tf)
+			if v contains appleId or v is appleId then return true
+		end if
+	end repeat
 	return false
 end emailFillSucceeded
 
@@ -623,54 +629,35 @@ on tryFillEmailOnField(targetW, tf, appleId)
 	return false
 end tryFillEmailOnField
 
--- 阶段 1：v1.0.7 process 内 set value → 浅层 text field → 网格坐标粘贴
+-- 阶段 1：v1.0.7 路径 — deepInputFields item 1 + process 内 set value / 粘贴
 on fillEmailInWindow(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
-	delay 1.2
+	delay 1.0
 
 	if my emailFillSucceeded(targetW, appleId) then return true
 
-	set allFields to my allInputFields(targetW)
-	if (count of allFields) > 0 then
-		try
-			my typeIntoFieldV07(procRef, item 1 of allFields, appleId)
-			delay 0.6
-			if my emailFillSucceeded(targetW, appleId) then return true
-			my pasteIntoFieldV07(procRef, item 1 of allFields, appleId)
-			delay 0.7
-			if my emailFillSucceeded(targetW, appleId) then return true
-		end try
+	set fields to my deepInputFieldsOfWindow(targetW)
+	set emailField to missing value
+	repeat with tf in fields
+		if not my isSidebarSearchField(tf) then
+			set emailField to tf
+			exit repeat
+		end if
+	end repeat
+	if emailField is missing value and (count of fields) > 0 then
+		set emailField to item 1 of fields
 	end if
 
-	set shallow to my shallowInputFields(targetW)
-	repeat with tf in shallow
-		try
-			my typeIntoFieldV07(procRef, tf, appleId)
-			delay 0.55
-			if my emailFillSucceeded(targetW, appleId) then return true
-			my pasteIntoFieldV07(procRef, tf, appleId)
-			delay 0.65
-			if my emailFillSucceeded(targetW, appleId) then return true
-		end try
-	end repeat
-
-	repeat with tf in allFields
-		if (count of shallow) > 0 then exit repeat
-		try
-			my typeIntoFieldV07(procRef, tf, appleId)
-			delay 0.55
-			if my emailFillSucceeded(targetW, appleId) then return true
-			my pasteIntoFieldV07(procRef, tf, appleId)
-			delay 0.65
-			if my emailFillSucceeded(targetW, appleId) then return true
-		end try
-	end repeat
-
-	if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
-	if my fillEmailByClickAndPaste(procRef, targetW, appleId) then
-		delay 0.8
+	if emailField is not missing value then
+		my typeIntoFieldV07(procRef, emailField, appleId)
+		delay 0.6
+		if my emailFillSucceeded(targetW, appleId) then return true
+		my pasteIntoFieldV07(procRef, emailField, appleId)
+		delay 0.7
 		if my emailFillSucceeded(targetW, appleId) then return true
 	end if
+
+	if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
 
 	my verifyEmailFilled(targetW, appleId)
 	return true
@@ -762,6 +749,21 @@ on readCredentials()
 	return {appleId, applePassword}
 end readCredentials
 
+on assertAutomationPermission(procRef)
+	try
+		tell application "System Events"
+			tell procRef
+				set _n to count of windows
+			end tell
+		end tell
+	on error errMsg number errNum
+		if errNum is -1743 then
+			error "缺少自动化权限：请在 系统设置 → 隐私与安全性 → 自动化 中允许 Terminal（或 Cursor）控制「系统设置」。"
+		end if
+		error "System Events 无法访问系统设置: " & errMsg & " (" & errNum & ")"
+	end try
+end assertAutomationPermission
+
 on run argv
 	set creds to my readCredentials()
 	set appleId to item 1 of creds
@@ -779,6 +781,7 @@ on run argv
 
 	tell application "System Events"
 		tell process "System Settings"
+			my assertAutomationPermission(it)
 			set frontmost to true
 			delay 0.8
 

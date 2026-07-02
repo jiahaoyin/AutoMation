@@ -42,6 +42,7 @@ const COPY_PATHS = [
   "scripts/apple-id-full-flow.mjs",
   "scripts/apple-2fa-wait.scpt",
   "scripts/mac-settings-apple-login.applescript",
+  "scripts/mac-settings-ui-dump.applescript",
   "scripts/mac-settings-signed-in.applescript",
   "scripts/lib/bidi-client.js",
   "scripts/lib/human-input-bidi.js",
@@ -213,6 +214,8 @@ cd apple-id-automation-${VERSION}
 
 - **辅助功能未授权**：运行 \`./install.sh\`，按提示在系统设置中勾选对应终端 App
 - **系统设置填表失败（macOS 15）**：确认已打开 Apple Account 页；辅助功能已授权 Terminal
+- **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」
+- **调试 UI 结构**：\`osascript scripts/mac-settings-ui-dump.applescript\`（登录页打开后运行）
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
 - **2FA 超时**：确认 Mac 已登录同一 Apple ID，且弹窗为 FollowUpUI 设备验证
