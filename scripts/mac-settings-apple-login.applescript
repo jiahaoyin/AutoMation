@@ -171,6 +171,109 @@ on firstNonSearchField(targetW)
 	return missing value
 end firstNonSearchField
 
+on fieldValue(tf)
+	try
+		tell application "System Events"
+			return value of tf
+		end tell
+	on error
+		return ""
+	end try
+end fieldValue
+
+on fieldMatchesMarkers(tf, markers)
+	tell application "System Events"
+		repeat with marker in markers
+			try
+				if description of tf contains marker then return true
+			end try
+			try
+				if title of tf contains marker then return true
+			end try
+		end repeat
+	end tell
+	return false
+end fieldMatchesMarkers
+
+on fieldLooksLikeEmail(tf, appleId)
+	if my fieldMatchesMarkers(tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then return true
+	set v to my fieldValue(tf)
+	if v contains "@" or v is appleId then return true
+	return false
+end fieldLooksLikeEmail
+
+-- 邮箱下方的第二个非搜索框，通常是密码框（避免 Tab 进侧边栏搜索）
+on secondNonSearchField(targetW)
+	set fields to my allInputFields(targetW)
+	set seenFirst to false
+	repeat with tf in fields
+		if not my isSidebarSearchField(tf) then
+			if seenFirst then return tf
+			set seenFirst to true
+		end if
+	end repeat
+	return missing value
+end secondNonSearchField
+
+on findPasswordFieldInWindow(targetW, appleId)
+	set fields to my allInputFields(targetW)
+	repeat with tf in fields
+		if not my isSidebarSearchField(tf) then
+			if my fieldMatchesMarkers(tf, {"密码", "Password"}) then return tf
+		end if
+	end repeat
+
+	set pw to my secondNonSearchField(targetW)
+	if pw is not missing value then
+		if not my fieldLooksLikeEmail(pw, appleId) then return pw
+	end if
+
+	repeat with tf in fields
+		if not my isSidebarSearchField(tf) then
+			if not my fieldLooksLikeEmail(tf, appleId) then return tf
+		end if
+	end repeat
+
+	return missing value
+end findPasswordFieldInWindow
+
+on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
+	repeat maxWaitSec times
+		set pw to my findPasswordFieldInWindow(targetW, appleId)
+		if pw is not missing value then return pw
+		if my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password") then
+			set pw to my findPasswordFieldInWindow(targetW, appleId)
+			if pw is not missing value then return pw
+		end if
+		delay 1
+	end repeat
+	return missing value
+end waitForPasswordFieldInWindow
+
+on emailFieldContains(targetW, appleId)
+	set tf to my firstNonSearchField(targetW)
+	if tf is missing value then return false
+	set v to my fieldValue(tf)
+	return v contains appleId or v is appleId
+end emailFieldContains
+
+on verifyEmailFilled(targetW, appleId)
+	if not my emailFieldContains(targetW, appleId) then
+		error "邮箱未成功填入登录框，请重试"
+	end if
+end verifyEmailFilled
+
+-- set value 写入后模拟一次键盘输入，触发密码框出现/焦点切换（不用 Tab）
+on nudgeEmailFieldForPassword(tf, appleId)
+	tell application "System Events"
+		click tf
+		delay 0.25
+		keystroke "a" using command down
+		delay 0.1
+		keystroke appleId
+	end tell
+end nudgeEmailFieldForPassword
+
 on clickInputLabelInWindow(targetW, labelTexts)
 	tell application "System Events"
 		repeat with lbl in labelTexts
@@ -214,52 +317,55 @@ on typeIntoField(tf, textValue, useKeystroke)
 	end tell
 end typeIntoField
 
--- 邮箱：第一个非搜索输入框 → 标签点击 → 直接 keystroke（勿 Tab）
+-- 邮箱：set value 可靠写入 → 校验 → 模拟键盘触发密码框（勿 Tab）
 on fillEmailInWindow(procRef, targetW, appleId)
 	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
+	set emailField to missing value
 
 	set tf to my firstNonSearchField(targetW)
 	if tf is not missing value then
-		my typeIntoField(tf, appleId, true)
-		return true
+		set emailField to tf
+		my typeIntoField(tf, appleId, false)
+	else
+		set fields to my allInputFields(targetW)
+		if (count of fields) > 0 then
+			set emailField to item 1 of fields
+			my typeIntoField(emailField, appleId, false)
+		else if my clickInputLabelInWindow(targetW, emailLabels) then
+			tell application "System Events" to keystroke appleId
+		else
+			tell application "System Events"
+				tell procRef
+					set frontmost to true
+				end tell
+				try
+					click targetW
+				end try
+				delay 0.2
+				keystroke appleId
+			end tell
+		end if
 	end if
 
-	set fields to my allInputFields(targetW)
-	if (count of fields) > 0 then
-		my typeIntoField(item 1 of fields, appleId, true)
-		return true
+	delay 0.4
+	my verifyEmailFilled(targetW, appleId)
+
+	if emailField is not missing value then
+		my nudgeEmailFieldForPassword(emailField, appleId)
+		delay 0.5
+		my verifyEmailFilled(targetW, appleId)
 	end if
 
-	if my clickInputLabelInWindow(targetW, emailLabels) then
-		tell application "System Events" to keystroke appleId
-		return true
-	end if
-
-	tell application "System Events"
-		tell procRef
-			set frontmost to true
-		end tell
-		try
-			click targetW
-		end try
-		delay 0.2
-		keystroke appleId
-	end tell
 	return true
 end fillEmailInWindow
 
--- 邮箱填完后系统会自动把焦点移到密码框；切勿按 Tab（会进侧边栏搜索框）
-on fillPasswordAtFocus(procRef, applePassword)
-	tell application "System Settings" to activate
-	tell application "System Events"
-		tell procRef
-			set frontmost to true
-		end tell
-		delay 0.8
-		keystroke applePassword
-	end tell
+-- 点击密码框输入（绝不 Tab；绝不向侧边栏搜索框输入）
+on fillPasswordInWindow(targetW, appleId, applePassword)
+	set passField to my findPasswordFieldInWindow(targetW, appleId)
+	if passField is missing value then error "未找到密码输入框"
+	my typeIntoField(passField, applePassword, true)
 	return true
-end fillPasswordAtFocus
+end fillPasswordInWindow
 
 on searchFieldContains(targetW, textValue)
 	tell application "System Events"
@@ -324,11 +430,16 @@ on run argv
 				set targetW to my findLoginWindow(it)
 			end if
 
-			-- 阶段 1：邮箱
+			-- 阶段 1：邮箱（set value + 校验）
 			my fillEmailInWindow(it, targetW, appleId)
-			-- 阶段 2：焦点已在密码框，直接输入（不要 Tab / 不要先点继续）
-			delay 1.2
-			my fillPasswordAtFocus(it, applePassword)
+			delay 1.0
+
+			-- 阶段 2：等待密码框 → 点击密码框输入（不要 Tab）
+			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 10)
+			if passField is missing value then
+				error "填写邮箱后未出现密码输入框，请重试"
+			end if
+			my fillPasswordInWindow(targetW, appleId, applePassword)
 			my verifyPasswordNotInSearch(targetW, applePassword)
 
 			-- 阶段 3：提交
