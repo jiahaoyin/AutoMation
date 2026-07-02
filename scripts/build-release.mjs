@@ -339,7 +339,25 @@ function uploadToGitHubRelease(version, zipPath) {
   const repo = getGitHubRepo();
   const tag = `v${version}`;
   const assetName = path.basename(zipPath);
-  const notes = [
+  const customNotes = process.env.RELEASE_NOTES?.trim();
+  const notes = customNotes
+    ? [
+        `## 更新说明`,
+        "",
+        customNotes,
+        "",
+        `- 版本: **${version}**`,
+        `- 附件: \`${assetName}\``,
+        "",
+        "### 使用",
+        "",
+        "```bash",
+        `curl -fsSL https://raw.githubusercontent.com/${repo}/main/scripts/fetch-latest.sh | bash`,
+        `cd apple-id-automation-latest/apple-id-automation-${version}`,
+        "./install.sh && ./run.sh",
+        "```",
+      ].join("\n")
+    : [
     `## Apple ID 自动化 macOS 分发包`,
     "",
     `- 版本: **${version}**`,
