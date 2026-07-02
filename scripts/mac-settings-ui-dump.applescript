@@ -1,5 +1,5 @@
 -- 诊断：打印 System Settings 登录页 AX 树（调试填表失败时用）
--- v1.0.25：禁止 entire contents（含 repeat with e in entire contents，macOS 会隐式 item i 索引导致 -1700）
+-- v1.0.26：禁止 entire contents（含 repeat with e in entire contents，macOS 会隐式 item i 索引导致 -1700）
 -- 改用 BFS + UI element ci of parent 逐层遍历
 -- 用法: osascript scripts/mac-settings-ui-dump.applescript
 
