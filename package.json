@@ -1,0 +1,20 @@
+{
+  "name": "apple-id-automation",
+  "version": "1.0.2",
+  "private": true,
+  "description": "macOS Apple ID 系统设置登录 + Firefox BiDi account.apple.com 自动化",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "flow": "node scripts/apple-id-full-flow.mjs",
+    "flow:browser-only": "node scripts/apple-id-full-flow.mjs --skip-mac",
+    "flow:mac-only": "node scripts/apple-id-full-flow.mjs --skip-browser",
+    "check": "node scripts/check-environment.mjs",
+    "setup": "node scripts/setup-environment.mjs",
+    "bump:patch": "node scripts/bump-patch-version.mjs",
+    "package": "node scripts/build-release.mjs",
+    "package:no-bump": "node scripts/build-release.mjs --no-bump"
+  }
+}

@@ -1,0 +1,6 @@
+.env
+data/
+.runtime/
+dist/
+.DS_Store
+*.zip

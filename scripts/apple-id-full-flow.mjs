@@ -1,0 +1,87 @@
+#!/usr/bin/env node
+/**
+ * Apple ID 完整流程：
+ * 1) macOS 系统设置登录（自动填账号密码，手机验证码人工，等待登录完成）
+ * 2) Firefox BiDi 访问 account.apple.com（人工模拟输入 + macOS 2FA Sidecar）
+ * 3) 采集姓名、生日，输出 report.json + 截图
+ *
+ * 用法:
+ *   node scripts/apple-id-full-flow.mjs
+ *   # 启动后终端输入 Apple ID / 密码，自动备份至 .env
+ *   node scripts/apple-id-full-flow.mjs --skip-mac    # 仅浏览器阶段（Mac 已登录）
+ *   node scripts/apple-id-full-flow.mjs --skip-browser # 仅 Mac 设置阶段
+ */
+
+import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
+import { promptAppleCredentials } from "./lib/credentials.js";
+import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
+import { createReportDir, writeReport } from "./lib/report.js";
+import { ensureEnvironment } from "./lib/env-setup.js";
+
+const skipMac = process.argv.includes("--skip-mac");
+const skipBrowser = process.argv.includes("--skip-browser");
+const skipSetup = process.argv.includes("--skip-setup");
+
+async function main() {
+  console.log("═══════════════════════════════════════════");
+  console.log(" Apple ID 流程：Mac 系统设置 → Firefox account");
+  console.log("═══════════════════════════════════════════\n");
+
+  if (!skipSetup) {
+    await ensureEnvironment({ quiet: false, skipFirefox: skipBrowser });
+    console.log("");
+  }
+
+  const creds = await promptAppleCredentials();
+  const reportDir = createReportDir("apple-id-flow");
+  const report = {
+    runAt: new Date().toISOString(),
+    appleId: creds.appleId.replace(/(.{2}).+(@.+)/, "$1***$2"),
+    phases: {},
+  };
+
+  if (!skipMac) {
+    try {
+      report.phases.macSettings = await runMacSettingsLoginPhase(creds);
+    } catch (e) {
+      report.phases.macSettings = {
+        success: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+      throw e;
+    }
+  } else {
+    console.log("[Mac 设置] --skip-mac：跳过系统设置登录阶段\n");
+    report.phases.macSettings = { skipped: true };
+  }
+
+  if (!skipBrowser) {
+    try {
+      report.phases.accountBrowser = await runAccountBrowserPhase({
+        creds,
+        reportDir,
+      });
+    } catch (e) {
+      report.phases.accountBrowser = {
+        success: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
+      throw e;
+    }
+  } else {
+    console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
+    report.phases.accountBrowser = { skipped: true };
+  }
+
+  const reportFile = writeReport(reportDir, report);
+  console.log("\n═══════════════════════════════════════════");
+  console.log(" 完成");
+  console.log(` 报告: ${reportFile}`);
+  console.log(` 截图: ${reportDir}/screenshots/`);
+  console.log("═══════════════════════════════════════════\n");
+}
+
+main().catch((e) => {
+  console.error("\n[失败]", e.message || e);
+  process.exit(1);
+});
