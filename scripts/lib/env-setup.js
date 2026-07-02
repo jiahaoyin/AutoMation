@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveFirefoxExecutable, DEFAULT_FIREFOX } from "./bidi-client.js";
-import { ensureAccessibility, getAccessibilityHostApp, isAccessibilityGranted } from "./accessibility.js";
+import { ensureAccessibility, ensureAutomation, getAccessibilityHostApp, isAccessibilityGranted, checkAutomationGranted } from "./accessibility.js";
 import { ensureMacOS15, getMacOSVersion } from "./macos.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -112,6 +112,7 @@ export function ensureProjectLayout({ quiet } = {}) {
     "scripts/setup-environment.mjs",
     "scripts/apple-2fa-wait.scpt",
     "scripts/accessibility-check.applescript",
+    "scripts/automation-check.applescript",
     "scripts/mac-settings-apple-login.applescript",
     "scripts/mac-settings-signed-in.applescript",
   ];
@@ -141,12 +142,14 @@ export function ensureProjectLayout({ quiet } = {}) {
  * @param {boolean} [options.quiet]
  * @param {boolean} [options.skipFirefox]
  * @param {boolean} [options.skipAccessibility]
+ * @param {boolean} [options.skipAutomation]
  */
 export async function ensureEnvironment(options = {}) {
   const {
     quiet = false,
     skipFirefox = false,
     skipAccessibility = false,
+    skipAutomation = false,
   } = options;
 
   if (process.platform !== "darwin") {
@@ -165,6 +168,9 @@ export async function ensureEnvironment(options = {}) {
   ensureProjectLayout({ quiet });
   if (!skipAccessibility) {
     await ensureAccessibility({ quiet });
+  }
+  if (!skipAutomation) {
+    await ensureAutomation({ quiet });
   }
   log("==> 环境就绪", quiet);
 }
@@ -194,6 +200,13 @@ export async function checkEnvironment(options = {}) {
     issues.push(`辅助功能未授权（需勾选 ${host.name}）`);
   }
 
+  const automation = await checkAutomationGranted();
+  if (!automation.granted) {
+    issues.push(
+      `自动化未授权（${host.name} → 系统设置${automation.code ? `，${automation.code}` : ""}）`
+    );
+  }
+
   const envPath = path.join(PACKAGE_ROOT, ".env");
 
   if (!options.quiet) {
@@ -203,6 +216,12 @@ export async function checkEnvironment(options = {}) {
     console.log(
       "  辅助功能:",
       accessibilityOk ? `ok（${host.name}）` : `未授权（请勾选 ${host.name}）`
+    );
+    console.log(
+      "  自动化:",
+      automation.granted
+        ? `ok（${host.name} → 系统设置）`
+        : `未授权（请勾选 ${host.name} → 系统设置）`
     );
     console.log("  .env:", fs.existsSync(envPath) ? "ok" : "首次运行 ./run.sh 时自动创建");
     if (issues.length) {

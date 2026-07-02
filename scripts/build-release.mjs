@@ -59,6 +59,7 @@ const COPY_PATHS = [
   "scripts/lib/macos.js",
   "scripts/bump-patch-version.mjs",
   "scripts/accessibility-check.applescript",
+  "scripts/automation-check.applescript",
   "scripts/lib/accessibility.js",
 ];
 
@@ -214,7 +215,7 @@ cd apple-id-automation-${VERSION}
 
 - **辅助功能未授权**：运行 \`./install.sh\`，按提示在系统设置中勾选对应终端 App
 - **系统设置填表失败（macOS 15）**：确认已打开 Apple Account 页；辅助功能已授权 Terminal
-- **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`osascript scripts/mac-settings-ui-dump.applescript\` 查看 AX 树（v1.0.21 零 text field 时用坐标粘贴）
+- **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`npm run dump:mac-ui\` 查看 AX 树（v1.0.22 修复 tell 上下文 + 自动化预检）
 - **调试 UI 结构**：\`osascript scripts/mac-settings-ui-dump.applescript\`（登录页打开后运行）
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`

@@ -13,11 +13,20 @@ import { sleep } from "./prompt.js";
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CHECK_SCPT = path.resolve(__dirname, "../accessibility-check.applescript");
+const AUTOMATION_CHECK_SCPT = path.resolve(
+  __dirname,
+  "../automation-check.applescript"
+);
 
 const ACCESSIBILITY_URLS = [
   "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
   "x-apple.systempreferences:com.apple.settings.PrivacySecurity",
+];
+
+const AUTOMATION_URLS = [
+  "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation",
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
 ];
 
 function psField(pid, field) {
@@ -70,6 +79,19 @@ export function getAccessibilityHostApp() {
   return { name: "Terminal" };
 }
 
+/** 是否为 macOS 自动化未授权错误（-1743 等） */
+export function isAutomationDeniedError(err) {
+  const parts = [
+    err instanceof Error ? err.message : "",
+    err?.stderr ?? "",
+    err?.stdout ?? "",
+    String(err),
+  ];
+  return /-1743|not authorized to send|未授权|自动化|AUTOMATION_DENIED|READ_DENIED|Automation permission/i.test(
+    parts.join("\n")
+  );
+}
+
 /** 是否为 macOS 辅助功能未授权错误（-25211 等） */
 export function isAccessibilityDeniedError(err) {
   const parts = [
@@ -113,6 +135,147 @@ export async function triggerAccessibilityPrompt() {
   } catch {
     /* 预期可能失败，用于唤起系统授权提示 */
   }
+}
+
+/**
+ * 检测 Terminal/Cursor 对「系统设置」的自动化权限
+ * @returns {Promise<{ granted: boolean, reason?: string, code?: string }>}
+ */
+export async function checkAutomationGranted() {
+  if (process.platform !== "darwin") return { granted: true };
+  if (!fs.existsSync(AUTOMATION_CHECK_SCPT)) {
+    return { granted: false, reason: "missing automation-check script" };
+  }
+
+  try {
+    const { stdout } = await execFileAsync("osascript", [AUTOMATION_CHECK_SCPT], {
+      timeout: 20_000,
+    });
+    const line = stdout.trim();
+    if (line === "yes") return { granted: true };
+    if (line.startsWith("no:partial:")) {
+      return {
+        granted: false,
+        code: "partial",
+        reason:
+          "可枚举 UI 节点但无法读取属性（辅助功能已开，自动化未授予 Terminal→系统设置）",
+      };
+    }
+    const m = line.match(/^no:(-?\d+):(.*)$/);
+    if (m) {
+      const code = m[1];
+      const detail = m[2]?.trim() || line;
+      if (code === "-1743") {
+        return {
+          granted: false,
+          code,
+          reason: "自动化未授权（-1743）：需允许终端 App 控制「系统设置」",
+        };
+      }
+      if (code === "-25211") {
+        return {
+          granted: false,
+          code,
+          reason: "辅助功能未授权（-25211）",
+        };
+      }
+      return { granted: false, code, reason: detail };
+    }
+    return { granted: false, reason: line || "unknown" };
+  } catch (err) {
+    return {
+      granted: false,
+      reason: String(err?.stderr ?? err?.message ?? err),
+    };
+  }
+}
+
+/** 打开系统设置 → 隐私与安全性 → 自动化 */
+export function openAutomationSettings() {
+  if (process.platform !== "darwin") return false;
+
+  for (const url of AUTOMATION_URLS) {
+    const r = spawnSync("open", [url], { encoding: "utf-8" });
+    if (r.status === 0) return true;
+  }
+  return false;
+}
+
+/** 尝试触发系统自动化授权弹窗 */
+export async function triggerAutomationPrompt() {
+  if (process.platform !== "darwin") return;
+  try {
+    await execFileAsync(
+      "osascript",
+      [
+        "-e",
+        'tell application "System Settings" to activate',
+        "-e",
+        "delay 0.5",
+        "-e",
+        'tell application "System Events" to tell process "System Settings" to get name of window 1',
+      ],
+      { timeout: 15_000 }
+    );
+  } catch {
+    /* 预期可能失败，用于唤起授权提示 */
+  }
+}
+
+/**
+ * 检测自动化权限；未授权时打开系统设置并等待用户勾选
+ * @param {object} [options]
+ * @param {boolean} [options.quiet]
+ * @param {number} [options.timeoutMs]
+ * @param {number} [options.pollMs]
+ */
+export async function ensureAutomation(options = {}) {
+  const { quiet = false, timeoutMs = 180_000, pollMs = 2000 } = options;
+
+  if (process.platform !== "darwin") {
+    return { granted: true, skipped: true };
+  }
+
+  const host = getAccessibilityHostApp();
+
+  const first = await checkAutomationGranted();
+  if (first.granted) {
+    log(`✓ 自动化已授权（${host.name} → 系统设置）`, quiet);
+    return { granted: true, host: host.name };
+  }
+
+  log(">>> 自动化权限未就绪，正在引导开启…", quiet);
+  if (first.reason) log(`    原因: ${first.reason}`, quiet);
+  log(
+    `    需要允许「${host.name}」控制「系统设置」（AppleScript 填表与粘贴依赖此项）`,
+    quiet
+  );
+
+  await triggerAutomationPrompt();
+  const opened = openAutomationSettings();
+  if (opened) {
+    log("    已打开：系统设置 → 隐私与安全性 → 自动化", quiet);
+  } else {
+    log("    请手动打开：系统设置 → 隐私与安全性 → 自动化", quiet);
+  }
+  log(
+    `    请展开「${host.name}」并勾选「系统设置」，完成后脚本将自动继续…`,
+    quiet
+  );
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(pollMs);
+    const check = await checkAutomationGranted();
+    if (check.granted) {
+      log(`✓ 自动化已授权（${host.name} → 系统设置）`, quiet);
+      return { granted: true, host: host.name };
+    }
+  }
+
+  throw new Error(
+    `自动化未授权：请在 系统设置 → 隐私与安全性 → 自动化 中展开「${host.name}」并勾选「系统设置」，完成后重新运行 ./run.sh`
+  );
 }
 
 /** 打开系统设置 → 隐私与安全性 → 辅助功能 */
