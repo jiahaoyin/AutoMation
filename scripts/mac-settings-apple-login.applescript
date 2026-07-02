@@ -1,6 +1,10 @@
 -- macOS 15 (Sequoia)：系统设置 → Apple Account 登录填表
 -- 凭证通过环境变量传入：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
 
+on loginPageMarkers()
+	return {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录"}
+end loginPageMarkers
+
 on openAppleAccountPane()
 	set urls to {"x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings", "x-apple.systempreferences:com.apple.preferences.AppleIDPref", "x-apple.systempreferences:com.apple.AccountSettings.AccountsSettingsExtension"}
 	repeat with u in urls
@@ -12,41 +16,94 @@ on openAppleAccountPane()
 	return false
 end openAppleAccountPane
 
-on clickButtonNamed(procRef, buttonLabels)
+on windowMatchesMarker(w, marker)
 	tell application "System Events"
-		tell procRef
-			repeat with w in windows
-				repeat with btnName in buttonLabels
-					try
-						click button btnName of w
-						return true
-					end try
-					try
-						click (first button of w whose name is btnName)
-						return true
-					end try
-					try
-						click button btnName of sheet 1 of w
-						return true
-					end try
-				end repeat
+		try
+			if name of w contains marker then return true
+		end try
+		try
+			repeat with e in entire contents of w
+				try
+					if value of e contains marker then return true
+				end try
+				try
+					if name of e contains marker then return true
+				end try
 			end repeat
-		end tell
+		end try
 	end tell
 	return false
-end clickButtonNamed
+end windowMatchesMarker
 
-on clickSidebarAppleAccount(procRef)
+on findLoginWindow(procRef)
+	tell application "System Events"
+		tell procRef
+			set markers to my loginPageMarkers()
+			repeat with w in windows
+				repeat with marker in markers
+					if my windowMatchesMarker(w, marker) then
+						try
+							set index of w to 1
+						end try
+						set frontmost to true
+						return w
+					end if
+				end repeat
+			end repeat
+			if (count of windows) > 0 then
+				set index of window 1 to 1
+				return window 1
+			end if
+		end tell
+	end tell
+	return missing value
+end findLoginWindow
+
+on waitForLoginWindow(procRef, maxWaitSec)
+	repeat maxWaitSec times
+		set targetW to my findLoginWindow(procRef)
+		if targetW is not missing value then
+			repeat with marker in my loginPageMarkers()
+				if my windowMatchesMarker(targetW, marker) then return targetW
+			end repeat
+		end if
+		my openAppleAccountPane()
+		delay 1
+	end repeat
+	return my findLoginWindow(procRef)
+end waitForLoginWindow
+
+on clickButtonNamedInWindow(targetW, buttonLabels)
+	tell application "System Events"
+		repeat with btnName in buttonLabels
+			try
+				click button btnName of targetW
+				return true
+			end try
+			try
+				click (first button of targetW whose name is btnName)
+				return true
+			end try
+			try
+				click button btnName of sheet 1 of targetW
+				return true
+			end try
+		end repeat
+	end tell
+	return false
+end clickButtonNamedInWindow
+
+on clickSidebarAppleAccount(procRef, targetW)
 	tell application "System Events"
 		tell procRef
 			set sidebarLabels to {"Apple Account", "Apple 账户", "Apple ID", "Apple 账户与密码"}
 			repeat with lbl in sidebarLabels
 				try
-					click static text lbl of scroll area 1 of group 1 of window 1
+					click static text lbl of scroll area 1 of group 1 of targetW
 					return true
 				on error
 					try
-						click UI element lbl of scroll area 1 of group 1 of window 1
+						click UI element lbl of scroll area 1 of group 1 of targetW
 						return true
 					end try
 				end try
@@ -89,93 +146,52 @@ on isInputElement(e)
 	return c is in {"text field", "text area", "combo box"}
 end isInputElement
 
-on deepInputFields(procRef)
+on deepInputFieldsOfWindow(targetW)
 	set found to {}
 	tell application "System Events"
-		tell procRef
-			repeat with w in windows
-				try
-					repeat with e in entire contents of w
-						if my isInputElement(e) then set end of found to e
-					end repeat
-				end try
-				try
-					repeat with e in entire contents of sheet 1 of w
-						if my isInputElement(e) then set end of found to e
-					end repeat
-				end try
+		try
+			repeat with e in entire contents of targetW
+				if my isInputElement(e) then set end of found to e
 			end repeat
-		end tell
+		end try
+		try
+			repeat with e in entire contents of sheet 1 of targetW
+				if my isInputElement(e) then set end of found to e
+			end repeat
+		end try
 	end tell
 	return found
-end deepInputFields
+end deepInputFieldsOfWindow
 
-on windowContainsText(procRef, marker)
+on clickInputLabelInWindow(targetW, labelTexts)
 	tell application "System Events"
-		tell procRef
-			repeat with w in windows
-				try
-					if name of w contains marker then return true
-				end try
-				try
-					repeat with e in entire contents of w
-						try
-							set t to value of e
-							if t contains marker then return true
-						end try
-						try
-							set t to name of e
-							if t contains marker then return true
-						end try
-					end repeat
-				end try
-			end repeat
-		end tell
-	end tell
-	return false
-end windowContainsText
-
-on isLoginPageVisible(procRef)
-	set markers to {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple"}
-	repeat with marker in markers
-		if my windowContainsText(procRef, marker) then return true
-	end repeat
-	return false
-end isLoginPageVisible
-
-on clickInputLabel(procRef, labelTexts)
-	tell application "System Events"
-		tell procRef
-			repeat with w in windows
-				repeat with lbl in labelTexts
+		repeat with lbl in labelTexts
+			try
+				click (first static text of targetW whose value is lbl)
+				return true
+			end try
+			try
+				repeat with e in entire contents of targetW
 					try
-						click (first static text of w whose value is lbl)
-						return true
-					end try
-					try
-						repeat with e in entire contents of w
-							try
-								if value of e is lbl then
-									click e
-									return true
-								end if
-							end try
-						end repeat
+						if value of e is lbl then
+							click e
+							return true
+						end if
 					end try
 				end repeat
-			end repeat
-		end tell
+			end try
+		end repeat
 	end tell
 	return false
-end clickInputLabel
+end clickInputLabelInWindow
 
-on typeViaFocus(procRef, textValue, useKeystroke, labelTexts)
+on typeViaFocusInWindow(procRef, targetW, textValue, useKeystroke, labelTexts)
 	set focused to false
 	if labelTexts is not {} then
-		set focused to my clickInputLabel(procRef, labelTexts)
+		set focused to my clickInputLabelInWindow(targetW, labelTexts)
 	end if
 	if not focused then
-		set fields to my deepInputFields(procRef)
+		set fields to my deepInputFieldsOfWindow(targetW)
 		if (count of fields) > 0 then
 			tell application "System Events" to click item 1 of fields
 			set focused to true
@@ -185,41 +201,35 @@ on typeViaFocus(procRef, textValue, useKeystroke, labelTexts)
 		tell application "System Events"
 			tell procRef
 				set frontmost to true
-				delay 0.2
-				key code 48
 			end tell
+			try
+				click targetW
+			end try
+			delay 0.2
+			key code 48
 		end tell
 	end if
 	delay 0.3
 	tell application "System Events"
-		if useKeystroke then
-			keystroke textValue
-		else
-			keystroke textValue
-		end if
+		keystroke textValue
 	end tell
 	return true
-end typeViaFocus
+end typeViaFocusInWindow
 
-on firstInputField(procRef)
-	set fields to my deepInputFields(procRef)
-	if (count of fields) > 0 then return item 1 of fields
-	return missing value
-end firstInputField
+on fillEmailInWindow(procRef, targetW, appleId)
+	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
+	set fields to my deepInputFieldsOfWindow(targetW)
+	if (count of fields) > 0 then
+		my typeIntoField(item 1 of fields, appleId, false)
+		return true
+	end if
+	my typeViaFocusInWindow(procRef, targetW, appleId, false, emailLabels)
+	return true
+end fillEmailInWindow
 
-on waitForInputField(procRef, maxWaitSec)
+on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
 	repeat maxWaitSec times
-		set tf to my firstInputField(procRef)
-		if tf is not missing value then return tf
-		if my isLoginPageVisible(procRef) then return missing value
-		delay 1
-	end repeat
-	return missing value
-end waitForInputField
-
-on waitForPasswordField(procRef, appleId, maxWaitSec)
-	repeat maxWaitSec times
-		set fields to my deepInputFields(procRef)
+		set fields to my deepInputFieldsOfWindow(targetW)
 		repeat with tf in fields
 			try
 				tell application "System Events"
@@ -231,32 +241,7 @@ on waitForPasswordField(procRef, appleId, maxWaitSec)
 		delay 1
 	end repeat
 	return missing value
-end waitForPasswordField
-
-on fillEmail(procRef, appleId)
-	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
-	set tf to my firstInputField(procRef)
-	if tf is not missing value then
-		my typeIntoField(tf, appleId, false)
-		return true
-	end if
-	if my isLoginPageVisible(procRef) then
-		my typeViaFocus(procRef, appleId, false, emailLabels)
-		return true
-	end if
-	return false
-end fillEmail
-
-on fillPassword(procRef, applePassword)
-	set passLabels to {"密码", "Password"}
-	set tf to my waitForPasswordField(procRef, "", 15)
-	if tf is not missing value then
-		my typeIntoField(tf, applePassword, true)
-		return true
-	end if
-	my typeViaFocus(procRef, applePassword, true, passLabels)
-	return true
-end fillPassword
+end waitForPasswordFieldInWindow
 
 on readCredentials()
 	set appleId to system attribute "APPLE_SCRIPT_APPLE_ID"
@@ -272,47 +257,54 @@ on run argv
 	set applePassword to item 2 of creds
 
 	tell application "System Settings" to activate
-	delay 1
-
-	if not my openAppleAccountPane() then
-		error "无法打开 Apple Account 设置页（macOS 15 Sequoia 深链失败）"
-	end if
-	delay 3
+	delay 0.5
+	my openAppleAccountPane()
+	delay 2
 
 	tell application "System Events"
 		tell process "System Settings"
 			set frontmost to true
-			delay 1
+			delay 0.5
 
-			if not my isLoginPageVisible(it) then
-				if my firstInputField(it) is missing value then
-					my clickSidebarAppleAccount(it)
-					delay 1.2
-					my clickButtonNamed(it, {"Sign In", "Sign in", "登录", "登入"})
-					delay 2
+			set targetW to my waitForLoginWindow(it, 12)
+			if targetW is missing value then
+				error "未找到 Apple 登录窗口（系统设置可能仍停留在辅助功能页）"
+			end if
+
+			set hasLoginContent to false
+			repeat with marker in my loginPageMarkers()
+				if my windowMatchesMarker(targetW, marker) then
+					set hasLoginContent to true
+					exit repeat
 				end if
+			end repeat
+
+			if not hasLoginContent then
+				my clickSidebarAppleAccount(it, targetW)
+				delay 1.2
+				my clickButtonNamedInWindow(targetW, {"Sign In", "Sign in", "登录", "登入"})
+				delay 2
+				set targetW to my findLoginWindow(it)
 			end if
 
-			if not my fillEmail(it, appleId) then
-				error "未找到 Apple ID 邮箱输入框（请确认系统设置已打开 Apple Account 登录界面）"
-			end if
-
+			my fillEmailInWindow(it, targetW, appleId)
 			delay 0.8
-			if not my clickButtonNamed(it, {"Continue", "继续", "Next", "下一步"}) then
+			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
 				key code 36
 			end if
 			delay 2.5
 
-			set passField to my waitForPasswordField(it, appleId, 15)
+			set targetW to my findLoginWindow(it)
+			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 15)
 			if passField is not missing value then
 				my typeIntoField(passField, applePassword, true)
 			else
-				my typeViaFocus(it, applePassword, true, {"密码", "Password"})
+				my typeViaFocusInWindow(it, targetW, applePassword, true, {"密码", "Password"})
 			end if
 
 			delay 0.8
-			if not my clickButtonNamed(it, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
-				if not my clickButtonNamed(it, {"Continue", "继续", "Sign In", "登录"}) then
+			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
+				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
 					key code 36
 				end if
 			end if

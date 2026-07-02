@@ -2,7 +2,7 @@
  * macOS 版本检测（目标平台：macOS 15 Sequoia）
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 
 export const TARGET_MACOS_MAJOR = 15;
 export const TARGET_MACOS_NAME = "Sequoia";
@@ -16,6 +16,15 @@ export const APPLE_ACCOUNT_URL_FALLBACKS = [
   "x-apple.systempreferences:com.apple.preferences.AppleIDPref",
   "x-apple.systempreferences:com.apple.AccountSettings.AccountsSettingsExtension",
 ];
+
+export function openAppleAccountSettings() {
+  if (process.platform !== "darwin") return false;
+  for (const url of APPLE_ACCOUNT_URL_FALLBACKS) {
+    const r = spawnSync("open", [url], { encoding: "utf-8" });
+    if (r.status === 0) return true;
+  }
+  return false;
+}
 
 /**
  * @returns {{ major: number, minor: number, patch: number, productVersion: string }}

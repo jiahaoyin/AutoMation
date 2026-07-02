@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { sleep, waitUntil } from "./prompt.js";
 import { withAccessibilityRetry } from "./accessibility.js";
-import { ensureMacOS15, getMacOSVersion } from "./macos.js";
+import { ensureMacOS15, getMacOSVersion, openAppleAccountSettings } from "./macos.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,15 +29,19 @@ export async function fillMacSettingsAppleLogin(creds) {
   console.log("\n[Mac 设置] 打开 Apple ID 并填入账号密码…");
 
   const { stdout, stderr } = await withAccessibilityRetry(
-    () =>
-      execFileAsync("osascript", [LOGIN_SCPT], {
+    async () => {
+      // 辅助功能引导可能停在「隐私→辅助功能」页，填表前强制切回 Apple 登录页
+      openAppleAccountSettings();
+      await sleep(2500);
+      return execFileAsync("osascript", [LOGIN_SCPT], {
         timeout: 120_000,
         env: {
           ...process.env,
           APPLE_SCRIPT_APPLE_ID: creds.appleId,
           APPLE_SCRIPT_PASSWORD: creds.password,
         },
-      }),
+      });
+    },
     { label: "Mac 系统设置填表", maxAttempts: 3 }
   );
 
