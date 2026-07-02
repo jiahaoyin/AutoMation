@@ -312,16 +312,57 @@ on continueButtonEnabled(targetW)
 		repeat with btnName in {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}
 			try
 				set b to button btnName of targetW
-				if enabled of b then return true
+				try
+					if enabled of b then return true
+				end try
+				try
+					if value of attribute "AXEnabled" of b then return true
+				end try
 			end try
 			try
 				set b to first button of targetW whose name is btnName
-				if enabled of b then return true
+				try
+					if enabled of b then return true
+				end try
+				try
+					if value of attribute "AXEnabled" of b then return true
+				end try
+			end try
+		end repeat
+		repeat with e in entire contents of targetW
+			try
+				if class of e as text is "button" then
+					if name of e is "继续" or name of e is "Continue" then
+						try
+							if enabled of e then return true
+						end try
+						try
+							if value of attribute "AXEnabled" of e then return true
+						end try
+					end if
+				end if
 			end try
 		end repeat
 	end tell
 	return false
 end continueButtonEnabled
+
+on windowContainsAppleId(targetW, appleId)
+	tell application "System Events"
+		repeat with e in entire contents of targetW
+			try
+				if value of e contains appleId then return true
+			end try
+			try
+				if name of e contains appleId then return true
+			end try
+			try
+				if description of e contains appleId then return true
+			end try
+		end repeat
+	end tell
+	return false
+end windowContainsAppleId
 
 on mainPaneContainsAppleId(targetW, appleId)
 	repeat with tf in my resolveLoginInputFields(targetW)
@@ -337,15 +378,105 @@ end mainPaneContainsAppleId
 
 on emailFillSucceeded(targetW, appleId)
 	if my continueButtonEnabled(targetW) then return true
+	if my windowContainsAppleId(targetW, appleId) then return true
 	if my mainPaneContainsAppleId(targetW, appleId) then return true
 	return false
 end emailFillSucceeded
 
+on dumpLoginUiDebug(targetW, appleId)
+	set msg to "[debug] "
+	set allFields to my allInputFields(targetW)
+	set msg to msg & "allFields=" & (count of allFields) & " "
+	set msg to msg & "mainPane=" & (count of (my mainPaneInputFields(targetW))) & " "
+	set msg to msg & "continue=" & my continueButtonEnabled(targetW) & " "
+	set msg to msg & "containsId=" & my windowContainsAppleId(targetW, appleId)
+	do shell script "echo " & quoted form of msg & " >&2"
+end dumpLoginUiDebug
+
 on verifyEmailFilled(targetW, appleId)
 	if not my emailFillSucceeded(targetW, appleId) then
-		error "邮箱未成功填入登录框，请重试"
+		my dumpLoginUiDebug(targetW, appleId)
+		error "邮箱未成功填入登录框。若系统弹出「Terminal 想要控制 系统设置」，请在 隐私与安全性 → 自动化 中允许。"
 	end if
 end verifyEmailFilled
+
+on shallowInputFields(targetW)
+	set found to {}
+	tell application "System Events"
+		try
+			repeat with tf in every text field of targetW
+				set end of found to tf
+			end repeat
+		end try
+		try
+			repeat with tf in every text field of sheet 1 of targetW
+				set end of found to tf
+			end repeat
+		end try
+	end tell
+	return found
+end shallowInputFields
+
+-- v1.0.7 验证有效：在 process 内 click + set value（第一个输入框，不过滤侧边栏）
+on typeIntoFieldV07(procRef, tf, textValue)
+	tell application "System Settings" to activate
+	delay 0.35
+	tell application "System Events"
+		tell procRef
+			set frontmost to true
+			click tf
+			delay 0.3
+			try
+				set value of tf to ""
+			end try
+			delay 0.12
+			try
+				set value of tf to textValue
+			on error errMsg number errNum
+				error "set value 失败: " & errMsg & " (" & errNum & ")"
+			end try
+		end tell
+	end tell
+end typeIntoFieldV07
+
+on pasteIntoFieldV07(procRef, tf, textValue)
+	set the clipboard to textValue
+	tell application "System Settings" to activate
+	delay 0.35
+	tell application "System Events"
+		tell procRef
+			set frontmost to true
+			click tf
+			delay 0.35
+			keystroke "a" using command down
+			delay 0.08
+			keystroke "v" using command down
+		end tell
+	end tell
+end pasteIntoFieldV07
+
+on pasteEmailViaGrid(procRef, targetW, appleId)
+	set the clipboard to appleId
+	tell application "System Events"
+		set winPos to position of targetW
+		set winSize to size of targetW
+		set baseX to item 1 of winPos
+		set baseY to item 2 of winPos
+		set w to item 1 of winSize
+		set h to item 2 of winSize
+		repeat with yFrac in {0.40, 0.44, 0.48, 0.52, 0.56}
+			my ensureSettingsFrontmost(procRef)
+			set clickX to baseX + w * 0.58
+			set clickY to baseY + h * yFrac
+			click at {clickX, clickY}
+			delay 0.4
+			keystroke "v" using command down
+			delay 0.55
+			if my emailFillSucceeded(targetW, appleId) then return true
+		end repeat
+	end tell
+	return false
+end pasteEmailViaGrid
 
 on focusAndSetValue(tf, textValue)
 	if my isSidebarSearchField(tf) then return false
@@ -492,24 +623,50 @@ on tryFillEmailOnField(targetW, tf, appleId)
 	return false
 end tryFillEmailOnField
 
--- 阶段 1：v1.0.7 第一个输入框 → 全候选 set value/剪贴板 → 坐标粘贴
+-- 阶段 1：v1.0.7 process 内 set value → 浅层 text field → 网格坐标粘贴
 on fillEmailInWindow(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
-	delay 1.0
+	delay 1.2
 
 	if my emailFillSucceeded(targetW, appleId) then return true
 
 	set allFields to my allInputFields(targetW)
 	if (count of allFields) > 0 then
-		if my tryFillEmailOnField(targetW, item 1 of allFields, appleId) then return true
+		try
+			my typeIntoFieldV07(procRef, item 1 of allFields, appleId)
+			delay 0.6
+			if my emailFillSucceeded(targetW, appleId) then return true
+			my pasteIntoFieldV07(procRef, item 1 of allFields, appleId)
+			delay 0.7
+			if my emailFillSucceeded(targetW, appleId) then return true
+		end try
 	end if
 
-	set candidates to my resolveLoginInputFields(targetW)
-	if (count of candidates) = 0 then set candidates to allFields
-	repeat with tf in candidates
-		if my tryFillEmailOnField(targetW, tf, appleId) then return true
+	set shallow to my shallowInputFields(targetW)
+	repeat with tf in shallow
+		try
+			my typeIntoFieldV07(procRef, tf, appleId)
+			delay 0.55
+			if my emailFillSucceeded(targetW, appleId) then return true
+			my pasteIntoFieldV07(procRef, tf, appleId)
+			delay 0.65
+			if my emailFillSucceeded(targetW, appleId) then return true
+		end try
 	end repeat
 
+	repeat with tf in allFields
+		if (count of shallow) > 0 then exit repeat
+		try
+			my typeIntoFieldV07(procRef, tf, appleId)
+			delay 0.55
+			if my emailFillSucceeded(targetW, appleId) then return true
+			my pasteIntoFieldV07(procRef, tf, appleId)
+			delay 0.65
+			if my emailFillSucceeded(targetW, appleId) then return true
+		end try
+	end repeat
+
+	if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
 	if my fillEmailByClickAndPaste(procRef, targetW, appleId) then
 		delay 0.8
 		if my emailFillSucceeded(targetW, appleId) then return true
@@ -555,10 +712,18 @@ on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
 
 	set passField to my waitForPasswordFieldInMainPane(targetW, appleId, 12)
 	if passField is not missing value then
-		my focusAndPasteIntoField(passField, applePassword)
+		my pasteIntoFieldV07(procRef, passField, applePassword)
 	else
 		delay 0.5
-		my pasteAtFrontmost(applePassword)
+		set the clipboard to applePassword
+		tell application "System Settings" to activate
+		delay 0.3
+		tell application "System Events"
+			tell procRef
+				set frontmost to true
+			end tell
+			keystroke "v" using command down
+		end tell
 	end if
 
 	my verifyPasswordNotInSearch(targetW, applePassword)

@@ -33,6 +33,18 @@ export async function fillMacSettingsAppleLogin(creds) {
       // 辅助功能引导可能停在「隐私→辅助功能」页，填表前强制切回 Apple 登录页
       openAppleAccountSettings();
       await sleep(3500);
+      // 单独激活一次，触发「自动化」授权弹窗（若尚未允许 Terminal 控制系统设置）
+      try {
+        await execFileAsync("osascript", [
+          "-e",
+          'tell application "System Settings" to activate',
+        ]);
+        await sleep(1200);
+      } catch {
+        console.warn(
+          "[Mac 设置] 提示: 若填表失败，请在 系统设置 → 隐私与安全性 → 自动化 中允许 Terminal 控制「系统设置」"
+        );
+      }
       return execFileAsync("osascript", [LOGIN_SCPT], {
         timeout: 120_000,
         env: {
