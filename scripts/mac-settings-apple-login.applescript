@@ -1,6 +1,6 @@
 -- macOS 15 (Sequoia)：系统设置 → Apple Account 登录
 -- 凭证：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
--- v1.0.22：所有 UI 属性读取必须在 tell procRef 内（handler 会丢失 tell 上下文）
+-- v1.0.24：entire contents 元素引用不可传给 handler；所有属性读取/点击/填值在 tell process 内联
 
 on loginPageMarkers()
 	return {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录", "密码", "Password"}
@@ -16,6 +16,14 @@ on openAppleAccountPane()
 	end repeat
 	return false
 end openAppleAccountPane
+
+on textContainsAny(textValue, markers)
+	if textValue is missing value or textValue is "" then return false
+	repeat with marker in markers
+		if textValue contains marker then return true
+	end repeat
+	return false
+end textContainsAny
 
 on windowMatchesMarker(procRef, w, marker)
 	tell application "System Events"
@@ -140,198 +148,28 @@ on forceActivateSettings(procRef)
 	end repeat
 end forceActivateSettings
 
-on ensureSettingsFrontmost(procRef)
-	my forceActivateSettings(procRef)
-end ensureSettingsFrontmost
-
-on elementClassName(procRef, e)
-	tell application "System Events"
-		tell procRef
-			try
-				return class of e as text
-			on error
-				return ""
-			end try
-		end tell
-	end tell
-	return ""
-end elementClassName
-
-on isInputElement(procRef, e)
-	set c to my elementClassName(procRef, e)
-	return c is in {"text field", "text area", "combo box"}
-end isInputElement
-
-on elementDescription(procRef, e)
-	set parts to {}
-	tell application "System Events"
-		tell procRef
-			try
-				set end of parts to description of e
-			end try
-			try
-				set end of parts to title of e
-			end try
-			try
-				set end of parts to name of e
-			end try
-			try
-				set end of parts to value of attribute "AXRoleDescription" of e
-			end try
-			try
-				set end of parts to value of attribute "AXPlaceholderValue" of e
-			end try
-		end tell
-	end tell
-	set merged to ""
-	repeat with p in parts
-		if p is not missing value and p is not "" then set merged to merged & p
-	end repeat
-	return merged
-end elementDescription
-
-on allInputFields(procRef, targetW)
-	set found to {}
+on countDeepInputFields(procRef, targetW)
+	set n to 0
 	tell application "System Events"
 		tell procRef
 			try
 				repeat with e in entire contents of targetW
-					if my isInputElement(procRef, e) then set end of found to e
+					try
+						if class of e as text is in {"text field", "text area", "combo box"} then set n to n + 1
+					end try
 				end repeat
 			end try
 			try
 				repeat with e in entire contents of sheet 1 of targetW
-					if my isInputElement(procRef, e) then set end of found to e
-				end repeat
-			end try
-		end tell
-	end tell
-	return found
-end allInputFields
-
-on sidebarScrollArea(procRef, targetW)
-	tell application "System Events"
-		tell procRef
-			try
-				return scroll area 1 of group 1 of targetW
-			end try
-		end tell
-	end tell
-	return missing value
-end sidebarScrollArea
-
-on isInsideSidebar(procRef, e, targetW)
-	set sidebar to my sidebarScrollArea(procRef, targetW)
-	if sidebar is missing value then return false
-	tell application "System Events"
-		tell procRef
-			try
-				repeat with se in entire contents of sidebar
-					if se is e then return true
-				end repeat
-			end try
-		end tell
-	end tell
-	return false
-end isInsideSidebar
-
-on isSidebarSearchField(procRef, tf)
-	if my textContainsAny(my elementDescription(procRef, tf), {"搜索", "Search", "search"}) then return true
-	return false
-end isSidebarSearchField
-
-on textContainsAny(textValue, markers)
-	if textValue is missing value or textValue is "" then return false
-	repeat with marker in markers
-		if textValue contains marker then return true
-	end repeat
-	return false
-end textContainsAny
-
-on mainPaneInputFieldsByPosition(procRef, targetW)
-	set found to {}
-	tell application "System Events"
-		tell procRef
-			try
-				set winPos to position of targetW
-				set winSize to size of targetW
-				set minX to (item 1 of winPos) + (item 1 of winSize) * 0.22
-				repeat with tf in my allInputFields(procRef, targetW)
 					try
-						set fp to position of tf
-						if (item 1 of fp) >= minX then set end of found to tf
+						if class of e as text is in {"text field", "text area", "combo box"} then set n to n + 1
 					end try
 				end repeat
 			end try
 		end tell
 	end tell
-	return found
-end mainPaneInputFieldsByPosition
-
-on firstNonSearchField(procRef, targetW)
-	repeat with tf in my allInputFields(procRef, targetW)
-		if not my isSidebarSearchField(procRef, tf) then return tf
-	end repeat
-	return missing value
-end firstNonSearchField
-
-on nonSearchInputFields(procRef, targetW)
-	set found to {}
-	repeat with tf in my allInputFields(procRef, targetW)
-		if not my isSidebarSearchField(procRef, tf) then set end of found to tf
-	end repeat
-	return found
-end nonSearchInputFields
-
-on resolveLoginInputFields(procRef, targetW)
-	set fields to my mainPaneInputFields(procRef, targetW)
-	if (count of fields) > 0 then return fields
-
-	set fields to my mainPaneInputFieldsByPosition(procRef, targetW)
-	if (count of fields) > 0 then return fields
-
-	set fields to my nonSearchInputFields(procRef, targetW)
-	if (count of fields) > 0 then return fields
-
-	return my allInputFields(procRef, targetW)
-end resolveLoginInputFields
-
-on mainPaneInputFields(procRef, targetW)
-	set found to {}
-	repeat with tf in my allInputFields(procRef, targetW)
-		if not my isInsideSidebar(procRef, tf, targetW) then set end of found to tf
-	end repeat
-	return found
-end mainPaneInputFields
-
-on fieldValue(procRef, tf)
-	tell application "System Events"
-		tell procRef
-			try
-				return value of tf
-			on error
-				return ""
-			end try
-		end tell
-	end tell
-	return ""
-end fieldValue
-
-on fieldMatchesMarkers(procRef, tf, markers)
-	tell application "System Events"
-		tell procRef
-			repeat with marker in markers
-				try
-					if description of tf contains marker then return true
-				end try
-				try
-					if title of tf contains marker then return true
-				end try
-			end repeat
-		end tell
-	end tell
-	return false
-end fieldMatchesMarkers
+	return n
+end countDeepInputFields
 
 on continueButtonEnabled(procRef, targetW)
 	tell application "System Events"
@@ -375,7 +213,7 @@ on continueButtonEnabled(procRef, targetW)
 	return false
 end continueButtonEnabled
 
-on windowContainsAppleId(procRef, targetW, appleId)
+on emailFillSucceeded(procRef, targetW, appleId)
 	tell application "System Events"
 		tell procRef
 			repeat with e in entire contents of targetW
@@ -389,114 +227,46 @@ on windowContainsAppleId(procRef, targetW, appleId)
 					if description of e contains appleId then return true
 				end try
 			end repeat
-		end tell
-	end tell
-	return false
-end windowContainsAppleId
-
-on getFocusedElementValue(procRef)
-	tell application "System Events"
-		tell procRef
 			try
 				set f to value of attribute "AXFocusedUIElement"
 				try
-					return value of f as text
-				on error
-					try
-						return description of f as text
-					end try
+					if value of f contains appleId then return true
 				end try
-			end try
-			try
-				repeat with w in windows
-					repeat with e in entire contents of w
-						try
-							if focused of e then return value of e as text
-						end try
-					end repeat
-				end repeat
+				try
+					if description of f contains appleId then return true
+				end try
 			end try
 		end tell
 	end tell
-	return ""
-end getFocusedElementValue
-
-on focusedContainsAppleId(procRef, appleId)
-	set fv to my getFocusedElementValue(procRef)
-	if fv contains appleId or fv is appleId then return true
-	return false
-end focusedContainsAppleId
-
-on emailFillSucceeded(procRef, targetW, appleId)
-	repeat with tf in my allInputFields(procRef, targetW)
-		if my isSidebarSearchField(procRef, tf) then
-			-- skip sidebar search
-		else
-			set v to my fieldValue(procRef, tf)
-			if v contains appleId or v is appleId then return true
-		end if
-	end repeat
-	if my windowContainsAppleId(procRef, targetW, appleId) then return true
-	if my focusedContainsAppleId(procRef, appleId) then return true
 	if my continueButtonEnabled(procRef, targetW) then return true
 	return false
 end emailFillSucceeded
 
-on dumpLoginUiDebug(procRef, targetW, appleId)
-	set msg to "[debug] "
-	set allFields to my allInputFields(procRef, targetW)
-	set msg to msg & "allFields=" & (count of allFields) & " "
-	set msg to msg & "mainPane=" & (count of (my mainPaneInputFields(procRef, targetW))) & " "
-	set msg to msg & "continue=" & my continueButtonEnabled(procRef, targetW) & " "
-	set msg to msg & "containsId=" & my windowContainsAppleId(procRef, targetW, appleId) & " "
-	set msg to msg & "focused=" & my getFocusedElementValue(procRef)
-	do shell script "echo " & quoted form of msg & " >&2"
-end dumpLoginUiDebug
-
-on verifyEmailFilled(procRef, targetW, appleId, usedCoordinatePaste)
-	if my emailFillSucceeded(procRef, targetW, appleId) then return
-	if my continueButtonEnabled(procRef, targetW) then return
-	if my focusedContainsAppleId(procRef, appleId) then return
-	if usedCoordinatePaste and not my searchFieldContains(procRef, targetW, appleId) then
-		-- 坐标粘贴后 AX 树可能仍为空；侧边栏未误填则视为成功
-		return
-	end if
-	my dumpLoginUiDebug(procRef, targetW, appleId)
-	error "邮箱未成功填入登录框 (-2700)。请在 隐私与安全性 → 自动化 中允许 Terminal/Cursor 控制「系统设置」。"
-end verifyEmailFilled
-
-on typeIntoFieldV07(procRef, tf, textValue)
-	my forceActivateSettings(procRef)
+on searchFieldContains(procRef, targetW, textValue)
 	tell application "System Events"
 		tell procRef
-			click tf
-			delay 0.3
-			try
-				set value of tf to ""
-			end try
-			delay 0.12
-			try
-				set value of tf to textValue
-			on error errMsg number errNum
-				error "set value 失败: " & errMsg & " (" & errNum & ")"
-			end try
+			repeat with e in entire contents of targetW
+				try
+					if class of e as text is in {"text field", "text area", "combo box"} then
+						set d to ""
+						try
+							set d to description of e
+						end try
+						try
+							set d to d & name of e
+						end try
+						if d contains "搜索" or d contains "Search" or d contains "search" then
+							try
+								if value of e contains textValue then return true
+							end try
+						end if
+					end if
+				end try
+			end repeat
 		end tell
 	end tell
-end typeIntoFieldV07
-
-on pasteIntoFieldV07(procRef, tf, textValue)
-	set the clipboard to textValue
-	my forceActivateSettings(procRef)
-	tell application "System Events"
-		tell procRef
-			click tf
-			delay 0.35
-			keystroke "a" using command down
-			delay 0.08
-			keystroke "v" using command down
-		end tell
-	end tell
-end pasteIntoFieldV07
+	return false
+end searchFieldContains
 
 on checkPasteAutomationPermission(procRef)
 	try
@@ -513,20 +283,22 @@ on checkPasteAutomationPermission(procRef)
 	end try
 end checkPasteAutomationPermission
 
-on pasteAtCoordinate(procRef, targetW, clickX, clickY, textValue)
+on pasteAtCoordinate(procRef, clickX, clickY, textValue)
 	set the clipboard to textValue
 	my forceActivateSettings(procRef)
 	tell application "System Events"
-		click at {clickX, clickY}
-		delay 0.55
-		keystroke "a" using command down
-		delay 0.1
-		try
-			keystroke "v" using command down
-		on error errMsg number errNum
-			my checkPasteAutomationPermission(procRef)
-			error "粘贴失败: " & errMsg & " (" & errNum & ")"
-		end try
+		tell procRef
+			click at {clickX, clickY}
+			delay 0.55
+			keystroke "a" using command down
+			delay 0.1
+			try
+				keystroke "v" using command down
+			on error errMsg number errNum
+				my checkPasteAutomationPermission(procRef)
+				error "粘贴失败: " & errMsg & " (" & errNum & ")"
+			end try
+		end tell
 	end tell
 end pasteAtCoordinate
 
@@ -544,7 +316,7 @@ on pasteEmailViaGrid(procRef, targetW, appleId)
 				repeat with yFrac in {0.36, 0.40, 0.44, 0.48, 0.52, 0.56, 0.60}
 					set clickX to baseX + w * xFrac
 					set clickY to baseY + h * yFrac
-					my pasteAtCoordinate(procRef, targetW, clickX, clickY, appleId)
+					my pasteAtCoordinate(procRef, clickX, clickY, appleId)
 					delay 0.75
 					if my emailFillSucceeded(procRef, targetW, appleId) then return true
 				end repeat
@@ -554,90 +326,49 @@ on pasteEmailViaGrid(procRef, targetW, appleId)
 	return false
 end pasteEmailViaGrid
 
-on focusAndSetValue(procRef, tf, textValue)
-	if my isSidebarSearchField(procRef, tf) then return false
-	my forceActivateSettings(procRef)
-	tell application "System Events"
-		tell procRef
-			try
-				set focused of tf to true
-			end try
-			click tf
-			delay 0.25
-			try
-				set value of tf to textValue
-				return true
-			on error
-				return false
-			end try
-		end tell
-	end tell
-end focusAndSetValue
-
-on focusAndPasteIntoField(procRef, tf, textValue)
-	if my isSidebarSearchField(procRef, tf) then return false
-	set the clipboard to textValue
-	my forceActivateSettings(procRef)
-	tell application "System Events"
-		tell procRef
-			try
-				set focused of tf to true
-			end try
-			click tf
-			delay 0.3
-			keystroke "a" using command down
-			delay 0.08
-			keystroke "v" using command down
-		end tell
-	end tell
-	return true
-end focusAndPasteIntoField
-
-on tryClickElement(procRef, e)
-	tell application "System Events"
-		tell procRef
-			try
-				click e
-				return true
-			end try
-			try
-				perform action "AXPress" of e
-				return true
-			end try
-			try
-				set focused of e to true
-				return true
-			end try
-		end tell
-	end tell
-	return false
-end tryClickElement
-
 on clickEmailFieldByMarker(procRef, targetW)
 	tell application "System Events"
 		tell procRef
 			repeat with e in entire contents of targetW
-				set desc to my elementDescription(procRef, e)
+				set desc to ""
+				try
+					set desc to description of e
+				end try
+				try
+					set desc to desc & title of e
+				end try
+				try
+					set desc to desc & name of e
+				end try
 				if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话", "必填", "Required"}) then
-					if my tryClickElement(procRef, e) then return true
+					try
+						click e
+						return true
+					end try
+					try
+						perform action "AXPress" of e
+						return true
+					end try
+					try
+						set focused of e to true
+						return true
+					end try
 				end if
 				try
 					set roleDesc to value of attribute "AXRoleDescription" of e
 					if roleDesc is "文本栏" or roleDesc contains "text field" or roleDesc contains "Text Field" then
-						if my tryClickElement(procRef, e) then return true
-					end if
-				end try
-				try
-					if class of e as text is "group" then
-						set roleDesc to value of attribute "AXRoleDescription" of e
-						if roleDesc is "文本栏" or roleDesc contains "text" then
-							if my tryClickElement(procRef, e) then return true
-						end if
+						try
+							click e
+							return true
+						end try
 					end if
 				end try
 				try
 					if value of e is "电子邮件或电话号码" or value of e is "Email or Phone Number" then
-						if my tryClickElement(procRef, e) then return true
+						try
+							click e
+							return true
+						end try
 					end if
 				end try
 			end repeat
@@ -674,12 +405,14 @@ on fillEmailByClickAndPaste(procRef, targetW, appleId)
 	set the clipboard to appleId
 	my forceActivateSettings(procRef)
 	tell application "System Events"
-		try
-			keystroke "v" using command down
-		on error errMsg number errNum
-			my checkPasteAutomationPermission(procRef)
-			error "粘贴失败: " & errMsg & " (" & errNum & ")"
-		end try
+		tell procRef
+			try
+				keystroke "v" using command down
+			on error errMsg number errNum
+				my checkPasteAutomationPermission(procRef)
+				error "粘贴失败: " & errMsg & " (" & errNum & ")"
+			end try
+		end tell
 	end tell
 	delay 0.75
 	return my emailFillSucceeded(procRef, targetW, appleId)
@@ -696,16 +429,49 @@ on fillEmailZeroFieldPath(procRef, targetW, appleId)
 	return false
 end fillEmailZeroFieldPath
 
-on tryFillEmailOnField(procRef, targetW, tf, appleId)
-	if my isSidebarSearchField(procRef, tf) then return false
-	my focusAndSetValue(procRef, tf, appleId)
-	delay 0.55
-	if my emailFillSucceeded(procRef, targetW, appleId) then return true
-	my focusAndPasteIntoField(procRef, tf, appleId)
-	delay 0.65
-	if my emailFillSucceeded(procRef, targetW, appleId) then return true
+on tryFillFirstEmailField(procRef, targetW, appleId)
+	tell application "System Events"
+		tell procRef
+			repeat with e in entire contents of targetW
+				try
+					if class of e as text is in {"text field", "text area", "combo box"} then
+						set d to ""
+						try
+							set d to description of e
+						end try
+						try
+							set d to d & name of e
+						end try
+						if d contains "搜索" or d contains "Search" or d contains "search" then
+							-- skip sidebar search
+						else
+							my forceActivateSettings(procRef)
+							click e
+							delay 0.3
+							try
+								set value of e to ""
+							end try
+							delay 0.12
+							try
+								set value of e to appleId
+							end try
+							delay 0.55
+							if my emailFillSucceeded(procRef, targetW, appleId) then return true
+							set the clipboard to appleId
+							keystroke "a" using command down
+							delay 0.08
+							keystroke "v" using command down
+							delay 0.65
+							if my emailFillSucceeded(procRef, targetW, appleId) then return true
+							return false
+						end if
+					end if
+				end try
+			end repeat
+		end tell
+	end tell
 	return false
-end tryFillEmailOnField
+end tryFillFirstEmailField
 
 on fillEmailInWindow(procRef, targetW, appleId)
 	my forceActivateSettings(procRef)
@@ -713,34 +479,14 @@ on fillEmailInWindow(procRef, targetW, appleId)
 
 	if my emailFillSucceeded(procRef, targetW, appleId) then return {true, false}
 
-	set allFields to my allInputFields(procRef, targetW)
-	set fieldCount to count of allFields
+	set fieldCount to my countDeepInputFields(procRef, targetW)
 	set usedCoordinatePaste to false
 
 	if fieldCount is 0 then
 		set usedCoordinatePaste to true
 		if my fillEmailZeroFieldPath(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
 	else
-		set emailField to missing value
-		repeat with tf in allFields
-			if not my isSidebarSearchField(procRef, tf) then
-				set emailField to tf
-				exit repeat
-			end if
-		end repeat
-		if emailField is missing value and fieldCount > 0 then
-			set emailField to item 1 of allFields
-		end if
-
-		if emailField is not missing value then
-			my typeIntoFieldV07(procRef, emailField, appleId)
-			delay 0.6
-			if my emailFillSucceeded(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
-			my pasteIntoFieldV07(procRef, emailField, appleId)
-			delay 0.7
-			if my emailFillSucceeded(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
-		end if
-
+		if my tryFillFirstEmailField(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
 		set usedCoordinatePaste to true
 		if my fillEmailByClickAndPaste(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
 		if my pasteEmailViaGrid(procRef, targetW, appleId) then return {true, usedCoordinatePaste}
@@ -750,35 +496,78 @@ on fillEmailInWindow(procRef, targetW, appleId)
 	return {true, usedCoordinatePaste}
 end fillEmailInWindow
 
-on findPasswordFieldInMainPane(procRef, targetW, appleId)
-	set fields to my resolveLoginInputFields(procRef, targetW)
-	repeat with tf in fields
-		if my fieldMatchesMarkers(procRef, tf, {"密码", "Password"}) then return tf
-	end repeat
-	if (count of fields) >= 2 then
-		repeat with tf in fields
-			if not my fieldMatchesMarkers(procRef, tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then
-				set v to my fieldValue(procRef, tf)
-				if v does not contain "@" and v is not appleId then return tf
-			end if
-		end repeat
-		return item 2 of fields
+on verifyEmailFilled(procRef, targetW, appleId, usedCoordinatePaste)
+	if my emailFillSucceeded(procRef, targetW, appleId) then return
+	if my continueButtonEnabled(procRef, targetW) then return
+	if usedCoordinatePaste and not my searchFieldContains(procRef, targetW, appleId) then
+		-- 坐标粘贴后 AX 树可能仍为空；侧边栏未误填则视为成功
+		return
 	end if
-	return missing value
-end findPasswordFieldInMainPane
+	error "邮箱未成功填入登录框 (-2700)。请在 隐私与安全性 → 自动化 中允许 Terminal/Cursor 控制「系统设置」。"
+end verifyEmailFilled
 
-on waitForPasswordFieldInMainPane(procRef, targetW, appleId, maxWaitSec)
-	repeat maxWaitSec times
-		set pw to my findPasswordFieldInMainPane(procRef, targetW, appleId)
-		if pw is not missing value then return pw
-		if my windowMatchesMarker(procRef, targetW, "密码") or my windowMatchesMarker(procRef, targetW, "Password") then
-			set pw to my findPasswordFieldInMainPane(procRef, targetW, appleId)
-			if pw is not missing value then return pw
-		end if
+on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
+	my forceActivateSettings(procRef)
+	delay 0.8
+
+	set filled to false
+	repeat 8 times
+		tell application "System Events"
+			tell procRef
+				repeat with e in entire contents of targetW
+					try
+						if class of e as text is in {"text field", "text area", "combo box"} then
+							set d to ""
+							try
+								set d to description of e
+							end try
+							try
+								set d to d & title of e
+							end try
+							try
+								set d to d & name of e
+							end try
+							if d contains "密码" or d contains "Password" then
+								set the clipboard to applePassword
+								click e
+								delay 0.35
+								keystroke "a" using command down
+								delay 0.08
+								keystroke "v" using command down
+								set filled to true
+								exit repeat
+							end if
+						end if
+					end try
+				end repeat
+			end tell
+		end tell
+		if filled then exit repeat
 		delay 0.5
 	end repeat
-	return missing value
-end waitForPasswordFieldInMainPane
+
+	if not filled then
+		set the clipboard to applePassword
+		my forceActivateSettings(procRef)
+		tell application "System Events"
+			tell procRef
+				try
+					keystroke "v" using command down
+				on error errMsg number errNum
+					my checkPasteAutomationPermission(procRef)
+					error "密码粘贴失败: " & errMsg & " (" & errNum & ")"
+				end try
+			end tell
+		end tell
+		delay 0.45
+		if my searchFieldContains(procRef, targetW, applePassword) then
+			my pastePasswordViaCoordinates(procRef, targetW, applePassword)
+		end if
+	end if
+
+	my verifyPasswordNotInSearch(procRef, targetW, applePassword)
+	return true
+end fillPasswordInWindow
 
 on pastePasswordViaCoordinates(procRef, targetW, applePassword)
 	tell application "System Events"
@@ -792,7 +581,7 @@ on pastePasswordViaCoordinates(procRef, targetW, applePassword)
 			repeat with yFrac in {0.52, 0.56, 0.60, 0.64, 0.68}
 				set clickX to baseX + w * 0.58
 				set clickY to baseY + h * yFrac
-				my pasteAtCoordinate(procRef, targetW, clickX, clickY, applePassword)
+				my pasteAtCoordinate(procRef, clickX, clickY, applePassword)
 				delay 0.55
 				if not my searchFieldContains(procRef, targetW, applePassword) then return true
 			end repeat
@@ -800,54 +589,6 @@ on pastePasswordViaCoordinates(procRef, targetW, applePassword)
 	end tell
 	return false
 end pastePasswordViaCoordinates
-
-on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
-	my forceActivateSettings(procRef)
-	delay 0.8
-
-	set passField to my waitForPasswordFieldInMainPane(procRef, targetW, appleId, 8)
-	if passField is not missing value then
-		my pasteIntoFieldV07(procRef, passField, applePassword)
-	else
-		set the clipboard to applePassword
-		my forceActivateSettings(procRef)
-		tell application "System Events"
-			try
-				keystroke "v" using command down
-			on error errMsg number errNum
-				my checkPasteAutomationPermission(procRef)
-				error "密码粘贴失败: " & errMsg & " (" & errNum & ")"
-			end try
-		end tell
-		delay 0.45
-		if my searchFieldContains(procRef, targetW, applePassword) then
-			my pastePasswordViaCoordinates(procRef, targetW, applePassword)
-		end if
-	end if
-
-	my verifyPasswordNotInSearch(procRef, targetW, applePassword)
-	return true
-end fillPasswordInWindow
-
-on searchFieldContains(procRef, targetW, textValue)
-	tell application "System Events"
-		tell procRef
-			repeat with e in entire contents of targetW
-				if my isInputElement(procRef, e) and my isSidebarSearchField(procRef, e) then
-					try
-						if value of e contains textValue then return true
-					end try
-				end if
-				if my isInputElement(procRef, e) and my isInsideSidebar(procRef, e, targetW) then
-					try
-						if value of e contains textValue then return true
-					end try
-				end if
-			end repeat
-		end tell
-	end tell
-	return false
-end searchFieldContains
 
 on verifyPasswordNotInSearch(procRef, targetW, applePassword)
 	if my searchFieldContains(procRef, targetW, applePassword) then
