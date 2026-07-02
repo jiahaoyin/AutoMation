@@ -58,6 +58,7 @@ on typeIntoField(tf, textValue, useKeystroke)
 		try
 			set value of tf to ""
 		end try
+		delay 0.15
 		if useKeystroke then
 			keystroke textValue
 		else
@@ -69,6 +70,66 @@ on typeIntoField(tf, textValue, useKeystroke)
 		end if
 	end tell
 end typeIntoField
+
+on collectTextFieldsFromWindow(w)
+	set collected to {}
+	tell application "System Events"
+		try
+			set collected to text fields of w
+		end try
+		try
+			set collected to collected & (text fields of sheet 1 of w)
+		end try
+	end tell
+	return collected
+end collectTextFieldsFromWindow
+
+on findTextFields(procRef)
+	set found to {}
+	tell application "System Events"
+		tell procRef
+			repeat with w in windows
+				set found to found & my collectTextFieldsFromWindow(w)
+			end repeat
+		end tell
+	end tell
+	return found
+end findTextFields
+
+on firstTextField(procRef)
+	set fields to my findTextFields(procRef)
+	if (count of fields) > 0 then return item 1 of fields
+	return missing value
+end firstTextField
+
+on isSignInLandingVisible(procRef)
+	return my firstTextField(procRef) is not missing value
+end isSignInLandingVisible
+
+on waitForTextField(procRef, maxWaitSec)
+	repeat maxWaitSec times
+		set tf to my firstTextField(procRef)
+		if tf is not missing value then return tf
+		delay 1
+	end repeat
+	return missing value
+end waitForTextField
+
+on waitForPasswordField(procRef, appleId, maxWaitSec)
+	repeat maxWaitSec times
+		set tf to my firstTextField(procRef)
+		if tf is not missing value then
+			try
+				tell application "System Events"
+					set v to value of tf
+					if v is "" or v is not appleId then return tf
+				end tell
+			end try
+		end if
+		delay 1
+	end repeat
+	return missing value
+end waitForPasswordField
 
 on readCredentials()
 	set appleId to system attribute "APPLE_SCRIPT_APPLE_ID"
@@ -95,55 +156,40 @@ on run argv
 		tell process "System Settings"
 			set frontmost to true
 			delay 0.8
-			my clickSidebarAppleAccount(it)
-			delay 1.2
 
-			my clickButtonNamed(it, {"Sign In", "Sign in", "登录", "登入"})
-			delay 1.5
-
-			set filledUser to false
-			set filledPass to false
-
-			repeat with w in windows
-				repeat with tf in text fields of w
-					try
-						if not filledUser then
-							my typeIntoField(tf, appleId, false)
-							set filledUser to true
-						else if not filledPass then
-							my typeIntoField(tf, applePassword, true)
-							set filledPass to true
-							exit repeat
-						end if
-					end try
-				end repeat
-
-				if not filledPass then
-					repeat with stf in text fields of sheet 1 of w
-						try
-							if not filledUser then
-								my typeIntoField(stf, appleId, false)
-								set filledUser to true
-							else
-								my typeIntoField(stf, applePassword, true)
-								set filledPass to true
-								exit repeat
-							end if
-						end try
-					end repeat
-				end if
-
-				if filledPass then exit repeat
-			end repeat
-
-			if not filledUser then
-				error "未找到 Apple ID 输入框（请确认 macOS 15 系统设置已打开 Apple Account 登录界面）"
+			-- 深链可能直接进入「登录」落地页（主窗口，无 sheet）
+			if not my isSignInLandingVisible(it) then
+				my clickSidebarAppleAccount(it)
+				delay 1.2
+				my clickButtonNamed(it, {"Sign In", "Sign in", "登录", "登入"})
+				delay 1.5
 			end if
 
+			-- 阶段 1：填写邮箱并点「继续」
+			set emailField to my waitForTextField(it, 10)
+			if emailField is missing value then
+				error "未找到 Apple ID 邮箱输入框（请确认系统设置已打开 Apple Account 登录界面）"
+			end if
+
+			my typeIntoField(emailField, appleId, false)
 			delay 0.6
-			my clickButtonNamed(it, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"})
-			if not my clickButtonNamed(it, {"Continue", "继续", "Sign In", "登录"}) then
+			if not my clickButtonNamed(it, {"Continue", "继续", "Next", "下一步"}) then
 				key code 36
+			end if
+			delay 2
+
+			-- 阶段 2：等待密码框出现并填写
+			set passField to my waitForPasswordField(it, appleId, 15)
+			if passField is missing value then
+				error "未找到密码输入框（邮箱提交后未出现密码页）"
+			end if
+
+			my typeIntoField(passField, applePassword, true)
+			delay 0.6
+			if not my clickButtonNamed(it, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
+				if not my clickButtonNamed(it, {"Continue", "继续", "Sign In", "登录"}) then
+					key code 36
+				end if
 			end if
 		end tell
 	end tell
