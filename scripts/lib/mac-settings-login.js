@@ -68,6 +68,18 @@ export async function fillMacSettingsAppleLogin(creds) {
     { label: "Mac 系统设置填表", maxAttempts: 3 }
   );
 
+  const errText = String(stderr ?? stdout ?? "");
+  if (/邮箱未成功填入|粘贴失败|-2700|-1743/.test(errText)) {
+    if (/-1743|自动化权限|缺少自动化/.test(errText)) {
+      throw new Error(
+        "缺少自动化权限：请在 系统设置 → 隐私与安全性 → 自动化 中允许当前终端 App 控制「系统设置」，然后重试。"
+      );
+    }
+    console.warn(
+      "[Mac 设置] 邮箱填入可能失败。请运行 npm run dump:mac-ui 查看 AX 树，并确认自动化权限已授予。"
+    );
+  }
+
   if (stderr?.trim()) {
     console.warn("[Mac 设置] AppleScript stderr:", stderr.trim());
   }

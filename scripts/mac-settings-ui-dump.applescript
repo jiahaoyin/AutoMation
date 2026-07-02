@@ -1,4 +1,4 @@
--- 诊断：打印 System Settings 登录页可访问输入框（调试填表失败时用）
+-- 诊断：打印 System Settings 登录页 AX 树（调试填表失败时用）
 -- 用法: osascript scripts/mac-settings-ui-dump.applescript
 
 on loginPageMarkers()
@@ -35,6 +35,15 @@ on findLoginWindow(procRef)
 	return missing value
 end findLoginWindow
 
+on safeText(v)
+	if v is missing value then return ""
+	try
+		return v as text
+	on error
+		return ""
+	end try
+end safeText
+
 on elementDescription(e)
 	tell application "System Events"
 		set parts to {}
@@ -45,18 +54,50 @@ on elementDescription(e)
 			set end of parts to title of e
 		end try
 		try
+			set end of parts to name of e
+		end try
+		try
 			set end of parts to value of attribute "AXRoleDescription" of e
 		end try
 		try
 			set end of parts to value of attribute "AXPlaceholderValue" of e
 		end try
+		try
+			set end of parts to value of e
+		end try
 	end tell
 	set merged to ""
 	repeat with p in parts
-		if p is not missing value and p is not "" then set merged to merged & " | " & p
+		set t to my safeText(p)
+		if t is not "" then
+			if merged is "" then
+				set merged to t
+			else
+				set merged to merged & " | " & t
+			end if
+		end if
 	end repeat
 	return merged
 end elementDescription
+
+on elementSummary(e, idx)
+	set cls to ""
+	set roleDesc to ""
+	set subroleDesc to ""
+	tell application "System Events"
+		try
+			set cls to class of e as text
+		end try
+		try
+			set roleDesc to my safeText(value of attribute "AXRoleDescription" of e)
+		end try
+		try
+			set subroleDesc to my safeText(value of attribute "AXSubrole" of e)
+		end try
+	end tell
+	set desc to my elementDescription(e)
+	return "#" & idx & " class=" & cls & " role=" & roleDesc & " subrole=" & subroleDesc & " desc=" & desc
+end elementSummary
 
 tell application "System Settings" to activate
 delay 1.5
@@ -70,14 +111,21 @@ tell application "System Events"
 
 		set nDeep to 0
 		set nShallow to 0
+		set nAll to 0
 		set report to "login window found" & linefeed
 
 		try
 			repeat with e in entire contents of targetW
+				set nAll to nAll + 1
+				if nAll is less than or equal to 30 then
+					set report to report & my elementSummary(e, nAll) & linefeed
+				end if
 				try
 					if class of e as text is in {"text field", "text area", "combo box"} then
 						set nDeep to nDeep + 1
-						set report to report & "deep#" & nDeep & ": " & my elementDescription(e) & linefeed
+						if nDeep is less than or equal to 10 then
+							set report to report & "  [input deep#" & nDeep & "] " & my elementDescription(e) & linefeed
+						end if
 					end if
 				end try
 			end repeat
@@ -90,7 +138,7 @@ tell application "System Events"
 			end repeat
 		end try
 
-		set report to report & "deep=" & nDeep & " shallow=" & nShallow
+		set report to report & "elements=" & nAll & " deep=" & nDeep & " shallow=" & nShallow
 		return report
 	end tell
 end tell

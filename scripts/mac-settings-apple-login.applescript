@@ -386,6 +386,8 @@ on emailFillSucceeded(targetW, appleId)
 			if v contains appleId or v is appleId then return true
 		end if
 	end repeat
+	if my windowContainsAppleId(targetW, appleId) then return true
+	if my continueButtonEnabled(targetW) then return true
 	return false
 end emailFillSucceeded
 
@@ -400,10 +402,11 @@ on dumpLoginUiDebug(targetW, appleId)
 end dumpLoginUiDebug
 
 on verifyEmailFilled(targetW, appleId)
-	if not my emailFillSucceeded(targetW, appleId) then
-		my dumpLoginUiDebug(targetW, appleId)
-		error "邮箱未成功填入登录框。若系统弹出「Terminal 想要控制 系统设置」，请在 隐私与安全性 → 自动化 中允许。"
-	end if
+	if my emailFillSucceeded(targetW, appleId) then return
+	if my continueButtonEnabled(targetW) then return
+	if my windowContainsAppleId(targetW, appleId) then return
+	my dumpLoginUiDebug(targetW, appleId)
+	error "邮箱未成功填入登录框。若系统弹出「Terminal 想要控制 系统设置」，请在 隐私与安全性 → 自动化 中允许。"
 end verifyEmailFilled
 
 on shallowInputFields(targetW)
@@ -461,6 +464,38 @@ on pasteIntoFieldV07(procRef, tf, textValue)
 	end tell
 end pasteIntoFieldV07
 
+on checkPasteAutomationPermission(procRef)
+	try
+		tell application "System Events"
+			tell procRef
+				set frontmost to true
+				keystroke "a" using command down
+			end tell
+		end tell
+	on error errMsg number errNum
+		if errNum is -1743 then
+			error "缺少自动化权限：请在 系统设置 → 隐私与安全性 → 自动化 中允许 Terminal（或 Cursor）控制「系统设置」。"
+		end if
+	end try
+end checkPasteAutomationPermission
+
+on pasteAtCoordinate(procRef, targetW, clickX, clickY, textValue)
+	set the clipboard to textValue
+	my ensureSettingsFrontmost(procRef)
+	tell application "System Events"
+		click at {clickX, clickY}
+		delay 0.45
+		keystroke "a" using command down
+		delay 0.08
+		try
+			keystroke "v" using command down
+		on error errMsg number errNum
+			my checkPasteAutomationPermission(procRef)
+			error "粘贴失败: " & errMsg & " (" & errNum & ")"
+		end try
+	end tell
+end pasteAtCoordinate
+
 on pasteEmailViaGrid(procRef, targetW, appleId)
 	set the clipboard to appleId
 	tell application "System Events"
@@ -470,15 +505,14 @@ on pasteEmailViaGrid(procRef, targetW, appleId)
 		set baseY to item 2 of winPos
 		set w to item 1 of winSize
 		set h to item 2 of winSize
-		repeat with yFrac in {0.40, 0.44, 0.48, 0.52, 0.56}
-			my ensureSettingsFrontmost(procRef)
-			set clickX to baseX + w * 0.58
-			set clickY to baseY + h * yFrac
-			click at {clickX, clickY}
-			delay 0.4
-			keystroke "v" using command down
-			delay 0.55
-			if my emailFillSucceeded(targetW, appleId) then return true
+		repeat with xFrac in {0.52, 0.55, 0.58, 0.62}
+			repeat with yFrac in {0.38, 0.42, 0.46, 0.50, 0.54, 0.58}
+				set clickX to baseX + w * xFrac
+				set clickY to baseY + h * yFrac
+				my pasteAtCoordinate(procRef, targetW, clickX, clickY, appleId)
+				delay 0.6
+				if my emailFillSucceeded(targetW, appleId) then return true
+			end repeat
 		end repeat
 	end tell
 	return false
@@ -571,20 +605,48 @@ on keystrokeIntoField(tf, textValue)
 	end tell
 end keystrokeIntoField
 
+on tryClickElement(e)
+	tell application "System Events"
+		try
+			click e
+			return true
+		end try
+		try
+			perform action "AXPress" of e
+			return true
+		end try
+		try
+			set focused of e to true
+			return true
+		end try
+	end tell
+	return false
+end tryClickElement
+
 on clickEmailFieldByMarker(targetW)
 	tell application "System Events"
 		repeat with e in entire contents of targetW
 			set desc to my elementDescription(e)
-			if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话"}) then
-				try
-					click e
-					return true
-				end try
+			if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话", "必填", "Required"}) then
+				if my tryClickElement(e) then return true
 			end if
 			try
+				set roleDesc to value of attribute "AXRoleDescription" of e
+				if roleDesc is "文本栏" or roleDesc contains "text field" or roleDesc contains "Text Field" then
+					if my tryClickElement(e) then return true
+				end if
+			end try
+			try
+				if class of e as text is "group" then
+					set roleDesc to value of attribute "AXRoleDescription" of e
+					if roleDesc is "文本栏" or roleDesc contains "text" then
+						if my tryClickElement(e) then return true
+					end if
+				end if
+			end try
+			try
 				if value of e is "电子邮件或电话号码" or value of e is "Email or Phone Number" then
-					click e
-					return true
+					if my tryClickElement(e) then return true
 				end if
 			end try
 		end repeat
@@ -613,10 +675,33 @@ on fillEmailByClickAndPaste(procRef, targetW, appleId)
 		set clicked to my clickEmailFieldByCoordinates(targetW)
 	end if
 	if not clicked then return false
-	delay 0.4
-	my pasteAtFrontmost(appleId)
-	return true
+	delay 0.45
+	set the clipboard to appleId
+	tell application "System Settings" to activate
+	delay 0.25
+	tell application "System Events"
+		try
+			keystroke "v" using command down
+		on error errMsg number errNum
+			my checkPasteAutomationPermission(procRef)
+			error "粘贴失败: " & errMsg & " (" & errNum & ")"
+		end try
+	end tell
+	delay 0.6
+	return my emailFillSucceeded(targetW, appleId)
 end fillEmailByClickAndPaste
+
+-- Sequoia 15.6：SwiftUI 登录页可能暴露 0 个 text field，坐标粘贴为主路径
+on fillEmailZeroFieldPath(procRef, targetW, appleId)
+	my ensureSettingsFrontmost(procRef)
+	delay 0.5
+
+	if my fillEmailByClickAndPaste(procRef, targetW, appleId) then return true
+	if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
+
+	my checkPasteAutomationPermission(procRef)
+	return false
+end fillEmailZeroFieldPath
 
 on tryFillEmailOnField(targetW, tf, appleId)
 	if my isSidebarSearchField(tf) then return false
@@ -629,35 +714,42 @@ on tryFillEmailOnField(targetW, tf, appleId)
 	return false
 end tryFillEmailOnField
 
--- 阶段 1：v1.0.7 路径 — deepInputFields item 1 + process 内 set value / 粘贴
+-- 阶段 1：零 text field 时坐标粘贴为主路径；有 AX 输入框时走 set value / 粘贴
 on fillEmailInWindow(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
 	delay 1.0
 
 	if my emailFillSucceeded(targetW, appleId) then return true
 
-	set fields to my deepInputFieldsOfWindow(targetW)
-	set emailField to missing value
-	repeat with tf in fields
-		if not my isSidebarSearchField(tf) then
-			set emailField to tf
-			exit repeat
+	set allFields to my allInputFields(targetW)
+	set fieldCount to count of allFields
+
+	if fieldCount is 0 then
+		if my fillEmailZeroFieldPath(procRef, targetW, appleId) then return true
+	else
+		set emailField to missing value
+		repeat with tf in allFields
+			if not my isSidebarSearchField(tf) then
+				set emailField to tf
+				exit repeat
+			end if
+		end repeat
+		if emailField is missing value and fieldCount > 0 then
+			set emailField to item 1 of allFields
 		end if
-	end repeat
-	if emailField is missing value and (count of fields) > 0 then
-		set emailField to item 1 of fields
-	end if
 
-	if emailField is not missing value then
-		my typeIntoFieldV07(procRef, emailField, appleId)
-		delay 0.6
-		if my emailFillSucceeded(targetW, appleId) then return true
-		my pasteIntoFieldV07(procRef, emailField, appleId)
-		delay 0.7
-		if my emailFillSucceeded(targetW, appleId) then return true
-	end if
+		if emailField is not missing value then
+			my typeIntoFieldV07(procRef, emailField, appleId)
+			delay 0.6
+			if my emailFillSucceeded(targetW, appleId) then return true
+			my pasteIntoFieldV07(procRef, emailField, appleId)
+			delay 0.7
+			if my emailFillSucceeded(targetW, appleId) then return true
+		end if
 
-	if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
+		if my fillEmailByClickAndPaste(procRef, targetW, appleId) then return true
+		if my pasteEmailViaGrid(procRef, targetW, appleId) then return true
+	end if
 
 	my verifyEmailFilled(targetW, appleId)
 	return true
@@ -693,24 +785,52 @@ on waitForPasswordFieldInMainPane(targetW, appleId, maxWaitSec)
 	return missing value
 end waitForPasswordFieldInMainPane
 
--- 阶段 2：剪贴板粘贴密码；找不到 AX 密码框则用邮箱后的焦点（禁止 Tab）
+on pastePasswordViaCoordinates(procRef, targetW, applePassword)
+	tell application "System Events"
+		set winPos to position of targetW
+		set winSize to size of targetW
+		set baseX to item 1 of winPos
+		set baseY to item 2 of winPos
+		set w to item 1 of winSize
+		set h to item 2 of winSize
+		repeat with yFrac in {0.52, 0.56, 0.60, 0.64}
+			set clickX to baseX + w * 0.58
+			set clickY to baseY + h * yFrac
+			my pasteAtCoordinate(procRef, targetW, clickX, clickY, applePassword)
+			delay 0.5
+			if not my searchFieldContains(targetW, applePassword) then return true
+		end repeat
+	end tell
+	return false
+end pastePasswordViaCoordinates
+
+-- 阶段 2：剪贴板粘贴密码；找不到 AX 密码框则坐标点击或当前焦点粘贴（禁止 Tab）
 on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
 	my ensureSettingsFrontmost(procRef)
+	delay 0.8
 
-	set passField to my waitForPasswordFieldInMainPane(targetW, appleId, 12)
+	set passField to my waitForPasswordFieldInMainPane(targetW, appleId, 8)
 	if passField is not missing value then
 		my pasteIntoFieldV07(procRef, passField, applePassword)
 	else
-		delay 0.5
 		set the clipboard to applePassword
 		tell application "System Settings" to activate
-		delay 0.3
+		delay 0.35
 		tell application "System Events"
 			tell procRef
 				set frontmost to true
 			end tell
-			keystroke "v" using command down
+			try
+				keystroke "v" using command down
+			on error errMsg number errNum
+				my checkPasteAutomationPermission(procRef)
+				error "密码粘贴失败: " & errMsg & " (" & errNum & ")"
+			end try
 		end tell
+		delay 0.4
+		if my searchFieldContains(targetW, applePassword) then
+			my pastePasswordViaCoordinates(procRef, targetW, applePassword)
+		end if
 	end if
 
 	my verifyPasswordNotInSearch(targetW, applePassword)
