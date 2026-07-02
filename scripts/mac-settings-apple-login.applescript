@@ -347,6 +347,52 @@ on verifyEmailFilled(targetW, appleId)
 	end if
 end verifyEmailFilled
 
+on focusAndSetValue(tf, textValue)
+	if my isSidebarSearchField(tf) then return false
+	tell application "System Settings" to activate
+	delay 0.2
+	tell application "System Events"
+		try
+			set focused of tf to true
+		end try
+		click tf
+		delay 0.25
+		try
+			set value of tf to textValue
+			return true
+		on error
+			return false
+		end try
+	end tell
+end focusAndSetValue
+
+on focusAndPasteIntoField(tf, textValue)
+	if my isSidebarSearchField(tf) then return false
+	set the clipboard to textValue
+	tell application "System Settings" to activate
+	delay 0.2
+	tell application "System Events"
+		try
+			set focused of tf to true
+		end try
+		click tf
+		delay 0.3
+		keystroke "a" using command down
+		delay 0.08
+		keystroke "v" using command down
+	end tell
+	return true
+end focusAndPasteIntoField
+
+on pasteAtFrontmost(textValue)
+	set the clipboard to textValue
+	tell application "System Settings" to activate
+	delay 0.25
+	tell application "System Events"
+		keystroke "v" using command down
+	end tell
+end pasteAtFrontmost
+
 on typeIntoField(tf, textValue, useKeystroke)
 	if my isSidebarSearchField(tf) then error "拒绝向侧边栏搜索框输入"
 	tell application "System Events"
@@ -423,58 +469,50 @@ on clickEmailFieldByCoordinates(targetW)
 	return false
 end clickEmailFieldByCoordinates
 
-on fillEmailByClickAndType(procRef, targetW, appleId)
+on fillEmailByClickAndPaste(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
 	set clicked to my clickEmailFieldByMarker(targetW)
 	if not clicked then
 		set clicked to my clickEmailFieldByCoordinates(targetW)
 	end if
-	if not clicked then error "未找到可点击的邮箱输入区域"
-	delay 0.35
-	tell application "System Events"
-		keystroke "a" using command down
-		delay 0.08
-		repeat with i from 1 to count of characters of appleId
-			keystroke character i of appleId
-			delay 0.015
-		end repeat
-	end tell
-end fillEmailByClickAndType
+	if not clicked then return false
+	delay 0.4
+	my pasteAtFrontmost(appleId)
+	return true
+end fillEmailByClickAndPaste
 
-on pickEmailFieldFromList(fields, appleId)
-	if (count of fields) = 0 then return missing value
-	set emailField to item 1 of fields
-	repeat with tf in fields
-		if my fieldMatchesMarkers(tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then
-			set emailField to tf
-			exit repeat
-		end if
-	end repeat
-	return emailField
-end pickEmailFieldFromList
+on tryFillEmailOnField(targetW, tf, appleId)
+	if my isSidebarSearchField(tf) then return false
+	my focusAndSetValue(tf, appleId)
+	delay 0.55
+	if my emailFillSucceeded(targetW, appleId) then return true
+	my focusAndPasteIntoField(tf, appleId)
+	delay 0.65
+	if my emailFillSucceeded(targetW, appleId) then return true
+	return false
+end tryFillEmailOnField
 
--- 阶段 1：v1.0.7 set value + keystroke；无 AX 字段时坐标/标记点击
+-- 阶段 1：v1.0.7 第一个输入框 → 全候选 set value/剪贴板 → 坐标粘贴
 on fillEmailInWindow(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
+	delay 1.0
 
-	set fields to {}
-	repeat 10 times
-		set fields to my resolveLoginInputFields(targetW)
-		if (count of fields) > 0 then exit repeat
-		delay 0.4
+	if my emailFillSucceeded(targetW, appleId) then return true
+
+	set allFields to my allInputFields(targetW)
+	if (count of allFields) > 0 then
+		if my tryFillEmailOnField(targetW, item 1 of allFields, appleId) then return true
+	end if
+
+	set candidates to my resolveLoginInputFields(targetW)
+	if (count of candidates) = 0 then set candidates to allFields
+	repeat with tf in candidates
+		if my tryFillEmailOnField(targetW, tf, appleId) then return true
 	end repeat
 
-	if (count of fields) > 0 then
-		set emailField to my pickEmailFieldFromList(fields, appleId)
-		my typeIntoField(emailField, appleId, false)
-		delay 0.45
-		if not my emailFillSucceeded(targetW, appleId) then
-			my keystrokeIntoField(emailField, appleId)
-			delay 0.7
-		end if
-	else
-		my fillEmailByClickAndType(procRef, targetW, appleId)
-		delay 0.7
+	if my fillEmailByClickAndPaste(procRef, targetW, appleId) then
+		delay 0.8
+		if my emailFillSucceeded(targetW, appleId) then return true
 	end if
 
 	my verifyEmailFilled(targetW, appleId)
@@ -511,16 +549,16 @@ on waitForPasswordFieldInMainPane(targetW, appleId, maxWaitSec)
 	return missing value
 end waitForPasswordFieldInMainPane
 
--- 阶段 2：点击主内容区密码框 keystroke；找不到则利用邮箱后的系统焦点（禁止 Tab）
+-- 阶段 2：剪贴板粘贴密码；找不到 AX 密码框则用邮箱后的焦点（禁止 Tab）
 on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
 	my ensureSettingsFrontmost(procRef)
 
 	set passField to my waitForPasswordFieldInMainPane(targetW, appleId, 12)
 	if passField is not missing value then
-		my keystrokeIntoField(passField, applePassword)
+		my focusAndPasteIntoField(passField, applePassword)
 	else
 		delay 0.5
-		tell application "System Events" to keystroke applePassword
+		my pasteAtFrontmost(applePassword)
 	end if
 
 	my verifyPasswordNotInSearch(targetW, applePassword)
@@ -566,8 +604,13 @@ on run argv
 
 	tell application "System Settings" to activate
 	delay 0.5
-	my openAppleAccountPane()
-	delay 2.5
+	set paneOpened to system attribute "APPLE_SCRIPT_PANE_OPENED"
+	if paneOpened is "1" then
+		delay 1.5
+	else
+		my openAppleAccountPane()
+		delay 2.5
+	end if
 
 	tell application "System Events"
 		tell process "System Settings"

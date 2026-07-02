@@ -32,13 +32,14 @@ export async function fillMacSettingsAppleLogin(creds) {
     async () => {
       // 辅助功能引导可能停在「隐私→辅助功能」页，填表前强制切回 Apple 登录页
       openAppleAccountSettings();
-      await sleep(2500);
+      await sleep(3500);
       return execFileAsync("osascript", [LOGIN_SCPT], {
         timeout: 120_000,
         env: {
           ...process.env,
           APPLE_SCRIPT_APPLE_ID: creds.appleId,
           APPLE_SCRIPT_PASSWORD: creds.password,
+          APPLE_SCRIPT_PANE_OPENED: "1",
         },
       });
     },
