@@ -144,6 +144,8 @@ function buildPackageJson(destRoot) {
       check: "node scripts/check-environment.mjs",
       setup: "node scripts/setup-environment.mjs",
       install: "./install.sh",
+      "check:automation": "osascript scripts/automation-check.applescript",
+      "dump:mac-ui": "osascript scripts/mac-settings-ui-dump.applescript",
     },
   };
   fs.writeFileSync(
@@ -199,6 +201,8 @@ cd apple-id-automation-${VERSION}
 | \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器） |
 | \`./run.sh --skip-browser\` | 仅 Mac 设置登录 |
 | \`npm run check\` | 环境自检 |
+| \`npm run check:automation\` | 检测终端对「系统设置」的自动化权限 |
+| \`npm run dump:mac-ui\` | 导出系统设置 Apple Account 页 AX 树（调试） |
 
 ## 环境变量（.env）
 

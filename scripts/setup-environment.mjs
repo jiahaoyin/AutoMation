@@ -12,6 +12,7 @@ const checkOnly = process.argv.includes("--check-only");
 const quiet = process.argv.includes("--quiet");
 const skipFirefox = process.argv.includes("--skip-firefox");
 const skipAccessibility = process.argv.includes("--skip-accessibility");
+const skipAutomation = process.argv.includes("--skip-automation");
 
 async function main() {
   if (checkOnly) {
@@ -19,8 +20,8 @@ async function main() {
     process.exit(result.ok ? 0 : 1);
   }
 
-  await ensureEnvironment({ quiet, skipFirefox, skipAccessibility });
-  const result = await checkEnvironment({ quiet: true });
+  await ensureEnvironment({ quiet, skipFirefox, skipAccessibility, skipAutomation });
+  const result = await checkEnvironment({ quiet });
   if (!result.ok && result.issues.some((i) => !i.includes(".env"))) {
     console.warn("警告: 仍有未解决项:", result.issues.join("; "));
   }
