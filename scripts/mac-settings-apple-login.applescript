@@ -1,5 +1,5 @@
--- macOS 15 (Sequoia)：系统设置 → Apple Account 登录填表
--- 流程：先填邮箱 → 等待下方密码框 → 填密码 → 继续
+-- macOS 15 (Sequoia)：系统设置 → Apple Account 登录
+-- 策略：主内容区输入框（排除侧边栏）| 邮箱 set value + keystroke | 密码 click/焦点 keystroke（禁止 Tab）
 -- 凭证：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
 
 on loginPageMarkers()
@@ -78,16 +78,25 @@ on clickButtonNamedInWindow(targetW, buttonLabels)
 	tell application "System Events"
 		repeat with btnName in buttonLabels
 			try
-				click button btnName of targetW
-				return true
+				set b to button btnName of targetW
+				if enabled of b then
+					click b
+					return true
+				end if
 			end try
 			try
-				click (first button of targetW whose name is btnName)
-				return true
+				set b to first button of targetW whose name is btnName
+				if enabled of b then
+					click b
+					return true
+				end if
 			end try
 			try
-				click button btnName of sheet 1 of targetW
-				return true
+				set b to button btnName of sheet 1 of targetW
+				if enabled of b then
+					click b
+					return true
+				end if
 			end try
 		end repeat
 	end tell
@@ -114,6 +123,17 @@ on clickSidebarAppleAccount(procRef, targetW)
 	return false
 end clickSidebarAppleAccount
 
+on ensureSettingsFrontmost(procRef)
+	tell application "System Settings" to activate
+	delay 0.35
+	tell application "System Events"
+		tell procRef
+			set frontmost to true
+		end tell
+	end tell
+	delay 0.35
+end ensureSettingsFrontmost
+
 on elementClassName(e)
 	try
 		return class of e as text
@@ -127,7 +147,6 @@ on isInputElement(e)
 	return c is in {"text field", "text area", "combo box"}
 end isInputElement
 
--- 与 v1.0.7 一致：收集全部输入框（邮箱阶段靠遍历顺序 + 排除搜索）
 on allInputFields(targetW)
 	set found to {}
 	tell application "System Events"
@@ -145,25 +164,31 @@ on allInputFields(targetW)
 	return found
 end allInputFields
 
-on isSidebarSearchField(tf)
+on sidebarScrollArea(targetW)
 	tell application "System Events"
 		try
-			set d to description of tf
-			if d contains "搜索" or d contains "Search" or d contains "search" then return true
-		end try
-		try
-			set d to title of tf
-			if d contains "搜索" or d contains "Search" or d contains "search" then return true
-		end try
-		try
-			set d to value of attribute "AXRoleDescription" of tf
-			if d contains "搜索" or d contains "Search" or d contains "search" then return true
-		end try
-		try
-			set ph to value of attribute "AXPlaceholderValue" of tf
-			if ph contains "搜索" or ph contains "Search" or ph contains "search" then return true
+			return scroll area 1 of group 1 of targetW
 		end try
 	end tell
+	return missing value
+end sidebarScrollArea
+
+-- 侧边栏搜索框是密码误入的根源；按 UI 结构排除，而非仅靠 description
+on isInsideSidebar(e, targetW)
+	set sidebar to my sidebarScrollArea(targetW)
+	if sidebar is missing value then return false
+	tell application "System Events"
+		try
+			repeat with se in entire contents of sidebar
+				if se is e then return true
+			end repeat
+		end try
+	end tell
+	return false
+end isInsideSidebar
+
+on isSidebarSearchField(tf)
+	if my textContainsAny(my elementDescription(tf), {"搜索", "Search", "search"}) then return true
 	return false
 end isSidebarSearchField
 
@@ -198,27 +223,14 @@ on textContainsAny(textValue, markers)
 	return false
 end textContainsAny
 
-on isEmailField(tf)
-	if my isSidebarSearchField(tf) then return false
-	return my textContainsAny(my elementDescription(tf), {"电子邮件", "Email", "email", "phone", "电话", "Phone"})
-end isEmailField
-
-on firstNonSearchField(targetW)
-	set fields to my allInputFields(targetW)
-	repeat with tf in fields
-		if not my isSidebarSearchField(tf) then return tf
+-- 登录表单只在主内容区；侧边栏只有「搜索」
+on mainPaneInputFields(targetW)
+	set found to {}
+	repeat with tf in my allInputFields(targetW)
+		if not my isInsideSidebar(tf, targetW) then set end of found to tf
 	end repeat
-	return missing value
-end firstNonSearchField
-
--- 按 description「电子邮件或电话号码」定位邮箱框（比遍历顺序更可靠）
-on findEmailFieldInWindow(targetW)
-	set fields to my allInputFields(targetW)
-	repeat with tf in fields
-		if my isEmailField(tf) then return tf
-	end repeat
-	return missing value
-end findEmailFieldInWindow
+	return found
+end mainPaneInputFields
 
 on fieldValue(tf)
 	try
@@ -244,163 +256,51 @@ on fieldMatchesMarkers(tf, markers)
 	return false
 end fieldMatchesMarkers
 
-on fieldLooksLikeEmail(tf, appleId)
-	if my isEmailField(tf) then return true
-	set v to my fieldValue(tf)
-	if v contains "@" or v is appleId then return true
-	return false
-end fieldLooksLikeEmail
-
--- 邮箱下方的第二个非搜索框，通常是密码框（避免 Tab 进侧边栏搜索）
-on secondNonSearchField(targetW)
-	set fields to my allInputFields(targetW)
-	set seenFirst to false
-	repeat with tf in fields
-		if not my isSidebarSearchField(tf) then
-			if seenFirst then return tf
-			set seenFirst to true
-		end if
-	end repeat
-	return missing value
-end secondNonSearchField
-
-on findPasswordFieldInWindow(targetW, appleId)
-	set fields to my allInputFields(targetW)
-	repeat with tf in fields
-		if not my isSidebarSearchField(tf) then
-			if my fieldMatchesMarkers(tf, {"密码", "Password"}) then return tf
-		end if
-	end repeat
-
-	set pw to my secondNonSearchField(targetW)
-	if pw is not missing value then
-		if not my fieldLooksLikeEmail(pw, appleId) then return pw
-	end if
-
-	repeat with tf in fields
-		if not my isSidebarSearchField(tf) then
-			if not my fieldLooksLikeEmail(tf, appleId) then return tf
-		end if
-	end repeat
-
-	return missing value
-end findPasswordFieldInWindow
-
-on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
-	repeat maxWaitSec times
-		set pw to my findPasswordFieldInWindow(targetW, appleId)
-		if pw is not missing value then return pw
-		if my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password") then
-			set pw to my findPasswordFieldInWindow(targetW, appleId)
-			if pw is not missing value then return pw
-		end if
-		delay 1
-	end repeat
-	return missing value
-end waitForPasswordFieldInWindow
-
-on emailFieldContains(targetW, appleId)
-	set tf to my findEmailFieldInWindow(targetW)
-	if tf is not missing value then
-		set v to my fieldValue(tf)
-		if v contains appleId or v is appleId then return true
-	end if
-
-	set tf to my firstNonSearchField(targetW)
-	if tf is not missing value then
-		set v to my fieldValue(tf)
-		if v contains appleId or v is appleId then return true
-	end if
-
+on continueButtonEnabled(targetW)
 	tell application "System Events"
-		repeat with e in entire contents of targetW
-			if my isInputElement(e) and not my isSidebarSearchField(e) then
-				try
-					set v to value of e
-					if v contains appleId or v is appleId then return true
-				end try
-			end if
+		repeat with btnName in {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}
+			try
+				set b to button btnName of targetW
+				if enabled of b then return true
+			end try
+			try
+				set b to first button of targetW whose name is btnName
+				if enabled of b then return true
+			end try
 		end repeat
 	end tell
 	return false
-end emailFieldContains
+end continueButtonEnabled
+
+on mainPaneContainsAppleId(targetW, appleId)
+	repeat with tf in my mainPaneInputFields(targetW)
+		set v to my fieldValue(tf)
+		if v contains appleId or v is appleId then return true
+	end repeat
+	return false
+end mainPaneContainsAppleId
+
+on emailFillSucceeded(targetW, appleId)
+	if my continueButtonEnabled(targetW) then return true
+	if my mainPaneContainsAppleId(targetW, appleId) then return true
+	return false
+end emailFillSucceeded
 
 on verifyEmailFilled(targetW, appleId)
-	if not my emailFieldContains(targetW, appleId) then
+	if not my emailFillSucceeded(targetW, appleId) then
 		error "邮箱未成功填入登录框，请重试"
 	end if
 end verifyEmailFilled
-
--- 点击邮箱输入区域后 keystroke（模拟人工输入，触发密码框）
-on keystrokeIntoEmailField(tf, appleId)
-	if my isSidebarSearchField(tf) then error "拒绝向侧边栏搜索框输入"
-	tell application "System Settings" to activate
-	tell application "System Events"
-		click tf
-		delay 0.35
-		try
-			set value of tf to ""
-		end try
-		delay 0.1
-		keystroke "a" using command down
-		delay 0.08
-		keystroke appleId
-	end tell
-end keystrokeIntoEmailField
-
-on clickEmailAreaInWindow(targetW)
-	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
-	if my clickInputLabelInWindow(targetW, emailLabels) then return true
-
-	tell application "System Events"
-		repeat with e in entire contents of targetW
-			set desc to my elementDescription(e)
-			if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number"}) then
-				if my isInputElement(e) then
-					click e
-					return true
-				end if
-				try
-					click e
-					return true
-				end try
-			end if
-		end repeat
-	end tell
-	return false
-end clickEmailAreaInWindow
-
-on clickInputLabelInWindow(targetW, labelTexts)
-	tell application "System Events"
-		repeat with lbl in labelTexts
-			try
-				click (first static text of targetW whose value is lbl)
-				return true
-			end try
-			try
-				repeat with e in entire contents of targetW
-					try
-						if value of e is lbl then
-							click e
-							return true
-						end if
-					end try
-				end repeat
-			end try
-		end repeat
-	end tell
-	return false
-end clickInputLabelInWindow
 
 on typeIntoField(tf, textValue, useKeystroke)
 	if my isSidebarSearchField(tf) then error "拒绝向侧边栏搜索框输入"
 	tell application "System Events"
 		click tf
-		delay 0.25
+		delay 0.3
 		try
 			set value of tf to ""
 		end try
-		delay 0.15
+		delay 0.12
 		if useKeystroke then
 			keystroke textValue
 		else
@@ -413,60 +313,91 @@ on typeIntoField(tf, textValue, useKeystroke)
 	end tell
 end typeIntoField
 
--- 邮箱：按 description 定位 → set value / keystroke 多策略（勿 Tab）
+on keystrokeIntoField(tf, textValue)
+	if my isSidebarSearchField(tf) then error "拒绝向侧边栏搜索框输入"
+	tell application "System Settings" to activate
+	delay 0.25
+	tell application "System Events"
+		click tf
+		delay 0.35
+		try
+			set value of tf to ""
+		end try
+		delay 0.1
+		keystroke "a" using command down
+		delay 0.08
+		repeat with i from 1 to count of characters of textValue
+			keystroke character i of textValue
+			delay 0.015
+		end repeat
+	end tell
+end keystrokeIntoField
+
+-- 阶段 1：v1.0.7 验证有效的 set value + keystroke 触发同页密码框（勿 Tab）
 on fillEmailInWindow(procRef, targetW, appleId)
-	set emailField to my findEmailFieldInWindow(targetW)
-	if emailField is not missing value then
-		my typeIntoField(emailField, appleId, false)
-		delay 0.5
-		if my emailFieldContains(targetW, appleId) then
-			my keystrokeIntoEmailField(emailField, appleId)
-			delay 0.6
-		end if
-	end if
+	my ensureSettingsFrontmost(procRef)
 
-	if not my emailFieldContains(targetW, appleId) then
-		set tf to my firstNonSearchField(targetW)
-		if tf is not missing value then
-			my keystrokeIntoEmailField(tf, appleId)
-			delay 0.6
-		end if
-	end if
+	set fields to my mainPaneInputFields(targetW)
+	if (count of fields) = 0 then error "未找到主内容区邮箱输入框"
 
-	if not my emailFieldContains(targetW, appleId) then
-		if my clickEmailAreaInWindow(targetW) then
-			tell application "System Events"
-				delay 0.3
-				keystroke appleId
-			end tell
-			delay 0.6
+	set emailField to item 1 of fields
+	repeat with tf in fields
+		if my fieldMatchesMarkers(tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then
+			set emailField to tf
+			exit repeat
 		end if
-	end if
+	end repeat
 
-	if not my emailFieldContains(targetW, appleId) then
-		tell application "System Settings" to activate
-		tell application "System Events"
-			tell procRef
-				set frontmost to true
-			end tell
-			try
-				click targetW
-			end try
-			delay 0.25
-			keystroke appleId
-		end tell
-		delay 0.6
+	my typeIntoField(emailField, appleId, false)
+	delay 0.45
+	if not my emailFillSucceeded(targetW, appleId) then
+		my keystrokeIntoField(emailField, appleId)
+		delay 0.7
 	end if
 
 	my verifyEmailFilled(targetW, appleId)
-	return true
+	return emailField
 end fillEmailInWindow
 
--- 点击密码框输入（绝不 Tab；绝不向侧边栏搜索框输入）
-on fillPasswordInWindow(targetW, appleId, applePassword)
-	set passField to my findPasswordFieldInWindow(targetW, appleId)
-	if passField is missing value then error "未找到密码输入框"
-	my typeIntoField(passField, applePassword, true)
+on findPasswordFieldInMainPane(targetW, appleId)
+	set fields to my mainPaneInputFields(targetW)
+	repeat with tf in fields
+		if my fieldMatchesMarkers(tf, {"密码", "Password"}) then return tf
+	end repeat
+	if (count of fields) >= 2 then return item 2 of fields
+	repeat with tf in fields
+		set v to my fieldValue(tf)
+		if v does not contain "@" and v is not appleId then return tf
+	end repeat
+	return missing value
+end findPasswordFieldInMainPane
+
+on waitForPasswordFieldInMainPane(targetW, appleId, maxWaitSec)
+	repeat maxWaitSec times
+		set pw to my findPasswordFieldInMainPane(targetW, appleId)
+		if pw is not missing value then return pw
+		if my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password") then
+			set pw to my findPasswordFieldInMainPane(targetW, appleId)
+			if pw is not missing value then return pw
+		end if
+		delay 0.5
+	end repeat
+	return missing value
+end waitForPasswordFieldInMainPane
+
+-- 阶段 2：点击主内容区密码框 keystroke；找不到则利用邮箱后的系统焦点（禁止 Tab）
+on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
+	my ensureSettingsFrontmost(procRef)
+
+	set passField to my waitForPasswordFieldInMainPane(targetW, appleId, 12)
+	if passField is not missing value then
+		my keystrokeIntoField(passField, applePassword)
+	else
+		delay 0.5
+		tell application "System Events" to keystroke applePassword
+	end if
+
+	my verifyPasswordNotInSearch(targetW, applePassword)
 	return true
 end fillPasswordInWindow
 
@@ -474,6 +405,11 @@ on searchFieldContains(targetW, textValue)
 	tell application "System Events"
 		repeat with e in entire contents of targetW
 			if my isInputElement(e) and my isSidebarSearchField(e) then
+				try
+					if value of e contains textValue then return true
+				end try
+			end if
+			if my isInputElement(e) and my isInsideSidebar(e, targetW) then
 				try
 					if value of e contains textValue then return true
 				end try
@@ -533,29 +469,13 @@ on run argv
 				set targetW to my findLoginWindow(it)
 			end if
 
-			-- 阶段 1：邮箱（set value + 校验）
 			my fillEmailInWindow(it, targetW, appleId)
-			delay 1.0
+			delay 0.8
+			my fillPasswordInWindow(it, targetW, appleId, applePassword)
 
-			-- 阶段 2：等待密码框 → 点击密码框输入（不要 Tab）
-			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 10)
-			if passField is not missing value then
-				my fillPasswordInWindow(targetW, appleId, applePassword)
-			else
-				-- 邮箱 keystroke 后焦点可能已在密码框，但 AX 树尚未暴露密码 field
-				tell application "System Settings" to activate
-				set frontmost to true
-				delay 0.5
-				keystroke applePassword
-			end if
-			my verifyPasswordNotInSearch(targetW, applePassword)
-
-			-- 阶段 3：提交
 			delay 0.5
 			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
-				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
-					key code 36
-				end if
+				key code 36
 			end if
 		end tell
 	end tell
