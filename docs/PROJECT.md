@@ -51,7 +51,8 @@ Apple-AutoMation/
 │   ├── setup-environment.mjs
 │   ├── check-environment.mjs
 │   ├── bootstrap-macos.sh          # Node 官方包引导
-│   ├── build-release.mjs           # 打 zip 分发包
+│   ├── build-release.mjs           # 打 zip 并可选上传 GitHub Releases
+│   ├── fetch-latest.sh             # 从 Releases 下载最新 zip
 │   ├── bump-patch-version.mjs
 │   ├── apple-2fa-wait.scpt
 │   ├── mac-settings-apple-login.applescript
@@ -118,14 +119,28 @@ Apple-AutoMation/
 
 ---
 
-## 6. 打包分发
+## 6. 打包与发布
 
 ```bash
-npm run package          # patch+1 后打 zip
+npm run package          # 仅本地打包（保留 dist/）
 npm run package:no-bump  # 不递增版本
+npm run release          # patch+1 → 打包 → 上传 GitHub Releases → 清理本地 dist/
+npm run release:no-bump  # 不递增版本，直接发布当前版本
 ```
 
-输出：`dist/apple-id-automation-{version}/` 与 `dist/apple-id-automation-{version}-macos.zip`
+本地打包输出：`dist/apple-id-automation-{version}/` 与 `dist/apple-id-automation-{version}-macos.zip`
+
+**推荐发布流程**：改完代码后执行 `npm run release`，zip 上传至 [GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases)，本地 `dist/` 自动清理。
+
+**其他机器拉取**（无需 clone，下载解压即用）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jiahaoyin/Apple-AutoMation/main/scripts/fetch-latest.sh | bash
+cd apple-id-automation-latest/apple-id-automation-*/
+./install.sh && ./run.sh
+```
+
+已 clone 仓库时也可运行 `./scripts/fetch-latest.sh`；有 `gh` 时优先用 gh，否则自动 fallback 到 curl。
 
 `build-release.mjs` 会在打包前 **校验 COPY_PATHS 是否包含所有 lib 依赖**（避免漏文件如 `macos.js`）。
 
@@ -153,10 +168,10 @@ npm run package:no-bump  # 不递增版本
 
 ## 9. 开发备忘
 
-- 改功能后：`npm run package` 发新 zip
+- 改功能后：`npm run release` 发布至 GitHub Releases
 - 每次发布默认 **patch 版本 +1**（1.0.2 → 1.0.3）
 - 测试机：macOS 15.6+，Terminal 需辅助功能
-- 勿在仓库中提交：`.env`、`data/`、`.runtime/`、`dist/*.zip`
+- 勿在仓库中提交：`.env`、`data/`、`.runtime/`、`dist/`
 
 ---
 
@@ -169,7 +184,7 @@ npm run package:no-bump  # 不递增版本
 | 改浏览器登录/采集 | `scripts/lib/account-browser-flow.js` |
 | 改 2FA 读码 | `scripts/apple-2fa-wait.scpt` |
 | 改安装/环境 | `scripts/lib/env-setup.js`, `install.sh` |
-| 改打包列表 | `scripts/build-release.mjs` → `COPY_PATHS` |
+| 改打包/发布 | `scripts/build-release.mjs` → `COPY_PATHS`；`npm run release` |
 
 ---
 

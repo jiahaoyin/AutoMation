@@ -31,7 +31,32 @@
 | `./run.sh --skip-mac` | 仅浏览器 |
 | `./run.sh --skip-browser` | 仅系统设置 |
 | `npm run check` | 环境自检 |
-| `npm run package` | 打包 `dist/apple-id-automation-{version}-macos.zip` |
+| `npm run package` | 本地打包 `dist/`（保留 zip） |
+| `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
+
+## 发布与分发
+
+**本机发布**（打包上传至 GitHub Releases，本地不保留 zip）：
+
+```bash
+npm run release
+```
+
+**其他 Mac 拉取最新版**（无需 clone 仓库，下载解压即用）：
+
+```bash
+# 方式一：一键脚本（推荐）
+curl -fsSL https://raw.githubusercontent.com/jiahaoyin/Apple-AutoMation/main/scripts/fetch-latest.sh | bash
+
+# 方式二：已 clone 仓库时
+./scripts/fetch-latest.sh
+
+# 解压后进入目录
+cd apple-id-automation-latest/apple-id-automation-*/
+./install.sh && ./run.sh
+```
+
+或手动下载：[GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases) 中的 `*-macos.zip`，解压后 `./install.sh && ./run.sh`。
 
 ## 文档
 
@@ -44,4 +69,4 @@
 
 ## 版本
 
-当前 `package.json` 版本即发布版本；`npm run package` 默认 patch +1 后打包。
+当前 `package.json` 版本即发布版本；`npm run release` 默认 patch +1 后上传 GitHub Releases。

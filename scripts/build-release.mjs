@@ -2,9 +2,14 @@
 /**
  * 打包 Apple ID 自动化流程为可分发目录 + zip（适用于其他 macOS 机器测试）
  *
- * 用法: node scripts/build-apple-id-release.mjs [--no-bump]
+ * 用法:
+ *   node scripts/build-release.mjs [--no-bump] [--upload] [--clean]
+ *   npm run release          # patch+1 → 打包 → 上传 GitHub Release → 清理本地 dist
+ *   npm run package          # 仅本地打包（保留 dist）
+ *
  * 默认打包前自动 patch +1（1.0.0 → 1.0.1）；--no-bump 跳过递增
- * 输出: dist/apple-id-automation-{version}/ 与 dist/apple-id-automation-{version}-macos.zip
+ * --upload  创建/更新 GitHub Release 并上传 zip（需 gh CLI）
+ * --clean   上传后删除本地 dist 目录与 zip（常与 --upload 联用）
  */
 
 import { execSync } from "node:child_process";
@@ -18,6 +23,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 
 const noBump = process.argv.includes("--no-bump");
+const uploadRelease = process.argv.includes("--upload");
+const cleanLocal = process.argv.includes("--clean");
 if (!noBump && !process.env.RELEASE_VERSION) {
   const current = readPkgVersion();
   const next = bumpPatchVersion(current);
@@ -298,6 +305,104 @@ function createZip(sourceDir, zipPath) {
   });
 }
 
+function getGitHubRepo() {
+  try {
+    const remote = execSync("git remote get-url origin", {
+      cwd: ROOT,
+      encoding: "utf-8",
+    }).trim();
+    const m =
+      remote.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/i) ??
+      remote.match(/github\.com[:/](.+)$/i);
+    if (!m) {
+      throw new Error(`无法从 origin 解析 GitHub 仓库: ${remote}`);
+    }
+    return m[1];
+  } catch (err) {
+    throw new Error(`读取 git remote 失败: ${err.message}`);
+  }
+}
+
+function releaseExists(repo, tag) {
+  try {
+    execSync(`gh release view "${tag}" -R "${repo}"`, {
+      cwd: ROOT,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function uploadToGitHubRelease(version, zipPath) {
+  const repo = getGitHubRepo();
+  const tag = `v${version}`;
+  const assetName = path.basename(zipPath);
+  const notes = [
+    `## Apple ID 自动化 macOS 分发包`,
+    "",
+    `- 版本: **${version}**`,
+    `- 附件: \`${assetName}\``,
+    "",
+    "### 使用",
+    "",
+    "```bash",
+    "# 下载并解压（需 gh CLI）",
+    `gh release download -R ${repo} --pattern '*-macos.zip'`,
+    `unzip ${assetName}`,
+    `cd apple-id-automation-${version}`,
+    "./install.sh && ./run.sh",
+    "```",
+  ].join("\n");
+
+  const notesFile = path.join(ROOT, "dist", `.release-notes-${version}.md`);
+  fs.mkdirSync(path.dirname(notesFile), { recursive: true });
+  fs.writeFileSync(notesFile, notes);
+
+  console.log(`上传 GitHub Release ${tag} (${repo}) …`);
+
+  try {
+    if (releaseExists(repo, tag)) {
+      execSync(
+        `gh release upload "${tag}" "${zipPath}" --clobber -R "${repo}"`,
+        { cwd: ROOT, stdio: "inherit" }
+      );
+      console.log(`已更新 Release 附件: ${assetName}`);
+      return;
+    }
+
+    execSync(
+      `gh release create "${tag}" "${zipPath}" --title "${tag}" --notes-file "${notesFile}" -R "${repo}"`,
+      { cwd: ROOT, stdio: "inherit" }
+    );
+    console.log(`已创建 Release: https://github.com/${repo}/releases/tag/${tag}`);
+  } finally {
+    rimraf(notesFile);
+  }
+}
+
+function cleanLocalArtifacts(outDir, zipPath) {
+  rimraf(outDir);
+  rimraf(zipPath);
+  const distDir = path.join(ROOT, "dist");
+  if (fs.existsSync(distDir)) {
+    for (const entry of fs.readdirSync(distDir)) {
+      const abs = path.join(distDir, entry);
+      if (
+        entry.startsWith("apple-id-automation-") ||
+        entry.endsWith("-macos.zip")
+      ) {
+        rimraf(abs);
+      }
+    }
+    if (fs.readdirSync(distDir).length === 0) {
+      fs.rmdirSync(distDir);
+    }
+  }
+  console.log("已清理本地打包产物");
+}
+
 function main() {
   validateCopyPaths();
   console.log(`打包 ${RELEASE_NAME} …`);
@@ -323,14 +428,33 @@ function main() {
   fs.mkdirSync(path.join(ROOT, "dist"), { recursive: true });
   createZip(OUT_DIR, ZIP_PATH);
 
+  if (uploadRelease) {
+    uploadToGitHubRelease(VERSION, ZIP_PATH);
+  }
+
+  if (cleanLocal) {
+    cleanLocalArtifacts(OUT_DIR, ZIP_PATH);
+  }
+
   console.log("");
   console.log("完成:");
-  console.log(`  目录: ${OUT_DIR}`);
-  console.log(`  压缩包: ${ZIP_PATH}`);
-  console.log("");
-  console.log("分发到其他 Mac:");
-  console.log(`  1. 复制 ${path.basename(ZIP_PATH)}`);
-  console.log("  2. unzip 后 ./install.sh && ./run.sh");
+  if (!cleanLocal) {
+    console.log(`  目录: ${OUT_DIR}`);
+    console.log(`  压缩包: ${ZIP_PATH}`);
+  }
+  if (uploadRelease) {
+    console.log(`  GitHub Release: v${VERSION}`);
+    console.log("");
+    console.log("其他 Mac 拉取最新版:");
+    console.log("  ./scripts/fetch-latest.sh");
+    console.log("  或: gh release download -R $(git remote get-url origin | sed -E 's#.*github.com[:/]([^/]+/[^/.]+).*#\\1#') --pattern '*-macos.zip'");
+  } else {
+    console.log("");
+    console.log("分发到其他 Mac:");
+    console.log(`  1. npm run release   # 上传至 GitHub Releases`);
+    console.log(`  2. 或手动复制 ${path.basename(ZIP_PATH)}`);
+    console.log("  3. unzip 后 ./install.sh && ./run.sh");
+  }
 }
 
 main();
