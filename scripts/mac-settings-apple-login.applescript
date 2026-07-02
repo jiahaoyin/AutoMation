@@ -2,7 +2,7 @@
 -- 凭证通过环境变量传入：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
 
 on loginPageMarkers()
-	return {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录"}
+	return {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录", "密码", "Password"}
 end loginPageMarkers
 
 on openAppleAccountPane()
@@ -113,25 +113,35 @@ on clickSidebarAppleAccount(procRef, targetW)
 	return false
 end clickSidebarAppleAccount
 
-on typeIntoField(tf, textValue, useKeystroke)
+on elementText(e, attrName)
+	try
+		tell application "System Events"
+			if attrName is "description" then return description of e
+			if attrName is "title" then return title of e
+			if attrName is "value" then return value of e
+		end tell
+	on error
+		return ""
+	end try
+end elementText
+
+on isSidebarSearchField(tf)
 	tell application "System Events"
-		click tf
-		delay 0.25
 		try
-			set value of tf to ""
+			set d to description of tf
+			if d contains "搜索" or d contains "Search" or d contains "search" then return true
 		end try
-		delay 0.15
-		if useKeystroke then
-			keystroke textValue
-		else
-			try
-				set value of tf to textValue
-			on error
-				keystroke textValue
-			end try
-		end if
+		try
+			set d to title of tf
+			if d contains "搜索" or d contains "Search" or d contains "search" then return true
+		end try
+		try
+			set d to value of attribute "AXRoleDescription" of tf
+			if d contains "搜索" or d contains "Search" or d contains "search" then return true
+		end try
 	end tell
-end typeIntoField
+	return false
+end isSidebarSearchField
 
 on elementClassName(e)
 	try
@@ -146,22 +156,26 @@ on isInputElement(e)
 	return c is in {"text field", "text area", "combo box"}
 end isInputElement
 
-on deepInputFieldsOfWindow(targetW)
+on loginFormInputFields(targetW)
 	set found to {}
 	tell application "System Events"
 		try
 			repeat with e in entire contents of targetW
-				if my isInputElement(e) then set end of found to e
+				if my isInputElement(e) then
+					if not my isSidebarSearchField(e) then set end of found to e
+				end if
 			end repeat
 		end try
 		try
 			repeat with e in entire contents of sheet 1 of targetW
-				if my isInputElement(e) then set end of found to e
+				if my isInputElement(e) then
+					if not my isSidebarSearchField(e) then set end of found to e
+				end if
 			end repeat
 		end try
 	end tell
 	return found
-end deepInputFieldsOfWindow
+end loginFormInputFields
 
 on clickInputLabelInWindow(targetW, labelTexts)
 	tell application "System Events"
@@ -185,63 +199,87 @@ on clickInputLabelInWindow(targetW, labelTexts)
 	return false
 end clickInputLabelInWindow
 
-on typeViaFocusInWindow(procRef, targetW, textValue, useKeystroke, labelTexts)
-	set focused to false
-	if labelTexts is not {} then
-		set focused to my clickInputLabelInWindow(targetW, labelTexts)
-	end if
-	if not focused then
-		set fields to my deepInputFieldsOfWindow(targetW)
-		if (count of fields) > 0 then
-			tell application "System Events" to click item 1 of fields
-			set focused to true
-		end if
-	end if
-	if not focused then
-		tell application "System Events"
-			tell procRef
-				set frontmost to true
-			end tell
-			try
-				click targetW
-			end try
-			delay 0.2
-			key code 48
-		end tell
-	end if
-	delay 0.3
+on typeIntoFocusedField(textValue, useKeystroke)
 	tell application "System Events"
-		keystroke textValue
+		delay 0.2
+		if useKeystroke then
+			keystroke textValue
+		else
+			try
+				keystroke "a" using command down
+				delay 0.1
+			end try
+			keystroke textValue
+		end if
 	end tell
-	return true
-end typeViaFocusInWindow
+end typeIntoFocusedField
 
-on fillEmailInWindow(procRef, targetW, appleId)
-	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
-	set fields to my deepInputFieldsOfWindow(targetW)
-	if (count of fields) > 0 then
-		my typeIntoField(item 1 of fields, appleId, false)
-		return true
+on typeByLabelInWindow(targetW, textValue, useKeystroke, labelTexts)
+	if not my clickInputLabelInWindow(targetW, labelTexts) then
+		error "未找到输入标签: " & (labelTexts as text)
 	end if
-	my typeViaFocusInWindow(procRef, targetW, appleId, false, emailLabels)
+	delay 0.35
+	my typeIntoFocusedField(textValue, useKeystroke)
+	return true
+end typeByLabelInWindow
+
+on typeIntoField(tf, textValue, useKeystroke)
+	if my isSidebarSearchField(tf) then
+		error "拒绝向侧边栏搜索框输入"
+	end if
+	tell application "System Events"
+		click tf
+		delay 0.25
+		try
+			set value of tf to ""
+		end try
+		delay 0.15
+		if useKeystroke then
+			keystroke textValue
+		else
+			try
+				set value of tf to textValue
+			on error
+				keystroke textValue
+			end try
+		end if
+	end tell
+end typeIntoField
+
+on fillEmailInWindow(targetW, appleId)
+	set emailLabels to {"电子邮件或电话号码", "Email or Phone Number", "Email or phone number"}
+	my typeByLabelInWindow(targetW, appleId, false, emailLabels)
 	return true
 end fillEmailInWindow
 
-on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
-	repeat maxWaitSec times
-		set fields to my deepInputFieldsOfWindow(targetW)
-		repeat with tf in fields
-			try
-				tell application "System Events"
-					set v to value of tf
-					if v is "" or v is not appleId then return tf
-				end tell
-			end try
+on fillPasswordInWindow(targetW, applePassword)
+	set passLabels to {"密码", "Password"}
+	my typeByLabelInWindow(targetW, applePassword, true, passLabels)
+	return true
+end fillPasswordInWindow
+
+on isPasswordFieldVisible(targetW)
+	return my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password")
+end isPasswordFieldVisible
+
+on searchFieldContains(targetW, textValue)
+	tell application "System Events"
+		repeat with e in entire contents of targetW
+			if my isInputElement(e) and my isSidebarSearchField(e) then
+				try
+					if value of e contains textValue then return true
+				end try
+			end if
 		end repeat
-		delay 1
-	end repeat
-	return missing value
-end waitForPasswordFieldInWindow
+	end tell
+	return false
+end searchFieldContains
+
+on verifyPasswordNotInSearch(targetW, applePassword)
+	if my searchFieldContains(targetW, applePassword) then
+		error "密码被误填入侧边栏搜索框，请重试"
+	end if
+end verifyPasswordNotInSearch
 
 on readCredentials()
 	set appleId to system attribute "APPLE_SCRIPT_APPLE_ID"
@@ -287,25 +325,29 @@ on run argv
 				set targetW to my findLoginWindow(it)
 			end if
 
-			my fillEmailInWindow(it, targetW, appleId)
+			my fillEmailInWindow(targetW, appleId)
 			delay 0.8
-			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
-				key code 36
-			end if
-			delay 2.5
 
-			set targetW to my findLoginWindow(it)
-			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 15)
-			if passField is not missing value then
-				my typeIntoField(passField, applePassword, true)
-			else
-				my typeViaFocusInWindow(it, targetW, applePassword, true, {"密码", "Password"})
-			end if
-
-			delay 0.8
-			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
-				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
+			if my isPasswordFieldVisible(targetW) then
+				my fillPasswordInWindow(targetW, applePassword)
+				my verifyPasswordNotInSearch(targetW, applePassword)
+				delay 0.8
+				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
 					key code 36
+				end if
+			else
+				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
+					key code 36
+				end if
+				delay 2.5
+				set targetW to my findLoginWindow(it)
+				my fillPasswordInWindow(targetW, applePassword)
+				my verifyPasswordNotInSearch(targetW, applePassword)
+				delay 0.8
+				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "Sign in", "登录", "Next", "下一步"}) then
+					if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Sign In", "登录"}) then
+						key code 36
+					end if
 				end if
 			end if
 		end tell
