@@ -144,7 +144,11 @@ end elementClassName
 
 on isInputElement(e)
 	set c to my elementClassName(e)
-	return c is in {"text field", "text area", "combo box"}
+	if c is in {"text field", "text area", "combo box"} then return true
+	set desc to my elementDescription(e)
+	if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话", "Phone"}) then return true
+	if my textContainsAny(desc, {"密码", "Password"}) then return true
+	return false
 end isInputElement
 
 on allInputFields(targetW)
@@ -224,6 +228,53 @@ on textContainsAny(textValue, markers)
 end textContainsAny
 
 -- 登录表单只在主内容区；侧边栏只有「搜索」
+on mainPaneInputFieldsByPosition(targetW)
+	set found to {}
+	tell application "System Events"
+		try
+			set winPos to position of targetW
+			set winSize to size of targetW
+			set minX to (item 1 of winPos) + (item 1 of winSize) * 0.22
+			repeat with tf in my allInputFields(targetW)
+				try
+					set fp to position of tf
+					if (item 1 of fp) >= minX then set end of found to tf
+				end try
+			end repeat
+		end try
+	end tell
+	return found
+end mainPaneInputFieldsByPosition
+
+on firstNonSearchField(targetW)
+	repeat with tf in my allInputFields(targetW)
+		if not my isSidebarSearchField(tf) then return tf
+	end repeat
+	return missing value
+end firstNonSearchField
+
+on nonSearchInputFields(targetW)
+	set found to {}
+	repeat with tf in my allInputFields(targetW)
+		if not my isSidebarSearchField(tf) then set end of found to tf
+	end repeat
+	return found
+end nonSearchInputFields
+
+-- 结构排除 → 坐标排除 → 非搜索 → 全部（v1.0.7）
+on resolveLoginInputFields(targetW)
+	set fields to my mainPaneInputFields(targetW)
+	if (count of fields) > 0 then return fields
+
+	set fields to my mainPaneInputFieldsByPosition(targetW)
+	if (count of fields) > 0 then return fields
+
+	set fields to my nonSearchInputFields(targetW)
+	if (count of fields) > 0 then return fields
+
+	return my allInputFields(targetW)
+end resolveLoginInputFields
+
 on mainPaneInputFields(targetW)
 	set found to {}
 	repeat with tf in my allInputFields(targetW)
@@ -273,7 +324,11 @@ on continueButtonEnabled(targetW)
 end continueButtonEnabled
 
 on mainPaneContainsAppleId(targetW, appleId)
-	repeat with tf in my mainPaneInputFields(targetW)
+	repeat with tf in my resolveLoginInputFields(targetW)
+		set v to my fieldValue(tf)
+		if v contains appleId or v is appleId then return true
+	end repeat
+	repeat with tf in my nonSearchInputFields(targetW)
 		set v to my fieldValue(tf)
 		if v contains appleId or v is appleId then return true
 	end repeat
@@ -333,13 +388,61 @@ on keystrokeIntoField(tf, textValue)
 	end tell
 end keystrokeIntoField
 
--- 阶段 1：v1.0.7 验证有效的 set value + keystroke 触发同页密码框（勿 Tab）
-on fillEmailInWindow(procRef, targetW, appleId)
+on clickEmailFieldByMarker(targetW)
+	tell application "System Events"
+		repeat with e in entire contents of targetW
+			set desc to my elementDescription(e)
+			if my textContainsAny(desc, {"电子邮件", "Email or", "email or", "phone number", "电话"}) then
+				try
+					click e
+					return true
+				end try
+			end if
+			try
+				if value of e is "电子邮件或电话号码" or value of e is "Email or Phone Number" then
+					click e
+					return true
+				end if
+			end try
+		end repeat
+	end tell
+	return false
+end clickEmailFieldByMarker
+
+on clickEmailFieldByCoordinates(targetW)
+	tell application "System Events"
+		try
+			set winPos to position of targetW
+			set winSize to size of targetW
+			set clickX to (item 1 of winPos) + (item 1 of winSize) * 0.55
+			set clickY to (item 2 of winPos) + (item 2 of winSize) * 0.48
+			click at {clickX, clickY}
+			return true
+		end try
+	end tell
+	return false
+end clickEmailFieldByCoordinates
+
+on fillEmailByClickAndType(procRef, targetW, appleId)
 	my ensureSettingsFrontmost(procRef)
+	set clicked to my clickEmailFieldByMarker(targetW)
+	if not clicked then
+		set clicked to my clickEmailFieldByCoordinates(targetW)
+	end if
+	if not clicked then error "未找到可点击的邮箱输入区域"
+	delay 0.35
+	tell application "System Events"
+		keystroke "a" using command down
+		delay 0.08
+		repeat with i from 1 to count of characters of appleId
+			keystroke character i of appleId
+			delay 0.015
+		end repeat
+	end tell
+end fillEmailByClickAndType
 
-	set fields to my mainPaneInputFields(targetW)
-	if (count of fields) = 0 then error "未找到主内容区邮箱输入框"
-
+on pickEmailFieldFromList(fields, appleId)
+	if (count of fields) = 0 then return missing value
 	set emailField to item 1 of fields
 	repeat with tf in fields
 		if my fieldMatchesMarkers(tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then
@@ -347,28 +450,51 @@ on fillEmailInWindow(procRef, targetW, appleId)
 			exit repeat
 		end if
 	end repeat
+	return emailField
+end pickEmailFieldFromList
 
-	my typeIntoField(emailField, appleId, false)
-	delay 0.45
-	if not my emailFillSucceeded(targetW, appleId) then
-		my keystrokeIntoField(emailField, appleId)
+-- 阶段 1：v1.0.7 set value + keystroke；无 AX 字段时坐标/标记点击
+on fillEmailInWindow(procRef, targetW, appleId)
+	my ensureSettingsFrontmost(procRef)
+
+	set fields to {}
+	repeat 10 times
+		set fields to my resolveLoginInputFields(targetW)
+		if (count of fields) > 0 then exit repeat
+		delay 0.4
+	end repeat
+
+	if (count of fields) > 0 then
+		set emailField to my pickEmailFieldFromList(fields, appleId)
+		my typeIntoField(emailField, appleId, false)
+		delay 0.45
+		if not my emailFillSucceeded(targetW, appleId) then
+			my keystrokeIntoField(emailField, appleId)
+			delay 0.7
+		end if
+	else
+		my fillEmailByClickAndType(procRef, targetW, appleId)
 		delay 0.7
 	end if
 
 	my verifyEmailFilled(targetW, appleId)
-	return emailField
+	return true
 end fillEmailInWindow
 
 on findPasswordFieldInMainPane(targetW, appleId)
-	set fields to my mainPaneInputFields(targetW)
+	set fields to my resolveLoginInputFields(targetW)
 	repeat with tf in fields
 		if my fieldMatchesMarkers(tf, {"密码", "Password"}) then return tf
 	end repeat
-	if (count of fields) >= 2 then return item 2 of fields
-	repeat with tf in fields
-		set v to my fieldValue(tf)
-		if v does not contain "@" and v is not appleId then return tf
-	end repeat
+	if (count of fields) >= 2 then
+		repeat with tf in fields
+			if not my fieldMatchesMarkers(tf, {"电子邮件", "Email", "phone", "电话", "Phone"}) then
+				set v to my fieldValue(tf)
+				if v does not contain "@" and v is not appleId then return tf
+			end if
+		end repeat
+		return item 2 of fields
+	end if
 	return missing value
 end findPasswordFieldInMainPane
 
@@ -469,6 +595,7 @@ on run argv
 				set targetW to my findLoginWindow(it)
 			end if
 
+			delay 1.2
 			my fillEmailInWindow(it, targetW, appleId)
 			delay 0.8
 			my fillPasswordInWindow(it, targetW, appleId, applePassword)
