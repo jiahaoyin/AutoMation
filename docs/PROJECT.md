@@ -160,9 +160,19 @@ cd apple-id-automation-latest/apple-id-automation-*/
 
 ## 8. 与 ChromeTest 的关系
 
-- **ChromeTest**（`/Users/yu/ChromeTest`）：浏览器指纹 / 交互风险**探针**平台（前后端 + Playwright/Puppeteer probe）
+- **ChromeTest**（`/Users/yu/ChromeTest`）：浏览器指纹 / 交互风险**探针**平台（前后端 + Playwright/Puppeteer/Firefox BiDi probe）
 - **本仓库**：仅 Apple ID macOS + Firefox 自动化，从 ChromeTest 的 `scripts/` 拆出（2025-07）
 - 两仓库**独立版本号、独立推送**，互不影响
+
+**正式跑 `./run.sh` 前**，建议在执行机跑探针门禁（云端或本地）：
+
+```bash
+export PROBE_BASE=https://your-probe-server
+cd /path/to/ChromeTest && npm run probe:gate:firefox
+# PASS 后再执行本仓库 ./run.sh
+```
+
+探针配置手册：`ChromeTest/docs/AUTOMATION_PLAYBOOK.md`
 
 ---
 
