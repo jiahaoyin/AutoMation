@@ -301,24 +301,39 @@ on findPasswordFieldInWindow(targetW, appleId)
 	return missing value
 end findPasswordFieldInWindow
 
-on waitForPasswordFieldInWindow(targetW, appleId, maxWaitSec)
-	repeat maxWaitSec times
-		set pw to my findPasswordFieldInWindow(targetW, appleId)
-		if pw is not missing value then return pw
-		if my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password") then
-			set pw to my findPasswordFieldInWindow(targetW, appleId)
-			if pw is not missing value then return pw
-		end if
-		delay 1
-	end repeat
-	return missing value
-end waitForPasswordFieldInWindow
+on isPasswordPageVisible(targetW)
+	return my windowMatchesMarker(targetW, "密码") or my windowMatchesMarker(targetW, "Password")
+end isPasswordPageVisible
 
-on fillPasswordInWindow(targetW, appleId, applePassword)
+on waitForPasswordPage(targetW, appleId, maxWaitSec)
+	repeat maxWaitSec times
+		if my isPasswordPageVisible(targetW) then return true
+		if my findPasswordFieldInWindow(targetW, appleId) is not missing value then return true
+		delay 0.5
+	end repeat
+	return false
+end waitForPasswordPage
+
+-- 密码页弹出后系统常已将光标置于密码框；找不到 UI 元素时直接 keystroke
+on fillPasswordInWindow(procRef, targetW, appleId, applePassword)
 	set tf to my findPasswordFieldInWindow(targetW, appleId)
-	if tf is missing value then error "未找到密码输入框"
-	my typeIntoField(tf, applePassword, true)
-	return true
+	if tf is not missing value then
+		my typeIntoField(tf, applePassword, true)
+		return true
+	end if
+
+	if my isPasswordPageVisible(targetW) then
+		tell application "System Events"
+			tell procRef
+				set frontmost to true
+			end tell
+			delay 0.4
+			keystroke applePassword
+		end tell
+		return true
+	end if
+
+	error "未找到密码输入框"
 end fillPasswordInWindow
 
 on searchFieldContains(targetW, textValue)
@@ -388,22 +403,15 @@ on run argv
 			my fillEmailInWindow(it, targetW, appleId)
 			delay 1.5
 
-			-- 阶段 2：等待密码框出现在邮箱下方
-			set passField to my waitForPasswordFieldInWindow(targetW, appleId, 8)
-			if passField is missing value then
-				if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
-					key code 36
-				end if
-				delay 2.5
-				set targetW to my findLoginWindow(it)
-				set passField to my waitForPasswordFieldInWindow(targetW, appleId, 15)
+			-- 阶段 2：点「继续」后等待密码页，优先用当前焦点直接输入
+			if not my clickButtonNamedInWindow(targetW, {"Continue", "继续", "Next", "下一步"}) then
+				key code 36
 			end if
+			delay 1.5
+			set targetW to my findLoginWindow(it)
+			my waitForPasswordPage(targetW, appleId, 12)
 
-			if passField is not missing value then
-				my typeIntoField(passField, applePassword, true)
-			else
-				my fillPasswordInWindow(targetW, appleId, applePassword)
-			end if
+			my fillPasswordInWindow(it, targetW, appleId, applePassword)
 			my verifyPasswordNotInSearch(targetW, applePassword)
 
 			delay 0.8
