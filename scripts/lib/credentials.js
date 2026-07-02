@@ -114,7 +114,7 @@ async function questionPassword(promptText) {
   return new Promise((resolve, reject) => {
     const stdin = input;
     const wasRaw = stdin.isRaw;
-    stdout.write(promptText);
+    output.write(promptText);
 
     stdin.setRawMode?.(true);
     stdin.resume();
@@ -133,14 +133,14 @@ async function questionPassword(promptText) {
 
       if (ch === "\n" || ch === "\r" || ch === "\u0004") {
         cleanup();
-        stdout.write("\n");
+        output.write("\n");
         resolve(password);
         return;
       }
 
       if (ch === "\u0003") {
         cleanup();
-        stdout.write("\n");
+        output.write("\n");
         reject(new Error("已取消"));
         return;
       }
