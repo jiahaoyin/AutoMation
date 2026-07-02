@@ -70,6 +70,19 @@ export function getAccessibilityHostApp() {
   return { name: "Terminal" };
 }
 
+/** 是否为 macOS 辅助功能未授权错误（-25211 等） */
+export function isAccessibilityDeniedError(err) {
+  const parts = [
+    err instanceof Error ? err.message : "",
+    err?.stderr ?? "",
+    err?.stdout ?? "",
+    String(err),
+  ];
+  return /-25211|assistive access|辅助访问|不允许辅助|not allowed assist/i.test(
+    parts.join("\n")
+  );
+}
+
 /** 是否已获得辅助功能权限（通过 System Events 探测） */
 export async function isAccessibilityGranted() {
   if (process.platform !== "darwin") return true;
@@ -160,6 +173,38 @@ export async function ensureAccessibility(options = {}) {
   }
 
   throw new Error(
-    `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完成后重新运行 ./install.sh`
+    `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完成后重新运行 ./run.sh`
   );
+}
+
+/**
+ * 执行依赖辅助功能的操作；未授权时引导开启，授权后自动重试
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @param {object} [options]
+ * @param {number} [options.maxAttempts]
+ * @param {string} [options.label]
+ */
+export async function withAccessibilityRetry(fn, options = {}) {
+  const { maxAttempts = 3, label = "操作" } = options;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await ensureAccessibility({ quiet: false });
+    await sleep(500);
+
+    try {
+      return await fn();
+    } catch (err) {
+      const canRetry = isAccessibilityDeniedError(err) && attempt < maxAttempts;
+      if (!canRetry) throw err;
+
+      console.warn(
+        `[辅助功能] ${label} 失败（尝试 ${attempt}/${maxAttempts}），请在系统设置中勾选后脚本将自动重试…`
+      );
+      await ensureAccessibility({ quiet: false, timeoutMs: 180_000 });
+      await sleep(1000);
+    }
+  }
+
+  throw new Error(`${label} 失败：辅助功能未授权`);
 }

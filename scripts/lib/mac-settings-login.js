@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { sleep, waitUntil } from "./prompt.js";
+import { withAccessibilityRetry } from "./accessibility.js";
 import { ensureMacOS15, getMacOSVersion } from "./macos.js";
 
 const execFileAsync = promisify(execFile);
@@ -26,19 +27,18 @@ export async function isMacSettingsSignedIn() {
  */
 export async function fillMacSettingsAppleLogin(creds) {
   console.log("\n[Mac 设置] 打开 Apple ID 并填入账号密码…");
-  console.log("[Mac 设置] 需要辅助功能权限：Terminal → 系统设置 → 隐私与安全性 → 辅助功能");
 
-  const { stdout, stderr } = await execFileAsync(
-    "osascript",
-    [LOGIN_SCPT],
-    {
-      timeout: 120_000,
-      env: {
-        ...process.env,
-        APPLE_SCRIPT_APPLE_ID: creds.appleId,
-        APPLE_SCRIPT_PASSWORD: creds.password,
-      },
-    }
+  const { stdout, stderr } = await withAccessibilityRetry(
+    () =>
+      execFileAsync("osascript", [LOGIN_SCPT], {
+        timeout: 120_000,
+        env: {
+          ...process.env,
+          APPLE_SCRIPT_APPLE_ID: creds.appleId,
+          APPLE_SCRIPT_PASSWORD: creds.password,
+        },
+      }),
+    { label: "Mac 系统设置填表", maxAttempts: 3 }
   );
 
   if (stderr?.trim()) {
