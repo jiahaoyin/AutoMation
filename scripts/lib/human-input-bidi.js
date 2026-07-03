@@ -53,6 +53,24 @@ export class HumanInput {
     this.keyId = "human-keyboard-1";
   }
 
+  /** @param {string} context */
+  setContext(context) {
+    this.context = context;
+  }
+
+  async preActionWander() {
+    const moves = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < moves; i++) {
+      const x = this.lastMouse.x + randomBetween(-90, 90);
+      const y = this.lastMouse.y + randomBetween(-60, 60);
+      await this.moveTo(
+        Math.max(20, Math.min(1400, x)),
+        Math.max(20, Math.min(860, y))
+      );
+      await sleep(randomBetween(40, 120));
+    }
+  }
+
   async moveTo(x, y) {
     const path = bezierPath(this.lastMouse, { x, y });
     const actions = path.map((p) => ({
@@ -109,6 +127,7 @@ export class HumanInput {
    * @param {{sharedId: string}} node
    */
   async clickElement(node) {
+    await this.preActionWander();
     const offsetX = Math.round(randomBetween(3, 18));
     const offsetY = Math.round(randomBetween(3, 14));
 
@@ -137,9 +156,12 @@ export class HumanInput {
     await sleep(randomBetween(180, 420));
   }
 
-  /** @param {string} text */
-  async typeText(text) {
-    for (const char of text) {
+  /** @param {string} text @param {{ slow?: boolean }} [opts] */
+  async typeText(text, opts = {}) {
+    const baseMin = opts.slow ? 90 : 55;
+    const baseMax = opts.slow ? 220 : 175;
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
       await this.bidi.performActions({
         context: this.context,
         actions: [
@@ -148,13 +170,44 @@ export class HumanInput {
             id: this.keyId,
             actions: [
               { type: "keyDown", value: char },
+              { type: "pause", duration: Math.round(randomBetween(20, 65)) },
               { type: "keyUp", value: char },
             ],
           },
         ],
       });
-      await sleep(randomBetween(60, 180) + (Math.random() < 0.08 ? 300 : 0));
+      let delay = randomBetween(baseMin, baseMax);
+      if (Math.random() < 0.1) delay += randomBetween(180, 420);
+      if (i > 0 && i % 4 === 0 && Math.random() < 0.15) {
+        delay += randomBetween(250, 600);
+      }
+      await sleep(delay);
     }
+  }
+
+  /** @param {{sharedId: string}} node */
+  async clearElement(node) {
+    await this.clickElement(node);
+    await sleep(randomBetween(100, 220));
+    const mod = process.platform === "darwin" ? "\uE03D" : "\uE009";
+    await this.bidi.performActions({
+      context: this.context,
+      actions: [
+        {
+          type: "key",
+          id: this.keyId,
+          actions: [
+            { type: "keyDown", value: mod },
+            { type: "keyDown", value: "a" },
+            { type: "keyUp", value: "a" },
+            { type: "keyUp", value: mod },
+            { type: "keyDown", value: "\uE017" },
+            { type: "keyUp", value: "\uE017" },
+          ],
+        },
+      ],
+    });
+    await sleep(randomBetween(120, 280));
   }
 
   async pressEnter() {
@@ -178,9 +231,14 @@ export class HumanInput {
   async waitForSelector(selector, timeoutMs = 60_000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      const found = await this.bidi.locateNodesInAnyContext(selector).catch(() => null);
+      if (found?.nodes?.length) {
+        this.setContext(found.context);
+        return found.nodes;
+      }
       const nodes = await this.bidi.locateNodes(selector, this.context).catch(() => []);
       if (nodes.length) return nodes;
-      await sleep(500);
+      await sleep(400 + Math.random() * 350);
     }
     throw new Error(`等待元素超时: ${selector}`);
   }

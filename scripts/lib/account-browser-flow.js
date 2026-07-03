@@ -1,5 +1,6 @@
 /**
  * account.apple.com：Firefox BiDi 登录 + macOS 2FA + 采集姓名/生日
+ * v1.0.28：iframe 感知、两步登录、反自动化探针、结构化采集
  */
 
 import {
@@ -9,11 +10,21 @@ import {
   stopFirefox,
 } from "./bidi-client.js";
 import { HumanInput, sleep } from "./human-input-bidi.js";
+import {
+  applyAutomationMitigations,
+  assessAutomationRisk,
+  humanJitter,
+  humanPageSettle,
+  humanThinkPause,
+  probeAutomationSignals,
+} from "./anti-automation.js";
+import { isAccessibilityGranted } from "./accessibility.js";
 import { startMac2FAWait } from "./two-fa-sidecar.js";
 import { saveScreenshot } from "./report.js";
 
 const ACCOUNT_HOME = "https://account.apple.com/";
 const ACCOUNT_MANAGE = "https://account.apple.com/account/manage";
+const ACCOUNT_PERSONAL = "https://account.apple.com/account/manage/section/information";
 const SIGN_IN_URL = "https://appleid.apple.com/sign-in";
 
 const USER_SELECTORS = [
@@ -21,18 +32,21 @@ const USER_SELECTORS = [
   'input[name="accountName"]',
   'input[autocomplete="username"]',
   'input[type="email"]',
+  'input[id*="account"]',
 ];
 
 const PASS_SELECTORS = [
   "#password_text_field",
   'input[name="password"]',
   'input[type="password"]',
+  'input[autocomplete="current-password"]',
 ];
 
-const SUBMIT_SELECTORS = [
+const CONTINUE_SELECTORS = [
   "#sign-in",
-  'button[type="submit"]',
   'button#sign-in',
+  'button[type="submit"]',
+  'input[type="submit"]',
 ];
 
 const CODE_SELECTORS = [
@@ -40,69 +54,92 @@ const CODE_SELECTORS = [
   ".form-security-code-input input",
   'input[autocomplete="one-time-code"]',
   'input[inputmode="numeric"]',
+  ".form-security-code input",
+  'input[type="tel"]',
+];
+
+const TRUST_SELECTORS = [
+  'button[name="trust"]',
+  'button[data-test="trust-browser"]',
+  'button[type="submit"]',
 ];
 
 const SIGN_IN_LINK_SELECTORS = [
   'a[href*="sign"]',
   'button[data-test*="sign"]',
+  'a[data-test*="sign"]',
 ];
 
-async function firstExisting(human, selectors) {
-  for (const sel of selectors) {
-    try {
-      const nodes = await human.waitForSelector(sel, 8000);
-      if (nodes.length) return { selector: sel, nodes };
-    } catch {
-      /* try next */
+/**
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {string[]} selectors
+ * @param {number} [timeoutMs]
+ */
+async function firstExistingInAnyContext(bidi, human, selectors, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
+      if (found?.nodes?.length) {
+        human.setContext(found.context);
+        return { selector: sel, ...found };
+      }
     }
+    await sleep(350 + Math.random() * 300);
   }
   return null;
 }
 
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 async function isAccountSignedIn(bidi, context) {
-  const href = await bidi.evaluate("location.href", context);
-  if (String(href).includes("/account/manage")) return true;
+  const href = String(await bidi.evaluate("location.href", context));
+  if (/\/account\/manage/i.test(href)) return true;
   const text = await bidi.evaluate(
-    `document.body && document.body.innerText ? document.body.innerText.slice(0, 500) : ""`,
+    `document.body?.innerText?.slice(0, 800) ?? ""`,
     context
   );
-  return /sign out|退出|manage your account|管理您的账户/i.test(String(text));
+  return /sign out|退出|log out|manage your account|管理您的账户|个人信息/i.test(
+    String(text)
+  );
 }
 
+/** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 async function clickSignInIfNeeded(human, bidi, context) {
   if (await isAccountSignedIn(bidi, context)) return false;
 
   for (const sel of SIGN_IN_LINK_SELECTORS) {
-    try {
-      const nodes = await bidi.locateNodes(sel, context);
-      if (nodes.length) {
-        await human.clickElement(nodes[0]);
-        await sleep(2000);
-        return true;
-      }
-    } catch {
-      /* continue */
+    const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
+    if (found?.nodes?.length) {
+      human.setContext(found.context);
+      await humanThinkPause(400, 900);
+      await human.clickElement(found.nodes[0]);
+      await humanPageSettle("点击登录");
+      return true;
     }
   }
   return false;
 }
 
+/** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} code */
 async function fillSecurityCode(human, bidi, context, code) {
+  human.setContext(context);
   for (const sel of CODE_SELECTORS) {
     try {
-      const nodes = await human.waitForSelector(sel, 15_000);
+      const nodes = await human.waitForSelector(sel, 20_000);
       if (nodes.length >= 6) {
         for (let i = 0; i < 6; i++) {
+          await humanJitter(120, 280);
           await human.clickElement(nodes[i]);
-          await human.typeText(code[i]);
-          await sleep(randomPause());
+          await human.typeText(code[i], { slow: true });
         }
+        await humanThinkPause(300, 700);
         await human.pressEnter();
         return;
       }
       if (nodes.length >= 1) {
         await human.clickElement(nodes[0]);
-        await human.typeText(code);
+        await human.typeText(code, { slow: true });
         await human.pressEnter();
         return;
       }
@@ -113,48 +150,177 @@ async function fillSecurityCode(human, bidi, context, code) {
   throw new Error("未找到网页 2FA 验证码输入框");
 }
 
-function randomPause() {
-  return 80 + Math.random() * 120;
+/** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi */
+async function clickTrustBrowserIfNeeded(human, bidi) {
+  for (const sel of TRUST_SELECTORS) {
+    const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
+    if (!found?.nodes?.length) continue;
+    const text = await bidi.evaluate(
+      `(el => el?.innerText || el?.value || "")(document.querySelector(${JSON.stringify(sel)}))`,
+      found.context
+    );
+    if (!/trust|信任|continue|继续/i.test(String(text))) continue;
+    human.setContext(found.context);
+    await humanThinkPause(500, 1200);
+    await human.clickElement(found.nodes[0]);
+    await humanPageSettle("信任浏览器");
+    return true;
+  }
+  return false;
 }
 
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 async function scrapePersonalInfo(bidi, context) {
-  await bidi.navigate(ACCOUNT_MANAGE, context);
-  await sleep(3000);
+  const urls = [ACCOUNT_PERSONAL, ACCOUNT_MANAGE];
+  let lastRaw = null;
 
-  const raw = await bidi.evaluate(
-    `JSON.stringify((() => {
-      const lines = (document.body?.innerText || "")
-        .split(/\\n+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const nameLabels = ["Name", "姓名", "名字", "Full Name", "全名"];
-      const bdayLabels = ["Birthday", "生日", "Date of Birth", "出生日期", "出生"];
-      let fullName = "";
-      let birthday = "";
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (!fullName && nameLabels.some((l) => line === l || line.startsWith(l))) {
-          fullName = lines[i + 1] || "";
+  for (const url of urls) {
+    await bidi.navigate(url, context);
+    await humanPageSettle("个人信息页");
+
+    lastRaw = await bidi.evaluate(
+      `JSON.stringify((() => {
+        const lines = (document.body?.innerText || "")
+          .split(/\\n+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        const nameLabels = ["Name", "姓名", "名字", "Full Name", "全名", "First Name"];
+        const bdayLabels = ["Birthday", "生日", "Date of Birth", "出生日期", "出生", "Birth date"];
+
+        let fullName = "";
+        let birthday = "";
+
+        const pickFromLines = (labels) => {
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (labels.some((l) => line === l || line.startsWith(l + " ") || line.endsWith(l))) {
+              const next = lines[i + 1];
+              if (next && !labels.includes(next)) return next;
+            }
+          }
+          return "";
+        };
+
+        fullName = pickFromLines(nameLabels);
+        birthday = pickFromLines(bdayLabels);
+
+        if (!fullName) {
+          const dt = [...document.querySelectorAll("dt, th, label, h3, span")].find((el) =>
+            nameLabels.some((l) => el.textContent?.trim() === l)
+          );
+          if (dt) {
+            const sib = dt.nextElementSibling || dt.parentElement?.querySelector("dd, p, span");
+            fullName = sib?.textContent?.trim() || "";
+          }
         }
-        if (!birthday && bdayLabels.some((l) => line === l || line.startsWith(l))) {
-          birthday = lines[i + 1] || "";
+
+        if (!birthday) {
+          const dt = [...document.querySelectorAll("dt, th, label, h3, span")].find((el) =>
+            bdayLabels.some((l) => el.textContent?.trim() === l || el.textContent?.includes(l))
+          );
+          if (dt) {
+            const sib = dt.nextElementSibling || dt.parentElement?.querySelector("dd, p, span");
+            birthday = sib?.textContent?.trim() || "";
+          }
         }
-      }
-      return {
-        fullName: fullName || null,
-        birthday: birthday || null,
-        url: location.href,
-        title: document.title,
-      };
-    })())`,
-    context
-  );
+
+        return {
+          fullName: fullName || null,
+          birthday: birthday || null,
+          url: location.href,
+          title: document.title,
+        };
+      })())`,
+      context
+    );
+
+    try {
+      const parsed = typeof lastRaw === "string" ? JSON.parse(lastRaw) : lastRaw ?? {};
+      if (parsed.fullName || parsed.birthday) return parsed;
+    } catch {
+      /* try next url */
+    }
+  }
 
   try {
-    return typeof raw === "string" ? JSON.parse(raw) : raw ?? {};
+    return typeof lastRaw === "string" ? JSON.parse(lastRaw) : lastRaw ?? {};
   } catch {
     return { fullName: null, birthday: null, parseError: true };
   }
+}
+
+/**
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {{ appleId: string, password: string }} creds
+ */
+async function runWebLogin(bidi, human, creds) {
+  await clickSignInIfNeeded(human, bidi, human.context);
+
+  let userField = await firstExistingInAnyContext(bidi, human, USER_SELECTORS, 12_000);
+  if (!userField) {
+    for (const url of [SIGN_IN_URL, ACCOUNT_HOME]) {
+      await bidi.navigate(url, human.context);
+      await humanPageSettle("导航登录页");
+      userField = await firstExistingInAnyContext(bidi, human, USER_SELECTORS, 15_000);
+      if (userField) break;
+    }
+  }
+  if (!userField) throw new Error("未找到 Apple ID 输入框（已搜索 iframe）");
+
+  console.log(`[Firefox] 邮箱框: ${userField.selector} @ ${userField.url || "root"}`);
+
+  await humanThinkPause(500, 1100);
+  await human.clickElement(userField.nodes[0]);
+  await humanJitter();
+  await human.typeText(creds.appleId);
+  await humanThinkPause(400, 900);
+
+  const continueBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 10_000);
+  if (continueBtn) {
+    await human.clickElement(continueBtn.nodes[0]);
+    console.log("[Firefox] 已点击继续，等待密码框…");
+    await humanPageSettle("密码框出现");
+  }
+
+  const passField = await firstExistingInAnyContext(bidi, human, PASS_SELECTORS, 30_000);
+  if (!passField) throw new Error("未找到密码输入框");
+
+  console.log(`[Firefox] 密码框: ${passField.selector} @ ${passField.url || "root"}`);
+
+  const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
+
+  await humanThinkPause(400, 900);
+  await human.clickElement(passField.nodes[0]);
+  await humanJitter();
+  await human.typeText(creds.password, { slow: true });
+  await humanThinkPause(500, 1100);
+
+  const submitBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 8000);
+  if (submitBtn) {
+    await human.clickElement(submitBtn.nodes[0]);
+  } else {
+    await human.pressEnter();
+  }
+
+  console.log("[Firefox] 已提交密码，等待 macOS 2FA 弹窗…");
+
+  const code = await twoFa.getCode();
+  console.log("[Firefox] 已获取 2FA 验证码，填入网页…");
+
+  await humanPageSettle("2FA 输入框");
+  await fillSecurityCode(human, bidi, human.context, code);
+  await humanPageSettle("2FA 提交后");
+
+  await clickTrustBrowserIfNeeded(human, bidi);
+
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    if (await isAccountSignedIn(bidi, human.context)) return;
+    await sleep(1500);
+  }
+  throw new Error("登录后未检测到 account 已登录状态");
 }
 
 /**
@@ -165,11 +331,17 @@ async function scrapePersonalInfo(bidi, context) {
 export async function runAccountBrowserPhase({ creds, reportDir }) {
   console.log("\n[Firefox] 启动独立 Profile + WebDriver BiDi…");
 
+  const axOk = await isAccessibilityGranted().catch(() => false);
+  if (!axOk) {
+    console.warn("[2FA] 警告: 辅助功能未授权，macOS FollowUpUI 2FA 可能失败");
+  }
+
   let firefoxProc = null;
   let bidi = null;
 
   const report = {
     browserLogin: { success: false },
+    antiAutomation: null,
     personalInfo: null,
     screenshots: {},
   };
@@ -188,7 +360,16 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
     const human = new HumanInput(bidi, context);
 
     await bidi.navigate(ACCOUNT_HOME, context);
-    await sleep(randomPause() + 1500);
+    await humanPageSettle("首页加载");
+
+    await applyAutomationMitigations(bidi, context);
+    const signals = await probeAutomationSignals(bidi, context);
+    const risk = assessAutomationRisk(signals);
+    report.antiAutomation = { signals, risk };
+    console.log(
+      `[反自动化] 探针: webdriver=${signals.webdriver}, plugins=${signals.pluginsCount}` +
+        (risk.warnings.length ? ` 警告: ${risk.warnings.join("; ")}` : " ✓")
+    );
 
     report.screenshots.home = saveScreenshot(
       reportDir,
@@ -197,66 +378,7 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
     );
 
     if (!(await isAccountSignedIn(bidi, context))) {
-      await clickSignInIfNeeded(human, bidi, context);
-      await sleep(2000);
-
-      let onSignInPage = false;
-      for (const url of [SIGN_IN_URL, ACCOUNT_HOME]) {
-        try {
-          await bidi.navigate(url, context);
-          await sleep(2000);
-          const found = await firstExisting(human, USER_SELECTORS);
-          if (found) {
-            onSignInPage = true;
-            break;
-          }
-        } catch {
-          /* continue */
-        }
-      }
-      if (!onSignInPage) {
-        await bidi.navigate(SIGN_IN_URL, context);
-        await sleep(2500);
-      }
-
-      const userField = await firstExisting(human, USER_SELECTORS);
-      if (!userField) throw new Error("未找到 Apple ID 输入框");
-
-      const passField = await firstExisting(human, PASS_SELECTORS);
-      if (!passField) throw new Error("未找到密码输入框");
-
-      const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
-
-      await human.clickElement(userField.nodes[0]);
-      await sleep(randomPause());
-      await human.typeText(creds.appleId);
-      await sleep(randomPause());
-
-      const submitAfterUser = await firstExisting(human, SUBMIT_SELECTORS);
-      if (submitAfterUser) {
-        await human.clickElement(submitAfterUser.nodes[0]);
-        await sleep(1500);
-      }
-
-      await human.clickElement(passField.nodes[0]);
-      await sleep(randomPause());
-      await human.typeText(creds.password);
-      await sleep(randomPause());
-
-      const submitBtn = await firstExisting(human, SUBMIT_SELECTORS);
-      if (submitBtn) {
-        await human.clickElement(submitBtn.nodes[0]);
-      } else {
-        await human.pressEnter();
-      }
-
-      console.log("[Firefox] 已提交密码，等待 macOS 2FA 弹窗与网页验证码框…");
-
-      const code = await twoFa.getCode();
-      await sleep(1000);
-      await fillSecurityCode(human, bidi, context, code);
-      await sleep(4000);
-
+      await runWebLogin(bidi, human, creds);
       report.screenshots.afterLogin = saveScreenshot(
         reportDir,
         "02-after-login",
@@ -266,9 +388,10 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
       console.log("[Firefox] 检测到 account 已登录，跳过网页登录");
     }
 
+    report.browserLogin.success = true;
+
     const personalInfo = await scrapePersonalInfo(bidi, context);
     report.personalInfo = personalInfo;
-    report.browserLogin.success = true;
 
     report.screenshots.manage = saveScreenshot(
       reportDir,
@@ -276,10 +399,19 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
       await bidi.captureScreenshot(context)
     );
 
+    const hasName = !!personalInfo?.fullName;
+    const hasBirthday = !!personalInfo?.birthday;
     console.log("[Firefox] 采集结果:", {
       fullName: personalInfo.fullName ?? "(未解析)",
       birthday: personalInfo.birthday ?? "(未解析)",
     });
+
+    if (!hasName && !hasBirthday) {
+      report.personalInfo.partial = true;
+      console.warn("[Firefox] 警告: 姓名/生日均未解析，请查看截图与 report.json");
+    } else {
+      report.personalInfo.partial = !(hasName && hasBirthday);
+    }
 
     return report;
   } finally {

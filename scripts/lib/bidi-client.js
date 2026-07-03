@@ -207,6 +207,61 @@ export class BidiClient {
   }
 
   /**
+   * @param {number} [maxDepth]
+   * @returns {Promise<Array<{ context: string, url: string, children?: unknown[] }>>}
+   */
+  async getContextTree(maxDepth = 8) {
+    const result = await this.send("browsingContext.getTree", { maxDepth });
+    return result?.contexts ?? [];
+  }
+
+  /**
+   * @param {unknown[]} nodes
+   * @param {Array<{ context: string, url: string }>} [out]
+   */
+  flattenContexts(nodes, out = []) {
+    for (const node of nodes ?? []) {
+      if (!node || typeof node !== "object") continue;
+      const n = /** @type {{ context?: string, url?: string, children?: unknown[] }} */ (node);
+      if (n.context) {
+        out.push({ context: n.context, url: n.url ?? "" });
+      }
+      if (n.children?.length) this.flattenContexts(n.children, out);
+    }
+    return out;
+  }
+
+  /** @param {number} [maxDepth] */
+  async getAllContexts(maxDepth = 8) {
+    const tree = await this.getContextTree(maxDepth);
+    return this.flattenContexts(tree);
+  }
+
+  /**
+   * @param {string} selector
+   * @param {number} [maxDepth]
+   * @returns {Promise<{ nodes: object[], context: string, url: string } | null>}
+   */
+  async locateNodesInAnyContext(selector, maxDepth = 8) {
+    const contexts = await this.getAllContexts(maxDepth);
+    const ordered = [...contexts].sort((a, b) => {
+      const score = (u) =>
+        /idmsa|appleid|auth/i.test(u) ? 0 : /account\.apple\.com/i.test(u) ? 1 : 2;
+      return score(a.url) - score(b.url);
+    });
+
+    for (const { context, url } of ordered) {
+      try {
+        const nodes = await this.locateNodes(selector, context);
+        if (nodes.length) return { nodes, context, url };
+      } catch {
+        /* try next context */
+      }
+    }
+    return null;
+  }
+
+  /**
    * @param {string} selector
    * @param {string} [context]
    */
