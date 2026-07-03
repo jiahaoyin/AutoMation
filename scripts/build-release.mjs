@@ -51,6 +51,7 @@ const COPY_PATHS = [
   "scripts/lib/human-input-bidi.js",
   "scripts/lib/mac-settings-login.js",
   "scripts/lib/account-browser-flow.js",
+  "scripts/lib/anti-automation.js",
   "scripts/lib/credentials.js",
   "scripts/lib/prompt.js",
   "scripts/lib/two-fa-sidecar.js",
