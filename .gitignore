@@ -1,6 +1,7 @@
 .env
 data/
 .runtime/
+scripts/bin/
 dist/
 .DS_Store
 *.zip

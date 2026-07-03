@@ -13,10 +13,16 @@ import {
   getAccessibilityHostApp,
 } from "./accessibility.js";
 import { ensureMacOS15, getMacOSVersion, openAppleAccountSettings } from "./macos.js";
+import {
+  compileAxFillHelper,
+  fillViaSwiftAx,
+  isAxFillAvailable,
+} from "./mac-settings-ax-fill.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOGIN_SCPT = path.resolve(__dirname, "../mac-settings-apple-login.applescript");
+const DUMP_SCPT = path.resolve(__dirname, "../mac-settings-ui-dump.applescript");
 const SIGNED_IN_SCPT = path.resolve(__dirname, "../mac-settings-signed-in.applescript");
 const AUTOMATION_CHECK_SCPT = path.resolve(
   __dirname,
@@ -42,120 +48,42 @@ export async function preflightMacSettingsAutomation() {
   return { ok: true, host: host.name };
 }
 
-/** Node 分步：激活 → 点击坐标 → 再激活 → 粘贴（每步独立 osascript，避免焦点丢失） */
-async function orchestratedCoordinateEmailPaste(appleId) {
-  console.log("[Mac 设置] 尝试分步坐标粘贴（Node 编排）…");
-
-  const activate = async () => {
-    await execFileAsync("osascript", [
-      "-e",
-      'tell application "System Settings" to activate',
-      "-e",
-      "delay 0.6",
-      "-e",
-      'tell application "System Events" to tell process "System Settings" to set frontmost to true',
-    ]);
-    await sleep(900);
-  };
-
-  const getWindowRect = async () => {
-    const { stdout } = await execFileAsync(
-      "osascript",
-      [
-        "-e",
-        'tell application "System Events" to tell process "System Settings"',
-        "-e",
-        "set w to window 1",
-        "-e",
-        "set p to position of w",
-        "-e",
-        "set s to size of w",
-        "-e",
-        'return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)',
-        "-e",
-        "end tell",
-      ],
-      { timeout: 15_000 }
-    );
-    const [x, y, w, h] = stdout.trim().split(",").map(Number);
-    if (![x, y, w, h].every(Number.isFinite)) {
-      throw new Error("无法读取系统设置窗口坐标");
+/** 预检：登录窗口是否可见（解析 dump 脚本输出） */
+async function preflightLoginWindowVisible() {
+  try {
+    const { stdout } = await execFileAsync("osascript", [DUMP_SCPT], { timeout: 25_000 });
+    const text = stdout.trim();
+    if (/login window found/.test(text) && /deep=[1-9]/.test(text)) {
+      console.log("[Mac 设置] ✓ 预检：登录窗口已就绪");
+      return true;
     }
-    return { x, y, w, h };
-  };
+    console.warn("[Mac 设置] 预检：登录窗口或输入框未就绪，dump 摘要:\n" + text.split("\n").slice(-5).join("\n"));
+    return false;
+  } catch (err) {
+    console.warn("[Mac 设置] 预检 dump 失败:", err.message);
+    return false;
+  }
+}
 
-  const clickAt = async (cx, cy) => {
-    await execFileAsync("osascript", [
-      "-e",
-      'tell application "System Events" to click at {' + cx + ", " + cy + "}",
-    ]);
-    await sleep(600);
-  };
+/** AppleScript 回退（索引式 BFS，不缓存元素引用） */
+async function fillViaAppleScript(creds) {
+  console.log("[Mac 设置] AppleScript 回退填表…");
+  const { stdout, stderr } = await execFileAsync("osascript", [LOGIN_SCPT], {
+    timeout: 180_000,
+    env: {
+      ...process.env,
+      APPLE_SCRIPT_APPLE_ID: creds.appleId,
+      APPLE_SCRIPT_PASSWORD: creds.password,
+      APPLE_SCRIPT_PANE_OPENED: "1",
+    },
+  });
 
-  const pasteClipboard = async () => {
-    await execFileAsync("osascript", [
-      "-e",
-      `set the clipboard to ${JSON.stringify(appleId)}`,
-      "-e",
-      'tell application "System Settings" to activate',
-      "-e",
-      "delay 0.5",
-      "-e",
-      'tell application "System Events" to keystroke "v" using command down',
-    ]);
-    await sleep(700);
-  };
-
-  const focusedContainsId = async () => {
-    try {
-      const { stdout } = await execFileAsync(
-        "osascript",
-        [
-          "-e",
-          'tell application "System Events" to tell process "System Settings"',
-          "-e",
-          'try',
-          "-e",
-          'set f to value of attribute "AXFocusedUIElement"',
-          "-e",
-          "return value of f as text",
-          "-e",
-          "on error",
-          "-e",
-          'return ""',
-          "-e",
-          "end try",
-          "-e",
-          "end tell",
-        ],
-        { timeout: 10_000 }
-      );
-      return stdout.trim().includes(appleId);
-    } catch {
-      return false;
-    }
-  };
-
-  await activate();
-  const rect = await getWindowRect();
-  const gridX = [0.5, 0.52, 0.55, 0.58, 0.62];
-  const gridY = [0.38, 0.42, 0.46, 0.5, 0.54, 0.58];
-
-  for (const xf of gridX) {
-    for (const yf of gridY) {
-      const cx = Math.round(rect.x + rect.w * xf);
-      const cy = Math.round(rect.y + rect.h * yf);
-      await activate();
-      await clickAt(cx, cy);
-      await activate();
-      await pasteClipboard();
-      if (await focusedContainsId()) {
-        console.log("[Mac 设置] ✓ 分步坐标粘贴成功（焦点元素含邮箱）");
-        return true;
-      }
+  if (stderr?.trim()) {
+    for (const line of stderr.trim().split("\n")) {
+      console.log(`[Mac 设置] ${line}`);
     }
   }
-  return false;
+  return stdout?.trim() || "ok";
 }
 
 export async function isMacSettingsSignedIn() {
@@ -175,9 +103,11 @@ export async function fillMacSettingsAppleLogin(creds) {
   console.log("\n[Mac 设置] 打开 Apple ID 并填入账号密码…");
 
   await preflightMacSettingsAutomation();
+  compileAxFillHelper({ quiet: true });
 
-  const { stdout, stderr } = await withAccessibilityRetry(
+  await withAccessibilityRetry(
     async () => {
+      console.log("[Mac 设置] 打开 Apple Account 深链…");
       openAppleAccountSettings();
       await sleep(3500);
 
@@ -193,41 +123,31 @@ export async function fillMacSettingsAppleLogin(creds) {
         }
       }
 
-      return execFileAsync("osascript", [LOGIN_SCPT], {
-        timeout: 180_000,
-        env: {
-          ...process.env,
-          APPLE_SCRIPT_APPLE_ID: creds.appleId,
-          APPLE_SCRIPT_PASSWORD: creds.password,
-          APPLE_SCRIPT_PANE_OPENED: "1",
-        },
-      });
+      await preflightLoginWindowVisible();
+
+      // 主路径：Swift AX API
+      if (isAxFillAvailable()) {
+        try {
+          await fillViaSwiftAx(creds);
+          return;
+        } catch (swiftErr) {
+          console.warn(
+            `[Mac 设置] Swift AX 主路径失败: ${swiftErr.message}，回退 AppleScript…`
+          );
+        }
+      } else {
+        console.warn("[Mac 设置] Swift AX helper 不可用，使用 AppleScript 回退");
+      }
+
+      const result = await fillViaAppleScript(creds);
+      if (result !== "ok") {
+        throw new Error(`AppleScript 填表异常: ${result}`);
+      }
     },
-    { label: "Mac 系统设置填表", maxAttempts: 3 }
+    { label: "Mac 系统设置填表", maxAttempts: 2 }
   );
 
-  const errText = String(stderr ?? stdout ?? "");
-  if (/邮箱未成功填入|粘贴失败|-2700|-1743/.test(errText)) {
-    if (/-1743|自动化权限|缺少自动化/.test(errText)) {
-      openAutomationSettings();
-      throw new Error(
-        "缺少自动化权限：请在 系统设置 → 隐私与安全性 → 自动化 中允许当前终端 App 控制「系统设置」，然后重试。"
-      );
-    }
-
-    console.warn("[Mac 设置] 主 AppleScript 填邮箱可能失败，尝试 Node 分步坐标粘贴…");
-    const ok = await orchestratedCoordinateEmailPaste(creds.appleId);
-    if (!ok) {
-      console.warn(
-        "[Mac 设置] 邮箱填入可能失败。请运行 npm run dump:mac-ui 查看 AX 树，并确认自动化权限已授予。"
-      );
-    }
-  }
-
-  if (stderr?.trim()) {
-    console.warn("[Mac 设置] AppleScript stderr:", stderr.trim());
-  }
-  console.log("[Mac 设置] 填表结果:", stdout.trim() || "ok");
+  console.log("[Mac 设置] 填表结果: ok");
 }
 
 /**
