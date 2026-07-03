@@ -296,6 +296,26 @@ export class BidiClient {
     return r;
   }
 
+  /** @param {string} [context] @returns {Promise<{ width: number, height: number }>} */
+  async getViewportSize(context = this.rootContext) {
+    const raw = await this.evaluate(
+      `JSON.stringify({
+        width: Math.max(1, window.innerWidth || document.documentElement?.clientWidth || 800),
+        height: Math.max(1, window.innerHeight || document.documentElement?.clientHeight || 600)
+      })`,
+      context
+    );
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return {
+        width: Math.max(1, Number(parsed?.width) || 800),
+        height: Math.max(1, Number(parsed?.height) || 600),
+      };
+    } catch {
+      return { width: 980, height: 720 };
+    }
+  }
+
   /** @param {object} params */
   async performActions(params) {
     return this.send("input.performActions", params);

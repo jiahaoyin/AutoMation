@@ -270,11 +270,11 @@ async function runWebLogin(bidi, human, creds) {
   if (!userField) throw new Error("未找到 Apple ID 输入框（已搜索 iframe）");
 
   console.log(`[Firefox] 邮箱框: ${userField.selector} @ ${userField.url || "root"}`);
+  const vp = await human.ensureViewport();
+  console.log(`[Firefox] iframe 视口: ${vp.width}x${vp.height}`);
 
   await humanThinkPause(500, 1100);
-  await human.clickElement(userField.nodes[0]);
-  await humanJitter();
-  await human.typeText(creds.appleId);
+  await human.focusAndTypeElement(userField.nodes[0], userField.selector, creds.appleId);
   await humanThinkPause(400, 900);
 
   const continueBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 10_000);
@@ -292,9 +292,9 @@ async function runWebLogin(bidi, human, creds) {
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 
   await humanThinkPause(400, 900);
-  await human.clickElement(passField.nodes[0]);
-  await humanJitter();
-  await human.typeText(creds.password, { slow: true });
+  await human.focusAndTypeElement(passField.nodes[0], passField.selector, creds.password, {
+    slow: true,
+  });
   await humanThinkPause(500, 1100);
 
   const submitBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 8000);
@@ -347,7 +347,7 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
   };
 
   try {
-    const launched = await launchFirefox();
+    const launched = await launchFirefox({ width: 1280, height: 960 });
     firefoxProc = launched.process;
     const wsUrl = ensureLoopbackHost(launched.wsUrl);
     console.log(`[Firefox] BiDi: ${wsUrl}`);
