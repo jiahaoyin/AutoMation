@@ -19,6 +19,7 @@ import {
   probeAutomationSignals,
 } from "./anti-automation.js";
 import { isAccessibilityGranted } from "./accessibility.js";
+import { fillInputWithVerify, readInputState, waitForVisibleInput } from "./browser-input.js";
 import { startMac2FAWait } from "./two-fa-sidecar.js";
 import { saveScreenshot } from "./report.js";
 
@@ -258,44 +259,54 @@ async function scrapePersonalInfo(bidi, context) {
 async function runWebLogin(bidi, human, creds) {
   await clickSignInIfNeeded(human, bidi, human.context);
 
-  let userField = await firstExistingInAnyContext(bidi, human, USER_SELECTORS, 12_000);
+  let userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, 20_000);
   if (!userField) {
     for (const url of [SIGN_IN_URL, ACCOUNT_HOME]) {
       await bidi.navigate(url, human.context);
       await humanPageSettle("导航登录页");
-      userField = await firstExistingInAnyContext(bidi, human, USER_SELECTORS, 15_000);
+      userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, 15_000);
       if (userField) break;
     }
   }
-  if (!userField) throw new Error("未找到 Apple ID 输入框（已搜索 iframe）");
+  if (!userField) throw new Error("未找到可见 Apple ID 输入框（已搜索 iframe）");
 
   console.log(`[Firefox] 邮箱框: ${userField.selector} @ ${userField.url || "root"}`);
   const vp = await human.ensureViewport();
   console.log(`[Firefox] iframe 视口: ${vp.width}x${vp.height}`);
 
   await humanThinkPause(500, 1100);
-  await human.focusAndTypeElement(userField.nodes[0], userField.selector, creds.appleId);
+  await fillInputWithVerify(human, bidi, userField.selector, creds.appleId, "邮箱");
   await humanThinkPause(400, 900);
+
+  const emailState = await readInputState(bidi, human.context, userField.selector);
+  if (!emailState.value || emailState.value.length < 3) {
+    throw new Error(`邮箱校验失败：读回 "${emailState.value}"`);
+  }
 
   const continueBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 10_000);
   if (continueBtn) {
     await human.clickElement(continueBtn.nodes[0]);
     console.log("[Firefox] 已点击继续，等待密码框…");
     await humanPageSettle("密码框出现");
+  } else {
+    throw new Error("邮箱已填但未找到「继续」按钮");
   }
 
-  const passField = await firstExistingInAnyContext(bidi, human, PASS_SELECTORS, 30_000);
-  if (!passField) throw new Error("未找到密码输入框");
+  const passField = await waitForVisibleInput(bidi, human, PASS_SELECTORS, 30_000);
+  if (!passField) throw new Error("未找到可见密码输入框");
 
   console.log(`[Firefox] 密码框: ${passField.selector} @ ${passField.url || "root"}`);
 
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 
   await humanThinkPause(400, 900);
-  await human.focusAndTypeElement(passField.nodes[0], passField.selector, creds.password, {
-    slow: true,
-  });
+  await fillInputWithVerify(human, bidi, passField.selector, creds.password, "密码");
   await humanThinkPause(500, 1100);
+
+  const passState = await readInputState(bidi, human.context, passField.selector);
+  if (!passState.value || passState.value.length < 1) {
+    throw new Error("密码校验失败：输入框为空");
+  }
 
   const submitBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 8000);
   if (submitBtn) {
