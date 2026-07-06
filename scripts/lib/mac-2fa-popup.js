@@ -171,4 +171,6 @@ export async function tryFetchMac2FAPopupAx(timeoutSec = 12) {
   return { code: r.code, source: r.source, raw: r.raw, action: r.action };
 }
 
-export { compile2FAPopupHelper, ensureSwiftHelper as is2FAPopupHelperAvailable };
+export function is2FAPopupHelperAvailable() {
+  return ensureSwiftHelper();
+}
