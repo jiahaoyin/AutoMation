@@ -20,13 +20,13 @@ import {
 } from "./anti-automation.js";
 import { isAccessibilityGranted } from "./accessibility.js";
 import {
+  clickContinueAndWaitForPasswordStep,
   diagnoseLoginFields,
   fillInputWithVerify,
   firstInAnyContext,
   getBrowserConfig,
   readInputState,
   readSignInStep,
-  waitForPasswordStepAfterContinue,
   waitForVisibleInput,
 } from "./browser-input.js";
 import {
@@ -311,19 +311,28 @@ async function runWebLogin(bidi, human, creds) {
     throw new Error(`邮箱校验失败：读回 "${emailResult.value ?? ""}"`);
   }
 
-  const continueBtn = await firstInAnyContext(bidi, CONTINUE_SELECTORS, 12_000);
-  if (!continueBtn) throw new Error("邮箱已填但未找到「继续」按钮");
-  human.setContext(continueBtn.context);
-
   await humanThinkPause(400, 900);
-  await human.clickElement(continueBtn.nodes[0]);
-  console.log("[Firefox] 已点击继续，等待密码步骤展示…");
+  const { context: passCtx } = await clickContinueAndWaitForPasswordStep(
+    bidi,
+    human,
+    userField.context
+  );
 
-  const passField = await waitForPasswordStepAfterContinue(bidi, human, human.context, cfg.passwordWaitMs);
-  if (!passField) throw new Error("密码步骤未出现（超时）");
+  const passField = await waitForVisibleInput(bidi, human, PASS_SELECTORS, cfg.passwordWaitMs, {
+    kind: "password",
+    stablePolls: Math.max(cfg.stablePolls, 3),
+    log: true,
+    contextOnly: passCtx,
+  });
+  if (!passField) throw new Error("密码步骤 UI 已出现但未找到可交互密码框");
 
-  const stepAfter = await readSignInStep(bidi, human.context);
+  const stepAfter = await readSignInStep(bidi, passCtx);
   console.log(`[Firefox] 登录步骤(填密码前): email=${stepAfter.email} password=${stepAfter.password}`);
+  if (stepAfter.password !== "shown" || stepAfter.email === "shown") {
+    throw new Error(
+      `仍在邮箱步骤，拒绝填密码 (email=${stepAfter.email} password=${stepAfter.password})`
+    );
+  }
 
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 

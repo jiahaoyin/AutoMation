@@ -171,27 +171,41 @@ function fieldMatchesKind(state, sel, kind) {
   return true;
 }
 
-/** BiDi 已定位到节点时，合并 evaluate 状态（iframe / XFO 时 evaluate 可能不可用） */
-function mergeFieldState(state, sel, found) {
+/** BiDi 已定位到节点时，合并 evaluate 状态（邮箱可用；密码框常在 DOM 中隐藏，禁止 locateOnly） */
+function mergeFieldState(state, sel, found, kind) {
+  if (kind === "password") {
+    return state.found ? state : { ...state, found: false };
+  }
   if (found?.nodes?.length && (!state.found || (!state.interactable && !state.scriptBlocked))) {
     return {
       found: true,
       interactable: true,
       locateOnly: true,
       scriptBlocked: state.scriptBlocked ?? false,
-      type: sel.includes("password") ? "password" : state.type || "text",
+      type: state.type || "text",
       value: state.value ?? "",
       selector: sel,
     };
   }
-  if (state.scriptBlocked) return { ...state, locateOnly: true, interactable: true };
+  if (state.scriptBlocked && kind === "email") {
+    return { ...state, locateOnly: true, interactable: true };
+  }
   return state;
 }
 
+function passwordStepReady(step, state) {
+  if (step.email === "shown" && step.password !== "shown") return false;
+  if (step.password !== "shown") return false;
+  return state.interactable === true;
+}
+
 function fieldReady(kind, step, state) {
-  if (state.locateOnly || state.scriptBlocked) return true;
   if (kind === "password") return passwordStepReady(step, state);
-  return state.interactable;
+  if (kind === "email") {
+    if (state.locateOnly || state.scriptBlocked) return true;
+    return state.interactable;
+  }
+  return state.interactable || state.locateOnly;
 }
 
 /**
@@ -239,11 +253,117 @@ export async function firstInAnyContext(bidi, selectors, timeoutMs = 15_000) {
   return null;
 }
 
-function passwordStepReady(step, state) {
-  const emailHidden = step.email === "hidden" || step.email === "missing" || step.scriptBlocked;
-  const passShown = step.password === "shown" || step.scriptBlocked;
-  if (step.scriptBlocked) return state.interactable;
-  return (passShown || emailHidden) && state.interactable;
+/**
+ * 轮询直到 UI 进入密码步骤（email 隐藏 + password 显示）
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {string} context
+ * @param {number} timeoutMs
+ */
+export async function waitForPasswordStepUi(bidi, context, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const step = await readSignInStep(bidi, context);
+    if (step.password === "shown" && step.email !== "shown") return step;
+    await sleep(400);
+  }
+  return null;
+}
+
+const CONTINUE_SELECTORS = [
+  "#sign-in",
+  'button#sign-in',
+  'button[type="submit"]',
+  'input[type="submit"]',
+  ".si-button",
+];
+
+/**
+ * 点击「继续」并等待密码步骤 UI 出现（禁止在 email 步骤填密码）
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {string} emailContext 邮箱所在 browsing context
+ * @param {string[]} [continueSelectors]
+ */
+export async function clickContinueAndWaitForPasswordStep(
+  bidi,
+  human,
+  emailContext,
+  continueSelectors = CONTINUE_SELECTORS
+) {
+  const cfg = getBrowserConfig();
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let btn = null;
+    for (const sel of continueSelectors) {
+      btn = await locateInContext(bidi, sel, emailContext);
+      if (btn?.nodes?.length) break;
+    }
+    if (!btn) {
+      btn = await firstInAnyContext(bidi, continueSelectors, 5000);
+    }
+    if (!btn) throw new Error("未找到「继续」按钮");
+
+    human.setContext(btn.context);
+
+    try {
+      const enabled = await bidi.evaluate(
+        `(() => {
+          const btn = document.querySelector(${JSON.stringify(btn.selector)});
+          if (!btn) return false;
+          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true";
+        })()`,
+        btn.context
+      );
+      if (enabled === false) {
+        console.warn(`[Firefox] 继续按钮暂不可用 (${btn.selector})，等待…`);
+        await sleep(800);
+      }
+    } catch {
+      /* evaluate 失败仍尝试点击 */
+    }
+
+    console.log(`[Firefox] 点击继续 (${btn.selector}) 第 ${attempt} 次…`);
+    await human.clickElement(btn.nodes[0]);
+    await sleep(cfg.minAfterContinueMs);
+
+    let step = await waitForPasswordStepUi(bidi, btn.context, cfg.passwordWaitMs);
+    if (step) {
+      console.log("[Firefox] ✓ 密码步骤已展示");
+      return { context: btn.context, step };
+    }
+
+    try {
+      await bidi.evaluate(
+        `(() => {
+          const btn = document.querySelector(${JSON.stringify(btn.selector)});
+          if (btn) btn.click();
+        })()`,
+        btn.context
+      );
+      await sleep(1200);
+      step = await waitForPasswordStepUi(bidi, btn.context, 8000);
+      if (step) {
+        console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
+        return { context: btn.context, step };
+      }
+    } catch {
+      /* 脚本点击失败 */
+    }
+
+    console.warn("[Firefox] 继续点击未切换步骤，尝试 Enter…");
+    await human.pressEnter();
+    await sleep(1500);
+    step = await waitForPasswordStepUi(bidi, btn.context, 10_000);
+    if (step) {
+      console.log("[Firefox] ✓ Enter 后密码步骤已展示");
+      return { context: btn.context, step };
+    }
+  }
+
+  const step = await readSignInStep(bidi, emailContext);
+  throw new Error(
+    `点击继续后仍未进入密码步骤 (email=${step.email} password=${step.password})`
+  );
 }
 
 /**
@@ -279,7 +399,7 @@ export async function waitForVisibleInput(bidi, human, selectors, timeoutMs = 30
       let state = await readInputState(bidi, found.context, sel).catch(() => ({
         found: false,
       }));
-      state = mergeFieldState(state, sel, found);
+      state = mergeFieldState(state, sel, found, kind);
       if (!fieldMatchesKind(state, sel, kind)) continue;
       if (!fieldReady(kind, step, state)) continue;
 
