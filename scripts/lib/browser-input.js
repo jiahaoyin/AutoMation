@@ -272,92 +272,271 @@ export async function waitForPasswordStepUi(bidi, context, timeoutMs) {
 const CONTINUE_SELECTORS = [
   "#sign-in",
   'button#sign-in',
+  "button.si-button.signin-button",
+  "button.si-button",
   'button[type="submit"]',
   'input[type="submit"]',
-  ".si-button",
 ];
+
+const FIND_CONTINUE_BUTTON_SCRIPT = `
+(() => {
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    if (r.width < 2 || r.height < 2) return false;
+    if (s.display === "none" || s.visibility === "hidden" || parseFloat(s.opacity || "1") < 0.1) return false;
+    let p = el.parentElement;
+    while (p && p !== document.body) {
+      const ps = window.getComputedStyle(p);
+      if (ps.display === "none" || ps.visibility === "hidden") return false;
+      p = p.parentElement;
+    }
+    return true;
+  };
+
+  const textOf = (el) =>
+    (el.textContent || el.value || el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim();
+
+  const isDisabled = (el) =>
+    el.disabled || el.getAttribute("aria-disabled") === "true" || el.classList.contains("disabled");
+
+  const toInfo = (el, reason) => ({
+    found: true,
+    id: el.id || "",
+    selector: el.id ? "#" + el.id : null,
+    text: textOf(el),
+    tag: el.tagName,
+    reason,
+    disabled: isDisabled(el),
+    visible: isVisible(el),
+  });
+
+  const scored = [];
+
+  const byId = document.getElementById("sign-in");
+  if (byId && isVisible(byId)) scored.push(toInfo(byId, "id-sign-in"));
+
+  for (const el of document.querySelectorAll(
+    "button, input[type=submit], [role=button]"
+  )) {
+    if (!isVisible(el)) continue;
+    const t = textOf(el).toLowerCase();
+    if (/^(continue|继续|next|下一步|sign in|登录|登入)$/.test(t)) {
+      scored.push(toInfo(el, "text"));
+    } else if (el.classList.contains("signin-button") || el.classList.contains("si-button")) {
+      scored.push(toInfo(el, "class"));
+    }
+  }
+
+  scored.sort((a, b) => {
+    const rank = (x) =>
+      x.reason === "id-sign-in" ? 0 : x.reason === "text" ? 1 : x.reason === "class" ? 2 : 3;
+    return rank(a) - rank(b) || Number(a.disabled) - Number(b.disabled);
+  });
+
+  if (!scored.length) return { found: false, candidates: 0 };
+  return scored[0];
+})()
+`;
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
+async function findContinueButtonInfo(bidi, context) {
+  try {
+    const raw = await bidi.evaluate(`JSON.stringify(${FIND_CONTINUE_BUTTON_SCRIPT})`, context);
+    return typeof raw === "string" ? JSON.parse(raw) : raw ?? { found: false };
+  } catch {
+    return { found: false };
+  }
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {number} timeoutMs */
+async function waitForContinueButtonReady(bidi, context, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const info = await findContinueButtonInfo(bidi, context);
+    if (info.found && info.visible && !info.disabled) return info;
+    await sleep(400);
+  }
+  return findContinueButtonInfo(bidi, context);
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
+async function diagnoseContinueButtons(bidi, context) {
+  try {
+    const raw = await bidi.evaluate(
+      `JSON.stringify((() => {
+        const rows = [];
+        for (const el of document.querySelectorAll("button, input[type=submit], #sign-in")) {
+          const r = el.getBoundingClientRect();
+          rows.push({
+            id: el.id || "",
+            text: (el.textContent || el.value || "").trim().slice(0, 40),
+            disabled: el.disabled,
+            w: Math.round(r.width),
+            h: Math.round(r.height),
+          });
+        }
+        return rows;
+      })())`,
+      context
+    );
+    const rows = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return "[Firefox] 继续按钮诊断: " + JSON.stringify(rows);
+  } catch (err) {
+    return `[Firefox] 继续按钮诊断失败: ${err instanceof Error ? err.message : err}`;
+  }
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {object} info */
+async function clickContinueViaScript(bidi, context, info) {
+  const raw = await bidi.evaluate(
+    `JSON.stringify((() => {
+      const isVisible = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.display !== "none" && s.visibility !== "hidden";
+      };
+      const pick = () => {
+        const id = ${JSON.stringify(info.id || "")};
+        if (id) {
+          const el = document.getElementById(id);
+          if (el && isVisible(el)) return el;
+        }
+        const sel = ${JSON.stringify(info.selector || "")};
+        if (sel) {
+          const el = document.querySelector(sel);
+          if (el && isVisible(el)) return el;
+        }
+        for (const el of document.querySelectorAll("button, input[type=submit]")) {
+          const t = (el.textContent || el.value || "").trim();
+          if (/^(继续|Continue|Next|下一步)$/i.test(t) && isVisible(el)) return el;
+        }
+        const si = document.getElementById("sign-in");
+        if (si && isVisible(si)) return si;
+        return null;
+      };
+      const el = pick();
+      if (!el) return { ok: false };
+      el.scrollIntoView({ block: "center", inline: "nearest" });
+      el.focus();
+      el.click();
+      return { ok: true, id: el.id, text: (el.textContent || "").trim() };
+    })())`,
+    context
+  );
+  const result = typeof raw === "string" ? JSON.parse(raw) : raw;
+  return result?.ok === true;
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} emailSelector */
+async function nudgeEmailValidation(bidi, context, emailSelector) {
+  try {
+    await bidi.evaluate(
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(emailSelector)});
+        if (!el) return false;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+        return true;
+      })()`,
+      context
+    );
+  } catch {
+    /* ignore */
+  }
+}
 
 /**
  * 点击「继续」并等待密码步骤 UI 出现（禁止在 email 步骤填密码）
- * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {string} emailContext 邮箱所在 browsing context
- * @param {string[]} [continueSelectors]
+ * @param {{ emailSelector?: string, emailNode?: {sharedId: string}, continueSelectors?: string[] }} [opts]
  */
 export async function clickContinueAndWaitForPasswordStep(
   bidi,
   human,
   emailContext,
-  continueSelectors = CONTINUE_SELECTORS
+  opts = {}
 ) {
   const cfg = getBrowserConfig();
+  const emailSelector = opts.emailSelector ?? "#account_name_text_field";
+  const emailNode = opts.emailNode ?? null;
+  const continueSelectors = opts.continueSelectors ?? CONTINUE_SELECTORS;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    let btn = null;
-    for (const sel of continueSelectors) {
-      btn = await locateInContext(bidi, sel, emailContext);
-      if (btn?.nodes?.length) break;
-    }
-    if (!btn) {
-      btn = await firstInAnyContext(bidi, continueSelectors, 5000);
-    }
-    if (!btn) throw new Error("未找到「继续」按钮");
+  human.setContext(emailContext);
+  await nudgeEmailValidation(bidi, emailContext, emailSelector);
 
-    human.setContext(btn.context);
+  const btnInfo = await waitForContinueButtonReady(bidi, emailContext, 12_000);
+  if (btnInfo?.found) {
+    console.log(
+      `[Firefox] 继续按钮: ${btnInfo.selector || btnInfo.id || btnInfo.reason} ` +
+        `text="${btnInfo.text || ""}" enabled=${!btnInfo.disabled}`
+    );
+  } else {
+    console.warn("[Firefox] 未探测到可见继续按钮，将尝试 Enter / 脚本点击…");
+    console.warn(await diagnoseContinueButtons(bidi, emailContext));
+  }
 
-    try {
-      const enabled = await bidi.evaluate(
-        `(() => {
-          const btn = document.querySelector(${JSON.stringify(btn.selector)});
-          if (!btn) return false;
-          return !btn.disabled && btn.getAttribute("aria-disabled") !== "true";
-        })()`,
-        btn.context
-      );
-      if (enabled === false) {
-        console.warn(`[Firefox] 继续按钮暂不可用 (${btn.selector})，等待…`);
-        await sleep(800);
-      }
-    } catch {
-      /* evaluate 失败仍尝试点击 */
-    }
-
-    console.log(`[Firefox] 点击继续 (${btn.selector}) 第 ${attempt} 次…`);
-    await human.clickElement(btn.nodes[0]);
+  const waitAfterAction = async (timeoutMs) => {
     await sleep(cfg.minAfterContinueMs);
+    return waitForPasswordStepUi(bidi, emailContext, timeoutMs);
+  };
 
-    let step = await waitForPasswordStepUi(bidi, btn.context, cfg.passwordWaitMs);
-    if (step) {
-      console.log("[Firefox] ✓ 密码步骤已展示");
-      return { context: btn.context, step };
-    }
-
-    try {
-      await bidi.evaluate(
-        `(() => {
-          const btn = document.querySelector(${JSON.stringify(btn.selector)});
-          if (btn) btn.click();
-        })()`,
-        btn.context
-      );
-      await sleep(1200);
-      step = await waitForPasswordStepUi(bidi, btn.context, 8000);
-      if (step) {
-        console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
-        return { context: btn.context, step };
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    if (attempt === 1 || attempt === 3) {
+      console.log(`[Firefox] 邮箱框 Enter 提交 (第 ${attempt} 次)…`);
+      if (emailNode) {
+        await human.clickElement(emailNode).catch(() => human.focusInputBySelector(emailSelector));
+      } else {
+        await human.focusInputBySelector(emailSelector);
       }
-    } catch {
-      /* 脚本点击失败 */
+      await sleep(randomBetween(200, 450));
+      await human.pressEnter();
+      let step = await waitAfterAction(8000);
+      if (step) {
+        console.log("[Firefox] ✓ Enter 后密码步骤已展示");
+        return { context: emailContext, step };
+      }
     }
 
-    console.warn("[Firefox] 继续点击未切换步骤，尝试 Enter…");
-    await human.pressEnter();
-    await sleep(1500);
-    step = await waitForPasswordStepUi(bidi, btn.context, 10_000);
-    if (step) {
-      console.log("[Firefox] ✓ Enter 后密码步骤已展示");
-      return { context: btn.context, step };
+    const info = (await findContinueButtonInfo(bidi, emailContext)) || btnInfo;
+    if (info?.found) {
+      console.log(
+        `[Firefox] JS 点击继续 ${info.selector || info.id || info.text} (第 ${attempt} 次)…`
+      );
+      if (await clickContinueViaScript(bidi, emailContext, info)) {
+        let step = await waitAfterAction(cfg.passwordWaitMs);
+        if (step) {
+          console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
+          return { context: emailContext, step };
+        }
+      }
+
+      const selectors = [
+        info.selector,
+        info.id ? `#${info.id}` : null,
+        ...continueSelectors,
+      ].filter(Boolean);
+      const located = await firstInContext(bidi, emailContext, selectors, 4000);
+      if (located?.nodes?.length) {
+        console.log(`[Firefox] 指针点击继续 (${located.selector})…`);
+        await human.clickElement(located.nodes[0]);
+        let step = await waitAfterAction(8000);
+        if (step) {
+          console.log("[Firefox] ✓ 指针点击继续后密码步骤已展示");
+          return { context: emailContext, step };
+        }
+      }
+    } else {
+      console.warn(`[Firefox] 第 ${attempt} 次未找到继续按钮`);
+      console.warn(await diagnoseContinueButtons(bidi, emailContext));
     }
+
+    await sleep(800);
   }
 
   const step = await readSignInStep(bidi, emailContext);

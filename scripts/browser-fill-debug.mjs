@@ -70,7 +70,8 @@ async function main() {
     const { context: passCtx } = await clickContinueAndWaitForPasswordStep(
       bidi,
       human,
-      userField.context
+      userField.context,
+      { emailSelector: userField.selector, emailNode: userField.nodes[0] }
     );
     console.log("[4] 密码步骤 UI 已就绪");
 

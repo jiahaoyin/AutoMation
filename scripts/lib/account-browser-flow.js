@@ -315,7 +315,8 @@ async function runWebLogin(bidi, human, creds) {
   const { context: passCtx } = await clickContinueAndWaitForPasswordStep(
     bidi,
     human,
-    userField.context
+    userField.context,
+    { emailSelector: userField.selector, emailNode: userField.nodes[0] }
   );
 
   const passField = await waitForVisibleInput(bidi, human, PASS_SELECTORS, cfg.passwordWaitMs, {
