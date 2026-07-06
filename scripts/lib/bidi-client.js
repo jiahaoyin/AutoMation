@@ -3,10 +3,13 @@
  * @see https://developer.mozilla.org/en-US/docs/Web/WebDriver/How_to/Create_BiDi_connection
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "../..");
@@ -101,6 +104,12 @@ export async function launchFirefox(options = {}) {
   });
 
   return { process: child, wsUrl, profileDir, stderr };
+}
+
+/** 系统设置取码后切回 Firefox（避免键盘输入落到错误窗口） */
+export async function activateFirefoxApp() {
+  if (process.platform !== "darwin") return;
+  await execFileAsync("osascript", ["-e", 'tell application "Firefox" to activate']).catch(() => {});
 }
 
 export class BidiClient {

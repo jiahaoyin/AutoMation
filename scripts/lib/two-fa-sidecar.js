@@ -68,6 +68,7 @@ export async function waitForMac2FACode(options = {}) {
 
     const code = await tryFetchMac2FACode(10);
     if (code) {
+      console.log(`[2FA] ★ 验证码: ${code}`);
       console.log("[2FA] 已获取 6 位验证码（系统弹窗）");
       return code;
     }
@@ -88,6 +89,7 @@ export async function waitForMac2FACode(options = {}) {
           const settingsCode = await fetch2FACodeFromSystemSettings({
             timeoutMs: Math.min(leftMs - 5000, 120_000),
           });
+          console.log(`[2FA] ★ 验证码: ${settingsCode}`);
           console.log("[2FA] 已获取 6 位验证码（系统设置）");
           return settingsCode;
         } catch (err) {

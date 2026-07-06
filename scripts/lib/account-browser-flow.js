@@ -13,7 +13,6 @@ import { HumanInput, sleep } from "./human-input-bidi.js";
 import {
   applyAutomationMitigations,
   assessAutomationRisk,
-  humanJitter,
   humanPageSettle,
   humanThinkPause,
   probeAutomationSignals,
@@ -25,6 +24,7 @@ import {
   diagnoseLoginFields,
   ensureRememberAccountChecked,
   fillInputWithVerify,
+  fillWebSecurityCode,
   firstInAnyContext,
   getBrowserConfig,
   readInputState,
@@ -68,15 +68,6 @@ const CONTINUE_SELECTORS = [
   'button#sign-in',
   'button[type="submit"]',
   'input[type="submit"]',
-];
-
-const CODE_SELECTORS = [
-  'input[name="securityCode"]',
-  ".form-security-code-input input",
-  'input[autocomplete="one-time-code"]',
-  'input[inputmode="numeric"]',
-  ".form-security-code input",
-  'input[type="tel"]',
 ];
 
 const TRUST_SELECTORS = [
@@ -131,35 +122,6 @@ async function clickSignInIfNeeded(human, bidi, context) {
     }
   }
   return false;
-}
-
-/** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} code */
-async function fillSecurityCode(human, bidi, context, code) {
-  human.setContext(context);
-  for (const sel of CODE_SELECTORS) {
-    try {
-      const nodes = await human.waitForSelector(sel, 20_000);
-      if (nodes.length >= 6) {
-        for (let i = 0; i < 6; i++) {
-          await humanJitter(120, 280);
-          await human.clickElement(nodes[i]);
-          await human.typeText(code[i], { slow: true });
-        }
-        await humanThinkPause(300, 700);
-        await human.pressEnter();
-        return;
-      }
-      if (nodes.length >= 1) {
-        await human.clickElement(nodes[0]);
-        await human.typeText(code, { slow: true });
-        await human.pressEnter();
-        return;
-      }
-    } catch {
-      /* next selector */
-    }
-  }
-  throw new Error("未找到网页 2FA 验证码输入框");
 }
 
 /** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi */
@@ -364,16 +326,14 @@ async function runWebLogin(bidi, human, creds) {
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 
   const code = await twoFa.getCode();
-  console.log("[Firefox] 已获取 2FA 验证码，填入网页…");
 
-  await humanPageSettle("2FA 输入框");
-  await fillSecurityCode(human, bidi, human.context, code);
-  await humanPageSettle("2FA 提交后");
+  await fillWebSecurityCode(human, bidi, code);
+  await sleep(1500);
 
   await clickTrustBrowserIfNeeded(human, bidi);
 
   console.log("[Firefox] 校验登录会话…");
-  await assertBrowserAccountSession(bidi, human.context);
+  await assertBrowserAccountSession(bidi, root);
   console.log("[Firefox] ✓ account 会话有效");
 }
 
