@@ -1208,27 +1208,65 @@ async function waitFor2FAOutcome(bidi, timeoutMs = 22_000) {
  */
 async function fill2FAViaKeyboard(human, bidi, fieldset, digits) {
   human.setContext(fieldset.context);
+  const selector = fieldset.selector;
   const inputs = fieldset.nodes.slice(0, 6);
 
   if (inputs.length >= 6) {
     for (let i = 0; i < 6; i++) {
-      await human.clickElement(inputs[i]);
-      await sleep(60);
+      try {
+        await bidi.evaluate(
+          `((idx) => {
+            const list = [...document.querySelectorAll(${JSON.stringify(selector)})];
+            const el = list[idx];
+            if (!el) return false;
+            el.scrollIntoView({ block: "center", inline: "nearest" });
+            el.focus();
+            el.click();
+            el.value = "";
+            return true;
+          })(${i})`,
+          fieldset.context
+        );
+      } catch {
+        await human.clickElement(inputs[i]);
+      }
+      await sleep(80);
       await human.typeText(digits[i], { fast: true });
-      await sleep(40);
+      await sleep(50);
     }
-    console.log(`[Firefox] ✓ 2FA 键盘逐格填入 (${fieldset.selector})`);
-    await sleep(300);
+    const readback = await read2FAInputValues(bidi, fieldset.context, selector);
+    console.log(
+      `[Firefox] ✓ 2FA 键盘逐格填入 (${selector}) 读回=${readback || "?"}`
+    );
+    if (readback && readback !== digits) {
+      console.warn(`[Firefox] 2FA 读回与目标不一致: 期望 ${digits} 实际 ${readback}`);
+    }
+    await sleep(400);
     await human.pressEnter();
     return;
   }
 
-  await human.clickElement(inputs[0]);
-  await sleep(100);
-  await human.typeText(digits, { fast: true });
-  await sleep(300);
+  await human.focusAndTypeElement(inputs[0], selector, digits, { fast: true });
+  await sleep(400);
   await human.pressEnter();
-  console.log(`[Firefox] ✓ 2FA 键盘单框填入 (${fieldset.selector})`);
+  console.log(`[Firefox] ✓ 2FA 键盘单框填入 (${selector})`);
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} selector */
+async function read2FAInputValues(bidi, context, selector) {
+  try {
+    const raw = await bidi.evaluate(
+      `JSON.stringify((() => {
+        const list = [...document.querySelectorAll(${JSON.stringify(selector)})].slice(0, 6);
+        return list.map((el) => el.value || "").join("");
+      })())`,
+      context
+    );
+    const s = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return String(s || "").replace(/\D/g, "").slice(0, 6);
+  } catch {
+    return "";
+  }
 }
 
 /**

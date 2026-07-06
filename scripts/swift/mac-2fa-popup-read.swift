@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
-// 扫描 macOS 系统 2FA 弹窗：清理旧窗 → 点「允许」→ 读取当前验证码
-// JSON stdout: { "ok": true, "code": "072426", "action": "read_code", ... }
+// 分阶段处理 macOS 2FA 弹窗：dismiss_stale → pre_allow → read_code
+// --phase dismiss_stale|pre_allow|read_code
 
 import ApplicationServices
 import AppKit
@@ -13,6 +13,13 @@ struct Output: Codable {
     let message: String
     let source: String?
     let raw: String?
+}
+
+enum Phase: String {
+    case dismissStale = "dismiss_stale"
+    case preAllow = "pre_allow"
+    case readCode = "read_code"
+    case all = "all"
 }
 
 struct WindowScan {
@@ -70,23 +77,12 @@ func looksLikeCodeDisplay(_ text: String) -> Bool {
     return false
 }
 
-/// 必须出现「在网页上输入此验证码」类文案，才认为是展示 6 位码的弹窗（排除旧窗/允许窗）
 func hasCodeDisplayPrompt(_ blob: String) -> Bool {
     if blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("在网页上输入") && blob.contains("验证码") { return true }
     if blob.contains("输入此验证码") { return true }
     let lower = blob.lowercased()
     if lower.contains("enter this verification code on the web") { return true }
-    if lower.contains("enter the verification code on the web") { return true }
-    return false
-}
-
-func looksLikeAllowPrompt(_ blob: String) -> Bool {
-    if blob.contains("正用于登录") && blob.contains("新设备") { return true }
-    if blob.contains("正在尝试登录") { return true }
-    let lower = blob.lowercased()
-    if lower.contains("trying to sign in") { return true }
-    if lower.contains("sign in to a new") { return true }
     return false
 }
 
@@ -101,8 +97,8 @@ func walkCollect(_ element: AXUIElement, depth: Int, maxDepth: Int, result: inou
     }
     if axRole(element) == kAXButtonRole as String {
         let title = axTexts(element).joined(separator: " ")
-        if ["允许", "Allow"].contains(where: { title == $0 }) { result.hasAllow = true }
-        if ["完成", "Done", "好", "OK"].contains(where: { title == $0 }) { result.hasDone = true }
+        if title.contains("允许") || title == "Allow" { result.hasAllow = true }
+        if title.contains("完成") || title == "Done" || title == "OK" || title.contains("好") { result.hasDone = true }
     }
     for child in axChildren(element) {
         walkCollect(child, depth: depth + 1, maxDepth: maxDepth, result: &result)
@@ -119,18 +115,18 @@ func scanWindow(_ root: AXUIElement, maxDepth: Int = 14) -> WindowScan {
 func pressButton(_ element: AXUIElement) -> Bool {
     if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success { return true }
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    usleep(60_000)
+    usleep(80_000)
     return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
 }
 
-func clickButtonInTree(_ root: AXUIElement, labels: [String], maxDepth: Int = 12) -> Bool {
+func clickButtonInTree(_ root: AXUIElement, matchers: [(String) -> Bool], maxDepth: Int = 14) -> Bool {
     var queue: [(AXUIElement, Int)] = [(root, 0)]
     while !queue.isEmpty {
         let (node, depth) = queue.removeFirst()
         if depth > maxDepth { continue }
         if axRole(node) == kAXButtonRole as String {
             let title = axTexts(node).joined(separator: " ")
-            if labels.contains(where: { title == $0 }) {
+            if matchers.contains(where: { $0(title) }) {
                 if pressButton(node) { return true }
             }
         }
@@ -140,6 +136,20 @@ func clickButtonInTree(_ root: AXUIElement, labels: [String], maxDepth: Int = 12
     }
     return false
 }
+
+func clickDone(_ win: AXUIElement) -> Bool {
+    clickButtonInTree(win, matchers: [
+        { $0.contains("完成") || $0 == "Done" || $0 == "OK" },
+    ])
+}
+
+func clickAllow(_ win: AXUIElement) -> Bool {
+    clickButtonInTree(win, matchers: [
+        { $0 == "允许" || $0 == "Allow" || $0.contains("允许") },
+    ])
+}
+
+let priorityApps = ["FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter"]
 
 func isPriorityApp(_ name: String) -> Bool {
     priorityApps.contains { name.contains($0) }
@@ -156,8 +166,6 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
     return list
 }
 
-let priorityApps = ["FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter"]
-
 struct ScannedWindow {
     let appName: String
     let window: AXUIElement
@@ -173,7 +181,6 @@ func collectPriorityWindows() -> [ScannedWindow] {
         let br = priorityApps.firstIndex { bn.contains($0) } ?? 99
         return ar < br
     }
-
     var out: [ScannedWindow] = []
     for app in apps {
         let appName = app.localizedName ?? ""
@@ -186,33 +193,38 @@ func collectPriorityWindows() -> [ScannedWindow] {
     return out
 }
 
-func scanPass() -> (code: String?, action: String, source: String?, raw: String?) {
-    let windows = collectPriorityWindows()
-
-    // 1) 关闭残留验证码窗（有「完成」+ 验证码展示文案）→ 避免读到上次 609574
-    for item in windows where item.scan.hasDone && item.scan.hasCodePrompt {
-        if clickButtonInTree(item.window, labels: ["完成", "Done", "好", "OK"]) {
-            return (nil, "dismissed_stale", item.appName, nil)
+func tryDismissStale(_ windows: [ScannedWindow]) -> (Bool, String?, String?, String?) {
+    for item in windows where item.scan.hasCodePrompt || item.scan.code != nil {
+        let oldCode = item.scan.code
+        let oldRaw = item.scan.codeRaw
+        if clickDone(item.window) {
+            return (true, item.appName, oldCode, oldRaw)
         }
     }
+    return (false, nil, nil, nil)
+}
 
-    // 2) 允许窗：有「允许」、尚无「在网页上输入验证码」文案
+func tryClickAllow(_ windows: [ScannedWindow]) -> (Bool, String?) {
     for item in windows where item.scan.hasAllow && !item.scan.hasCodePrompt {
-        if looksLikeAllowPrompt(item.scan.blob) || item.scan.hasAllow {
-            if clickButtonInTree(item.window, labels: ["允许", "Allow"]) {
-                return (nil, "clicked_allow", item.appName, nil)
-            }
+        if clickAllow(item.window) {
+            return (true, item.appName)
         }
     }
+    for item in windows where item.scan.hasAllow {
+        if clickAllow(item.window) {
+            return (true, item.appName)
+        }
+    }
+    return (false, nil)
+}
 
-    // 3) 仅当验证码展示窗出现时才读码（必须有 code prompt + NNN NNN）
+func tryReadCode(_ windows: [ScannedWindow]) -> (String, String, String)? {
     for item in windows where item.scan.hasCodePrompt {
         if let c = item.scan.code, let raw = item.scan.codeRaw {
-            return (c, "read_code", item.appName, raw)
+            return (c, item.appName, raw)
         }
     }
-
-    return (nil, "none", nil, nil)
+    return nil
 }
 
 func emit(_ output: Output) -> Never {
@@ -225,8 +237,12 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
+func emitAction(_ action: String, source: String? = nil) -> Never {
+    emit(Output(ok: action != "none", code: nil, action: action, message: "ok", source: source, raw: nil))
+}
+
 var timeoutSec = 8
-var dismissOnly = false
+var phase = Phase.all
 var i = 1
 let args = CommandLine.arguments
 while i < args.count {
@@ -235,49 +251,54 @@ while i < args.count {
         i += 2
         continue
     }
+    if args[i] == "--phase", i + 1 < args.count {
+        phase = Phase(rawValue: args[i + 1]) ?? .all
+        i += 2
+        continue
+    }
     if args[i] == "--dismiss-stale" {
-        dismissOnly = true
+        phase = .dismissStale
         i += 1
         continue
     }
     i += 1
 }
 
-if dismissOnly {
-    let windows = collectPriorityWindows()
-    for item in windows where item.scan.hasDone && (item.scan.hasCodePrompt || item.scan.code != nil) {
-        if clickButtonInTree(item.window, labels: ["完成", "Done", "好", "OK"]) {
-            logStep(0, "dismissed stale dialog")
-            emit(Output(ok: true, code: nil, action: "dismissed_stale", message: "ok", source: item.appName, raw: nil))
-        }
-    }
-    emit(Output(ok: false, code: nil, action: "none", message: "no-stale", source: nil, raw: nil))
-}
-
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
-var lastAction = ""
 
 while Date() < deadline {
-    let (code, action, source, raw) = scanPass()
-    if action == "dismissed_stale" {
-        logStep(0, "dismissed stale from \(source ?? "?")")
-        lastAction = action
-        usleep(800_000)
-        continue
-    }
-    if action == "clicked_allow" {
-        if lastAction != "clicked_allow" {
-            logStep(2, "clicked Allow on \(source ?? "?")")
+    let windows = collectPriorityWindows()
+
+    if phase == .dismissStale || phase == .preAllow || phase == .all {
+        let (dismissed, src, oldCode, oldRaw) = tryDismissStale(windows)
+        if dismissed {
+            logStep(0, "dismissed stale from \(src ?? "?") code=\(oldCode ?? "?")")
+            if phase == .dismissStale {
+                emit(Output(ok: true, code: oldCode, action: "dismissed_stale", message: "ok", source: src, raw: oldRaw))
+            }
+            usleep(900_000)
+            continue
         }
-        lastAction = "clicked_allow"
-        usleep(2_200_000)
-        continue
     }
-    if let c = code {
-        logStep(1, "code=\(c) source=\(source ?? "?") raw=\(raw ?? c)")
-        emit(Output(ok: true, code: c, action: "read_code", message: "ok", source: source, raw: raw))
+
+    if phase == .preAllow || phase == .all {
+        let (allowed, src) = tryClickAllow(windows)
+        if allowed {
+            logStep(2, "clicked Allow on \(src ?? "?")")
+            if phase == .preAllow { emitAction("clicked_allow", source: src) }
+            usleep(2_200_000)
+            continue
+        }
     }
+
+    if phase == .readCode || phase == .all {
+        if let (code, src, raw) = tryReadCode(windows) {
+            logStep(1, "code=\(code) source=\(src) raw=\(raw)")
+            emit(Output(ok: true, code: code, action: "read_code", message: "ok", source: src, raw: raw))
+        }
+    }
+
     usleep(400_000)
 }
 
-emit(Output(ok: false, code: nil, action: lastAction.isEmpty ? "none" : lastAction, message: "timeout", source: nil, raw: nil))
+emit(Output(ok: false, code: nil, action: "none", message: "timeout", source: nil, raw: nil))

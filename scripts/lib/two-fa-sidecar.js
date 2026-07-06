@@ -1,15 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
-import { dismissStale2FAPopups, tryFetchMac2FAPopupAx } from "./mac-2fa-popup.js";
+import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
 import { sleep } from "./prompt.js";
-
-const execFileAsync = promisify(execFile);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCPT = path.resolve(__dirname, "../apple-2fa-wait.scpt");
 
 function get2FAConfig() {
   const num = (key, fallback) => {
@@ -24,32 +15,7 @@ function get2FAConfig() {
 }
 
 /**
- * 单次轮询 macOS 系统弹窗 2FA
- * @param {number} [timeoutSec]
- */
-export async function tryFetchMac2FACode(timeoutSec = 12) {
-  if (process.platform === "darwin") {
-    const axHit = await tryFetchMac2FAPopupAx(timeoutSec);
-    if (axHit?.code) return axHit;
-  }
-
-  try {
-    const scptSec = Math.min(timeoutSec, 4);
-    const { stdout } = await execFileAsync(SCPT, [`--timeout=${scptSec}`], {
-      timeout: (scptSec + 6) * 1000,
-    });
-    const digits = stdout.trim().replace(/\D/g, "");
-    const code = digits.length >= 6 ? digits.slice(0, 6) : null;
-    return code ? { code, source: "applescript", raw: stdout.trim() } : null;
-  } catch (err) {
-    const msg = err instanceof Error ? err.stderr || err.message : String(err);
-    if (process.env.DEBUG_2FA) console.warn("[2FA] 扫描:", msg.slice(0, 200));
-    return null;
-  }
-}
-
-/**
- * 等待 2FA：先扫系统弹窗，超时后从系统设置获取验证码
+ * 等待 2FA：关闭旧窗 → 点允许 → 再读新验证码
  * @param {object} [options]
  */
 export async function waitForMac2FACode(options = {}) {
@@ -57,15 +23,53 @@ export async function waitForMac2FACode(options = {}) {
   const timeoutMs = options.timeoutMs ?? 240_000;
   const popupFirstMs = options.popupFirstMs ?? cfg.popupFirstMs;
   const deadline = Date.now() + timeoutMs;
-  let polls = 0;
   let settingsTried = false;
 
-  console.log("[2FA] 扫描系统弹窗（允许 / 验证码）…");
+  console.log("[2FA] 分阶段处理系统弹窗（清旧窗 → 允许 → 读码）…");
+
+  /** @type {Set<string>} */
+  const dismissedCodes = new Set();
+
   if (process.platform === "darwin") {
-    const dismissed = await dismissStale2FAPopups();
-    if (dismissed) console.log("[2FA] 已尝试关闭残留验证码弹窗");
-    await sleep(400);
+    const { count, codes } = await dismissStale2FAPopups(6);
+    for (const c of codes) dismissedCodes.add(c);
+    if (count > 0) {
+      console.log(`[2FA] 已关闭 ${count} 个残留验证码窗（旧码: ${[...dismissedCodes].join(", ") || "无"}）`);
+    } else {
+      console.log("[2FA] 已扫描残留窗（未发现可关闭的旧验证码）");
+    }
+    await sleep(500);
   }
+
+  console.log("[2FA] 阶段 1/2：等待并点击「允许」…");
+  let allowClicked = false;
+  const allowDeadline = Math.min(deadline, Date.now() + 120_000);
+
+  while (Date.now() < allowDeadline && !allowClicked) {
+    if (process.platform === "darwin") {
+      const r = await runPopupPhase("pre_allow", 6);
+      if (r.action === "dismissed_stale") {
+        if (r.code) dismissedCodes.add(r.code);
+        console.log("[2FA] 关闭残留验证码窗（允许前）");
+        continue;
+      }
+      if (r.action === "clicked_allow") {
+        allowClicked = true;
+        console.log("[2FA] ✓ 已点击「允许」");
+        break;
+      }
+    }
+    await sleep(cfg.pollIntervalMs);
+  }
+
+  if (!allowClicked) {
+    console.warn("[2FA] 未自动点到「允许」，继续等待验证码（可能需手动允许）");
+  }
+
+  await sleep(allowClicked ? 2200 : 800);
+
+  console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
+  let polls = 0;
 
   while (Date.now() < deadline) {
     polls += 1;
@@ -74,17 +78,29 @@ export async function waitForMac2FACode(options = {}) {
 
     if (polls === 1 || polls % 8 === 0) {
       const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-      const phase = inPopupPhase ? "弹窗" : "弹窗+设置";
+      const phase = inPopupPhase ? "读码" : "读码+设置";
       console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
     }
 
-    const hit = await tryFetchMac2FACode(12);
-    if (hit?.code) {
-      const src = hit.source ? ` 来源=${hit.source}` : "";
-      const raw = hit.raw ? ` 原文="${String(hit.raw).slice(0, 40)}"` : "";
-      console.log(`[2FA] ★ 验证码: ${hit.code}${src}${raw}`);
-      console.log("[2FA] 已获取 6 位验证码（允许后展示窗）");
-      return hit.code;
+    if (process.platform === "darwin") {
+      const r = await runPopupPhase("read_code", 10);
+      if (r.action === "dismissed_stale") {
+        if (r.code) dismissedCodes.add(r.code);
+        console.log("[2FA] 读码前关闭残留窗");
+        continue;
+      }
+      if (r.code) {
+        if (dismissedCodes.has(r.code)) {
+          console.log(`[2FA] 跳过已关闭的旧验证码 ${r.code}，等待本次新码…`);
+          await runPopupPhase("dismiss_stale", 2);
+          continue;
+        }
+        const src = r.source ? ` 来源=${r.source}` : "";
+        const raw = r.raw ? ` 原文="${String(r.raw).slice(0, 40)}"` : "";
+        console.log(`[2FA] ★ 验证码: ${r.code}${src}${raw}`);
+        console.log("[2FA] 已获取 6 位验证码（点击允许后）");
+        return r.code;
+      }
     }
 
     if (
@@ -118,7 +134,7 @@ export async function waitForMac2FACode(options = {}) {
   }
 
   throw new Error(
-    "macOS 2FA 验证码获取超时：请确认弹窗已出现或系统设置中可手动获取验证码，并检查辅助功能/自动化权限"
+    "macOS 2FA 验证码获取超时：请确认已点「允许」且验证码窗已出现，并检查辅助功能权限"
   );
 }
 
