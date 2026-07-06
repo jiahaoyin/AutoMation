@@ -1,5 +1,5 @@
 /**
- * Apple 登录 iframe 输入状态检测与分步等待
+ * Apple 登录输入：顶层页面操作，避免 iframe XFO；修复 stable 轮询逻辑
  */
 
 import { sleep, randomBetween } from "./human-input-bidi.js";
@@ -68,51 +68,109 @@ const INPUT_STATE_SCRIPT = `
 })()
 `;
 
+export function isScriptBlockedError(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /XFO_VIOLATION|cross-origin|Permission denied|not allowed to access/i.test(msg);
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} selector @param {string} context */
+export async function locateInContext(bidi, selector, context) {
+  try {
+    const nodes = await bidi.locateNodes(selector, context);
+    if (!nodes.length) return null;
+    const url = String(await bidi.evaluate("location.href", context).catch(() => ""));
+    return { nodes, context, url };
+  } catch {
+    return null;
+  }
+}
+
 /** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} selector */
 export async function readInputState(bidi, context, selector) {
   const expression = `JSON.stringify(${INPUT_STATE_SCRIPT.replace("SELECTOR", JSON.stringify(selector))})`;
-  const raw = await bidi.evaluate(expression, context);
   try {
+    const raw = await bidi.evaluate(expression, context);
     return typeof raw === "string" ? JSON.parse(raw) : raw ?? { found: false };
-  } catch {
-    return { found: false };
+  } catch (err) {
+    if (isScriptBlockedError(err)) {
+      return {
+        found: true,
+        selector,
+        value: "",
+        visible: true,
+        interactable: true,
+        scriptBlocked: true,
+      };
+    }
+    throw err;
   }
 }
 
 /** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 export async function readSignInStep(bidi, context) {
-  const raw = await bidi.evaluate(
-    `JSON.stringify((() => {
-      const email = document.querySelector("#account_name_text_field");
-      const pass = document.querySelector("#password_text_field");
-      const stepOf = (el) => {
-        if (!el) return "missing";
-        const s = window.getComputedStyle(el);
-        const r = el.getBoundingClientRect();
-        const op = parseFloat(s.opacity || "1");
-        const shown =
-          r.width > 2 &&
-          r.height > 2 &&
-          op > 0.1 &&
-          s.display !== "none" &&
-          s.visibility !== "hidden" &&
-          el.tabIndex !== -1 &&
-          el.getAttribute("aria-hidden") !== "true";
-        return shown ? "shown" : "hidden";
-      };
-      return {
-        email: stepOf(email),
-        password: stepOf(pass),
-        bodySnippet: (document.body?.innerText || "").slice(0, 200),
-      };
-    })())`,
-    context
-  );
   try {
+    const raw = await bidi.evaluate(
+      `JSON.stringify((() => {
+        const email = document.querySelector("#account_name_text_field");
+        const pass = document.querySelector("#password_text_field");
+        const stepOf = (el) => {
+          if (!el) return "missing";
+          const s = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          const op = parseFloat(s.opacity || "1");
+          const shown =
+            r.width > 2 &&
+            r.height > 2 &&
+            op > 0.1 &&
+            s.display !== "none" &&
+            s.visibility !== "hidden" &&
+            el.tabIndex !== -1 &&
+            el.getAttribute("aria-hidden") !== "true";
+          return shown ? "shown" : "hidden";
+        };
+        return {
+          email: stepOf(email),
+          password: stepOf(pass),
+        };
+      })())`,
+      context
+    );
     return typeof raw === "string" ? JSON.parse(raw) : raw ?? {};
-  } catch {
+  } catch (err) {
+    if (isScriptBlockedError(err)) return { email: "unknown", password: "unknown", scriptBlocked: true };
     return {};
   }
+}
+
+/**
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {string} context
+ * @param {string[]} selectors
+ * @param {number} [timeoutMs]
+ */
+export async function firstInContext(bidi, context, selectors, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const found = await locateInContext(bidi, sel, context);
+      if (found?.nodes?.length) return { selector: sel, ...found };
+    }
+    await sleep(350);
+  }
+  return null;
+}
+
+function fieldMatchesKind(state, sel, kind) {
+  if (kind === "email" && state.type === "password") return false;
+  if (kind === "password" && state.type !== "password" && !sel.includes("password")) return false;
+  return true;
+}
+
+function passwordStepReady(step, state) {
+  const emailHidden = step.email === "hidden" || step.email === "missing" || step.scriptBlocked;
+  const passShown = step.password === "shown" || step.scriptBlocked;
+  if (step.scriptBlocked) return state.interactable;
+  return (passShown || emailHidden) && state.interactable;
 }
 
 /**
@@ -120,77 +178,75 @@ export async function readSignInStep(bidi, context) {
  * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {string[]} selectors
  * @param {number} [timeoutMs]
- * @param {{ kind?: "email" | "password", stablePolls?: number, log?: boolean }} [opts]
+ * @param {{ kind?: "email" | "password", stablePolls?: number, log?: boolean, contextOnly?: string }} [opts]
  */
 export async function waitForVisibleInput(bidi, human, selectors, timeoutMs = 30_000, opts = {}) {
   const kind = opts.kind ?? "any";
   const stablePolls = opts.stablePolls ?? getBrowserConfig().stablePolls;
   const log = opts.log ?? false;
+  const contextOnly = opts.contextOnly ?? null;
   const deadline = Date.now() + timeoutMs;
   let stable = 0;
   let lastLog = 0;
 
   while (Date.now() < deadline) {
-    const step = await readSignInStep(bidi, human.context).catch(() => ({}));
+    const ctx = contextOnly ?? human.context;
+    const step = await readSignInStep(bidi, ctx).catch(() => ({}));
+
+    /** @type {object | null} */
+    let matched = null;
 
     for (const sel of selectors) {
-      const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
+      const found = contextOnly
+        ? await locateInContext(bidi, sel, contextOnly)
+        : await bidi.locateNodesInAnyContext(sel).catch(() => null);
       if (!found?.nodes?.length) continue;
+
       human.setContext(found.context);
       const state = await readInputState(bidi, found.context, sel);
-
-      if (kind === "email" && state.type === "password") continue;
-      if (kind === "password" && state.type !== "password" && !sel.includes("password")) continue;
+      if (!fieldMatchesKind(state, sel, kind)) continue;
 
       if (kind === "password") {
-        const emailHidden = step.email === "hidden" || step.email === "missing";
-        const passShown = step.password === "shown";
-        if (!passShown && !emailHidden) {
-          stable = 0;
-          continue;
-        }
-        if (!state.interactable) {
-          stable = 0;
-          continue;
-        }
-      } else if (!state.interactable) {
-        stable = 0;
+        if (!passwordStepReady(step, state)) continue;
+      } else if (!state.interactable && !state.scriptBlocked) {
         continue;
       }
 
+      matched = { selector: sel, ...found, state, step };
+      break;
+    }
+
+    if (matched) {
       stable += 1;
-      if (log && Date.now() - lastLog > 2000) {
+      if (log && Date.now() - lastLog > 1500) {
         console.log(
           `[Firefox] 等待${kind === "password" ? "密码" : "邮箱"}框: stable=${stable}/${stablePolls} ` +
-            `email=${step.email} password=${step.password} interactable=${state.interactable}`
+            `email=${step.email} password=${step.password} ctx=${matched.url?.slice(0, 50) || "root"}`
         );
         lastLog = Date.now();
       }
-
-      if (stable >= stablePolls) {
-        return { selector: sel, ...found, state, step };
-      }
+      if (stable >= stablePolls) return matched;
+    } else {
+      stable = 0;
     }
 
-    stable = 0;
     await sleep(getBrowserConfig().pollIntervalMs + Math.random() * 200);
   }
   return null;
 }
 
-/** 点击继续后等待密码步骤真正展示 */
-export async function waitForPasswordStepAfterContinue(bidi, human, timeoutMs) {
+/** 点击继续后等待密码步骤 */
+export async function waitForPasswordStepAfterContinue(bidi, human, context, timeoutMs) {
   const cfg = getBrowserConfig();
-  const minWait = cfg.minAfterContinueMs;
-  console.log(`[Firefox] 继续后最少等待 ${minWait}ms，再检测密码步骤…`);
-  await sleep(minWait);
+  console.log(`[Firefox] 继续后最少等待 ${cfg.minAfterContinueMs}ms…`);
+  await sleep(cfg.minAfterContinueMs);
 
-  const field = await waitForVisibleInput(bidi, human, PASS_SELECTORS, timeoutMs, {
+  return waitForVisibleInput(bidi, human, PASS_SELECTORS, timeoutMs, {
     kind: "password",
     stablePolls: cfg.stablePolls,
     log: true,
+    contextOnly: context,
   });
-  return field;
 }
 
 export function getBrowserConfig() {
@@ -199,13 +255,14 @@ export function getBrowserConfig() {
     return Number.isFinite(v) && v > 0 ? v : fallback;
   };
   return {
-    pollIntervalMs: num("BROWSER_POLL_MS", 500),
-    stablePolls: num("BROWSER_STABLE_POLLS", 4),
+    pollIntervalMs: num("BROWSER_POLL_MS", 400),
+    stablePolls: num("BROWSER_STABLE_POLLS", 2),
     minAfterContinueMs: num("BROWSER_AFTER_CONTINUE_MS", 2500),
     pageSettleMinMs: num("BROWSER_PAGE_SETTLE_MIN_MS", 2000),
     pageSettleMaxMs: num("BROWSER_PAGE_SETTLE_MAX_MS", 4000),
     passwordWaitMs: num("BROWSER_PASSWORD_WAIT_MS", 45_000),
-    emailWaitMs: num("BROWSER_EMAIL_WAIT_MS", 25_000),
+    emailWaitMs: num("BROWSER_EMAIL_WAIT_MS", 30_000),
+    signInUrl: process.env.BROWSER_SIGN_IN_URL || "https://appleid.apple.com/sign-in",
   };
 }
 
@@ -216,60 +273,49 @@ const PASS_SELECTORS = [
   'input[autocomplete="current-password"]',
 ];
 
-/**
- * @param {import("./bidi-client.js").BidiClient} bidi
- * @param {string} context
- * @param {string} selector
- * @param {string} value
- */
 export async function fillInputViaScript(bidi, context, selector, value) {
   const state = await readInputState(bidi, context, selector);
-  if (!state.interactable) {
-    return { ok: false, reason: "not interactable", state };
-  }
-
-  const raw = await bidi.evaluate(
-    `JSON.stringify((() => {
-      const sel = ${JSON.stringify(selector)};
-      const text = ${JSON.stringify(value)};
-      const el = document.querySelector(sel);
-      if (!el) return { ok: false, reason: "element not found" };
-
-      el.scrollIntoView({ block: "center", inline: "nearest" });
-      el.focus();
-      el.click?.();
-
-      const proto = window.HTMLInputElement?.prototype;
-      const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
-      if (desc?.set) {
-        desc.set.call(el, "");
-        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
-      } else {
-        el.value = "";
-      }
-
-      if (desc?.set) {
-        desc.set.call(el, text);
-      } else {
-        el.value = text;
-      }
-
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-
-      return {
-        ok: true,
-        value: el.value ?? "",
-        active: document.activeElement === el,
-      };
-    })())`,
-    context
-  );
+  if (state.scriptBlocked) return { ok: false, reason: "script-blocked", state };
+  if (!state.interactable) return { ok: false, reason: "not interactable", state };
 
   try {
+    const raw = await bidi.evaluate(
+      `JSON.stringify((() => {
+        const sel = ${JSON.stringify(selector)};
+        const text = ${JSON.stringify(value)};
+        const el = document.querySelector(sel);
+        if (!el) return { ok: false, reason: "element not found" };
+
+        el.scrollIntoView({ block: "center", inline: "nearest" });
+        el.focus();
+        el.click?.();
+
+        const proto = window.HTMLInputElement?.prototype;
+        const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc?.set) {
+          desc.set.call(el, "");
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+        } else {
+          el.value = "";
+        }
+
+        if (desc?.set) {
+          desc.set.call(el, text);
+        } else {
+          el.value = text;
+        }
+
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+
+        return { ok: true, value: el.value ?? "" };
+      })())`,
+      context
+    );
     return typeof raw === "string" ? JSON.parse(raw) : raw ?? { ok: false };
-  } catch {
-    return { ok: false, reason: "parse error" };
+  } catch (err) {
+    if (isScriptBlockedError(err)) return { ok: false, reason: "script-blocked" };
+    throw err;
   }
 }
 
@@ -279,52 +325,52 @@ export async function fillInputViaScript(bidi, context, selector, value) {
  * @param {string} selector
  * @param {string} value
  * @param {string} label
+ * @param {{sharedId: string}} [node]
  */
-export async function fillInputWithVerify(human, bidi, selector, value, label) {
+export async function fillInputWithVerify(human, bidi, selector, value, label, node) {
   const context = human.context;
-
   let state = await readInputState(bidi, context, selector);
-  if (!state.found) throw new Error(`${label}：未找到元素 ${selector}`);
-  if (!state.interactable) {
-    throw new Error(
-      `${label}：输入框不可交互 (visible=${state.visible} opacity=${state.opacity} tabIndex=${state.tabIndex})`
-    );
-  }
+
+  if (!state.found && !node) throw new Error(`${label}：未找到元素 ${selector}`);
 
   console.log(`[Firefox] 填写 ${label}（${selector}）…`);
-  await human.focusInputBySelector(selector);
-  await sleep(randomBetween(200, 450));
 
-  await fillInputViaScript(bidi, context, selector, value);
-  await sleep(randomBetween(300, 600));
-  state = await readInputState(bidi, context, selector);
+  const inputNode = node ?? (await locateInContext(bidi, selector, context))?.nodes?.[0];
+  if (!inputNode) throw new Error(`${label}：无 BiDi 节点 ${selector}`);
 
-  if (state.value === value || (value.length > 3 && state.value.includes(value.slice(0, 3)))) {
-    console.log(`[Firefox] ✓ ${label} 已填入 (${state.value.length} 字符)`);
-    return state;
+  await human.clickElement(inputNode);
+  await sleep(randomBetween(250, 500));
+
+  if (!state.scriptBlocked) {
+    const js = await fillInputViaScript(bidi, context, selector, value);
+    await sleep(randomBetween(300, 600));
+    state = await readInputState(bidi, context, selector);
+    if (state.value === value || (value.length > 3 && state.value?.includes(value.slice(0, 3)))) {
+      console.log(`[Firefox] ✓ ${label} 已填入 (${state.value.length} 字符)`);
+      return state;
+    }
+    if (js.ok && js.value === value) {
+      console.log(`[Firefox] ✓ ${label} JS 填入成功`);
+      return { ...state, value: js.value };
+    }
   }
 
-  console.warn(`[Firefox] JS 填 ${label} 未生效 (读回: "${state.value}")，尝试键盘输入…`);
-  await human.focusInputBySelector(selector);
+  console.log(`[Firefox] 使用 BiDi 键盘输入 ${label}…`);
+  await human.clickElement(inputNode);
   await human.typeText(value, { slow: true });
   await sleep(randomBetween(400, 700));
-  state = await readInputState(bidi, context, selector);
 
-  if (state.value === value || (value.length > 3 && state.value.includes(value.slice(0, 3)))) {
-    console.log(`[Firefox] ✓ ${label} 键盘输入成功`);
-    return state;
+  if (!state.scriptBlocked) {
+    state = await readInputState(bidi, context, selector);
+    if (state.value === value || (value.length > 3 && state.value?.includes(value.slice(0, 3)))) {
+      console.log(`[Firefox] ✓ ${label} 键盘输入成功 (${state.value?.length} 字符)`);
+      return state;
+    }
+    throw new Error(`${label} 填入失败：读回 "${state.value ?? ""}"`);
   }
 
-  await fillInputViaScript(bidi, context, selector, value);
-  state = await readInputState(bidi, context, selector);
-  if (state.value === value || (value.length > 3 && state.value.includes(value.slice(0, 3)))) {
-    console.log(`[Firefox] ✓ ${label} 二次 JS 填入成功`);
-    return state;
-  }
-
-  throw new Error(
-    `${label} 填入失败：期望 ${value.length} 字符，读回 "${state.value}" (${selector})`
-  );
+  console.log(`[Firefox] ✓ ${label} 已通过 BiDi 输入 (${value.length} 字符，XFO 环境无法读回校验)`);
+  return { ...state, value, bidiOnly: true };
 }
 
 export { PASS_SELECTORS };

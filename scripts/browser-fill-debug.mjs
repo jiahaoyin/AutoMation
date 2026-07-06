@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 浏览器登录分步测试：邮箱 → 继续 → 等待密码步骤 → 填密码（不提交）
+ * 浏览器登录分步测试：顶层 appleid 登录页 → 邮箱 → 继续 → 密码
  * 用法: npm run browser:debug
  */
 
@@ -11,10 +11,11 @@ import {
   stopFirefox,
 } from "./lib/bidi-client.js";
 import { HumanInput, sleep } from "./lib/human-input-bidi.js";
+import { humanPageSettle } from "./lib/anti-automation.js";
 import {
   fillInputWithVerify,
+  firstInContext,
   getBrowserConfig,
-  readInputState,
   readSignInStep,
   waitForPasswordStepAfterContinue,
   waitForVisibleInput,
@@ -22,40 +23,21 @@ import {
 import { probeBrowserAccountSession } from "./lib/browser-session.js";
 import { loadEnvFile } from "./lib/credentials.js";
 
-const ACCOUNT_HOME = "https://account.apple.com/";
-
-const USER_SELECTORS = [
-  "#account_name_text_field",
-  'input[name="accountName"]',
-  'input[autocomplete="username"]',
-];
-
+const USER_SELECTORS = ["#account_name_text_field", 'input[name="accountName"]'];
 const CONTINUE_SELECTORS = ["#sign-in", 'button#sign-in', 'button[type="submit"]'];
 
 function loadCreds() {
   loadEnvFile();
-  const appleId = process.env.APPLE_ID || process.env.APPLE_SCRIPT_APPLE_ID || "test@example.com";
-  const password = process.env.APPLE_PASSWORD || process.env.APPLE_SCRIPT_PASSWORD || "test-pass";
-  return { appleId, password };
-}
-
-async function firstContinue(bidi, human) {
-  for (const sel of CONTINUE_SELECTORS) {
-    const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
-    if (found?.nodes?.length) {
-      human.setContext(found.context);
-      return found;
-    }
-  }
-  return null;
+  return {
+    appleId: process.env.APPLE_ID || "test@example.com",
+    password: process.env.APPLE_PASSWORD || "test-pass",
+  };
 }
 
 async function main() {
   const { appleId, password } = loadCreds();
   const cfg = getBrowserConfig();
-  console.log("═══ browser:debug — 分步登录测试 ═══");
-  console.log("配置:", cfg);
-  console.log(`邮箱: ${appleId.replace(/(.{0,2}).*/, "$1***")}\n`);
+  console.log("═══ browser:debug ═══", cfg);
 
   let firefoxProc = null;
   let bidi = null;
@@ -65,47 +47,39 @@ async function main() {
     firefoxProc = launched.process;
     bidi = new BidiClient(ensureLoopbackHost(launched.wsUrl));
     await bidi.connect();
-    const human = new HumanInput(bidi, bidi.rootContext);
+    const root = bidi.rootContext;
+    const human = new HumanInput(bidi, root);
 
-    await bidi.navigate(ACCOUNT_HOME, bidi.rootContext);
-    await sleep(3500);
+    const session = await probeBrowserAccountSession(bidi, root);
+    console.log("[0] 会话:", session.signedIn, session.reason);
 
-    const session = await probeBrowserAccountSession(bidi, bidi.rootContext);
-    console.log("[0] 会话探测:", session.signedIn, session.reason, session.page?.href);
-
-    let step = await readSignInStep(bidi, human.context);
-    console.log("[1] 初始步骤:", step);
+    console.log(`[1] 打开 ${cfg.signInUrl}`);
+    await bidi.navigate(cfg.signInUrl, root);
+    human.setContext(root);
+    await humanPageSettle("顶层登录页");
 
     const userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
       kind: "email",
+      contextOnly: root,
       log: true,
     });
     if (!userField) throw new Error("邮箱框未就绪");
-    console.log("[2] 邮箱框就绪:", userField.selector);
+    console.log("[2] 邮箱框:", userField.selector);
 
-    await fillInputWithVerify(human, bidi, userField.selector, appleId, "邮箱");
-    step = await readSignInStep(bidi, human.context);
-    console.log("[3] 填邮箱后步骤:", step);
+    await fillInputWithVerify(human, bidi, userField.selector, appleId, "邮箱", userField.nodes[0]);
+    console.log("[3] 步骤:", await readSignInStep(bidi, root));
 
-    const cont = await firstContinue(bidi, human);
-    if (!cont) throw new Error("未找到继续按钮");
+    const cont = await firstInContext(bidi, root, CONTINUE_SELECTORS);
+    if (!cont) throw new Error("无继续按钮");
     await human.clickElement(cont.nodes[0]);
-    console.log("[4] 已点继续，等待密码步骤…");
+    console.log("[4] 已点继续");
 
-    const t0 = Date.now();
-    const passField = await waitForPasswordStepAfterContinue(bidi, human, cfg.passwordWaitMs);
-    console.log(`[5] 密码步骤就绪 (+${Date.now() - t0}ms):`, passField?.selector, passField?.state);
+    const passField = await waitForPasswordStepAfterContinue(bidi, human, root, cfg.passwordWaitMs);
+    if (!passField) throw new Error("密码框超时");
+    console.log("[5] 密码框:", passField.selector);
 
-    if (!passField) throw new Error("密码步骤超时");
-
-    await fillInputWithVerify(human, bidi, passField.selector, password, "密码");
-    const passState = await readInputState(bidi, human.context, passField.selector);
-    console.log("[6] 密码读回长度:", passState.value?.length, "interactable:", passState.interactable);
-
-    step = await readSignInStep(bidi, human.context);
-    console.log("[7] 填密码后步骤:", step);
-    console.log("\n✓ 分步测试完成（未点登录提交）");
-    console.log("浏览器将保持 8 秒供目视确认…");
+    await fillInputWithVerify(human, bidi, passField.selector, password, "密码", passField.nodes[0]);
+    console.log("\n✓ 完成（未提交登录），浏览器保持 8s…");
     await sleep(8000);
   } finally {
     if (bidi) await bidi.close().catch(() => {});
