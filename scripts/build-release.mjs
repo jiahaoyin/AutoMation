@@ -45,9 +45,11 @@ const COPY_PATHS = [
   "scripts/mac-settings-ui-dump.applescript",
   "scripts/mac-settings-signed-in.applescript",
   "scripts/swift/mac-settings-ax-fill.swift",
+  "scripts/swift/mac-settings-2fa-code.swift",
   "scripts/fill-debug.mjs",
   "scripts/browser-fill-debug.mjs",
   "scripts/lib/mac-settings-ax-fill.js",
+  "scripts/lib/mac-settings-2fa.js",
   "scripts/lib/bidi-client.js",
   "scripts/lib/human-input-bidi.js",
   "scripts/lib/mac-settings-login.js",
@@ -290,6 +292,14 @@ if command -v swiftc >/dev/null 2>&1; then
     echo "✓ mac-settings-ax-fill 已编译"
   else
     echo "⚠ Swift 编译失败，将使用 AppleScript 回退"
+  fi
+  if swiftc -O -o scripts/bin/mac-settings-2fa-code \\
+    scripts/swift/mac-settings-2fa-code.swift \\
+    -framework ApplicationServices -framework AppKit 2>/dev/null; then
+    chmod +x scripts/bin/mac-settings-2fa-code
+    echo "✓ mac-settings-2fa-code 已编译"
+  else
+    echo "⚠ mac-settings-2fa-code 编译失败，2FA 将仅依赖系统弹窗"
   fi
 else
   echo "⚠ 未找到 swiftc，将使用 AppleScript 回退"
