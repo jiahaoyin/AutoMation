@@ -1,6 +1,5 @@
 #!/usr/bin/env osascript
 -- 分阶段 2FA 弹窗：dismiss_stale | pre_allow | read_code
--- 输出 JSON 一行到 stdout
 
 on parseArgs(argv)
 	set phase to "read_code"
@@ -16,7 +15,7 @@ on parseArgs(argv)
 end parseArgs
 
 on procNames()
-	return {"FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd"}
+	return {"FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow"}
 end procNames
 
 on isSixDigits(txt)
@@ -60,24 +59,67 @@ on elText(el)
 	return ""
 end elText
 
-on windowBlob(win)
+on blobFromRoot(root)
+	set blob to ""
+	tell application "System Events"
+		my collectBlob(root, ref blob)
+	end tell
+	return blob
+end blobFromRoot
+
+on collectBlob(el, blobRef)
+	try
+		set tx to my elText(el)
+		if tx is not "" then set blobRef to (blobRef & " " & tx) as text
+	end try
+	try
+		repeat with child in (UI elements of el)
+			my collectBlob(child, blobRef)
+		end repeat
+	end try
+end collectBlob
+
+-- 简化：深度遍历 static text
+on blobDeep(root)
 	set blob to ""
 	tell application "System Events"
 		try
-			repeat with t in (static texts of win)
+			repeat with t in (every UI element of root whose role is "AXStaticText")
 				set blob to blob & " " & (my elText(t))
 			end repeat
 		end try
 		try
-			repeat with g in (groups of win)
-				repeat with t in (static texts of g)
-					set blob to blob & " " & (my elText(t))
-				end repeat
+			repeat with t in (static texts of root)
+				set blob to blob & " " & (my elText(t))
+			end repeat
+		end try
+		try
+			repeat with g in (groups of root)
+				try
+					repeat with t in (static texts of g)
+						set blob to blob & " " & (my elText(t))
+					end repeat
+				end try
+				try
+					repeat with sg in (groups of g)
+						repeat with t in (static texts of sg)
+							set blob to blob & " " & (my elText(t))
+						end repeat
+					end repeat
+				end try
+			end repeat
+		end try
+		try
+			repeat with el in (UI elements of root)
+				set r to role of el
+				if r is "AXGroup" or r is "group" then
+					set blob to blob & " " & (my blobDeep(el))
+				end if
 			end repeat
 		end try
 	end tell
 	return blob
-end windowBlob
+end blobDeep
 
 on hasCodeDisplayPrompt(blob)
 	if blob contains "在网页上输入此验证码" then return true
@@ -88,67 +130,117 @@ on hasCodeDisplayPrompt(blob)
 	return false
 end hasCodeDisplayPrompt
 
-on extractCodeFromWindow(win)
+on looksLikeAllowDialog(blob)
+	if blob contains "正用于登录" and blob contains "新设备" then return true
+	if blob contains "正被用于" and blob contains "登录" then return true
+	if blob contains "不允许" and blob contains "允许" then return true
+	if blob contains "Don't Allow" and blob contains "Allow" then return true
+	if blob contains "trying to sign in" then return true
+	return false
+end looksLikeAllowDialog
+
+on extractCodeFromRoot(root)
 	tell application "System Events"
 		try
-			repeat with t in (static texts of win)
+			repeat with t in (every UI element of root whose role is "AXStaticText")
 				set tx to my elText(t)
 				set c to my digitsFromText(tx)
-				if c is not "" and (length of (tx as text)) < 20 then return {c, tx}
+				if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
 			end repeat
 		end try
 		try
-			repeat with g in (groups of win)
+			repeat with t in (static texts of root)
+				set tx to my elText(t)
+				set c to my digitsFromText(tx)
+				if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
+			end repeat
+		end try
+		try
+			repeat with g in (groups of root)
 				repeat with t in (static texts of g)
 					set tx to my elText(t)
 					set c to my digitsFromText(tx)
-					if c is not "" and (length of (tx as text)) < 20 then return {c, tx}
+					if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
 				end repeat
 			end repeat
 		end try
 	end tell
 	return {"", ""}
-end extractCodeFromWindow
+end extractCodeFromRoot
 
-on hasButton(win, names)
-	tell application "System Events"
-		repeat with b in (buttons of win)
-			try
-				set bn to name of b
-				repeat with n in names
-					if bn is n or bn contains n then return true
-				end repeat
-			end try
-		end repeat
-	end tell
-	return false
-end hasButton
+on buttonName(b)
+	try
+		return name of b as text
+	end try
+	return ""
+end buttonName
 
-on clickButton(win, names)
+on clickAllowDeep(root)
 	tell application "System Events"
-		repeat with b in (buttons of win)
-			try
-				set bn to name of b
-				repeat with n in names
-					if bn is n or bn contains n then
-						click b
-						return true
-					end if
-				end repeat
-			end try
-		end repeat
 		try
-			set n to count of buttons of win
-			if n is greater than or equal to 2 then
-				click button n of win
-				return true
-			end if
+			repeat with b in (buttons of root)
+				set bn to my buttonName(b)
+				if bn is "允许" or bn is "Allow" or bn contains "允许" then
+					click b
+					return true
+				end if
+			end repeat
+		end try
+		try
+			repeat with el in (UI elements of root)
+				if my clickAllowDeep(el) then return true
+			end repeat
 		end try
 	end tell
 	return false
-end clickButton
+end clickAllowDeep
 
-on eachDialogWindow()
+on clickDoneDeep(root)
+	tell application "System Events"
+		try
+			repeat with b in (buttons of root)
+				set bn to my buttonName(b)
+				if bn contains "完成" or bn is "Done" or bn is "OK" then
+					click b
+					return true
+				end if
+			end repeat
+		end try
+		try
+			repeat with el in (UI elements of root)
+				if my clickDoneDeep(el) then return true
+			end repeat
+		end try
+	end tell
+	return false
+end clickDoneDeep
+
+on clickRightAllow(root)
+	tell application "System Events"
+		set btnList to {}
+		try
+			repeat with b in (buttons of root)
+				set end of btnList to b
+			end repeat
+		end try
+		try
+			repeat with el in (UI elements of root)
+				try
+					repeat with b in (buttons of el)
+						set end of btnList to b
+					end repeat
+				end try
+			end repeat
+		end try
+		if (count of btnList) is greater than or equal to 2 then
+			click item (count of btnList) of btnList
+			return true
+		end if
+	end tell
+	return false
+end clickRightAllow
+
+on eachDialogRoot()
 	set results to {}
 	tell application "System Events"
 		repeat with pn in my procNames()
@@ -156,23 +248,35 @@ on eachDialogWindow()
 				tell process pn
 					repeat with w in windows
 						set end of results to {pn, w}
+						try
+							repeat with s in (sheets of w)
+								set end of results to {pn, s}
+							end repeat
+						end try
 					end repeat
 				end tell
 			end if
 		end repeat
-		repeat with procRef in (every process whose visible is true)
+		repeat with procRef in (every process)
 			set pn to name of procRef
 			try
 				tell procRef
-					repeat with w in windows
-						set end of results to {pn, w}
-					end repeat
+					if (count of windows) is greater than 0 then
+						repeat with w in windows
+							set end of results to {pn, w}
+							try
+								repeat with s in (sheets of w)
+									set end of results to {pn, s}
+								end repeat
+							end try
+						end repeat
+					end if
 				end tell
 			end try
 		end repeat
 	end tell
 	return results
-end eachDialogWindow
+end eachDialogRoot
 
 on jsonEscape(s)
 	set s to s as text
@@ -198,38 +302,46 @@ on emitJson(ok, code, action, source, raw)
 	return "{\"ok\":" & okStr & ",\"code\":\"" & c & "\",\"action\":\"" & a & "\",\"source\":\"" & (my jsonEscape(src)) & "\",\"raw\":\"" & (my jsonEscape(r)) & "\"}"
 end emitJson
 
+on tryClickAllow(pn, root, blob)
+	tell application "System Events"
+		try
+			set frontmost of process pn to true
+		end try
+	end tell
+	delay 0.15
+	if my clickAllowDeep(root) then return true
+	if my looksLikeAllowDialog(blob) then
+		if my clickRightAllow(root) then return true
+	end if
+	return false
+end tryClickAllow
+
 on scanPhase(phase)
-	set dialogs to my eachDialogWindow()
+	set dialogs to my eachDialogRoot()
 	repeat with itemRef in dialogs
 		set pn to item 1 of itemRef
-		set w to item 2 of itemRef
-		set blob to my windowBlob(w)
-		set codePair to my extractCodeFromWindow(w)
+		set root to item 2 of itemRef
+		set blob to my blobDeep(root)
+		set codePair to my extractCodeFromRoot(root)
 		set code to item 1 of codePair
 		set raw to item 2 of codePair
 		set hasPrompt to my hasCodeDisplayPrompt(blob)
-		set hasAllow to my hasButton(w, {"允许", "Allow"})
-		set hasDone to my hasButton(w, {"完成", "Done", "OK"})
+		set isAllowDlg to my looksLikeAllowDialog(blob)
 
 		if phase is "dismiss_stale" then
 			if hasPrompt or code is not "" then
-				if my clickButton(w, {"完成", "Done", "OK"}) then
+				if my clickDoneDeep(root) then
 					return my emitJson(true, code, "dismissed_stale", pn, raw)
 				end if
 			end if
 		else if phase is "pre_allow" then
 			if hasPrompt or code is not "" then
-				if my clickButton(w, {"完成", "Done", "OK"}) then
+				if my clickDoneDeep(root) then
 					return my emitJson(true, code, "dismissed_stale", pn, raw)
 				end if
 			end if
-			if hasAllow and not hasPrompt then
-				if my clickButton(w, {"允许", "Allow"}) then
-					return my emitJson(true, "", "clicked_allow", pn, "")
-				end if
-			end if
-			if hasAllow and code is "" then
-				if my clickButton(w, {"允许", "Allow"}) then
+			if isAllowDlg and not hasPrompt then
+				if my tryClickAllow(pn, root, blob) then
 					return my emitJson(true, "", "clicked_allow", pn, "")
 				end if
 			end if
@@ -253,11 +365,7 @@ on run argv
 			do shell script "printf %s\\n " & quoted form of out
 			return out
 		end if
-		if phase is "pre_allow" and out contains "clicked_allow" then
-			do shell script "printf %s\\n " & quoted form of out
-			return out
-		end if
-		delay 0.35
+		delay 0.25
 	end repeat
 	set out to my emitJson(false, "", "none", "", "")
 	do shell script "printf %s\\n " & quoted form of out

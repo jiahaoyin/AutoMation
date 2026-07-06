@@ -115,7 +115,7 @@ async function runSwiftPhase(phase, timeoutSec) {
 
 function logPhaseResult(phase, r) {
   if (r.action === "clicked_allow") {
-    console.log(`[2FA] ✓ AppleScript 已点击「允许」(${r.source || "弹窗"})`);
+    console.log(`[2FA] ✓ 已点击「允许」(${r.source || "System Events"})`);
   } else if (r.action === "dismissed_stale") {
     const old = r.code ? ` 旧码=${r.code}` : "";
     console.log(`[2FA] 已关闭残留验证码窗${old}`);
@@ -137,6 +137,15 @@ export async function runPopupPhase(phase, timeoutSec = 6) {
   const as = await runAppleScriptPhase(phase, timeoutSec);
   if (as.ok || as.action === "clicked_allow" || as.action === "dismissed_stale") {
     logPhaseResult(phase, as);
+    return as;
+  }
+
+  if (phase === "pre_allow") {
+    const swift = await runSwiftPhase(phase, Math.min(timeoutSec, 3));
+    if (swift.action === "clicked_allow" || swift.action === "dismissed_stale") {
+      logPhaseResult(phase, swift);
+      return swift;
+    }
     return as;
   }
 

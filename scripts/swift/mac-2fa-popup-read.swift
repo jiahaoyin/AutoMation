@@ -172,8 +172,35 @@ struct ScannedWindow {
     let scan: WindowScan
 }
 
+func looksLikeAllowDialog(_ blob: String) -> Bool {
+    if blob.contains("正用于登录") && blob.contains("新设备") { return true }
+    if blob.contains("正被用于") && blob.contains("登录") { return true }
+    if blob.contains("不允许") && blob.contains("允许") { return true }
+    return false
+}
+
+func collectButtons(_ root: AXUIElement, maxDepth: Int = 14) -> [AXUIElement] {
+    var out: [AXUIElement] = []
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    while !queue.isEmpty {
+        let (node, depth) = queue.removeFirst()
+        if depth > maxDepth { continue }
+        if axRole(node) == kAXButtonRole as String { out.append(node) }
+        for child in axChildren(node) { queue.append((child, depth + 1)) }
+    }
+    return out
+}
+
+func clickRightmostButton(_ root: AXUIElement) -> Bool {
+    let buttons = collectButtons(root)
+    guard let last = buttons.last else { return false }
+    return pressButton(last)
+}
+
 func collectPriorityWindows() -> [ScannedWindow] {
-    var apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+    var apps = NSWorkspace.shared.runningApplications.filter {
+        $0.activationPolicy == .regular || $0.activationPolicy == .accessory
+    }
     apps.sort { a, b in
         let an = a.localizedName ?? ""
         let bn = b.localizedName ?? ""
@@ -206,14 +233,14 @@ func tryDismissStale(_ windows: [ScannedWindow]) -> (Bool, String?, String?, Str
 
 func tryClickAllow(_ windows: [ScannedWindow]) -> (Bool, String?) {
     for item in windows where item.scan.hasAllow && !item.scan.hasCodePrompt {
-        if clickAllow(item.window) {
-            return (true, item.appName)
-        }
+        if clickAllow(item.window) { return (true, item.appName) }
+    }
+    for item in windows where looksLikeAllowDialog(item.scan.blob) && !item.scan.hasCodePrompt {
+        if clickAllow(item.window) { return (true, item.appName) }
+        if clickRightmostButton(item.window) { return (true, item.appName) }
     }
     for item in windows where item.scan.hasAllow {
-        if clickAllow(item.window) {
-            return (true, item.appName)
-        }
+        if clickAllow(item.window) { return (true, item.appName) }
     }
     return (false, nil)
 }

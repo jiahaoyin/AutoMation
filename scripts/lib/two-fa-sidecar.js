@@ -44,10 +44,12 @@ export async function waitForMac2FACode(options = {}) {
   console.log("[2FA] 阶段 1/2：等待并点击「允许」…");
   let allowClicked = false;
   const allowDeadline = Math.min(deadline, Date.now() + 120_000);
+  let allowPolls = 0;
 
   while (Date.now() < allowDeadline && !allowClicked) {
+    allowPolls += 1;
     if (process.platform === "darwin") {
-      const r = await runPopupPhase("pre_allow", 4);
+      const r = await runPopupPhase("pre_allow", 3);
       if (r.action === "dismissed_stale") {
         if (r.code) dismissedCodes.add(r.code);
         continue;
@@ -57,7 +59,10 @@ export async function waitForMac2FACode(options = {}) {
         break;
       }
     }
-    await sleep(cfg.pollIntervalMs);
+    if (allowPolls === 1 || allowPolls % 6 === 0) {
+      console.log("[2FA] 仍在查找「允许」按钮…（请确认终端已获「自动化」权限）");
+    }
+    await sleep(500);
   }
 
   if (!allowClicked) {
