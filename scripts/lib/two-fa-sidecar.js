@@ -29,8 +29,8 @@ function get2FAConfig() {
  */
 export async function tryFetchMac2FACode(timeoutSec = 4) {
   if (process.platform === "darwin") {
-    const axCode = await tryFetchMac2FAPopupAx(timeoutSec);
-    if (axCode) return axCode;
+    const axHit = await tryFetchMac2FAPopupAx(timeoutSec);
+    if (axHit?.code) return axHit;
   }
 
   try {
@@ -40,7 +40,7 @@ export async function tryFetchMac2FACode(timeoutSec = 4) {
     });
     const digits = stdout.trim().replace(/\D/g, "");
     const code = digits.length >= 6 ? digits.slice(0, 6) : null;
-    return code ?? null;
+    return code ? { code, source: "applescript", raw: stdout.trim() } : null;
   } catch (err) {
     const msg = err instanceof Error ? err.stderr || err.message : String(err);
     if (process.env.DEBUG_2FA) console.warn("[2FA] 扫描:", msg.slice(0, 200));
@@ -73,11 +73,13 @@ export async function waitForMac2FACode(options = {}) {
       console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
     }
 
-    const code = await tryFetchMac2FACode(4);
-    if (code) {
-      console.log(`[2FA] ★ 验证码: ${code}`);
+    const hit = await tryFetchMac2FACode(4);
+    if (hit?.code) {
+      const src = hit.source ? ` 来源=${hit.source}` : "";
+      const raw = hit.raw ? ` 原文="${String(hit.raw).slice(0, 40)}"` : "";
+      console.log(`[2FA] ★ 验证码: ${hit.code}${src}${raw}`);
       console.log("[2FA] 已获取 6 位验证码（系统弹窗）");
-      return code;
+      return hit.code;
     }
 
     if (

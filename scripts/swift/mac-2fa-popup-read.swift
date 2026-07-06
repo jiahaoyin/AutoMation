@@ -11,6 +11,8 @@ struct Output: Codable {
     let code: String?
     let action: String?
     let message: String
+    let source: String?
+    let raw: String?
 }
 
 func logStep(_ n: Int, _ msg: String) {
@@ -60,22 +62,34 @@ func looksLike2FABlob(_ blob: String) -> Bool {
     return false
 }
 
+func looksLikeCodeDisplay(_ text: String) -> Bool {
+    let digits = text.filter(\.isNumber)
+    guard digits.count == 6 else { return false }
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil { return true }
+    if t.range(of: #"^\d{6}$"#, options: .regularExpression) != nil { return true }
+    return digits.count == 6 && text.filter(\.isNumber).count == 6
+}
+
 struct ScanResult {
     var blob: String = ""
     var code: String?
+    var raw: String?
 }
 
 func walk(_ element: AXUIElement, depth: Int, maxDepth: Int, result: inout ScanResult) {
     if depth > maxDepth || result.code != nil { return }
     for t in axTexts(element) {
         result.blob += " " + t
-        if let c = extractSixDigits(t), t.filter(\.isNumber).count >= 6 {
+        if looksLikeCodeDisplay(t), let c = extractSixDigits(t) {
             result.code = c
+            result.raw = t
             return
         }
     }
     if result.code == nil, looksLike2FABlob(result.blob), let c = extractSixDigits(result.blob) {
         result.code = c
+        result.raw = result.blob
         return
     }
     for child in axChildren(element) {
@@ -84,11 +98,11 @@ func walk(_ element: AXUIElement, depth: Int, maxDepth: Int, result: inout ScanR
     }
 }
 
-func scanElementForCode(_ root: AXUIElement, maxDepth: Int = 14, appName: String = "") -> String? {
+func scanElementForCode(_ root: AXUIElement, maxDepth: Int = 14, appName: String = "") -> (String, String)? {
     var result = ScanResult()
     walk(root, depth: 0, maxDepth: maxDepth, result: &result)
     guard let code = result.code else { return nil }
-    if isPriorityApp(appName) || looksLike2FABlob(result.blob) { return code }
+    if isPriorityApp(appName) || looksLike2FABlob(result.blob) { return (code, result.raw ?? code) }
     return nil
 }
 
@@ -133,8 +147,13 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
 }
 
 let priorityApps = ["FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter"]
+let excludeApps = ["Firefox", "Google Chrome", "Safari", "Microsoft Edge", "Arc", "Chromium"]
 
-func scanPass(clickAllow: Bool) -> (code: String?, action: String) {
+func isExcludedApp(_ name: String) -> Bool {
+    excludeApps.contains { name.contains($0) }
+}
+
+func scanPass(clickAllow: Bool) -> (code: String?, action: String, source: String?, raw: String?) {
     var apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
     apps.sort { a, b in
         let an = a.localizedName ?? ""
@@ -146,14 +165,27 @@ func scanPass(clickAllow: Bool) -> (code: String?, action: String) {
 
     for app in apps {
         let appName = app.localizedName ?? ""
+        if isExcludedApp(appName) { continue }
+        if !isPriorityApp(appName) { continue }
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         for win in windowsForApp(appEl) {
-            if let code = scanElementForCode(win, appName: appName) {
-                return (code, "read_code")
+            if let hit = scanElementForCode(win, appName: appName) {
+                return (hit.0, "read_code", appName, hit.1)
             }
         }
-        if let code = scanElementForCode(appEl, maxDepth: 10, appName: appName) {
-            return (code, "read_code")
+        if let hit = scanElementForCode(appEl, maxDepth: 10, appName: appName) {
+            return (hit.0, "read_code", appName, hit.1)
+        }
+    }
+
+    for app in apps {
+        let appName = app.localizedName ?? ""
+        if isExcludedApp(appName) || isPriorityApp(appName) { continue }
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        for win in windowsForApp(appEl) {
+            if let hit = scanElementForCode(win, appName: appName) {
+                return (hit.0, "read_code", appName, hit.1)
+            }
         }
     }
 
@@ -163,19 +195,19 @@ func scanPass(clickAllow: Bool) -> (code: String?, action: String) {
             if !priorityApps.contains(where: { name.contains($0) }) && !name.contains("System Settings") { continue }
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
             for win in windowsForApp(appEl) {
-                if clickAllowInTree(win) { return (nil, "clicked_allow") }
+                if clickAllowInTree(win) { return (nil, "clicked_allow", nil, nil) }
             }
-            if clickAllowInTree(appEl) { return (nil, "clicked_allow") }
+            if clickAllowInTree(appEl) { return (nil, "clicked_allow", nil, nil) }
         }
         for app in apps {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
             for win in windowsForApp(appEl) {
-                if clickAllowInTree(win) { return (nil, "clicked_allow") }
+                if clickAllowInTree(win) { return (nil, "clicked_allow", nil, nil) }
             }
         }
     }
 
-    return (nil, "none")
+    return (nil, "none", nil, nil)
 }
 
 func emit(_ output: Output) -> Never {
@@ -204,10 +236,10 @@ let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 var lastAction = ""
 
 while Date() < deadline {
-    let (code, action) = scanPass(clickAllow: true)
+    let (code, action, source, raw) = scanPass(clickAllow: true)
     if let c = code {
-        logStep(1, "code=\(c)")
-        emit(Output(ok: true, code: c, action: "read_code", message: "ok"))
+        logStep(1, "code=\(c) source=\(source ?? "?") raw=\(raw ?? c)")
+        emit(Output(ok: true, code: c, action: "read_code", message: "ok", source: source, raw: raw))
     }
     if action == "clicked_allow", lastAction != "clicked_allow" {
         logStep(2, "clicked Allow")
@@ -218,4 +250,4 @@ while Date() < deadline {
     }
 }
 
-emit(Output(ok: false, code: nil, action: lastAction.isEmpty ? "none" : lastAction, message: "timeout"))
+emit(Output(ok: false, code: nil, action: lastAction.isEmpty ? "none" : lastAction, message: "timeout", source: nil, raw: nil))

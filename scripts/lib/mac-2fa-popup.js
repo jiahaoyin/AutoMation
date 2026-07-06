@@ -73,7 +73,12 @@ export async function tryFetchMac2FAPopupAx(timeoutSec = 4) {
 
     if (!parsed.ok || !parsed.code) return null;
     const code = String(parsed.code).replace(/\D/g, "").slice(0, 6);
-    return code.length === 6 ? code : null;
+    if (code.length !== 6) return null;
+    return {
+      code,
+      source: parsed.source ?? null,
+      raw: parsed.raw ?? null,
+    };
   } catch (err) {
     if (process.env.DEBUG_2FA) {
       const msg = err instanceof Error ? err.stderr || err.message : String(err);

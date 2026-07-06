@@ -235,10 +235,10 @@ export class HumanInput {
     await sleep(randomBetween(150, 320));
   }
 
-  /** @param {string} text @param {{ slow?: boolean }} [opts] */
+  /** @param {string} text @param {{ slow?: boolean, fast?: boolean }} [opts] */
   async typeText(text, opts = {}) {
-    const baseMin = opts.slow ? 90 : 55;
-    const baseMax = opts.slow ? 220 : 175;
+    const baseMin = opts.fast ? 20 : opts.slow ? 90 : 55;
+    const baseMax = opts.fast ? 45 : opts.slow ? 220 : 175;
     for (let i = 0; i < text.length; i++) {
       const char = text[i];
       await this.bidi.performActions({
@@ -321,6 +321,20 @@ export class HumanInput {
       ],
     });
     await sleep(randomBetween(200, 400));
+  }
+
+  async pressBackspace() {
+    await this.bidi.performActions({
+      context: this.context,
+      actions: [
+        {
+          type: "key",
+          id: this.keyId,
+          actions: [{ type: "keyDown", value: "\uE003" }, { type: "keyUp", value: "\uE003" }],
+        },
+      ],
+    });
+    await sleep(randomBetween(40, 90));
   }
 
   /**

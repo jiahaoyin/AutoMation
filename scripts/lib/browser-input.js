@@ -1086,8 +1086,150 @@ async function submit2FAStep(human, bidi, context) {
   }
 }
 
+/** @param {import("./bidi-client.js").BidiClient} bidi */
+async function discover2FAInputs(bidi) {
+  const contexts = await bidi.getAllContexts(8);
+  const ordered = [...contexts].sort((a, b) => {
+    const score = (u) =>
+      /idmsa|appleid|auth/i.test(u) ? 0 : /account\.apple\.com/i.test(u) ? 1 : 2;
+    return score(a.url) - score(b.url);
+  });
+
+  for (const sel of SECURITY_CODE_SELECTORS) {
+    for (const { context, url } of ordered) {
+      try {
+        const nodes = await bidi.locateNodes(sel, context);
+        if (nodes.length >= 6 || nodes.length === 1) {
+          return { selector: sel, nodes, context, url, count: nodes.length };
+        }
+      } catch {
+        /* try next */
+      }
+    }
+  }
+
+  const probe = `JSON.stringify((() => {
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 2 && r.height > 2 && s.display !== "none" && s.visibility !== "hidden";
+    };
+    const singles = [...document.querySelectorAll('input[maxlength="1"], input[maxLength="1"]')].filter(visible);
+    const on2FA = /双重|验证码|verification code|security code/i.test(document.body?.innerText || "");
+    if (on2FA && singles.length >= 6) {
+      return { ok: true, selector: 'input[maxlength="1"]', count: singles.length };
+    }
+    return { ok: false };
+  })())`;
+
+  for (const { context, url } of ordered) {
+    try {
+      const raw = await bidi.evaluate(probe, context);
+      const hit = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!hit?.ok) continue;
+      const nodes = await bidi.locateNodes(hit.selector, context);
+      if (nodes.length >= 6) {
+        return { selector: hit.selector, nodes: nodes.slice(0, 6), context, url, count: 6 };
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+/** @param {import("./bidi-client.js").BidiClient} bidi */
+async function probe2FAPageState(bidi) {
+  const contexts = await bidi.getAllContexts(8);
+  let on2FAPage = false;
+  let errorText = null;
+  let trustBrowser = false;
+
+  for (const { context } of contexts) {
+    try {
+      const raw = await bidi.evaluate(
+        `JSON.stringify((() => {
+          const body = document.body?.innerText || "";
+          return {
+            err: /不正确|错误|无效|incorrect|invalid|try again|doesn.?t match/i.test(body),
+            twofa: /双重|验证码|verification code|security code/i.test(body),
+            trust: /信任此浏览器|trust this browser|trust.*browser/i.test(body),
+            snippet: body.slice(0, 400),
+          };
+        })())`,
+        context
+      );
+      const s = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (s?.trust) trustBrowser = true;
+      if (s?.twofa) on2FAPage = true;
+      if (s?.err) {
+        errorText =
+          s.snippet?.match(/[^\n]{0,60}(不正确|错误|incorrect|invalid)[^\n]{0,60}/i)?.[0] ||
+          "验证码被拒绝";
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return { on2FAPage, errorText, trustBrowser };
+}
+
 /**
- * 尽快将 6 位 2FA 填入网页（iframe 感知，取码后先激活 Firefox）
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {number} [timeoutMs]
+ */
+async function waitFor2FAOutcome(bidi, timeoutMs = 22_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await probe2FAPageState(bidi);
+    if (state.errorText) {
+      return { ok: false, reason: state.errorText };
+    }
+    if (state.trustBrowser) {
+      return { ok: true, phase: "trust" };
+    }
+    if (!state.on2FAPage) {
+      return { ok: true, phase: "left-2fa" };
+    }
+    await sleep(500);
+  }
+  const final = await probe2FAPageState(bidi);
+  if (final.errorText) return { ok: false, reason: final.errorText };
+  if (!final.on2FAPage || final.trustBrowser) return { ok: true, phase: "timeout-assume-ok" };
+  return { ok: false, reason: "2FA 页未跳转（可能未成功提交）" };
+}
+
+/**
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {{ selector: string, nodes: object[], context: string, url?: string }} fieldset
+ * @param {string} digits
+ */
+async function fill2FAViaKeyboard(human, bidi, fieldset, digits) {
+  human.setContext(fieldset.context);
+  const inputs = fieldset.nodes.slice(0, 6);
+
+  if (inputs.length >= 6) {
+    for (const node of inputs) {
+      await human.clickElement(node);
+      await human.pressBackspace();
+    }
+    await human.clickElement(inputs[0]);
+    await sleep(100);
+    await human.typeText(digits, { fast: true });
+    console.log(`[Firefox] ✓ 2FA 键盘逐格填入 (${fieldset.selector})`);
+    return;
+  }
+
+  await human.clickElement(inputs[0]);
+  await sleep(100);
+  await human.typeText(digits, { fast: true });
+  console.log(`[Firefox] ✓ 2FA 键盘单框填入 (${fieldset.selector})`);
+}
+
+/**
+ * 尽快将 6 位 2FA 填入网页（BiDi 真实键盘，避免 JS 只改 DOM 不更新 React 状态）
  * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {import("./bidi-client.js").BidiClient} bidi
  * @param {string} code
@@ -1096,55 +1238,34 @@ export async function fillWebSecurityCode(human, bidi, code) {
   const digits = String(code).replace(/\D/g, "").slice(0, 6);
   if (digits.length !== 6) throw new Error(`2FA 验证码格式错误: ${code}`);
 
-  console.log(`[Firefox] 立即填入 2FA: ${digits}`);
+  console.log(`[Firefox] 立即填入 2FA（键盘）: ${digits}`);
   await activateFirefoxApp();
   await sleep(200);
 
   const deadline = Date.now() + 15_000;
+  let fieldset = null;
   while (Date.now() < deadline) {
-    const universal = await fill2FAUniversalInAnyContext(bidi, digits);
-    if (universal) {
-      human.setContext(universal.context);
-      console.log(
-        `[Firefox] ✓ 2FA 通用填入 (${universal.mode}) ctx=${universal.url?.slice(0, 55) || "root"} values=${(universal.values || []).join("")}`
-      );
-      await submit2FAStep(human, bidi, universal.context);
-      return { context: universal.context, digits, method: "universal-js" };
-    }
-
-    for (const sel of SECURITY_CODE_SELECTORS) {
-      const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
-      if (!found?.nodes?.length) continue;
-
-      human.setContext(found.context);
-      console.log(
-        `[Firefox] 2FA 框: ${sel} ×${found.nodes.length} ctx=${found.url?.slice(0, 55) || "root"}`
-      );
-
-      const js = await fill2FAViaScript(bidi, found.context, sel, digits);
-      if (js) {
-        console.log(`[Firefox] ✓ 2FA JS 填入 (${js.mode})`);
-        await submit2FAStep(human, bidi, found.context);
-        return { context: found.context, digits, method: "js" };
-      }
-
-      if (found.nodes.length >= 6) {
-        await human.clickElement(found.nodes[0]);
-        await sleep(80);
-        await human.typeText(digits, { slow: false });
-      } else {
-        await human.clickElement(found.nodes[0]);
-        await sleep(100);
-        await human.typeText(digits);
-      }
-      console.log("[Firefox] ✓ 2FA 键盘填入");
-      await submit2FAStep(human, bidi, found.context);
-      return { context: found.context, digits, method: "keyboard" };
-    }
+    fieldset = await discover2FAInputs(bidi);
+    if (fieldset) break;
     await sleep(250);
   }
+  if (!fieldset) {
+    throw new Error("未找到网页 2FA 验证码输入框（请确认浏览器仍在双重认证页）");
+  }
 
-  throw new Error("未找到网页 2FA 验证码输入框（请确认浏览器仍在双重认证页）");
+  console.log(
+    `[Firefox] 2FA 框: ${fieldset.selector} ×${fieldset.count} ctx=${fieldset.url?.slice(0, 55) || "root"}`
+  );
+
+  await fill2FAViaKeyboard(human, bidi, fieldset, digits);
+
+  const outcome = await waitFor2FAOutcome(bidi);
+  if (!outcome.ok) {
+    throw new Error(`2FA 提交失败: ${outcome.reason}（已填 ${digits}，请核对弹窗原文是否一致）`);
+  }
+
+  console.log(`[Firefox] ✓ 2FA 已通过 (${outcome.phase})`);
+  return { context: fieldset.context, digits, method: "keyboard", phase: outcome.phase };
 }
 
 export { PASS_SELECTORS };

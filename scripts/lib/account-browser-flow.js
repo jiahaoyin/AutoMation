@@ -328,7 +328,7 @@ async function runWebLogin(bidi, human, creds) {
   const code = await twoFa.getCode();
 
   await fillWebSecurityCode(human, bidi, code);
-  await sleep(1500);
+  await sleep(800);
 
   await clickTrustBrowserIfNeeded(human, bidi);
 
