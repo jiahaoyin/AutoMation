@@ -161,9 +161,82 @@ export async function firstInContext(bidi, context, selectors, timeoutMs = 15_00
 }
 
 function fieldMatchesKind(state, sel, kind) {
-  if (kind === "email" && state.type === "password") return false;
-  if (kind === "password" && state.type !== "password" && !sel.includes("password")) return false;
+  if (kind === "email") {
+    if (sel.includes("password") || state.type === "password") return false;
+    return true;
+  }
+  if (kind === "password") {
+    return sel.includes("password") || state.type === "password";
+  }
   return true;
+}
+
+/** BiDi 已定位到节点时，合并 evaluate 状态（iframe / XFO 时 evaluate 可能不可用） */
+function mergeFieldState(state, sel, found) {
+  if (found?.nodes?.length && (!state.found || (!state.interactable && !state.scriptBlocked))) {
+    return {
+      found: true,
+      interactable: true,
+      locateOnly: true,
+      scriptBlocked: state.scriptBlocked ?? false,
+      type: sel.includes("password") ? "password" : state.type || "text",
+      value: state.value ?? "",
+      selector: sel,
+    };
+  }
+  if (state.scriptBlocked) return { ...state, locateOnly: true, interactable: true };
+  return state;
+}
+
+function fieldReady(kind, step, state) {
+  if (state.locateOnly || state.scriptBlocked) return true;
+  if (kind === "password") return passwordStepReady(step, state);
+  return state.interactable;
+}
+
+/**
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {string[]} selectors
+ */
+export async function diagnoseLoginFields(bidi, selectors) {
+  const contexts = await bidi.getAllContexts(12);
+  const lines = [`BiDi contexts=${contexts.length}`];
+  for (const { context, url } of contexts) {
+    lines.push(`  ctx url=${url || "(empty)"}`);
+  }
+  for (const sel of selectors) {
+    let hits = 0;
+    for (const { context, url } of contexts) {
+      try {
+        const nodes = await bidi.locateNodes(sel, context);
+        if (nodes.length) {
+          lines.push(`  ✓ ${sel} → ${url || context}`);
+          hits++;
+        }
+      } catch {
+        /* skip */
+      }
+    }
+    if (!hits) lines.push(`  ✗ ${sel} → 无匹配`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {string[]} selectors
+ * @param {number} [timeoutMs]
+ */
+export async function firstInAnyContext(bidi, selectors, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectors) {
+      const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
+      if (found?.nodes?.length) return { selector: sel, ...found };
+    }
+    await sleep(350);
+  }
+  return null;
 }
 
 function passwordStepReady(step, state) {
@@ -203,14 +276,12 @@ export async function waitForVisibleInput(bidi, human, selectors, timeoutMs = 30
       if (!found?.nodes?.length) continue;
 
       human.setContext(found.context);
-      const state = await readInputState(bidi, found.context, sel);
+      let state = await readInputState(bidi, found.context, sel).catch(() => ({
+        found: false,
+      }));
+      state = mergeFieldState(state, sel, found);
       if (!fieldMatchesKind(state, sel, kind)) continue;
-
-      if (kind === "password") {
-        if (!passwordStepReady(step, state)) continue;
-      } else if (!state.interactable && !state.scriptBlocked) {
-        continue;
-      }
+      if (!fieldReady(kind, step, state)) continue;
 
       matched = { selector: sel, ...found, state, step };
       break;
@@ -236,7 +307,7 @@ export async function waitForVisibleInput(bidi, human, selectors, timeoutMs = 30
 }
 
 /** 点击继续后等待密码步骤 */
-export async function waitForPasswordStepAfterContinue(bidi, human, context, timeoutMs) {
+export async function waitForPasswordStepAfterContinue(bidi, human, _context, timeoutMs) {
   const cfg = getBrowserConfig();
   console.log(`[Firefox] 继续后最少等待 ${cfg.minAfterContinueMs}ms…`);
   await sleep(cfg.minAfterContinueMs);
@@ -245,7 +316,6 @@ export async function waitForPasswordStepAfterContinue(bidi, human, context, tim
     kind: "password",
     stablePolls: cfg.stablePolls,
     log: true,
-    contextOnly: context,
   });
 }
 
@@ -258,10 +328,10 @@ export function getBrowserConfig() {
     pollIntervalMs: num("BROWSER_POLL_MS", 400),
     stablePolls: num("BROWSER_STABLE_POLLS", 2),
     minAfterContinueMs: num("BROWSER_AFTER_CONTINUE_MS", 2500),
-    pageSettleMinMs: num("BROWSER_PAGE_SETTLE_MIN_MS", 2000),
-    pageSettleMaxMs: num("BROWSER_PAGE_SETTLE_MAX_MS", 4000),
+    pageSettleMinMs: num("BROWSER_PAGE_SETTLE_MIN_MS", 3500),
+    pageSettleMaxMs: num("BROWSER_PAGE_SETTLE_MAX_MS", 5500),
     passwordWaitMs: num("BROWSER_PASSWORD_WAIT_MS", 45_000),
-    emailWaitMs: num("BROWSER_EMAIL_WAIT_MS", 30_000),
+    emailWaitMs: num("BROWSER_EMAIL_WAIT_MS", 45_000),
     signInUrl: process.env.BROWSER_SIGN_IN_URL || "https://appleid.apple.com/sign-in",
   };
 }

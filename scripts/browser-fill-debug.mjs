@@ -14,7 +14,7 @@ import { HumanInput, sleep } from "./lib/human-input-bidi.js";
 import { humanPageSettle } from "./lib/anti-automation.js";
 import {
   fillInputWithVerify,
-  firstInContext,
+  firstInAnyContext,
   getBrowserConfig,
   readSignInStep,
   waitForPasswordStepAfterContinue,
@@ -60,7 +60,6 @@ async function main() {
 
     const userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
       kind: "email",
-      contextOnly: root,
       log: true,
     });
     if (!userField) throw new Error("邮箱框未就绪");
@@ -69,12 +68,12 @@ async function main() {
     await fillInputWithVerify(human, bidi, userField.selector, appleId, "邮箱", userField.nodes[0]);
     console.log("[3] 步骤:", await readSignInStep(bidi, root));
 
-    const cont = await firstInContext(bidi, root, CONTINUE_SELECTORS);
+    const cont = await firstInAnyContext(bidi, CONTINUE_SELECTORS);
     if (!cont) throw new Error("无继续按钮");
     await human.clickElement(cont.nodes[0]);
     console.log("[4] 已点继续");
 
-    const passField = await waitForPasswordStepAfterContinue(bidi, human, root, cfg.passwordWaitMs);
+    const passField = await waitForPasswordStepAfterContinue(bidi, human, human.context, cfg.passwordWaitMs);
     if (!passField) throw new Error("密码框超时");
     console.log("[5] 密码框:", passField.selector);
 

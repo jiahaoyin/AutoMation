@@ -20,8 +20,9 @@ import {
 } from "./anti-automation.js";
 import { isAccessibilityGranted } from "./accessibility.js";
 import {
+  diagnoseLoginFields,
   fillInputWithVerify,
-  firstInContext,
+  firstInAnyContext,
   getBrowserConfig,
   readInputState,
   readSignInStep,
@@ -48,6 +49,9 @@ const USER_SELECTORS = [
   'input[autocomplete="username"]',
   'input[type="email"]',
   'input[id*="account"]',
+  'input[canfield="accountName"]',
+  ".form-textbox-input",
+  'input.signin-form-textbox',
 ];
 
 const PASS_SELECTORS = [
@@ -271,19 +275,24 @@ async function runWebLogin(bidi, human, creds) {
   human.setContext(root);
   await humanPageSettle("顶层登录页");
 
+  // 登录控件常在 iframe 内：全 context 搜索（BiDi locateNodes），填表用指针+键盘避 XFO
   const userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
     kind: "email",
     stablePolls: 2,
     log: true,
-    contextOnly: root,
   });
   if (!userField) {
-    throw new Error("未找到邮箱输入框（顶层登录页）。请确认网络可访问 appleid.apple.com");
+    const diag = await diagnoseLoginFields(bidi, USER_SELECTORS);
+    console.error("[Firefox] 诊断:\n" + diag);
+    throw new Error("未找到邮箱输入框。登录页可能仍在加载 iframe，或网络受限");
   }
 
-  const stepBefore = await readSignInStep(bidi, root);
+  console.log(
+    `[Firefox] 邮箱框: ${userField.selector} ctx=${userField.url?.slice(0, 70) || "root"} ` +
+      `locateOnly=${!!userField.state?.locateOnly}`
+  );
+  const stepBefore = await readSignInStep(bidi, human.context);
   console.log(`[Firefox] 登录步骤(填邮箱前): email=${stepBefore.email} password=${stepBefore.password}`);
-  console.log(`[Firefox] 邮箱框: ${userField.selector} @ ${userField.url || "root"}`);
   const vp = await human.ensureViewport();
   console.log(`[Firefox] 视口: ${vp.width}x${vp.height}`);
 
@@ -302,17 +311,18 @@ async function runWebLogin(bidi, human, creds) {
     throw new Error(`邮箱校验失败：读回 "${emailResult.value ?? ""}"`);
   }
 
-  const continueBtn = await firstInContext(bidi, root, CONTINUE_SELECTORS, 12_000);
+  const continueBtn = await firstInAnyContext(bidi, CONTINUE_SELECTORS, 12_000);
   if (!continueBtn) throw new Error("邮箱已填但未找到「继续」按钮");
+  human.setContext(continueBtn.context);
 
   await humanThinkPause(400, 900);
   await human.clickElement(continueBtn.nodes[0]);
   console.log("[Firefox] 已点击继续，等待密码步骤展示…");
 
-  const passField = await waitForPasswordStepAfterContinue(bidi, human, root, cfg.passwordWaitMs);
+  const passField = await waitForPasswordStepAfterContinue(bidi, human, human.context, cfg.passwordWaitMs);
   if (!passField) throw new Error("密码步骤未出现（超时）");
 
-  const stepAfter = await readSignInStep(bidi, root);
+  const stepAfter = await readSignInStep(bidi, human.context);
   console.log(`[Firefox] 登录步骤(填密码前): email=${stepAfter.email} password=${stepAfter.password}`);
 
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
@@ -332,8 +342,9 @@ async function runWebLogin(bidi, human, creds) {
     throw new Error(`密码校验失败：读回长度 ${passResult.value?.length ?? 0}`);
   }
 
-  const submitBtn = await firstInContext(bidi, root, CONTINUE_SELECTORS, 8000);
+  const submitBtn = await firstInAnyContext(bidi, CONTINUE_SELECTORS, 8000);
   if (submitBtn) {
+    human.setContext(submitBtn.context);
     await human.clickElement(submitBtn.nodes[0]);
   } else {
     await human.pressEnter();
