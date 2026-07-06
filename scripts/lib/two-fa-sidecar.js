@@ -47,15 +47,13 @@ export async function waitForMac2FACode(options = {}) {
 
   while (Date.now() < allowDeadline && !allowClicked) {
     if (process.platform === "darwin") {
-      const r = await runPopupPhase("pre_allow", 6);
+      const r = await runPopupPhase("pre_allow", 4);
       if (r.action === "dismissed_stale") {
         if (r.code) dismissedCodes.add(r.code);
-        console.log("[2FA] 关闭残留验证码窗（允许前）");
         continue;
       }
       if (r.action === "clicked_allow") {
         allowClicked = true;
-        console.log("[2FA] ✓ 已点击「允许」");
         break;
       }
     }

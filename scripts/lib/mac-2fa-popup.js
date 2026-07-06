@@ -1,5 +1,5 @@
 /**
- * macOS 系统 2FA 弹窗：分阶段 Swift AX（dismiss → allow → read）
+ * 2FA 弹窗：AppleScript（System Events）为主，Swift AX 为辅
  */
 
 import { execFile, spawnSync } from "node:child_process";
@@ -10,20 +10,27 @@ import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const AS_SCRIPT = path.resolve(__dirname, "../apple-2fa-phase.applescript");
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-2fa-popup-read.swift");
-const BIN = path.resolve(__dirname, "../bin/mac-2fa-popup-read");
+const SWIFT_BIN = path.resolve(__dirname, "../bin/mac-2fa-popup-read");
 
 /** @typedef {"dismiss_stale"|"pre_allow"|"read_code"} PopupPhase */
+
+function swiftNeedsRecompile() {
+  if (!fs.existsSync(SWIFT_BIN)) return true;
+  if (!fs.existsSync(SWIFT_SRC)) return false;
+  return fs.statSync(SWIFT_SRC).mtimeMs > fs.statSync(SWIFT_BIN).mtimeMs;
+}
 
 export function compile2FAPopupHelper(options = {}) {
   const { quiet = false } = options;
   if (process.platform !== "darwin") return { ok: false, reason: "non-darwin" };
   if (!fs.existsSync(SWIFT_SRC)) return { ok: false, reason: "missing swift source" };
 
-  fs.mkdirSync(path.dirname(BIN), { recursive: true });
+  fs.mkdirSync(path.dirname(SWIFT_BIN), { recursive: true });
   const r = spawnSync(
     "swiftc",
-    ["-O", "-o", BIN, SWIFT_SRC, "-framework", "ApplicationServices", "-framework", "AppKit"],
+    ["-O", "-o", SWIFT_BIN, SWIFT_SRC, "-framework", "ApplicationServices", "-framework", "AppKit"],
     { encoding: "utf-8" }
   );
   if (r.status !== 0) {
@@ -31,31 +38,92 @@ export function compile2FAPopupHelper(options = {}) {
     return { ok: false, reason: r.stderr?.trim() || String(r.error) };
   }
   try {
-    fs.chmodSync(BIN, 0o755);
+    fs.chmodSync(SWIFT_BIN, 0o755);
   } catch {
     /* ignore */
   }
-  return { ok: true, bin: BIN };
+  return { ok: true, bin: SWIFT_BIN };
 }
 
-export function is2FAPopupHelperAvailable() {
-  return process.platform === "darwin" && fs.existsSync(BIN) && fs.statSync(BIN).isFile();
-}
-
-async function ensurePopupHelper() {
-  if (!is2FAPopupHelperAvailable()) {
-    const built = compile2FAPopupHelper({ quiet: true });
-    if (!built.ok) return false;
+function ensureSwiftHelper() {
+  if (swiftNeedsRecompile()) {
+    return compile2FAPopupHelper({ quiet: true }).ok;
   }
-  return true;
+  return fs.existsSync(SWIFT_BIN);
 }
 
-function logStderrActions(stderr) {
-  if (!stderr?.trim()) return;
-  for (const line of stderr.trim().split("\n")) {
-    if (/clicked Allow|dismissed|code=/.test(line)) {
-      console.log(`[2FA] ${line.replace(/^\[2FA-popup \d+\] /, "")}`);
-    }
+/**
+ * @param {string} stdout
+ */
+function parsePhaseJson(stdout) {
+  const line = stdout.trim().split("\n").pop() || "";
+  try {
+    const parsed = JSON.parse(line);
+    const code =
+      parsed.code != null && String(parsed.code).length > 0
+        ? String(parsed.code).replace(/\D/g, "").slice(0, 6)
+        : null;
+    return {
+      ok: Boolean(parsed.ok),
+      action: parsed.action ?? "none",
+      code: code?.length === 6 ? code : null,
+      source: parsed.source ? String(parsed.source) : null,
+      raw: parsed.raw ? String(parsed.raw) : null,
+    };
+  } catch {
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+}
+
+/**
+ * @param {PopupPhase} phase
+ * @param {number} timeoutSec
+ */
+export async function runAppleScriptPhase(phase, timeoutSec = 6) {
+  if (process.platform !== "darwin" || !fs.existsSync(AS_SCRIPT)) {
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "osascript",
+      [AS_SCRIPT, `--phase=${phase}`, `--timeout=${timeoutSec}`],
+      { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 }
+    );
+    return parsePhaseJson(stdout);
+  } catch (err) {
+    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
+    if (stdout.trim()) return parsePhaseJson(stdout);
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+}
+
+async function runSwiftPhase(phase, timeoutSec) {
+  if (!ensureSwiftHelper()) return { ok: false, action: "none", code: null, source: null, raw: null };
+  try {
+    const { stdout } = await execFileAsync(
+      SWIFT_BIN,
+      ["--phase", phase, "--timeout", String(timeoutSec)],
+      { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 }
+    );
+    return parsePhaseJson(stdout);
+  } catch (err) {
+    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
+    if (stdout.trim()) return parsePhaseJson(stdout);
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+}
+
+function logPhaseResult(phase, r) {
+  if (r.action === "clicked_allow") {
+    console.log(`[2FA] ✓ AppleScript 已点击「允许」(${r.source || "弹窗"})`);
+  } else if (r.action === "dismissed_stale") {
+    const old = r.code ? ` 旧码=${r.code}` : "";
+    console.log(`[2FA] 已关闭残留验证码窗${old}`);
+  } else if (r.action === "read_code" && r.code) {
+    const raw = r.raw ? ` 原文="${String(r.raw).slice(0, 40)}"` : "";
+    console.log(`[2FA] 读到验证码 ${r.code}${raw}`);
+  } else if (phase === "pre_allow" && r.action === "none" && process.env.DEBUG_2FA) {
+    console.log("[2FA] 未检测到允许按钮（继续轮询）");
   }
 }
 
@@ -64,40 +132,23 @@ function logStderrActions(stderr) {
  * @param {number} [timeoutSec]
  */
 export async function runPopupPhase(phase, timeoutSec = 6) {
-  if (process.platform !== "darwin") return { ok: false, action: "none" };
-  if (!(await ensurePopupHelper())) return { ok: false, action: "none" };
+  if (process.platform !== "darwin") return { ok: false, action: "none", code: null, source: null, raw: null };
 
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      BIN,
-      ["--phase", phase, "--timeout", String(timeoutSec)],
-      { timeout: (timeoutSec + 8) * 1000, maxBuffer: 256 * 1024 }
-    );
-    logStderrActions(stderr);
-    let parsed = { ok: false, code: null, action: "none" };
-    try {
-      parsed = JSON.parse(stdout.trim());
-    } catch {
-      return { ok: false, action: "none" };
-    }
-    const code =
-      parsed.code != null ? String(parsed.code).replace(/\D/g, "").slice(0, 6) : null;
-    return {
-      ok: Boolean(parsed.ok),
-      action: parsed.action ?? "none",
-      code: code?.length === 6 ? code : null,
-      source: parsed.source ?? null,
-      raw: parsed.raw ?? null,
-    };
-  } catch (err) {
-    logStderrActions(err instanceof Error && "stderr" in err ? String(err.stderr || "") : "");
-    return { ok: false, action: "none" };
+  const as = await runAppleScriptPhase(phase, timeoutSec);
+  if (as.ok || as.action === "clicked_allow" || as.action === "dismissed_stale") {
+    logPhaseResult(phase, as);
+    return as;
   }
+
+  const swift = await runSwiftPhase(phase, timeoutSec);
+  if (swift.ok || swift.action !== "none") {
+    logPhaseResult(phase, swift);
+  }
+  return swift;
 }
 
-/** 多次尝试关闭残留验证码窗；返回被关闭的旧码列表 */
+/** @returns {Promise<{ count: number, codes: string[] }>} */
 export async function dismissStale2FAPopups(maxRounds = 6) {
-  if (!(await ensurePopupHelper())) return { count: 0, codes: [] };
   let dismissed = 0;
   /** @type {string[]} */
   const codes = [];
@@ -114,12 +165,10 @@ export async function dismissStale2FAPopups(maxRounds = 6) {
   return { count: dismissed, codes };
 }
 
-/**
- * @deprecated 使用 runPopupPhase + 分阶段 waitForMac2FACode
- * @param {number} [timeoutSec]
- */
 export async function tryFetchMac2FAPopupAx(timeoutSec = 12) {
   const r = await runPopupPhase("read_code", timeoutSec);
   if (!r.code) return null;
   return { code: r.code, source: r.source, raw: r.raw, action: r.action };
 }
+
+export { compile2FAPopupHelper, ensureSwiftHelper as is2FAPopupHelperAvailable };
