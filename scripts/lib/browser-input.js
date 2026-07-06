@@ -1179,7 +1179,7 @@ async function probe2FAPageState(bidi) {
  * @param {import("./bidi-client.js").BidiClient} bidi
  * @param {number} [timeoutMs]
  */
-async function waitFor2FAOutcome(bidi, timeoutMs = 22_000) {
+async function waitFor2FAOutcome(bidi, timeoutMs = 28_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const state = await probe2FAPageState(bidi);
@@ -1241,14 +1241,12 @@ async function fill2FAViaKeyboard(human, bidi, fieldset, digits) {
     if (readback && readback !== digits) {
       console.warn(`[Firefox] 2FA 读回与目标不一致: 期望 ${digits} 实际 ${readback}`);
     }
-    await sleep(400);
-    await human.pressEnter();
+    await sleep(1200);
     return;
   }
 
   await human.focusAndTypeElement(inputs[0], selector, digits, { fast: true });
-  await sleep(400);
-  await human.pressEnter();
+  await sleep(1200);
   console.log(`[Firefox] ✓ 2FA 键盘单框填入 (${selector})`);
 }
 

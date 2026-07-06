@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
 import { sleep } from "./prompt.js";
@@ -119,12 +121,24 @@ export async function waitForMac2FACode(options = {}) {
           "[2FA] 弹窗未及时出现，改从 系统设置 → 登录与安全性 → 双重认证 → 获取验证码…"
         );
         try {
-          const settingsCode = await fetch2FACodeFromSystemSettings({
+          const screenshotPath = options.reportDir
+            ? path.join(options.reportDir, "screenshots", "2fa-settings-code.png")
+            : undefined;
+          const { code, screenshot } = await fetch2FACodeFromSystemSettings({
             timeoutMs: Math.min(leftMs - 5000, 120_000),
+            screenshotPath,
           });
-          console.log(`[2FA] ★ 验证码: ${settingsCode}`);
+          console.log(`[2FA] ★ 验证码: ${code}`);
+          if (screenshot) {
+            console.log(`[2FA] 系统设置验证码截图已保存: ${screenshot}`);
+          }
+          if (!allowClicked) {
+            console.warn(
+              "[2FA] 提示: 未在弹窗点「允许」时，设置里的验证码可能无法用于本次网页登录；请对照截图核对"
+            );
+          }
           console.log("[2FA] 已获取 6 位验证码（系统设置）");
-          return settingsCode;
+          return code;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[2FA] 系统设置获取验证码失败: ${msg}`);

@@ -13,6 +13,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-settings-2fa-code.swift");
 const BIN = path.resolve(__dirname, "../bin/mac-settings-2fa-code");
 
+function swiftNeedsRecompile() {
+  if (!fs.existsSync(BIN)) return true;
+  if (!fs.existsSync(SWIFT_SRC)) return false;
+  return fs.statSync(SWIFT_SRC).mtimeMs > fs.statSync(BIN).mtimeMs;
+}
+
 export function compile2FASettingsHelper(options = {}) {
   const { quiet = false } = options;
   if (process.platform !== "darwin") return { ok: false, reason: "non-darwin" };
@@ -37,11 +43,15 @@ export function compile2FASettingsHelper(options = {}) {
 }
 
 export function is2FASettingsHelperAvailable() {
+  if (swiftNeedsRecompile()) {
+    compile2FASettingsHelper({ quiet: true });
+  }
   return process.platform === "darwin" && fs.existsSync(BIN) && fs.statSync(BIN).isFile();
 }
 
 /**
- * @param {{ timeoutMs?: number, verbose?: boolean }} [opts]
+ * @param {{ timeoutMs?: number, verbose?: boolean, screenshotPath?: string }} [opts]
+ * @returns {Promise<{ code: string, screenshot: string|null }>}
  */
 export async function fetch2FACodeFromSystemSettings(opts = {}) {
   if (!is2FASettingsHelperAvailable()) {
@@ -54,7 +64,13 @@ export async function fetch2FACodeFromSystemSettings(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
 
-  const { stdout, stderr } = await execFileAsync(BIN, ["--timeout", String(timeoutSec)], {
+  const args = ["--timeout", String(timeoutSec)];
+  if (opts.screenshotPath) {
+    fs.mkdirSync(path.dirname(opts.screenshotPath), { recursive: true });
+    args.push("--screenshot", opts.screenshotPath);
+  }
+
+  const { stdout, stderr } = await execFileAsync(BIN, args, {
     timeout: timeoutMs + 15_000,
     maxBuffer: 512 * 1024,
   });
@@ -65,7 +81,7 @@ export async function fetch2FACodeFromSystemSettings(opts = {}) {
     }
   }
 
-  let parsed = { ok: false, code: null, message: stdout?.trim() || "empty" };
+  let parsed = { ok: false, code: null, message: stdout?.trim() || "empty", screenshot: null };
   try {
     parsed = JSON.parse(stdout.trim());
   } catch {
@@ -80,5 +96,9 @@ export async function fetch2FACodeFromSystemSettings(opts = {}) {
   if (code.length !== 6) {
     throw new Error(`验证码格式异常: ${parsed.code}`);
   }
-  return code;
+
+  const screenshot =
+    parsed.screenshot && fs.existsSync(parsed.screenshot) ? parsed.screenshot : opts.screenshotPath ?? null;
+
+  return { code, screenshot };
 }

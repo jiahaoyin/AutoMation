@@ -13,7 +13,7 @@
  */
 
 import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
-import { promptAppleCredentials } from "./lib/credentials.js";
+import { confirmOrPromptAppleCredentials } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
 import { createReportDir, writeReport } from "./lib/report.js";
 import { ensureEnvironment } from "./lib/env-setup.js";
@@ -32,7 +32,7 @@ async function main() {
     console.log("");
   }
 
-  const creds = await promptAppleCredentials();
+  const creds = await confirmOrPromptAppleCredentials();
   const reportDir = createReportDir("apple-id-flow");
   const report = {
     runAt: new Date().toISOString(),

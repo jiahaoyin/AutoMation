@@ -229,7 +229,7 @@ async function scrapePersonalInfo(bidi, context) {
  * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {{ appleId: string, password: string }} creds
  */
-async function runWebLogin(bidi, human, creds) {
+async function runWebLogin(bidi, human, creds, options = {}) {
   const cfg = getBrowserConfig();
   const root = bidi.rootContext;
   if (!root) throw new Error("无 root browsing context");
@@ -323,7 +323,7 @@ async function runWebLogin(bidi, human, creds) {
   await humanPageSettle("登录提交");
 
   console.log("[Firefox] 已提交登录，等待 macOS 2FA 弹窗…");
-  const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
+  const twoFa = startMac2FAWait({ timeoutMs: 240_000, reportDir: options.reportDir });
 
   const code = await twoFa.getCode();
 
@@ -403,7 +403,21 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
     );
 
     if (!session.signedIn) {
-      await runWebLogin(bidi, human, creds);
+      try {
+        await runWebLogin(bidi, human, creds, { reportDir });
+      } catch (loginErr) {
+        try {
+          const failShot = saveScreenshot(
+            reportDir,
+            "02-login-or-2fa-failed",
+            await bidi.captureScreenshot(context)
+          );
+          if (failShot) console.log(`[Firefox] 失败时页面截图: ${failShot}`);
+        } catch {
+          /* ignore screenshot errors */
+        }
+        throw loginErr;
+      }
       const afterLogin = await probeBrowserAccountSession(bidi, context);
       report.browserLogin.postLoginProbe = {
         signedIn: afterLogin.signedIn,
@@ -453,7 +467,13 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
 
     return report;
   } finally {
-    if (bidi) await bidi.close().catch(() => {});
-    if (firefoxProc) await stopFirefox(firefoxProc);
+    const succeeded = report.browserLogin?.success === true;
+    if (succeeded) {
+      if (bidi) await bidi.close().catch(() => {});
+      if (firefoxProc) await stopFirefox(firefoxProc);
+    } else {
+      console.log("\n[Firefox] 浏览器保持打开（失败或中断时可手动检查页面）");
+      console.log("[Firefox] 检查完毕后请手动关闭 Firefox");
+    }
   }
 }

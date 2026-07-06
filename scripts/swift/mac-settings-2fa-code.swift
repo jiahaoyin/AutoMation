@@ -4,12 +4,14 @@
 
 import ApplicationServices
 import AppKit
+import CoreGraphics
 import Foundation
 
 struct Output: Codable {
     let ok: Bool
     let code: String?
     let message: String
+    let screenshot: String?
 }
 
 let settingsBundleIds = ["com.apple.systempreferences", "com.apple.SystemSettings"]
@@ -176,12 +178,50 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
+func captureWindowScreenshot(pid: pid_t, path: String) -> Bool {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let infoList = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+        return false
+    }
+    for info in infoList {
+        guard let ownerPid = info[kCGWindowOwnerPID as String] as? pid_t, ownerPid == pid else { continue }
+        guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+        guard let wid = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-x", "-l", String(wid), path]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            if task.terminationStatus == 0, FileManager.default.fileExists(atPath: path) { return true }
+        } catch {
+            continue
+        }
+    }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    task.arguments = ["-x", path]
+    do {
+        try task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0 && FileManager.default.fileExists(atPath: path)
+    } catch {
+        return false
+    }
+}
+
 var timeoutSec = 90
+var screenshotPath: String?
 var i = 1
 let args = CommandLine.arguments
 while i < args.count {
     if args[i] == "--timeout", i + 1 < args.count {
         timeoutSec = Int(args[i + 1]) ?? timeoutSec
+        i += 2
+        continue
+    }
+    if args[i] == "--screenshot", i + 1 < args.count {
+        screenshotPath = args[i + 1]
         i += 2
         continue
     }
@@ -193,7 +233,7 @@ openAppleAccountSettings()
 usleep(1_500_000)
 
 guard let app = findSettingsApp() else {
-    emit(Output(ok: false, code: nil, message: "System Settings not found"))
+    emit(Output(ok: false, code: nil, message: "System Settings not found", screenshot: nil))
 }
 
 app.activate(options: [.activateIgnoringOtherApps])
@@ -208,19 +248,19 @@ let getCodeBtn = ["获取验证码", "Get Verification Code", "Get a Verificatio
 
 logStep(3, "click Sign-In & Security")
 guard clickNamed(in: appElement, names: signInSecurity) else {
-    emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found"))
+    emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found", screenshot: nil))
 }
 usleep(1_200_000)
 
 logStep(4, "click Two-Factor Authentication")
 guard clickNamed(in: appElement, names: twoFactor) else {
-    emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
+    emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found", screenshot: nil))
 }
 usleep(1_200_000)
 
 logStep(5, "click Get Verification Code")
 guard clickNamed(in: appElement, names: getCodeBtn) else {
-    emit(Output(ok: false, code: nil, message: "Get Verification Code button not found"))
+    emit(Output(ok: false, code: nil, message: "Get Verification Code button not found", screenshot: nil))
 }
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
@@ -234,9 +274,21 @@ while Date() < deadline {
 }
 
 guard let finalCode = code else {
-    emit(Output(ok: false, code: nil, message: "verification code alert not found"))
+    emit(Output(ok: false, code: nil, message: "verification code alert not found", screenshot: nil))
 }
 
 logStep(6, "code=\(finalCode)")
+
+var savedShot: String?
+if let shotPath = screenshotPath {
+    usleep(700_000)
+    if captureWindowScreenshot(pid: app.processIdentifier, path: shotPath) {
+        savedShot = shotPath
+        logStep(7, "screenshot=\(shotPath)")
+    } else {
+        logStep(7, "screenshot failed")
+    }
+}
+
 _ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
-emit(Output(ok: true, code: finalCode, message: "ok"))
+emit(Output(ok: true, code: finalCode, message: "ok", screenshot: savedShot))

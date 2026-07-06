@@ -168,6 +168,51 @@ export function requireAppleCredentials() {
   return { appleId, password };
 }
 
+function maskAppleId(appleId) {
+  return appleId.replace(/(.{2}).+(@.+)/, "$1***$2");
+}
+
+/**
+ * .env 已有账号时回车确认；否则完整输入并备份
+ */
+export async function confirmOrPromptAppleCredentials() {
+  loadEnvFile();
+  const existingId = process.env.APPLE_ID?.trim();
+  const existingPw = process.env.APPLE_PASSWORD?.trim();
+
+  if (existingId && existingPw) {
+    const masked = maskAppleId(existingId);
+    console.log(`已读取 .env 中的账号: ${masked}`);
+    console.log("按回车确认使用该账号，或输入新的 Apple ID 邮箱：");
+
+    const rl = readline.createInterface({ input, output });
+    let line;
+    try {
+      line = (await rl.question("> ")).trim();
+    } finally {
+      rl.close();
+    }
+
+    if (!line) {
+      console.log(`✓ 使用 .env 账号 ${masked}\n`);
+      return { appleId: existingId, password: existingPw };
+    }
+
+    const appleId = line;
+    const password = (await questionPassword("Apple ID 密码: ")).trim();
+    if (!password) throw new Error("密码不能为空");
+
+    const creds = { appleId, password };
+    const envPath = saveCredentialsToEnv(creds);
+    console.log(`\n✓ 已更新并备份至 ${envPath}\n`);
+    process.env.APPLE_ID = appleId;
+    process.env.APPLE_PASSWORD = password;
+    return creds;
+  }
+
+  return promptAppleCredentials();
+}
+
 /**
  * 终端交互输入账号密码，备份至 .env 后返回
  */
