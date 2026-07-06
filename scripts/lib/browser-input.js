@@ -115,19 +115,38 @@ export async function readSignInStep(bidi, context) {
         const pass = document.querySelector("#password_text_field");
         const stepOf = (el) => {
           if (!el) return "missing";
-          const s = window.getComputedStyle(el);
-          const r = el.getBoundingClientRect();
-          const op = parseFloat(s.opacity || "1");
-          const shown =
-            r.width > 2 &&
-            r.height > 2 &&
-            op > 0.1 &&
-            s.display !== "none" &&
-            s.visibility !== "hidden" &&
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const opacity = parseFloat(style.opacity || "1");
+          const inViewport =
+            rect.width > 2 &&
+            rect.height > 2 &&
+            rect.bottom > 0 &&
+            rect.top < window.innerHeight;
+          const parentHidden = (() => {
+            let p = el.parentElement;
+            while (p && p !== document.body) {
+              const ps = window.getComputedStyle(p);
+              if (ps.display === "none" || ps.visibility === "hidden" || parseFloat(ps.opacity || "1") < 0.05) {
+                return true;
+              }
+              p = p.parentElement;
+            }
+            return false;
+          })();
+          const visible =
+            inViewport &&
+            opacity > 0.1 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            !parentHidden &&
             el.getAttribute("aria-hidden") !== "true" &&
             !el.disabled &&
-            el.offsetHeight > 0;
-          return shown ? "shown" : "hidden";
+            el.offsetWidth > 0 &&
+            el.offsetHeight > 0 &&
+            el.tabIndex !== -1;
+          const interactable = visible && !el.readOnly;
+          return interactable ? "shown" : "hidden";
         };
         const signInBtn = document.getElementById("sign-in");
         const btnText = (signInBtn?.textContent || "").replace(/\\s+/g, " ").trim();
@@ -257,7 +276,7 @@ export async function firstInAnyContext(bidi, selectors, timeoutMs = 15_000) {
 
 const PASSWORD_FIELD_SELECTOR = "#password_text_field";
 
-/** 密码步骤就绪：密码框可交互，或主按钮已变为「登录」 */
+/** 密码步骤就绪：密码框可交互，或主按钮已变为「登录」（不能仅凭 DOM 中隐藏的密码框） */
 export async function isPasswordStepReady(bidi, context) {
   const passState = await readInputState(bidi, context, PASSWORD_FIELD_SELECTOR).catch(() => ({
     interactable: false,
@@ -268,7 +287,6 @@ export async function isPasswordStepReady(bidi, context) {
   if (btn.found && /^(登录|登入|sign in)$/i.test(btn.text || "")) return true;
 
   const step = await readSignInStep(bidi, context);
-  if (step.password === "shown") return true;
   if (/^(登录|登入|sign in)$/i.test(step.submitLabel || "")) return true;
 
   return false;
@@ -484,10 +502,8 @@ export async function clickContinueAndWaitForPasswordStep(
   emailContext,
   opts = {}
 ) {
-  const cfg = getBrowserConfig();
   const emailSelector = opts.emailSelector ?? "#account_name_text_field";
   const emailNode = opts.emailNode ?? null;
-  const continueSelectors = opts.continueSelectors ?? CONTINUE_SELECTORS;
 
   human.setContext(emailContext);
   await nudgeEmailValidation(bidi, emailContext, emailSelector);
@@ -499,67 +515,81 @@ export async function clickContinueAndWaitForPasswordStep(
         `text="${btnInfo.text || ""}" enabled=${!btnInfo.disabled}`
     );
   } else {
-    console.warn("[Firefox] 未探测到可见继续按钮，将尝试 Enter / 脚本点击…");
+    console.warn("[Firefox] 未探测到可见继续按钮");
     console.warn(await diagnoseContinueButtons(bidi, emailContext));
   }
 
-  const waitAfterAction = async (timeoutMs) => waitForPasswordStepUi(bidi, emailContext, timeoutMs);
-
-  const finishIfReady = async (label) => {
+  const tryFinish = async (label) => {
+    const passState = await readInputState(bidi, emailContext, PASSWORD_FIELD_SELECTOR).catch(() => ({
+      interactable: false,
+    }));
     if (!(await isPasswordStepReady(bidi, emailContext))) return null;
     const step = await readSignInStep(bidi, emailContext);
-    console.log(`[Firefox] ✓ ${label}（email=${step.email} password=${step.password} btn="${step.submitLabel || ""}"）`);
+    console.log(
+      `[Firefox] ✓ ${label}（password interactable=${!!passState.interactable} ` +
+        `btn="${step.submitLabel || ""}"）`
+    );
     return { context: emailContext, step };
   };
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const ready = await finishIfReady("密码步骤已就绪");
-    if (ready) return ready;
+  const already = await tryFinish("已在密码步骤");
+  if (already) return already;
 
+  const clickContinueJs = async () => {
     const info = await findContinueButtonInfo(bidi, emailContext);
-    if (info?.found && /^(登录|登入|sign in)$/i.test(info.text || "")) {
-      return finishIfReady("主按钮已为登录");
+    if (!info?.found || !/^(继续|continue|next|下一步)$/i.test(info.text || "")) {
+      console.warn("[Firefox] 无「继续」按钮可点");
+      return false;
     }
+    console.log(`[Firefox] JS 点击继续 ${info.selector || info.id}…`);
+    return clickContinueViaScript(bidi, emailContext, info);
+  };
 
-    if (attempt === 1) {
-      console.log("[Firefox] 邮箱框 Enter 提交…");
-      if (emailNode) {
-        await human.clickElement(emailNode).catch(() => human.focusInputBySelector(emailSelector));
-      } else {
-        await human.focusInputBySelector(emailSelector);
-      }
-      await sleep(randomBetween(200, 450));
-      await human.pressEnter();
-      const step = await waitAfterAction(6000);
-      if (step) {
-        console.log("[Firefox] ✓ Enter 后密码步骤已展示");
-        return { context: emailContext, step };
-      }
-      continue;
+  const submitEmailEnter = async () => {
+    console.log("[Firefox] 邮箱框 Enter 提交…");
+    if (emailNode) {
+      await human.clickElement(emailNode).catch(() => human.focusInputBySelector(emailSelector));
+    } else {
+      await human.focusInputBySelector(emailSelector);
     }
+    await sleep(randomBetween(200, 450));
+    await human.pressEnter();
+    return true;
+  };
 
-    if (info?.found && /^(继续|continue|next|下一步)$/i.test(info.text || "")) {
-      console.log(`[Firefox] JS 点击继续 ${info.selector || info.id} (第 ${attempt} 次)…`);
-      await clickContinueViaScript(bidi, emailContext, info);
-      const step = await waitAfterAction(8000);
-      if (step) {
-        console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
-        return { context: emailContext, step };
-      }
-      continue;
+  const clickContinuePointer = async () => {
+    const info = await findContinueButtonInfo(bidi, emailContext);
+    if (!info?.found) return false;
+    const selectors = [info.selector, info.id ? `#${info.id}` : null, "#sign-in"].filter(Boolean);
+    const located = await firstInContext(bidi, emailContext, selectors, 4000);
+    if (!located?.nodes?.length) return false;
+    console.log(`[Firefox] 指针点击继续 (${located.selector})…`);
+    await human.clickElement(located.nodes[0]);
+    return true;
+  };
+
+  const strategies = [
+    { name: "JS 点击继续", run: clickContinueJs },
+    { name: "Enter 提交邮箱", run: submitEmailEnter },
+    { name: "指针点击继续", run: clickContinuePointer },
+  ];
+
+  for (const { name, run } of strategies) {
+    await run();
+    const step = await waitForPasswordStepUi(bidi, emailContext, 12_000);
+    if (step) {
+      const done = await tryFinish(name + "后");
+      if (done) return done;
     }
-
-    console.warn(`[Firefox] 第 ${attempt} 次未推进密码步骤`);
-    console.warn(await diagnoseContinueButtons(bidi, emailContext));
-    await sleep(600);
+    console.warn(`[Firefox] ${name} 后密码步骤未就绪，尝试下一策略…`);
   }
 
-  const ready = await finishIfReady("密码步骤最终检测");
-  if (ready) return ready;
-
   const step = await readSignInStep(bidi, emailContext);
+  const passState = await readInputState(bidi, emailContext, PASSWORD_FIELD_SELECTOR).catch(() => ({}));
+  console.warn(await diagnoseContinueButtons(bidi, emailContext));
   throw new Error(
-    `点击继续后仍未进入密码步骤 (email=${step.email} password=${step.password} btn="${step.submitLabel || ""}")`
+    `点击继续后仍未进入密码步骤 (password interactable=${!!passState.interactable} ` +
+      `email=${step.email} password=${step.password} btn="${step.submitLabel || ""}")`
   );
 }
 
