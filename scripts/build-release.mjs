@@ -54,6 +54,7 @@ const COPY_PATHS = [
   "scripts/lib/account-browser-flow.js",
   "scripts/lib/anti-automation.js",
   "scripts/lib/browser-input.js",
+  "scripts/lib/browser-session.js",
   "scripts/lib/credentials.js",
   "scripts/lib/prompt.js",
   "scripts/lib/two-fa-sidecar.js",

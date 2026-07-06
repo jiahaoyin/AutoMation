@@ -19,6 +19,7 @@ import {
   waitForPasswordStepAfterContinue,
   waitForVisibleInput,
 } from "./lib/browser-input.js";
+import { probeBrowserAccountSession } from "./lib/browser-session.js";
 import { loadEnvFile } from "./lib/credentials.js";
 
 const ACCOUNT_HOME = "https://account.apple.com/";
@@ -68,6 +69,9 @@ async function main() {
 
     await bidi.navigate(ACCOUNT_HOME, bidi.rootContext);
     await sleep(3500);
+
+    const session = await probeBrowserAccountSession(bidi, bidi.rootContext);
+    console.log("[0] 会话探测:", session.signedIn, session.reason, session.page?.href);
 
     let step = await readSignInStep(bidi, human.context);
     console.log("[1] 初始步骤:", step);

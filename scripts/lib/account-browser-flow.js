@@ -20,6 +20,12 @@ import {
 } from "./anti-automation.js";
 import { isAccessibilityGranted } from "./accessibility.js";
 import { fillInputWithVerify, readInputState, readSignInStep, waitForPasswordStepAfterContinue, waitForVisibleInput, getBrowserConfig } from "./browser-input.js";
+import {
+  assertBrowserAccountSession,
+  evaluatePageSession,
+  hasInteractableLoginForm,
+  probeBrowserAccountSession,
+} from "./browser-session.js";
 import { startMac2FAWait } from "./two-fa-sidecar.js";
 import { saveScreenshot } from "./report.js";
 
@@ -92,22 +98,13 @@ async function firstExistingInAnyContext(bidi, human, selectors, timeoutMs = 20_
   return null;
 }
 
-/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
-async function isAccountSignedIn(bidi, context) {
-  const href = String(await bidi.evaluate("location.href", context));
-  if (/\/account\/manage/i.test(href)) return true;
-  const text = await bidi.evaluate(
-    `document.body?.innerText?.slice(0, 800) ?? ""`,
-    context
-  );
-  return /sign out|退出|log out|manage your account|管理您的账户|个人信息/i.test(
-    String(text)
-  );
-}
-
 /** @param {import("./human-input-bidi.js").HumanInput} human @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 async function clickSignInIfNeeded(human, bidi, context) {
-  if (await isAccountSignedIn(bidi, context)) return false;
+  const loginForm = await hasInteractableLoginForm(bidi, context);
+  if (loginForm.yes) return false;
+
+  const page = await evaluatePageSession(bidi, context);
+  if (page.onManage && page.manageMarkers) return false;
 
   for (const sel of SIGN_IN_LINK_SELECTORS) {
     const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
@@ -258,7 +255,14 @@ async function scrapePersonalInfo(bidi, context) {
  */
 async function runWebLogin(bidi, human, creds) {
   const cfg = getBrowserConfig();
-  await clickSignInIfNeeded(human, bidi, human.context);
+
+  const existingLogin = await hasInteractableLoginForm(bidi, human.context);
+  if (!existingLogin.yes) {
+    await clickSignInIfNeeded(human, bidi, human.context);
+  } else {
+    human.setContext(existingLogin.context);
+    console.log(`[Firefox] 已在登录页 (${existingLogin.selector})`);
+  }
 
   let userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
     kind: "email",
@@ -335,12 +339,9 @@ async function runWebLogin(bidi, human, creds) {
 
   await clickTrustBrowserIfNeeded(human, bidi);
 
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    if (await isAccountSignedIn(bidi, human.context)) return;
-    await sleep(1500);
-  }
-  throw new Error("登录后未检测到 account 已登录状态");
+  console.log("[Firefox] 校验登录会话…");
+  await assertBrowserAccountSession(bidi, human.context);
+  console.log("[Firefox] ✓ account 会话有效");
 }
 
 /**
@@ -397,18 +398,42 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
       await bidi.captureScreenshot(context)
     );
 
-    if (!(await isAccountSignedIn(bidi, context))) {
+    console.log("[Firefox] 探测 account 会话（访问 /account/manage）…");
+    const session = await probeBrowserAccountSession(bidi, context);
+    report.browserLogin.sessionProbe = {
+      signedIn: session.signedIn,
+      reason: session.reason,
+      href: session.page?.href,
+    };
+    console.log(
+      `[Firefox] 会话探测: ${session.signedIn ? "已登录" : "未登录"} (${session.reason})`
+    );
+
+    if (!session.signedIn) {
       await runWebLogin(bidi, human, creds);
+      const afterLogin = await probeBrowserAccountSession(bidi, context);
+      report.browserLogin.postLoginProbe = {
+        signedIn: afterLogin.signedIn,
+        reason: afterLogin.reason,
+      };
+      if (!afterLogin.signedIn) {
+        throw new Error(`网页登录后会话仍无效: ${afterLogin.reason}`);
+      }
+      report.browserLogin.success = true;
       report.screenshots.afterLogin = saveScreenshot(
         reportDir,
         "02-after-login",
         await bidi.captureScreenshot(context)
       );
     } else {
-      console.log("[Firefox] 检测到 account 已登录，跳过网页登录");
+      console.log("[Firefox] 已有有效浏览器会话，跳过网页登录");
+      report.browserLogin.success = true;
+      report.browserLogin.skipped = true;
     }
 
-    report.browserLogin.success = true;
+    if (!report.browserLogin.sessionProbe?.signedIn && !report.browserLogin.success) {
+      throw new Error("未完成网页登录且无可用的 account 会话");
+    }
 
     const personalInfo = await scrapePersonalInfo(bidi, context);
     report.personalInfo = personalInfo;
