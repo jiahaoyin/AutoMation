@@ -19,7 +19,7 @@ import {
   probeAutomationSignals,
 } from "./anti-automation.js";
 import { isAccessibilityGranted } from "./accessibility.js";
-import { fillInputWithVerify, readInputState, waitForVisibleInput } from "./browser-input.js";
+import { fillInputWithVerify, readInputState, readSignInStep, waitForPasswordStepAfterContinue, waitForVisibleInput, getBrowserConfig } from "./browser-input.js";
 import { startMac2FAWait } from "./two-fa-sidecar.js";
 import { saveScreenshot } from "./report.js";
 
@@ -257,55 +257,64 @@ async function scrapePersonalInfo(bidi, context) {
  * @param {{ appleId: string, password: string }} creds
  */
 async function runWebLogin(bidi, human, creds) {
+  const cfg = getBrowserConfig();
   await clickSignInIfNeeded(human, bidi, human.context);
 
-  let userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, 20_000);
+  let userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
+    kind: "email",
+    log: true,
+  });
   if (!userField) {
     for (const url of [SIGN_IN_URL, ACCOUNT_HOME]) {
       await bidi.navigate(url, human.context);
       await humanPageSettle("导航登录页");
-      userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, 15_000);
+      userField = await waitForVisibleInput(bidi, human, USER_SELECTORS, cfg.emailWaitMs, {
+        kind: "email",
+        log: true,
+      });
       if (userField) break;
     }
   }
-  if (!userField) throw new Error("未找到可见 Apple ID 输入框（已搜索 iframe）");
+  if (!userField) throw new Error("未找到可交互 Apple ID 输入框（已搜索 iframe）");
 
+  const stepBefore = await readSignInStep(bidi, human.context);
+  console.log(`[Firefox] 登录步骤(填邮箱前): email=${stepBefore.email} password=${stepBefore.password}`);
   console.log(`[Firefox] 邮箱框: ${userField.selector} @ ${userField.url || "root"}`);
   const vp = await human.ensureViewport();
   console.log(`[Firefox] iframe 视口: ${vp.width}x${vp.height}`);
 
-  await humanThinkPause(500, 1100);
+  await humanThinkPause(600, 1400);
   await fillInputWithVerify(human, bidi, userField.selector, creds.appleId, "邮箱");
-  await humanThinkPause(400, 900);
+  await humanThinkPause(500, 1100);
 
   const emailState = await readInputState(bidi, human.context, userField.selector);
-  if (!emailState.value || emailState.value.length < 3) {
+  if (!emailState.value || emailState.value.length < 1) {
     throw new Error(`邮箱校验失败：读回 "${emailState.value}"`);
   }
 
-  const continueBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 10_000);
-  if (continueBtn) {
-    await human.clickElement(continueBtn.nodes[0]);
-    console.log("[Firefox] 已点击继续，等待密码框…");
-    await humanPageSettle("密码框出现");
-  } else {
-    throw new Error("邮箱已填但未找到「继续」按钮");
-  }
+  const continueBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 12_000);
+  if (!continueBtn) throw new Error("邮箱已填但未找到「继续」按钮");
 
-  const passField = await waitForVisibleInput(bidi, human, PASS_SELECTORS, 30_000);
-  if (!passField) throw new Error("未找到可见密码输入框");
+  await humanThinkPause(400, 900);
+  await human.clickElement(continueBtn.nodes[0]);
+  console.log("[Firefox] 已点击继续，等待密码步骤展示…");
 
-  console.log(`[Firefox] 密码框: ${passField.selector} @ ${passField.url || "root"}`);
+  const passField = await waitForPasswordStepAfterContinue(bidi, human, cfg.passwordWaitMs);
+  if (!passField) throw new Error("密码步骤未出现（超时）：请增大 BROWSER_PASSWORD_WAIT_MS");
+
+  const stepAfter = await readSignInStep(bidi, human.context);
+  console.log(`[Firefox] 登录步骤(填密码前): email=${stepAfter.email} password=${stepAfter.password}`);
+  console.log(`[Firefox] 密码框: ${passField.selector} interactable=${passField.state?.interactable}`);
 
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 
-  await humanThinkPause(400, 900);
+  await humanThinkPause(600, 1400);
   await fillInputWithVerify(human, bidi, passField.selector, creds.password, "密码");
-  await humanThinkPause(500, 1100);
+  await humanThinkPause(600, 1200);
 
   const passState = await readInputState(bidi, human.context, passField.selector);
   if (!passState.value || passState.value.length < 1) {
-    throw new Error("密码校验失败：输入框为空");
+    throw new Error(`密码校验失败：读回长度 ${passState.value?.length ?? 0}`);
   }
 
   const submitBtn = await firstExistingInAnyContext(bidi, human, CONTINUE_SELECTORS, 8000);

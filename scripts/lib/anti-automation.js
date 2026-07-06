@@ -3,6 +3,7 @@
  */
 
 import { randomBetween, sleep } from "./human-input-bidi.js";
+import { getBrowserConfig } from "./browser-input.js";
 
 /** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context */
 export async function probeAutomationSignals(bidi, context) {
@@ -59,7 +60,8 @@ export function assessAutomationRisk(signals) {
 
 /** 页面加载后的人类化等待 */
 export async function humanPageSettle(label = "") {
-  const ms = Math.round(randomBetween(1200, 2800));
+  const cfg = getBrowserConfig();
+  const ms = Math.round(randomBetween(cfg.pageSettleMinMs, cfg.pageSettleMaxMs));
   if (label) console.log(`[反自动化] ${label} 等待 ${ms}ms…`);
   await sleep(ms);
 }
