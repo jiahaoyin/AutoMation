@@ -21,7 +21,9 @@ import {
 import { isAccessibilityGranted } from "./accessibility.js";
 import {
   clickContinueAndWaitForPasswordStep,
+  clickLoginSubmitButton,
   diagnoseLoginFields,
+  ensureRememberAccountChecked,
   fillInputWithVerify,
   firstInAnyContext,
   getBrowserConfig,
@@ -337,8 +339,6 @@ async function runWebLogin(bidi, human, creds) {
     throw new Error(`密码框不可交互 (email=${stepAfter.email} password=${stepAfter.password})`);
   }
 
-  const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
-
   await humanThinkPause(600, 1400);
   const passResult = await fillInputWithVerify(
     human,
@@ -348,21 +348,20 @@ async function runWebLogin(bidi, human, creds) {
     "密码",
     passField.nodes[0]
   );
-  await humanThinkPause(600, 1200);
+  await humanThinkPause(500, 1000);
 
   if (!passResult.value && !passResult.bidiOnly && !passResult.scriptBlocked) {
     throw new Error(`密码校验失败：读回长度 ${passResult.value?.length ?? 0}`);
   }
 
-  const submitBtn = await firstInAnyContext(bidi, CONTINUE_SELECTORS, 8000);
-  if (submitBtn) {
-    human.setContext(submitBtn.context);
-    await human.clickElement(submitBtn.nodes[0]);
-  } else {
-    await human.pressEnter();
-  }
+  await ensureRememberAccountChecked(bidi, human, passCtx);
+  await humanThinkPause(400, 900);
 
-  console.log("[Firefox] 已提交密码，等待 macOS 2FA 弹窗…");
+  await clickLoginSubmitButton(bidi, human, passCtx);
+  await humanPageSettle("登录提交");
+
+  console.log("[Firefox] 已提交登录，等待 macOS 2FA 弹窗…");
+  const twoFa = startMac2FAWait({ timeoutMs: 240_000 });
 
   const code = await twoFa.getCode();
   console.log("[Firefox] 已获取 2FA 验证码，填入网页…");

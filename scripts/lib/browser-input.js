@@ -470,6 +470,117 @@ async function clickContinueViaScript(bidi, context, info) {
   return result?.ok === true;
 }
 
+const REMEMBER_ACCOUNT_SELECTORS = [
+  "#remember-me",
+  "input#remember-me",
+  'input[name="rememberMe"]',
+  'input[type="checkbox"][id*="remember"]',
+];
+
+/**
+ * 勾选「记住我的账户」（密码框下方，登录前）
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {string} context
+ */
+export async function ensureRememberAccountChecked(bidi, human, context) {
+  human.setContext(context);
+
+  const readChecked = async (sel) => {
+    try {
+      const raw = await bidi.evaluate(
+        `JSON.stringify((() => {
+          const el = document.querySelector(${JSON.stringify(sel)});
+          if (!el) return null;
+          return { found: true, checked: !!el.checked };
+        })())`,
+        context
+      );
+      return typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return null;
+    }
+  };
+
+  for (const sel of REMEMBER_ACCOUNT_SELECTORS) {
+    const state = await readChecked(sel);
+    if (!state?.found) continue;
+    if (state.checked) {
+      console.log("[Firefox] ✓ 记住我的账户 已勾选");
+      return;
+    }
+
+    console.log("[Firefox] 勾选「记住我的账户」…");
+    const located = await firstInContext(bidi, context, [sel], 4000);
+    if (located?.nodes?.length) {
+      await human.clickElement(located.nodes[0]);
+    } else {
+      await bidi.evaluate(
+        `(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (el) el.click(); })()`,
+        context
+      );
+    }
+    await sleep(350);
+    const after = await readChecked(sel);
+    if (after?.checked) {
+      console.log("[Firefox] ✓ 已勾选「记住我的账户」");
+      return;
+    }
+  }
+
+  try {
+    const ok = await bidi.evaluate(
+      `(() => {
+        for (const lbl of document.querySelectorAll("label")) {
+          if (!/记住|remember/i.test(lbl.textContent || "")) continue;
+          const id = lbl.getAttribute("for");
+          const cb = id ? document.getElementById(id) : lbl.querySelector("input[type=checkbox]");
+          if (!cb) continue;
+          if (!cb.checked) cb.click();
+          return cb.checked;
+        }
+        return false;
+      })()`,
+      context
+    );
+    if (ok) console.log("[Firefox] ✓ 已勾选「记住我的账户」(label)");
+    else console.warn("[Firefox] 未找到「记住我的账户」勾选框，继续登录…");
+  } catch {
+    console.warn("[Firefox] 勾选「记住我的账户」失败，继续登录…");
+  }
+}
+
+/**
+ * 点击「登录」提交（#sign-in 在密码步骤文案为登录）
+ * @param {import("./bidi-client.js").BidiClient} bidi
+ * @param {import("./human-input-bidi.js").HumanInput} human
+ * @param {string} context
+ */
+export async function clickLoginSubmitButton(bidi, human, context) {
+  human.setContext(context);
+
+  const info = await findContinueButtonInfo(bidi, context);
+  const step = await readSignInStep(bidi, context);
+  const label = (info?.text || step.submitLabel || "").trim();
+
+  if (!/^(登录|登入|sign in)$/i.test(label)) {
+    throw new Error(`登录按钮未就绪，当前主按钮文案: "${label}"`);
+  }
+
+  console.log(`[Firefox] JS 点击登录 ${info?.selector || "#sign-in"}…`);
+  const jsOk = await clickContinueViaScript(bidi, context, info || { id: "sign-in", selector: "#sign-in" });
+  if (!jsOk) throw new Error("JS 点击登录失败");
+
+  await sleep(randomBetween(400, 800));
+
+  const located = await firstInContext(bidi, context, ["#sign-in", "button#sign-in"], 3000);
+  if (located?.nodes?.length) {
+    await human.clickElement(located.nodes[0]).catch(() => {});
+  }
+
+  console.log("[Firefox] ✓ 已点击登录");
+}
+
 /** @param {import("./bidi-client.js").BidiClient} bidi @param {string} context @param {string} emailSelector */
 async function nudgeEmailValidation(bidi, context, emailSelector) {
   try {
