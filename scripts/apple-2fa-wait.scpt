@@ -1,5 +1,5 @@
 #!/usr/bin/env osascript
--- Apple ID 2FA：扫描系统弹窗 → 点「允许」→ 读取 6 位验证码
+-- Apple ID 2FA：扫描系统弹窗 → 点「允许」→ 读取 6 位验证码（支持 011 172 格式）
 
 on parseTimeout(argv)
 	set timeoutSeconds to 120
@@ -22,15 +22,31 @@ on priorityProcessNames()
 	return {"FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "UserNotificationCenter", "akd", "SecurityAgent", "loginwindow", "System Settings", "系统设置"}
 end priorityProcessNames
 
-on normalizeSixDigit(txt)
+on isSixDigits(txt)
+	if (length of txt) is not 6 then return false
+	repeat with i from 1 to 6
+		if character i of txt is not in "0123456789" then return false
+	end repeat
+	return true
+end isSixDigits
+
+-- 从任意文本提取 6 位数字（011 172 → 011172）
+on digitsFromText(txt)
 	if txt is missing value then return ""
+	set s to txt as text
 	set AppleScript's text item delimiters to {" ", "-", tab, return, character id 160}
-	set parts to text items of (txt as text)
+	set parts to text items of s
 	set AppleScript's text item delimiters to ""
-	set digits to parts as text
-	if (length of digits) is 6 and digits is in "0123456789" then return digits
+	set joined to parts as text
+	if my isSixDigits(joined) then return joined
+	set onlyDigits to ""
+	repeat with i from 1 to count of characters of s
+		set ch to character i of s
+		if ch is in "0123456789" then set onlyDigits to onlyDigits & ch
+	end repeat
+	if my isSixDigits(onlyDigits) then return onlyDigits
 	return ""
-end normalizeSixDigit
+end digitsFromText
 
 on elementText(el)
 	try
@@ -41,25 +57,66 @@ on elementText(el)
 		set d to description of el
 		if d is not missing value and (d as text) is not "" then return d as text
 	end try
+	try
+		set t to title of el
+		if t is not missing value and (t as text) is not "" then return t as text
+	end try
 	return ""
 end elementText
 
+on tryCodeFromText(txt)
+	set c to my digitsFromText(txt)
+	if c is not "" then return c
+	return ""
+end tryCodeFromText
+
 on extractSixDigitCodeFromWindow(win)
 	tell application "System Events"
+		set blob to ""
 		try
 			repeat with t in (static texts of win)
-				set c to my normalizeSixDigit(my elementText(t))
+				set tx to my elementText(t)
+				set c to my tryCodeFromText(tx)
 				if c is not "" then return c
+				set blob to blob & " " & tx
+			end repeat
+		end try
+		try
+			repeat with tf in (text fields of win)
+				set tx to my elementText(tf)
+				set c to my tryCodeFromText(tx)
+				if c is not "" then return c
+				set blob to blob & " " & tx
 			end repeat
 		end try
 		try
 			repeat with g in (groups of win)
 				repeat with t in (static texts of g)
-					set c to my normalizeSixDigit(my elementText(t))
+					set tx to my elementText(t)
+					set c to my tryCodeFromText(tx)
 					if c is not "" then return c
+					set blob to blob & " " & tx
+				end repeat
+				repeat with t in (text fields of g)
+					set tx to my elementText(t)
+					set c to my tryCodeFromText(tx)
+					if c is not "" then return c
+					set blob to blob & " " & tx
 				end repeat
 			end repeat
 		end try
+		try
+			repeat with el in (UI elements of win)
+				set tx to my elementText(el)
+				if tx is not "" then
+					set c to my tryCodeFromText(tx)
+					if c is not "" then return c
+					set blob to blob & " " & tx
+				end if
+			end repeat
+		end try
+		set c to my tryCodeFromText(blob)
+		if c is not "" then return c
 	end tell
 	return ""
 end extractSixDigitCodeFromWindow
@@ -69,7 +126,7 @@ on clickAllowOnWindow(win)
 		repeat with b in (buttons of win)
 			try
 				set bname to name of b
-				if bname is in {"允许", "Allow", "OK", "好"} then
+				if bname is in {"允许", "Allow"} then
 					click b
 					return true
 				end if
@@ -86,7 +143,7 @@ on clickAllowOnWindow(win)
 	return false
 end clickAllowOnWindow
 
-on windowLooksLikeAppleSignIn(win)
+on windowLooksLikeAppleDialog(win)
 	tell application "System Events"
 		try
 			set blob to ""
@@ -94,44 +151,56 @@ on windowLooksLikeAppleSignIn(win)
 				set blob to blob & " " & (my elementText(t))
 			end repeat
 			if blob contains "Apple" or blob contains "账户" then return true
+			if blob contains "Apple ID" then return true
 			if blob contains "登录" or blob contains "sign in" then return true
 			if blob contains "Sign in" or blob contains "新设备" then return true
-			if blob contains "new device" or blob contains "双重认证" then return true
-			if blob contains "two-factor" or blob contains "Two-Factor" then return true
+			if blob contains "new device" then return true
+			if blob contains "验证码" or blob contains "verification code" then return true
+			if blob contains "Verification Code" then return true
+			if blob contains "双重认证" or blob contains "two-factor" then return true
+			if blob contains "Two-Factor" then return true
 		end try
 	end tell
 	return false
-end windowLooksLikeAppleSignIn
+end windowLooksLikeAppleDialog
 
 on windowHasAllowButton(win)
 	tell application "System Events"
 		repeat with b in (buttons of win)
 			try
 				set bname to name of b
-				if bname is in {"允许", "Allow", "OK", "好"} then return true
+				if bname is in {"允许", "Allow"} then return true
 			end try
 		end repeat
-		if (count of buttons of win) is greater than or equal to 2 then return true
 	end tell
 	return false
 end windowHasAllowButton
+
+on windowHasDoneOnly(win)
+	tell application "System Events"
+		try
+			set btnCount to count of buttons of win
+			if btnCount is 1 then
+				set bname to name of button 1 of win
+				if bname is in {"完成", "Done", "OK"} then return true
+			end if
+		end try
+	end tell
+	return false
+end windowHasDoneOnly
 
 on handleProcessWindows(procRef, procName)
 	tell procRef
 		if not (exists window 1) then return {clicked:false, code:"", dialogProc:procName}
 		repeat with w in windows
-			set hasAllow to my windowHasAllowButton(w)
-
 			set c to my extractSixDigitCodeFromWindow(w)
 			if c is not "" then return {clicked:false, code:c, dialogProc:procName}
 
-			if hasAllow then
+			if my windowHasAllowButton(w) then
 				if my clickAllowOnWindow(w) then return {clicked:true, code:"", dialogProc:procName}
-			else
-				if my windowLooksLikeAppleSignIn(w) then
-					set c2 to my extractSixDigitCodeFromWindow(w)
-					if c2 is not "" then return {clicked:false, code:c2, dialogProc:procName}
-				end if
+			else if my windowLooksLikeAppleDialog(w) or my windowHasDoneOnly(w) then
+				set c2 to my extractSixDigitCodeFromWindow(w)
+				if c2 is not "" then return {clicked:false, code:c2, dialogProc:procName}
 			end if
 		end repeat
 	end tell
@@ -188,9 +257,9 @@ on tryOnce(timeoutSeconds)
 			return c
 		end if
 		if (clicked of r) then
-			delay 2.5
+			delay 2
 		else
-			delay 0.45
+			delay 0.4
 		end if
 	end repeat
 	return ""

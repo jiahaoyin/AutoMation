@@ -18,7 +18,8 @@ export async function tryFetchMac2FACode(timeoutSec = 12) {
     const { stdout } = await execFileAsync(SCPT, [`--timeout=${timeoutSec}`], {
       timeout: (timeoutSec + 8) * 1000,
     });
-    const code = stdout.trim().match(/\d{6}/)?.[0];
+    const digits = stdout.trim().replace(/\D/g, "");
+    const code = digits.length >= 6 ? digits.slice(0, 6) : null;
     return code ?? null;
   } catch (err) {
     const msg = err instanceof Error ? err.stderr || err.message : String(err);
