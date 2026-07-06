@@ -1,8 +1,5 @@
 #!/usr/bin/env osascript
--- Wait for Apple ID 2FA FollowUpUI dialog, click Allow, return 6-digit code on stdout.
--- Usage:
---   ./scripts/apple-2fa-wait.scpt           # single attempt, 120s timeout
---   ./scripts/apple-2fa-wait.scpt --watch   # loop forever (for long-running automation)
+-- Apple ID 2FA：扫描系统弹窗 → 点「允许」→ 读取 6 位验证码
 
 on parseTimeout(argv)
 	set timeoutSeconds to 120
@@ -21,81 +18,180 @@ on isWatchMode(argv)
 	return false
 end isWatchMode
 
-on clickAllowButton(procRef)
+on priorityProcessNames()
+	return {"FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "UserNotificationCenter", "akd", "SecurityAgent", "loginwindow", "System Settings", "系统设置"}
+end priorityProcessNames
+
+on normalizeSixDigit(txt)
+	if txt is missing value then return ""
+	set AppleScript's text item delimiters to {" ", "-", tab, return, character id 160}
+	set parts to text items of (txt as text)
+	set AppleScript's text item delimiters to ""
+	set digits to parts as text
+	if (length of digits) is 6 and digits is in "0123456789" then return digits
+	return ""
+end normalizeSixDigit
+
+on elementText(el)
 	try
-		click button "Allow" of window 1 of procRef
-		return true
-	on error
+		set v to value of el
+		if v is not missing value and (v as text) is not "" then return v as text
+	end try
+	try
+		set d to description of el
+		if d is not missing value and (d as text) is not "" then return d as text
+	end try
+	return ""
+end elementText
+
+on extractSixDigitCodeFromWindow(win)
+	tell application "System Events"
 		try
-			click button "允许" of window 1 of procRef
-			return true
-		on error
+			repeat with t in (static texts of win)
+				set c to my normalizeSixDigit(my elementText(t))
+				if c is not "" then return c
+			end repeat
+		end try
+		try
+			repeat with g in (groups of win)
+				repeat with t in (static texts of g)
+					set c to my normalizeSixDigit(my elementText(t))
+					if c is not "" then return c
+				end repeat
+			end repeat
+		end try
+	end tell
+	return ""
+end extractSixDigitCodeFromWindow
+
+on clickAllowOnWindow(win)
+	tell application "System Events"
+		repeat with b in (buttons of win)
 			try
-				click button 1 of window 1 of procRef
-				return true
-			on error
-				return false
+				set bname to name of b
+				if bname is in {"允许", "Allow", "OK", "好"} then
+					click b
+					return true
+				end if
 			end try
-		end try
-	end try
-end clickAllowButton
-
-on closeDialog(procRef)
-	try
-		click button "Done" of window 1 of procRef
-	on error
+		end repeat
 		try
-			click button "完成" of window 1 of procRef
+			set btnCount to count of buttons of win
+			if btnCount is greater than or equal to 2 then
+				click button btnCount of win
+				return true
+			end if
 		end try
-	end try
-end closeDialog
+	end tell
+	return false
+end clickAllowOnWindow
 
-on extractSixDigitCode(procRef)
-	set codeText to ""
-	try
-		set codeText to value of static text 1 of group 1 of window 1 of procRef
-	on error
-		repeat with t in (static texts of window 1 of procRef)
-			set v to value of t
-			if v matches "[0-9]{6}" then
-				set codeText to v
-				exit repeat
+on windowLooksLikeAppleSignIn(win)
+	tell application "System Events"
+		try
+			set blob to ""
+			repeat with t in (static texts of win)
+				set blob to blob & " " & (my elementText(t))
+			end repeat
+			if blob contains "Apple" or blob contains "账户" then return true
+			if blob contains "登录" or blob contains "sign in" then return true
+			if blob contains "Sign in" or blob contains "新设备" then return true
+			if blob contains "new device" or blob contains "双重认证" then return true
+			if blob contains "two-factor" or blob contains "Two-Factor" then return true
+		end try
+	end tell
+	return false
+end windowLooksLikeAppleSignIn
+
+on windowHasAllowButton(win)
+	tell application "System Events"
+		repeat with b in (buttons of win)
+			try
+				set bname to name of b
+				if bname is in {"允许", "Allow", "OK", "好"} then return true
+			end try
+		end repeat
+		if (count of buttons of win) is greater than or equal to 2 then return true
+	end tell
+	return false
+end windowHasAllowButton
+
+on handleProcessWindows(procRef, procName)
+	tell procRef
+		if not (exists window 1) then return {clicked:false, code:"", dialogProc:procName}
+		repeat with w in windows
+			set hasAllow to my windowHasAllowButton(w)
+
+			set c to my extractSixDigitCodeFromWindow(w)
+			if c is not "" then return {clicked:false, code:c, dialogProc:procName}
+
+			if hasAllow then
+				if my clickAllowOnWindow(w) then return {clicked:true, code:"", dialogProc:procName}
+			else
+				if my windowLooksLikeAppleSignIn(w) then
+					set c2 to my extractSixDigitCodeFromWindow(w)
+					if c2 is not "" then return {clicked:false, code:c2, dialogProc:procName}
+				end if
 			end if
 		end repeat
+	end tell
+	return {clicked:false, code:"", dialogProc:procName}
+end handleProcessWindows
+
+on scanOnce()
+	tell application "System Events"
+		repeat with procName in my priorityProcessNames()
+			if exists process procName then
+				set r to my handleProcessWindows(process procName, procName)
+				if (code of r) is not "" then return r
+				if (clicked of r) then return r
+			end if
+		end repeat
+
+		repeat with procRef in (every process whose visible is true)
+			set procName to name of procRef
+			try
+				set r to my handleProcessWindows(procRef, procName)
+				if (code of r) is not "" then return r
+				if (clicked of r) then return r
+			end try
+		end repeat
+	end tell
+	return {clicked:false, code:"", dialogProc:""}
+end scanOnce
+
+on closeDialog(procName)
+	try
+		tell application "System Events"
+			if exists process procName then
+				tell process procName
+					try
+						click button "Done" of window 1
+					on error
+						try
+							click button "完成" of window 1
+						end try
+					end try
+				end tell
+			end if
+		end tell
 	end try
-
-	if codeText is "" then return ""
-
-	set AppleScript's text item delimiters to {" ", "-", tab, return}
-	set parts to text items of codeText
-	set AppleScript's text item delimiters to ""
-	set codeText to parts as text
-
-	if (length of codeText) is 6 and codeText is in "0123456789" then
-		return codeText
-	end if
-	return ""
-end extractSixDigitCode
+end closeDialog
 
 on tryOnce(timeoutSeconds)
 	set deadline to (current date) + timeoutSeconds
 	repeat while (current date) < deadline
-		tell application "System Events"
-			if exists process "FollowUpUI" then
-				tell process "FollowUpUI"
-					if exists window 1 then
-						my clickAllowButton(it)
-						delay 2
-						set code to my extractSixDigitCode(it)
-						if code is not "" then
-							my closeDialog(it)
-							return code
-						end if
-					end if
-				end tell
-			end if
-		end tell
-		delay 0.5
+		set r to my scanOnce()
+		set c to code of r
+		if c is not "" then
+			my closeDialog(dialogProc of r)
+			return c
+		end if
+		if (clicked of r) then
+			delay 2.5
+		else
+			delay 0.45
+		end if
 	end repeat
 	return ""
 end tryOnce

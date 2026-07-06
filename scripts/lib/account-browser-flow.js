@@ -387,7 +387,7 @@ export async function runAccountBrowserPhase({ creds, reportDir }) {
 
   const axOk = await isAccessibilityGranted().catch(() => false);
   if (!axOk) {
-    console.warn("[2FA] 警告: 辅助功能未授权，macOS FollowUpUI 2FA 可能失败");
+    console.warn("[2FA] 警告: 辅助功能未授权，系统弹窗 2FA 可能失败");
   }
 
   let firefoxProc = null;
