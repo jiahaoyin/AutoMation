@@ -1211,20 +1211,23 @@ async function fill2FAViaKeyboard(human, bidi, fieldset, digits) {
   const inputs = fieldset.nodes.slice(0, 6);
 
   if (inputs.length >= 6) {
-    for (const node of inputs) {
-      await human.clickElement(node);
-      await human.pressBackspace();
+    for (let i = 0; i < 6; i++) {
+      await human.clickElement(inputs[i]);
+      await sleep(60);
+      await human.typeText(digits[i], { fast: true });
+      await sleep(40);
     }
-    await human.clickElement(inputs[0]);
-    await sleep(100);
-    await human.typeText(digits, { fast: true });
     console.log(`[Firefox] ✓ 2FA 键盘逐格填入 (${fieldset.selector})`);
+    await sleep(300);
+    await human.pressEnter();
     return;
   }
 
   await human.clickElement(inputs[0]);
   await sleep(100);
   await human.typeText(digits, { fast: true });
+  await sleep(300);
+  await human.pressEnter();
   console.log(`[Firefox] ✓ 2FA 键盘单框填入 (${fieldset.selector})`);
 }
 

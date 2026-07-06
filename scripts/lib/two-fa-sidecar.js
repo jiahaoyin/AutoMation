@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
-import { tryFetchMac2FAPopupAx } from "./mac-2fa-popup.js";
+import { dismissStale2FAPopups, tryFetchMac2FAPopupAx } from "./mac-2fa-popup.js";
 import { sleep } from "./prompt.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,7 +27,7 @@ function get2FAConfig() {
  * 单次轮询 macOS 系统弹窗 2FA
  * @param {number} [timeoutSec]
  */
-export async function tryFetchMac2FACode(timeoutSec = 4) {
+export async function tryFetchMac2FACode(timeoutSec = 12) {
   if (process.platform === "darwin") {
     const axHit = await tryFetchMac2FAPopupAx(timeoutSec);
     if (axHit?.code) return axHit;
@@ -61,6 +61,11 @@ export async function waitForMac2FACode(options = {}) {
   let settingsTried = false;
 
   console.log("[2FA] 扫描系统弹窗（允许 / 验证码）…");
+  if (process.platform === "darwin") {
+    const dismissed = await dismissStale2FAPopups();
+    if (dismissed) console.log("[2FA] 已尝试关闭残留验证码弹窗");
+    await sleep(400);
+  }
 
   while (Date.now() < deadline) {
     polls += 1;
@@ -73,12 +78,12 @@ export async function waitForMac2FACode(options = {}) {
       console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
     }
 
-    const hit = await tryFetchMac2FACode(4);
+    const hit = await tryFetchMac2FACode(12);
     if (hit?.code) {
       const src = hit.source ? ` 来源=${hit.source}` : "";
       const raw = hit.raw ? ` 原文="${String(hit.raw).slice(0, 40)}"` : "";
       console.log(`[2FA] ★ 验证码: ${hit.code}${src}${raw}`);
-      console.log("[2FA] 已获取 6 位验证码（系统弹窗）");
+      console.log("[2FA] 已获取 6 位验证码（允许后展示窗）");
       return hit.code;
     }
 

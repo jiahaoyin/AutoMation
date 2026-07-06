@@ -41,8 +41,25 @@ export function is2FAPopupHelperAvailable() {
 }
 
 /**
+ * 登录前关闭残留的验证码弹窗（避免读到上次的 609574）
+ */
+export async function dismissStale2FAPopups() {
+  if (process.platform !== "darwin") return false;
+  if (!is2FAPopupHelperAvailable()) {
+    const built = compile2FAPopupHelper({ quiet: true });
+    if (!built.ok) return false;
+  }
+  try {
+    await execFileAsync(BIN, ["--dismiss-stale", "--timeout", "2"], { timeout: 8000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * @param {number} [timeoutSec]
- * @returns {Promise<string|null>}
+ * @returns {Promise<{ code: string, source?: string|null, raw?: string|null, action?: string }|null>}
  */
 export async function tryFetchMac2FAPopupAx(timeoutSec = 4) {
   if (process.platform !== "darwin") return null;
@@ -58,9 +75,11 @@ export async function tryFetchMac2FAPopupAx(timeoutSec = 4) {
       maxBuffer: 256 * 1024,
     });
 
-    if (process.env.DEBUG_2FA && stderr?.trim()) {
+    if (stderr?.trim()) {
       for (const line of stderr.trim().split("\n")) {
-        console.log(`[2FA] ${line}`);
+        if (/clicked Allow|dismissed|code=/.test(line)) {
+          console.log(`[2FA] ${line.replace(/^\[2FA-popup \d+\] /, "")}`);
+        }
       }
     }
 
@@ -71,15 +90,29 @@ export async function tryFetchMac2FAPopupAx(timeoutSec = 4) {
       return null;
     }
 
-    if (!parsed.ok || !parsed.code) return null;
+    if (!parsed.ok || !parsed.code) {
+      if (parsed.action && parsed.action !== "none" && process.env.DEBUG_2FA) {
+        console.log(`[2FA] popup AX action=${parsed.action}`);
+      }
+      return null;
+    }
     const code = String(parsed.code).replace(/\D/g, "").slice(0, 6);
     if (code.length !== 6) return null;
     return {
       code,
       source: parsed.source ?? null,
       raw: parsed.raw ?? null,
+      action: parsed.action ?? null,
     };
   } catch (err) {
+    const stderr = err instanceof Error && "stderr" in err ? String(err.stderr || "") : "";
+    if (stderr.trim()) {
+      for (const line of stderr.trim().split("\n")) {
+        if (/clicked Allow|dismissed|code=/.test(line)) {
+          console.log(`[2FA] ${line.replace(/^\[2FA-popup \d+\] /, "")}`);
+        }
+      }
+    }
     if (process.env.DEBUG_2FA) {
       const msg = err instanceof Error ? err.stderr || err.message : String(err);
       console.warn("[2FA] popup AX:", msg.slice(0, 200));
