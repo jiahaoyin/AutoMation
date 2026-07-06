@@ -328,11 +328,13 @@ async function runWebLogin(bidi, human, creds) {
   if (!passField) throw new Error("密码步骤 UI 已出现但未找到可交互密码框");
 
   const stepAfter = await readSignInStep(bidi, passCtx);
-  console.log(`[Firefox] 登录步骤(填密码前): email=${stepAfter.email} password=${stepAfter.password}`);
-  if (stepAfter.password !== "shown" || stepAfter.email === "shown") {
-    throw new Error(
-      `仍在邮箱步骤，拒绝填密码 (email=${stepAfter.email} password=${stepAfter.password})`
-    );
+  const passState = await readInputState(bidi, passCtx, passField.selector);
+  console.log(
+    `[Firefox] 登录步骤(填密码前): email=${stepAfter.email} password=${stepAfter.password} ` +
+      `btn="${stepAfter.submitLabel || ""}" interactable=${!!passState.interactable}`
+  );
+  if (!passState.interactable) {
+    throw new Error(`密码框不可交互 (email=${stepAfter.email} password=${stepAfter.password})`);
   }
 
   const twoFa = startMac2FAWait({ timeoutMs: 240_000 });

@@ -124,13 +124,17 @@ export async function readSignInStep(bidi, context) {
             op > 0.1 &&
             s.display !== "none" &&
             s.visibility !== "hidden" &&
-            el.tabIndex !== -1 &&
-            el.getAttribute("aria-hidden") !== "true";
+            el.getAttribute("aria-hidden") !== "true" &&
+            !el.disabled &&
+            el.offsetHeight > 0;
           return shown ? "shown" : "hidden";
         };
+        const signInBtn = document.getElementById("sign-in");
+        const btnText = (signInBtn?.textContent || "").replace(/\\s+/g, " ").trim();
         return {
           email: stepOf(email),
           password: stepOf(pass),
+          submitLabel: btnText,
         };
       })())`,
       context
@@ -193,9 +197,7 @@ function mergeFieldState(state, sel, found, kind) {
   return state;
 }
 
-function passwordStepReady(step, state) {
-  if (step.email === "shown" && step.password !== "shown") return false;
-  if (step.password !== "shown") return false;
+function passwordStepReady(_step, state) {
   return state.interactable === true;
 }
 
@@ -253,8 +255,27 @@ export async function firstInAnyContext(bidi, selectors, timeoutMs = 15_000) {
   return null;
 }
 
+const PASSWORD_FIELD_SELECTOR = "#password_text_field";
+
+/** 密码步骤就绪：密码框可交互，或主按钮已变为「登录」 */
+export async function isPasswordStepReady(bidi, context) {
+  const passState = await readInputState(bidi, context, PASSWORD_FIELD_SELECTOR).catch(() => ({
+    interactable: false,
+  }));
+  if (passState.interactable) return true;
+
+  const btn = await findContinueButtonInfo(bidi, context);
+  if (btn.found && /^(登录|登入|sign in)$/i.test(btn.text || "")) return true;
+
+  const step = await readSignInStep(bidi, context);
+  if (step.password === "shown") return true;
+  if (/^(登录|登入|sign in)$/i.test(step.submitLabel || "")) return true;
+
+  return false;
+}
+
 /**
- * 轮询直到 UI 进入密码步骤（email 隐藏 + password 显示）
+ * 轮询直到密码步骤就绪（邮箱可与密码同屏）
  * @param {import("./bidi-client.js").BidiClient} bidi
  * @param {string} context
  * @param {number} timeoutMs
@@ -262,9 +283,10 @@ export async function firstInAnyContext(bidi, selectors, timeoutMs = 15_000) {
 export async function waitForPasswordStepUi(bidi, context, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const step = await readSignInStep(bidi, context);
-    if (step.password === "shown" && step.email !== "shown") return step;
-    await sleep(400);
+    if (await isPasswordStepReady(bidi, context)) {
+      return readSignInStep(bidi, context);
+    }
+    await sleep(300);
   }
   return null;
 }
@@ -481,14 +503,26 @@ export async function clickContinueAndWaitForPasswordStep(
     console.warn(await diagnoseContinueButtons(bidi, emailContext));
   }
 
-  const waitAfterAction = async (timeoutMs) => {
-    await sleep(cfg.minAfterContinueMs);
-    return waitForPasswordStepUi(bidi, emailContext, timeoutMs);
+  const waitAfterAction = async (timeoutMs) => waitForPasswordStepUi(bidi, emailContext, timeoutMs);
+
+  const finishIfReady = async (label) => {
+    if (!(await isPasswordStepReady(bidi, emailContext))) return null;
+    const step = await readSignInStep(bidi, emailContext);
+    console.log(`[Firefox] ✓ ${label}（email=${step.email} password=${step.password} btn="${step.submitLabel || ""}"）`);
+    return { context: emailContext, step };
   };
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    if (attempt === 1 || attempt === 3) {
-      console.log(`[Firefox] 邮箱框 Enter 提交 (第 ${attempt} 次)…`);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const ready = await finishIfReady("密码步骤已就绪");
+    if (ready) return ready;
+
+    const info = await findContinueButtonInfo(bidi, emailContext);
+    if (info?.found && /^(登录|登入|sign in)$/i.test(info.text || "")) {
+      return finishIfReady("主按钮已为登录");
+    }
+
+    if (attempt === 1) {
+      console.log("[Firefox] 邮箱框 Enter 提交…");
       if (emailNode) {
         await human.clickElement(emailNode).catch(() => human.focusInputBySelector(emailSelector));
       } else {
@@ -496,52 +530,36 @@ export async function clickContinueAndWaitForPasswordStep(
       }
       await sleep(randomBetween(200, 450));
       await human.pressEnter();
-      let step = await waitAfterAction(8000);
+      const step = await waitAfterAction(6000);
       if (step) {
         console.log("[Firefox] ✓ Enter 后密码步骤已展示");
         return { context: emailContext, step };
       }
+      continue;
     }
 
-    const info = (await findContinueButtonInfo(bidi, emailContext)) || btnInfo;
-    if (info?.found) {
-      console.log(
-        `[Firefox] JS 点击继续 ${info.selector || info.id || info.text} (第 ${attempt} 次)…`
-      );
-      if (await clickContinueViaScript(bidi, emailContext, info)) {
-        let step = await waitAfterAction(cfg.passwordWaitMs);
-        if (step) {
-          console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
-          return { context: emailContext, step };
-        }
+    if (info?.found && /^(继续|continue|next|下一步)$/i.test(info.text || "")) {
+      console.log(`[Firefox] JS 点击继续 ${info.selector || info.id} (第 ${attempt} 次)…`);
+      await clickContinueViaScript(bidi, emailContext, info);
+      const step = await waitAfterAction(8000);
+      if (step) {
+        console.log("[Firefox] ✓ JS 点击继续后密码步骤已展示");
+        return { context: emailContext, step };
       }
-
-      const selectors = [
-        info.selector,
-        info.id ? `#${info.id}` : null,
-        ...continueSelectors,
-      ].filter(Boolean);
-      const located = await firstInContext(bidi, emailContext, selectors, 4000);
-      if (located?.nodes?.length) {
-        console.log(`[Firefox] 指针点击继续 (${located.selector})…`);
-        await human.clickElement(located.nodes[0]);
-        let step = await waitAfterAction(8000);
-        if (step) {
-          console.log("[Firefox] ✓ 指针点击继续后密码步骤已展示");
-          return { context: emailContext, step };
-        }
-      }
-    } else {
-      console.warn(`[Firefox] 第 ${attempt} 次未找到继续按钮`);
-      console.warn(await diagnoseContinueButtons(bidi, emailContext));
+      continue;
     }
 
-    await sleep(800);
+    console.warn(`[Firefox] 第 ${attempt} 次未推进密码步骤`);
+    console.warn(await diagnoseContinueButtons(bidi, emailContext));
+    await sleep(600);
   }
+
+  const ready = await finishIfReady("密码步骤最终检测");
+  if (ready) return ready;
 
   const step = await readSignInStep(bidi, emailContext);
   throw new Error(
-    `点击继续后仍未进入密码步骤 (email=${step.email} password=${step.password})`
+    `点击继续后仍未进入密码步骤 (email=${step.email} password=${step.password} btn="${step.submitLabel || ""}")`
   );
 }
 
