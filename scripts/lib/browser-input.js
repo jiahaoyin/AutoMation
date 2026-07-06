@@ -919,6 +919,91 @@ const SECURITY_CODE_SELECTORS = [
  * @param {string} selector
  * @param {string} digits
  */
+function buildUniversal2FAFillScript(digits) {
+  return `JSON.stringify((() => {
+    const digits = ${JSON.stringify(digits)};
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      const op = parseFloat(s.opacity || "1");
+      return (
+        r.width > 2 &&
+        r.height > 2 &&
+        r.bottom > 0 &&
+        r.top < window.innerHeight &&
+        s.display !== "none" &&
+        s.visibility !== "hidden" &&
+        op > 0.1 &&
+        !el.disabled &&
+        el.tabIndex !== -1
+      );
+    };
+    const byPos = (arr) =>
+      arr.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return ra.top - rb.top || ra.left - rb.left;
+      });
+    const allInputs = byPos([...document.querySelectorAll("input")].filter(visible));
+    const singles = allInputs.filter((el) => el.maxLength === 1 || el.getAttribute("maxlength") === "1");
+    const on2FAPage = /双重|验证码|verification|security code/i.test(document.body?.innerText || "");
+    let targets = singles.length >= 6 ? singles.slice(0, 6) : null;
+    if (!targets) {
+      const sec = byPos(
+        allInputs.filter(
+          (el) =>
+            /security|code|otp/i.test(
+              (el.className || "") + (el.name || "") + (el.id || "") + (el.autocomplete || "")
+            ) || el.getAttribute("inputmode") === "numeric"
+        )
+      );
+      if (sec.length >= 6) targets = sec.slice(0, 6);
+      else if (sec.length === 1) {
+        const el = sec[0];
+        el.focus();
+        el.click();
+        const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+        if (desc?.set) desc.set.call(el, digits);
+        else el.value = digits;
+        el.dispatchEvent(
+          new InputEvent("input", { bubbles: true, data: digits, inputType: "insertFromPaste" })
+        );
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return { ok: true, mode: "single-security", value: el.value };
+      }
+    }
+    if (!targets && on2FAPage) {
+      const numeric = allInputs.filter(
+        (el) => el.type !== "password" && el.type !== "email" && el.type !== "checkbox"
+      );
+      if (numeric.length >= 6) targets = numeric.slice(0, 6);
+    }
+    if (!targets || targets.length < 6) {
+      return { ok: false, reason: "no-six-inputs", count: allInputs.length, on2FAPage };
+    }
+    const fire = (el, ch) => {
+      el.focus();
+      el.click();
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", { key: ch, code: "Digit" + ch, bubbles: true, cancelable: true })
+      );
+      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      if (desc?.set) desc.set.call(el, ch);
+      else el.value = ch;
+      el.dispatchEvent(
+        new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: ch })
+      );
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: ch, inputType: "insertText" }));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, code: "Digit" + ch, bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    for (let i = 0; i < 6; i++) fire(targets[i], digits[i]);
+    const values = targets.map((el) => el.value);
+    const filled = values.join("").replace(/\\D/g, "");
+    return { ok: filled.length === 6, mode: "universal-six", values, filled };
+  })())`;
+}
+
 async function fill2FAViaScript(bidi, context, selector, digits) {
   try {
     const raw = await bidi.evaluate(
@@ -957,6 +1042,27 @@ async function fill2FAViaScript(bidi, context, selector, digits) {
   }
 }
 
+/** @param {import("./bidi-client.js").BidiClient} bidi @param {string} digits */
+async function fill2FAUniversalInAnyContext(bidi, digits) {
+  const contexts = await bidi.getAllContexts(8);
+  const ordered = [...contexts].sort((a, b) => {
+    const score = (u) =>
+      /idmsa|appleid|auth/i.test(u) ? 0 : /account\.apple\.com/i.test(u) ? 1 : 2;
+    return score(a.url) - score(b.url);
+  });
+
+  for (const { context, url } of ordered) {
+    try {
+      const raw = await bidi.evaluate(buildUniversal2FAFillScript(digits), context);
+      const result = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (result?.ok) return { ...result, context, url };
+    } catch (err) {
+      if (!isScriptBlockedError(err)) throw err;
+    }
+  }
+  return null;
+}
+
 /**
  * @param {import("./human-input-bidi.js").HumanInput} human
  * @param {import("./bidi-client.js").BidiClient} bidi
@@ -992,10 +1098,20 @@ export async function fillWebSecurityCode(human, bidi, code) {
 
   console.log(`[Firefox] 立即填入 2FA: ${digits}`);
   await activateFirefoxApp();
-  await sleep(350);
+  await sleep(200);
 
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
+    const universal = await fill2FAUniversalInAnyContext(bidi, digits);
+    if (universal) {
+      human.setContext(universal.context);
+      console.log(
+        `[Firefox] ✓ 2FA 通用填入 (${universal.mode}) ctx=${universal.url?.slice(0, 55) || "root"} values=${(universal.values || []).join("")}`
+      );
+      await submit2FAStep(human, bidi, universal.context);
+      return { context: universal.context, digits, method: "universal-js" };
+    }
+
     for (const sel of SECURITY_CODE_SELECTORS) {
       const found = await bidi.locateNodesInAnyContext(sel).catch(() => null);
       if (!found?.nodes?.length) continue;
@@ -1013,11 +1129,9 @@ export async function fillWebSecurityCode(human, bidi, code) {
       }
 
       if (found.nodes.length >= 6) {
-        for (let i = 0; i < 6; i++) {
-          await human.clickElement(found.nodes[i]);
-          await sleep(50);
-          await human.typeText(digits[i]);
-        }
+        await human.clickElement(found.nodes[0]);
+        await sleep(80);
+        await human.typeText(digits, { slow: false });
       } else {
         await human.clickElement(found.nodes[0]);
         await sleep(100);

@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
+import { tryFetchMac2FAPopupAx } from "./mac-2fa-popup.js";
 import { sleep } from "./prompt.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,7 +19,7 @@ function get2FAConfig() {
   return {
     popupFirstMs: num("BROWSER_2FA_POPUP_WAIT_MS", 45_000),
     settingsFallback: process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
-    pollIntervalMs: num("BROWSER_2FA_POLL_MS", 1500),
+    pollIntervalMs: num("BROWSER_2FA_POLL_MS", 800),
   };
 }
 
@@ -26,10 +27,16 @@ function get2FAConfig() {
  * 单次轮询 macOS 系统弹窗 2FA
  * @param {number} [timeoutSec]
  */
-export async function tryFetchMac2FACode(timeoutSec = 12) {
+export async function tryFetchMac2FACode(timeoutSec = 4) {
+  if (process.platform === "darwin") {
+    const axCode = await tryFetchMac2FAPopupAx(timeoutSec);
+    if (axCode) return axCode;
+  }
+
   try {
-    const { stdout } = await execFileAsync(SCPT, [`--timeout=${timeoutSec}`], {
-      timeout: (timeoutSec + 8) * 1000,
+    const scptSec = Math.min(timeoutSec, 4);
+    const { stdout } = await execFileAsync(SCPT, [`--timeout=${scptSec}`], {
+      timeout: (scptSec + 6) * 1000,
     });
     const digits = stdout.trim().replace(/\D/g, "");
     const code = digits.length >= 6 ? digits.slice(0, 6) : null;
@@ -66,7 +73,7 @@ export async function waitForMac2FACode(options = {}) {
       console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
     }
 
-    const code = await tryFetchMac2FACode(10);
+    const code = await tryFetchMac2FACode(4);
     if (code) {
       console.log(`[2FA] ★ 验证码: ${code}`);
       console.log("[2FA] 已获取 6 位验证码（系统弹窗）");
