@@ -428,11 +428,18 @@ export async function check2FAAutomationGranted() {
         };
       }
       if (code === "-25211") {
+        if (axOk) {
+          return {
+            granted: true,
+            mode: "idle",
+            warn: `个别系统进程不可读（${detail}），核心探测已通过`,
+          };
+        }
         return {
           granted: false,
           code,
           kind: "accessibility",
-          reason: `辅助功能未授权（-25211）：请在 辅助功能 中勾选「${host.name}」（自动化已开时仍需要此项）`,
+          reason: `辅助功能未授权（-25211）：请在 辅助功能 中勾选「${host.name}」`,
         };
       }
       return { granted: false, code, reason: detail };
