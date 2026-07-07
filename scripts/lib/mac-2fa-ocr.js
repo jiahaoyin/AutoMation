@@ -50,9 +50,19 @@ function ensureOcrBin() {
   return true;
 }
 
+function looksLikeFormattedRaw(raw) {
+  if (!raw || typeof raw !== "string") return false;
+  const s = raw.trim();
+  return /^\d{3}[\s\u00a0\u2009]\d{3}$/.test(s);
+}
+
+function normalizeCode(code) {
+  return String(code ?? "").replace(/\D/g, "").slice(0, 6);
+}
+
 /**
  * @param {number} [timeoutSec]
- * @param {{ debugDir?: string }} [options]
+ * @param {{ debugDir?: string, requireFormattedRaw?: boolean }} [options]
  * @returns {Promise<{ code: string, raw: string|null, source: string }|null>}
  */
 export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
@@ -73,9 +83,14 @@ export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
     }
     const parsed = JSON.parse(stdout.trim().split("\n").pop() || "{}");
     if (parsed.ok && parsed.code) {
-      const code = String(parsed.code).replace(/\D/g, "").slice(0, 6);
+      const code = normalizeCode(parsed.code);
+      const raw = parsed.raw ?? null;
       if (code.length === 6) {
-        return { code, raw: parsed.raw ?? null, source: parsed.source ?? "vision" };
+        if (options.requireFormattedRaw !== false && !looksLikeFormattedRaw(raw)) {
+          console.log(`[2FA] OCR 跳过非 NNN NNN 格式: 原文="${raw ?? ""}"`);
+          return null;
+        }
+        return { code, raw, source: parsed.source ?? "vision" };
       }
     }
   } catch (err) {
@@ -84,9 +99,13 @@ export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
       try {
         const parsed = JSON.parse(stdout.trim().split("\n").pop() || "{}");
         if (parsed.ok && parsed.code) {
-          const code = String(parsed.code).replace(/\D/g, "").slice(0, 6);
+          const code = normalizeCode(parsed.code);
+          const raw = parsed.raw ?? null;
           if (code.length === 6) {
-            return { code, raw: parsed.raw ?? null, source: parsed.source ?? "vision" };
+            if (options.requireFormattedRaw !== false && !looksLikeFormattedRaw(raw)) {
+              return null;
+            }
+            return { code, raw, source: parsed.source ?? "vision" };
           }
         }
       } catch {

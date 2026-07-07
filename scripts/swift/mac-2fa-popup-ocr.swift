@@ -218,12 +218,13 @@ func ocrText(from cgImage: CGImage) -> String {
     return ocrLines(from: cgImage, level: .fast).joined(separator: " ")
 }
 
-func findFormattedCode(_ text: String) -> (String, String)? {
-    let patterns = [
-        #"\d{3}[\s\u00a0\u2009]+\d{3}"#,
-        #"\d{3}\s*\d{3}"#,
-        #"(?<!\d)\d{6}(?!\d)"#,
-    ]
+func findFormattedCode(_ text: String, strictPopup: Bool = true) -> (String, String)? {
+    let patterns = strictPopup
+        ? [#"\d{3}[\s\u00a0\u2009]+\d{3}"#]
+        : [
+            #"\d{3}[\s\u00a0\u2009]+\d{3}"#,
+            #"\d{3}\s*\d{3}"#,
+        ]
     for pattern in patterns {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
         let ns = text as NSString
@@ -234,17 +235,15 @@ func findFormattedCode(_ text: String) -> (String, String)? {
             if digits.count == 6 { return (String(digits), raw) }
         }
     }
-    // 分行合并：Vision 有时把 "350" 与 "566" 拆成两行
-    let onlyDigits = text.filter { $0.isNumber || $0.isWhitespace }
-    let chunks = onlyDigits.split(whereSeparator: { $0.isWhitespace })
-    for chunk in chunks {
-        let d = String(chunk).filter(\.isNumber)
-        if d.count == 6 { return (d, d) }
-    }
-    let allDigits = text.filter(\.isNumber)
-    if allDigits.count >= 6 {
-        let code = String(allDigits.prefix(6))
-        return (code, code)
+    if strictPopup { return nil }
+    // 分行合并：Vision 有时把 "350" 与 "566" 拆成两行（仅非 strict）
+    let chunks = text.split(whereSeparator: { $0.isWhitespace })
+    if chunks.count >= 2 {
+        let a = String(chunks[0]).filter(\.isNumber)
+        let b = String(chunks[1]).filter(\.isNumber)
+        if a.count == 3 && b.count == 3 {
+            return (a + b, "\(a) \(b)")
+        }
     }
     return nil
 }
@@ -313,15 +312,6 @@ while Date() < deadline {
         }
         if let dir = debugDir {
             saveDebugImage(cg, dir: dir, label: "failed-\(method)")
-        }
-    }
-    // 全屏回退：弹窗坐标不准时仍可能读到中间大字
-    if attempt % 3 == 0 {
-        for screen in NSScreen.screens {
-            let f = screen.frame
-            if let cg = captureRectScreencapture(f), let (code, raw) = tryOcrOnImage(cg, label: "fullscreen") {
-                emit(Output(ok: true, code: code, raw: raw, source: "vision_fullscreen", message: "ok"))
-            }
         }
     }
     usleep(350_000)

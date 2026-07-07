@@ -214,9 +214,19 @@ export async function confirmAllowSuccess() {
     const state = await probe2FAState(2);
     if (state.action === "has_code_dialog") return true;
     if (state.action === "has_allow_dialog") continue;
-    if (state.action === "idle" && i >= 2) return true;
   }
   return false;
+}
+
+async function dismissStaleCodeDialogOnce() {
+  const r = await runAppleScriptPhase("dismiss_stale", 3);
+  if (r.action === "dismissed_stale") {
+    const old = r.code ? ` 旧码=${r.code}` : "";
+    console.log(`[2FA] 已关闭残留验证码窗${old}`);
+    await sleep(400);
+    return r.code ?? null;
+  }
+  return null;
 }
 
 export async function tryAllowOnce(timeoutSec = 4) {
@@ -240,10 +250,12 @@ export async function waitForManualAllow(options = {}) {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
   let prompted = false;
+  let sawAllowDialog = false;
 
   while (Date.now() < deadline) {
     const state = await probe2FAState(2);
-    if (state.action === "has_code_dialog") {
+    if (state.action === "has_allow_dialog") sawAllowDialog = true;
+    if (state.action === "has_code_dialog" && sawAllowDialog) {
       return { clicked: true, source: state.source, strategy: "manual" };
     }
     if (state.action === "has_allow_dialog") {
@@ -265,12 +277,23 @@ export async function waitForAllowClick(options = {}) {
   let polls = 0;
   let autoAttempts = 0;
   let manualStarted = false;
+  let sawAllowDialog = false;
+  let allowExplicitlyClicked = false;
 
   while (Date.now() < deadline) {
     polls += 1;
     const state = await probe2FAState(3);
 
+    if (state.action === "has_allow_dialog") {
+      sawAllowDialog = true;
+    }
+
     if (state.action === "has_code_dialog") {
+      if (!sawAllowDialog && !allowExplicitlyClicked) {
+        console.log("[2FA] 验证码窗在「允许」之前出现，视为残留窗并关闭…");
+        await dismissStaleCodeDialogOnce();
+        continue;
+      }
       console.log("[2FA] ✓ 验证码窗已出现（允许已生效）");
       return { clicked: true, source: state.source, strategy: "code_visible" };
     }
@@ -279,6 +302,7 @@ export async function waitForAllowClick(options = {}) {
       autoAttempts += 1;
       const r = await tryAllowOnce(5);
       if (r.clicked) {
+        allowExplicitlyClicked = true;
         console.log(
           `[2FA] ✓ 已点击「允许」(${r.strategy || "auto"}${r.source ? ` / ${r.source}` : ""})`
         );
@@ -290,6 +314,7 @@ export async function waitForAllowClick(options = {}) {
         console.log("[2FA] 自动点击未成功，等待手动点击「允许」…");
         const manual = await waitForManualAllow({ timeoutMs: deadline - Date.now() });
         if (manual.clicked) {
+          allowExplicitlyClicked = true;
           console.log("[2FA] ✓ 用户已手动点击「允许」");
           return { clicked: true, source: manual.source, strategy: "manual" };
         }
@@ -307,7 +332,7 @@ export async function waitForAllowClick(options = {}) {
   }
 
   const last = await probe2FAState(2);
-  if (last.action === "has_code_dialog") {
+  if (last.action === "has_code_dialog" && (sawAllowDialog || allowExplicitlyClicked)) {
     return { clicked: true, source: last.source, strategy: "code_visible_late" };
   }
 
@@ -326,31 +351,47 @@ export async function readPopupCodeViaAppleScript(timeoutSec = 12) {
 /**
  * 并行读码：code 窗已出现时优先 OCR，避免每轮空等 AppleScript
  * @param {number} [timeoutSec]
- * @param {{ preferOcr?: boolean, debugDir?: string }} [options]
+ * @param {{ preferOcr?: boolean, debugDir?: string, rejectCodes?: Set<string>, requireFormattedRaw?: boolean }} [options]
  */
 export async function readPopupCode(timeoutSec = 10, options = {}) {
   const preferOcr = options.preferOcr ?? false;
+  const rejectCodes = options.rejectCodes;
+  const ocrOpts = {
+    debugDir: options.debugDir,
+    requireFormattedRaw: options.requireFormattedRaw ?? true,
+  };
   const asTimeout = preferOcr ? Math.min(2, timeoutSec) : Math.min(timeoutSec, 8);
   const ocrTimeout = preferOcr ? timeoutSec : timeoutSec;
 
+  const accept = (hit) => {
+    if (!hit?.code) return null;
+    if (rejectCodes?.has(hit.code)) {
+      console.log(`[2FA] 跳过旧/无效验证码 ${hit.code}`);
+      return null;
+    }
+    return hit;
+  };
+
   if (preferOcr) {
     const [ocr, as] = await Promise.all([
-      readPopupCodeViaOcr(ocrTimeout, { debugDir: options.debugDir }),
+      readPopupCodeViaOcr(ocrTimeout, ocrOpts),
       readPopupCodeViaAppleScript(asTimeout),
     ]);
-    if (ocr?.code) {
-      console.log(`[2FA] Vision OCR 读到验证码 ${ocr.code} 原文="${ocr.raw ?? ""}"`);
-      return ocr;
+    const hit = accept(ocr) ?? accept(as);
+    if (hit) {
+      if (hit.source?.includes("vision")) {
+        console.log(`[2FA] Vision OCR 读到验证码 ${hit.code} 原文="${hit.raw ?? ""}"`);
+      }
+      return hit;
     }
-    if (as?.code) return as;
     console.log("[2FA] 并行 OCR/AppleScript 均未读到验证码");
     return null;
   }
 
-  const as = await readPopupCodeViaAppleScript(asTimeout);
+  const as = accept(await readPopupCodeViaAppleScript(asTimeout));
   if (as?.code) return as;
   console.log("[2FA] AX/AppleScript 未读到验证码，尝试 Vision OCR…");
-  const ocr = await readPopupCodeViaOcr(ocrTimeout, { debugDir: options.debugDir });
+  const ocr = accept(await readPopupCodeViaOcr(ocrTimeout, ocrOpts));
   if (ocr?.code) {
     console.log(`[2FA] Vision OCR 读到验证码 ${ocr.code} 原文="${ocr.raw ?? ""}"`);
     return ocr;

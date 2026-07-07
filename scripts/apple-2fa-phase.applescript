@@ -425,10 +425,9 @@ on scanPhase(phase)
 			end if
 		else if phase is "pre_allow" then
 			if isCodeDlg then
-				if code is not "" then
-					return my emitJson(true, code, "clicked_allow", pn, raw)
+				if my clickDoneDeep(root) then
+					return my emitJson(true, code, "dismissed_stale", pn, raw)
 				end if
-				return my emitJson(true, "", "clicked_allow", pn, "")
 			end if
 			if hasPrompt or code is not "" then
 				if my clickDoneDeep(root) then

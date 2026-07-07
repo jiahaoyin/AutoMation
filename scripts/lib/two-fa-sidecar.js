@@ -25,6 +25,30 @@ function logCodeResult(code, { source, raw, allowStrategy }) {
   console.log(`[2FA] ★ 验证码: ${code}${src}${rawPart}${allowPart}`);
 }
 
+function normalizeCode(code) {
+  return String(code ?? "").replace(/\D/g, "").slice(0, 6);
+}
+
+/** @param {Set<string>} rejected */
+async function snapshotVisiblePopupCodes(rejected) {
+  const state = await probe2FAState(2);
+  if (state.code) rejected.add(normalizeCode(state.code));
+  const r = await runPopupPhase("read_code", 2);
+  if (r.code) rejected.add(normalizeCode(r.code));
+}
+
+/**
+ * @param {string} code
+ * @param {{ source?: string, raw?: string, allowStrategy?: string }} meta
+ * @param {object} audit
+ */
+function returnPopupCode(code, meta, audit) {
+  logCodeResult(code, meta);
+  append2FAAudit(audit.reportDir, audit.entry);
+  console.log(`[2FA] 已获取 6 位验证码（${meta.raw ?? code}）`);
+  return code;
+}
+
 /**
  * 等待 2FA：关闭旧窗 → 点允许 → 再读新验证码
  * @param {object} [options]
@@ -57,6 +81,7 @@ export async function waitForMac2FACode(options = {}) {
       dismissedCount: count,
       dismissedCodes: [...dismissedCodes],
     });
+    await snapshotVisiblePopupCodes(dismissedCodes);
     await sleep(500);
   }
 
@@ -86,38 +111,86 @@ export async function waitForMac2FACode(options = {}) {
     );
   }
 
+  await sleep(800);
+  if (process.platform === "darwin") {
+    await snapshotVisiblePopupCodes(dismissedCodes);
+  }
+
   console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
   const ocrDebugDir = reportDir ? path.join(reportDir, "screenshots") : undefined;
+  let lastStableCode = null;
+  let stableHits = 0;
+
   for (let i = 0; i < 40; i++) {
     const state = await probe2FAState(2);
-    const preferOcr = state.action === "has_code_dialog";
-    const asRead = await readPopupCode(preferOcr ? 5 : 6, { preferOcr, debugDir: ocrDebugDir });
-    if (asRead?.code) {
-      if (!dismissedCodes.has(asRead.code)) {
-        logCodeResult(asRead.code, {
+    if (state.action === "has_allow_dialog") {
+      lastStableCode = null;
+      stableHits = 0;
+      if (i === 0 || i % 8 === 0) {
+        console.log("[2FA] 仍在等待「允许」流程完成…");
+      }
+      await sleep(500);
+      continue;
+    }
+    if (state.action !== "has_code_dialog") {
+      lastStableCode = null;
+      stableHits = 0;
+      if (i === 0 || i % 10 === 0) {
+        console.log(`[2FA] 等待验证码窗出现… (${i + 1}/40)`);
+      }
+      await sleep(500);
+      continue;
+    }
+
+    const preferOcr = true;
+    const asRead = await readPopupCode(5, {
+      preferOcr,
+      debugDir: ocrDebugDir,
+      rejectCodes: dismissedCodes,
+      requireFormattedRaw: true,
+    });
+    if (asRead?.code && !dismissedCodes.has(asRead.code)) {
+      if (asRead.code === lastStableCode) {
+        stableHits += 1;
+      } else {
+        lastStableCode = asRead.code;
+        stableHits = 1;
+      }
+      if (stableHits >= 2) {
+        return returnPopupCode(asRead.code, {
           source: "popup",
           raw: asRead.raw,
           allowStrategy,
+        }, {
+          reportDir,
+          entry: {
+            phase: "read_popup_fast",
+            allowClicked: true,
+            allowStrategy,
+            code: asRead.code,
+            raw: asRead.raw ?? null,
+            source: asRead.source ?? "applescript",
+          },
         });
-        append2FAAudit(reportDir, {
-          phase: "read_popup_fast",
-          allowClicked: true,
-          allowStrategy,
-          code: asRead.code,
-          raw: asRead.raw ?? null,
-          source: asRead.source ?? "applescript",
-        });
-        console.log(`[2FA] 已获取 6 位验证码（弹窗 ${asRead.raw ?? asRead.code}）`);
-        return asRead.code;
       }
+      console.log(`[2FA] 验证码 ${asRead.raw ?? asRead.code} 首次读到，等待稳定确认 (${stableHits}/2)…`);
+      await sleep(400);
+      continue;
     }
+
     if (state.code && !dismissedCodes.has(state.code)) {
-      logCodeResult(state.code, { source: "popup", raw: state.code, allowStrategy });
-      console.log("[2FA] 已获取 6 位验证码（probe）");
-      return state.code;
-    }
-    if (i === 0 || i % 10 === 0) {
-      console.log(`[2FA] 等待验证码展示… (${i + 1}/40)`);
+      const c = normalizeCode(state.code);
+      if (c === lastStableCode) stableHits += 1;
+      else {
+        lastStableCode = c;
+        stableHits = 1;
+      }
+      if (stableHits >= 2) {
+        return returnPopupCode(c, { source: "popup", raw: state.code, allowStrategy }, {
+          reportDir,
+          entry: { phase: "read_popup_probe", allowClicked: true, allowStrategy, code: c },
+        });
+      }
     }
     await sleep(500);
   }
@@ -138,12 +211,22 @@ export async function waitForMac2FACode(options = {}) {
 
     if (process.platform === "darwin") {
       const popupState = await probe2FAState(2);
-      const preferOcr = popupState.action === "has_code_dialog";
+      if (popupState.action === "has_allow_dialog") {
+        await sleep(cfg.pollIntervalMs);
+        continue;
+      }
+      if (popupState.action !== "has_code_dialog") {
+        await sleep(cfg.pollIntervalMs);
+        continue;
+      }
+      const preferOcr = true;
       let r = await runPopupPhase("read_code", preferOcr ? 4 : 10);
       if (!r.code) {
         const fallback = await readPopupCode(preferOcr ? 6 : 8, {
           preferOcr,
           debugDir: reportDir ? path.join(reportDir, "screenshots") : undefined,
+          rejectCodes: dismissedCodes,
+          requireFormattedRaw: true,
         });
         if (fallback?.code) {
           r = {
@@ -166,23 +249,33 @@ export async function waitForMac2FACode(options = {}) {
           await runPopupPhase("dismiss_stale", 2);
           continue;
         }
+        if (r.code === lastStableCode) stableHits += 1;
+        else {
+          lastStableCode = r.code;
+          stableHits = 1;
+        }
+        if (stableHits < 2) {
+          console.log(`[2FA] 验证码 ${r.raw ?? r.code} 首次读到，等待稳定确认 (${stableHits}/2)…`);
+          await sleep(400);
+          continue;
+        }
         const popupShot = screenshotPathFor(reportDir, "2fa-popup-code.png");
-        logCodeResult(r.code, {
+        return returnPopupCode(r.code, {
           source: "popup",
           raw: r.raw,
           allowStrategy,
+        }, {
+          reportDir,
+          entry: {
+            phase: "read_popup",
+            allowClicked: true,
+            allowStrategy,
+            code: r.code,
+            raw: r.raw ?? null,
+            source: r.source ?? "popup",
+            screenshot: popupShot ?? null,
+          },
         });
-        append2FAAudit(reportDir, {
-          phase: "read_popup",
-          allowClicked: true,
-          allowStrategy,
-          code: r.code,
-          raw: r.raw ?? null,
-          source: r.source ?? "popup",
-          screenshot: popupShot ?? null,
-        });
-        console.log("[2FA] 已获取 6 位验证码（点击允许后）");
-        return r.code;
       }
     }
 
