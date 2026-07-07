@@ -289,8 +289,8 @@ export async function waitForAllowClick(options = {}) {
   return { clicked: false, reason: "timeout" };
 }
 
-/** 通过 AppleScript 直接读弹窗验证码（Swift 失败时的可靠回退） */
-export async function readPopupCodeViaAppleScript(timeoutSec = 8) {
+/** 通过 AppleScript 直接读弹窗验证码 */
+export async function readPopupCodeViaAppleScript(timeoutSec = 12) {
   const r = await runAppleScriptPhase("read_code", timeoutSec);
   if (r.code) {
     return { code: r.code, raw: r.raw, source: r.source ?? "applescript" };

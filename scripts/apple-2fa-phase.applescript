@@ -125,6 +125,7 @@ on hasCodeDisplayPrompt(blob)
 	if blob contains "在网页上输入此验证码" then return true
 	if blob contains "在网页上输入" and blob contains "验证码" then return true
 	if blob contains "输入此验证码" then return true
+	if blob contains "验证码以登录" then return true
 	if blob contains "verification code on the web" then return true
 	if blob contains "Enter this verification code" then return true
 	return false
@@ -139,28 +140,91 @@ on looksLikeAllowDialog(blob)
 	return false
 end looksLikeAllowDialog
 
-on extractCodeFromRoot(root)
+end looksLikeAllowDialog
+
+on looksLikeCodeDialog(blob)
+	if my hasCodeDisplayPrompt(blob) then return true
+	if blob contains "验证码以登录" then return true
+	if blob contains "正用于登录" and blob contains "新设备" and (blob contains "完成" or blob contains "Done") then return true
+	return false
+end looksLikeCodeDialog
+
+on looksLikeFormattedCode(txt)
+	if txt is missing value then return false
+	set s to txt as text
+	if (length of s) < 7 or (length of s) > 12 then return false
+	set d to my digitsFromText(s)
+	if d is "" then return false
+	if (length of s) is 7 then
+		set c4 to character 4 of s
+		if c4 is " " or c4 is (character id 160) then return true
+	end if
+	return false
+end looksLikeFormattedCode
+
+on findFormattedCodeInBlob(blob)
+	set i to 1
+	set maxI to (length of blob) - 6
+	repeat while i ≤ maxI
+		try
+			set chunk to text i thru (i + 6) of blob
+			if my looksLikeFormattedCode(chunk) then
+				return {my digitsFromText(chunk), chunk}
+			end if
+		end try
+		set i to i + 1
+	end repeat
+	return {"", ""}
+end findFormattedCodeInBlob
+
+on extractCodeDeep(el, depth)
+	if depth > 24 then return {"", ""}
+	set tx to my elText(el)
+	if tx is not "" and my looksLikeFormattedCode(tx) then
+		set c to my digitsFromText(tx)
+		if c is not "" then return {c, tx}
+	end if
 	tell application "System Events"
+		try
+			repeat with child in (UI elements of el)
+				set pair to my extractCodeDeep(child, depth + 1)
+				if item 1 of pair is not "" then return pair
+			end repeat
+		end try
+	end tell
+	return {"", ""}
+end extractCodeDeep
+
+on extractCodeFromRoot(root)
+	set blob to my blobDeep(root)
+	set pair to my findFormattedCodeInBlob(blob)
+	if item 1 of pair is not "" then return pair
+	tell application "System Events"
+		set pair to my extractCodeDeep(root, 0)
+		if item 1 of pair is not "" then return pair
 		try
 			repeat with t in (every UI element of root whose role is "AXStaticText")
 				set tx to my elText(t)
-				set c to my digitsFromText(tx)
-				if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
+				if my looksLikeFormattedCode(tx) then
+					return {my digitsFromText(tx), tx}
+				end if
 			end repeat
 		end try
 		try
 			repeat with t in (static texts of root)
 				set tx to my elText(t)
-				set c to my digitsFromText(tx)
-				if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
+				if my looksLikeFormattedCode(tx) then
+					return {my digitsFromText(tx), tx}
+				end if
 			end repeat
 		end try
 		try
 			repeat with g in (groups of root)
 				repeat with t in (static texts of g)
 					set tx to my elText(t)
-					set c to my digitsFromText(tx)
-					if c is not "" and (length of (tx as text)) < 24 then return {c, tx}
+					if my looksLikeFormattedCode(tx) then
+						return {my digitsFromText(tx), tx}
+					end if
 				end repeat
 			end repeat
 		end try
@@ -331,6 +395,7 @@ on scanPhase(phase)
 		set raw to item 2 of codePair
 		set hasPrompt to my hasCodeDisplayPrompt(blob)
 		set isAllowDlg to my looksLikeAllowDialog(blob)
+		set isCodeDlg to my looksLikeCodeDialog(blob)
 
 		if phase is "dismiss_stale" then
 			if hasPrompt or code is not "" then
@@ -339,25 +404,31 @@ on scanPhase(phase)
 				end if
 			end if
 		else if phase is "pre_allow" then
+			if isCodeDlg then
+				if code is not "" then
+					return my emitJson(true, code, "clicked_allow", pn, raw)
+				end if
+				return my emitJson(true, "", "clicked_allow", pn, "")
+			end if
 			if hasPrompt or code is not "" then
 				if my clickDoneDeep(root) then
 					return my emitJson(true, code, "dismissed_stale", pn, raw)
 				end if
 			end if
-			if isAllowDlg and not hasPrompt then
+			if isAllowDlg then
 				if my tryClickAllow(pn, root, blob) then
 					return my emitJson(true, "", "clicked_allow", pn, "")
 				end if
 			end if
 		else if phase is "read_code" then
-			if hasPrompt and code is not "" then
+			if code is not "" and (isCodeDlg or hasPrompt) then
 				return my emitJson(true, code, "read_code", pn, raw)
 			end if
 		else if phase is "probe" then
-			if hasPrompt and code is not "" then
+			if (isCodeDlg or hasPrompt) and code is not "" then
 				return my emitJson(true, code, "has_code_dialog", pn, raw)
 			end if
-			if hasPrompt then
+			if isCodeDlg or hasPrompt then
 				return my emitJson(true, "", "has_code_dialog", pn, "")
 			end if
 			if isAllowDlg and not hasPrompt then

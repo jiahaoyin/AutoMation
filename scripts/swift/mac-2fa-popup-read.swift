@@ -78,6 +78,7 @@ func hasCodeDisplayPrompt(_ blob: String) -> Bool {
     if blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("在网页上输入") && blob.contains("验证码") { return true }
     if blob.contains("输入此验证码") { return true }
+    if blob.contains("验证码以登录") { return true }
     let lower = blob.lowercased()
     if lower.contains("enter this verification code on the web") { return true }
     return false
@@ -349,7 +350,7 @@ while Date() < deadline {
                 stableSource = src
                 stableHits = 1
             }
-            if stableHits >= 2 {
+            if stableHits >= 1 {
                 logStep(1, "code=\(code) source=\(src) raw=\(raw)")
                 emit(Output(ok: true, code: code, action: "read_code", message: "ok", source: src, raw: raw))
             }

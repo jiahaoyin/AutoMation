@@ -168,6 +168,14 @@ export async function runPopupPhase(phase, timeoutSec = 6) {
   }
 
   const as = await runAppleScriptPhase(phase, timeoutSec);
+  if (
+    phase === "read_code" &&
+    (as.ok || as.action === "read_code") &&
+    as.code
+  ) {
+    logPhaseResult(phase, as);
+    return as;
+  }
   if (as.ok || as.action === "clicked_allow" || as.action === "dismissed_stale" || as.action === "read_code") {
     logPhaseResult(phase, as);
     return as;

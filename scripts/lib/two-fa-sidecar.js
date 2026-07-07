@@ -1,7 +1,7 @@
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
-import { waitForAllowClick, readPopupCodeViaAppleScript } from "./mac-2fa-allow.js";
+import { waitForAllowClick, readPopupCodeViaAppleScript, probe2FAState } from "./mac-2fa-allow.js";
 import { sleep } from "./prompt.js";
 
 function get2FAConfig() {
@@ -85,9 +85,40 @@ export async function waitForMac2FACode(options = {}) {
     );
   }
 
-  await sleep(2200);
-
   console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
+  for (let i = 0; i < 40; i++) {
+    const asRead = await readPopupCodeViaAppleScript(4);
+    if (asRead?.code) {
+      if (!dismissedCodes.has(asRead.code)) {
+        logCodeResult(asRead.code, {
+          source: "popup",
+          raw: asRead.raw,
+          allowStrategy,
+        });
+        append2FAAudit(reportDir, {
+          phase: "read_popup_fast",
+          allowClicked: true,
+          allowStrategy,
+          code: asRead.code,
+          raw: asRead.raw ?? null,
+          source: asRead.source ?? "applescript",
+        });
+        console.log(`[2FA] 已获取 6 位验证码（弹窗 ${asRead.raw ?? asRead.code}）`);
+        return asRead.code;
+      }
+    }
+    const state = await probe2FAState(2);
+    if (state.code && !dismissedCodes.has(state.code)) {
+      logCodeResult(state.code, { source: "popup", raw: state.code, allowStrategy });
+      console.log("[2FA] 已获取 6 位验证码（probe）");
+      return state.code;
+    }
+    if (i === 0 || i % 10 === 0) {
+      console.log(`[2FA] 等待验证码展示… (${i + 1}/40)`);
+    }
+    await sleep(500);
+  }
+
   let polls = 0;
 
   while (Date.now() < deadline) {
@@ -156,7 +187,10 @@ export async function waitForMac2FACode(options = {}) {
       process.platform === "darwin"
     ) {
       const leftMs = deadline - Date.now();
-      if (leftMs > 25_000) {
+      const popupStill = await probe2FAState(3);
+      if (popupStill.action === "has_code_dialog") {
+        console.log("[2FA] 弹窗验证码仍在，跳过系统设置回退，继续读弹窗…");
+      } else if (leftMs > 25_000) {
         settingsTried = true;
         console.log(
           "[2FA] 弹窗未及时出现，改从 系统设置 → 登录与安全性 → 双重认证 → 获取验证码…"
