@@ -351,8 +351,36 @@ on scanPhase(phase)
 			end if
 		end if
 	end repeat
+	if phase is "pre_allow" then
+		if my clickAllowViaReturnKey() then
+			return my emitJson(true, "", "clicked_allow", "keystroke", "")
+		end if
+	end if
 	return my emitJson(false, "", "none", "", "")
 end scanPhase
+
+on clickAllowViaReturnKey()
+	tell application "System Events"
+		repeat with procRef in (every process)
+			try
+				set pn to name of procRef
+				tell procRef
+					repeat with w in windows
+						if my looksLikeAllowDialog(my blobDeep(w)) then
+							set frontmost of procRef to true
+							delay 0.2
+							perform action "AXRaise" of w
+							delay 0.1
+							keystroke return
+							return true
+						end if
+					end repeat
+				end tell
+			end try
+		end repeat
+	end tell
+	return false
+end clickAllowViaReturnKey
 
 on run argv
 	set parsed to my parseArgs(argv)

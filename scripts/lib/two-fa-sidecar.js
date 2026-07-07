@@ -1,7 +1,7 @@
-import path from "node:path";
-
+import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
+import { waitForAllowClick } from "./mac-2fa-allow.js";
 import { sleep } from "./prompt.js";
 
 function get2FAConfig() {
@@ -11,9 +11,17 @@ function get2FAConfig() {
   };
   return {
     popupFirstMs: num("BROWSER_2FA_POPUP_WAIT_MS", 45_000),
+    settingsFallbackAfterMs: num("BROWSER_2FA_SETTINGS_AFTER_MS", 120_000),
     settingsFallback: process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
     pollIntervalMs: num("BROWSER_2FA_POLL_MS", 800),
   };
+}
+
+function logCodeResult(code, { source, raw, allowStrategy }) {
+  const src = source ? ` 来源=${source}` : "";
+  const rawPart = raw ? ` 原文="${String(raw).slice(0, 40)}"` : "";
+  const allowPart = allowStrategy ? ` allow=${allowStrategy}` : "";
+  console.log(`[2FA] ★ 验证码: ${code}${src}${rawPart}${allowPart}`);
 }
 
 /**
@@ -24,7 +32,10 @@ export async function waitForMac2FACode(options = {}) {
   const cfg = get2FAConfig();
   const timeoutMs = options.timeoutMs ?? 240_000;
   const popupFirstMs = options.popupFirstMs ?? cfg.popupFirstMs;
-  const deadline = Date.now() + timeoutMs;
+  const settingsAfterMs = options.settingsFallbackAfterMs ?? cfg.settingsFallbackAfterMs;
+  const reportDir = options.reportDir;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   let settingsTried = false;
 
   console.log("[2FA] 分阶段处理系统弹窗（清旧窗 → 允许 → 读码）…");
@@ -40,50 +51,54 @@ export async function waitForMac2FACode(options = {}) {
     } else {
       console.log("[2FA] 已扫描残留窗（未发现可关闭的旧验证码）");
     }
+    append2FAAudit(reportDir, {
+      phase: "dismiss_stale",
+      dismissedCount: count,
+      dismissedCodes: [...dismissedCodes],
+    });
     await sleep(500);
   }
 
   console.log("[2FA] 阶段 1/2：等待并点击「允许」…");
   let allowClicked = false;
-  const allowDeadline = Math.min(deadline, Date.now() + 120_000);
-  let allowPolls = 0;
+  let allowStrategy = "none";
+  let allowSource;
 
-  while (Date.now() < allowDeadline && !allowClicked) {
-    allowPolls += 1;
-    if (process.platform === "darwin") {
-      const r = await runPopupPhase("pre_allow", 3);
-      if (r.action === "dismissed_stale") {
-        if (r.code) dismissedCodes.add(r.code);
-        continue;
-      }
-      if (r.action === "clicked_allow") {
-        allowClicked = true;
-        break;
-      }
-    }
-    if (allowPolls === 1 || allowPolls % 6 === 0) {
-      console.log("[2FA] 仍在查找「允许」按钮…（请确认终端已获「自动化」权限）");
-    }
-    await sleep(500);
+  if (process.platform === "darwin") {
+    const allow = await waitForAllowClick({
+      timeoutMs: Math.min(deadline - Date.now(), 120_000),
+    });
+    allowClicked = allow.clicked;
+    allowStrategy = allow.strategy ?? (allow.clicked ? "auto" : "none");
+    allowSource = allow.source;
+    append2FAAudit(reportDir, {
+      phase: "wait_allow",
+      allowClicked,
+      allowStrategy,
+      allowSource: allowSource ?? null,
+    });
   }
 
   if (!allowClicked) {
-    console.warn("[2FA] 未自动点到「允许」，继续等待验证码（可能需手动允许）");
+    throw new Error(
+      "请先手动点击系统弹窗「允许」，并确认终端已获 System Events 自动化权限（系统设置 → 隐私与安全性 → 自动化）"
+    );
   }
 
-  await sleep(allowClicked ? 2200 : 800);
+  await sleep(2200);
 
   console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
   let polls = 0;
 
   while (Date.now() < deadline) {
     polls += 1;
-    const elapsed = timeoutMs - (deadline - Date.now());
+    const elapsed = Date.now() - startedAt;
     const inPopupPhase = elapsed < popupFirstMs;
+    const canTrySettings = elapsed >= settingsAfterMs;
 
     if (polls === 1 || polls % 8 === 0) {
       const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-      const phase = inPopupPhase ? "读码" : "读码+设置";
+      const phase = inPopupPhase ? "读码" : allowClicked ? "读码+设置" : "读码";
       console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
     }
 
@@ -100,9 +115,21 @@ export async function waitForMac2FACode(options = {}) {
           await runPopupPhase("dismiss_stale", 2);
           continue;
         }
-        const src = r.source ? ` 来源=${r.source}` : "";
-        const raw = r.raw ? ` 原文="${String(r.raw).slice(0, 40)}"` : "";
-        console.log(`[2FA] ★ 验证码: ${r.code}${src}${raw}`);
+        const popupShot = screenshotPathFor(reportDir, "2fa-popup-code.png");
+        logCodeResult(r.code, {
+          source: "popup",
+          raw: r.raw,
+          allowStrategy,
+        });
+        append2FAAudit(reportDir, {
+          phase: "read_popup",
+          allowClicked: true,
+          allowStrategy,
+          code: r.code,
+          raw: r.raw ?? null,
+          source: r.source ?? "popup",
+          screenshot: popupShot ?? null,
+        });
         console.log("[2FA] 已获取 6 位验证码（点击允许后）");
         return r.code;
       }
@@ -110,38 +137,50 @@ export async function waitForMac2FACode(options = {}) {
 
     if (
       cfg.settingsFallback &&
+      allowClicked &&
       !settingsTried &&
-      !inPopupPhase &&
+      canTrySettings &&
       process.platform === "darwin"
     ) {
-      settingsTried = true;
       const leftMs = deadline - Date.now();
       if (leftMs > 25_000) {
+        settingsTried = true;
         console.log(
           "[2FA] 弹窗未及时出现，改从 系统设置 → 登录与安全性 → 双重认证 → 获取验证码…"
         );
         try {
-          const screenshotPath = options.reportDir
-            ? path.join(options.reportDir, "screenshots", "2fa-settings-code.png")
-            : undefined;
-          const { code, screenshot } = await fetch2FACodeFromSystemSettings({
+          const screenshotPath = screenshotPathFor(reportDir, "2fa-settings-code.png");
+          const { code, raw, screenshot } = await fetch2FACodeFromSystemSettings({
             timeoutMs: Math.min(leftMs - 5000, 120_000),
             screenshotPath,
           });
-          console.log(`[2FA] ★ 验证码: ${code}`);
+          logCodeResult(code, {
+            source: "settings",
+            raw,
+            allowStrategy,
+          });
           if (screenshot) {
             console.log(`[2FA] 系统设置验证码截图已保存: ${screenshot}`);
           }
-          if (!allowClicked) {
-            console.warn(
-              "[2FA] 提示: 未在弹窗点「允许」时，设置里的验证码可能无法用于本次网页登录；请对照截图核对"
-            );
-          }
+          append2FAAudit(reportDir, {
+            phase: "read_settings",
+            allowClicked: true,
+            allowStrategy,
+            code,
+            raw: raw ?? null,
+            source: "settings",
+            screenshot: screenshot ?? null,
+          });
           console.log("[2FA] 已获取 6 位验证码（系统设置）");
           return code;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[2FA] 系统设置获取验证码失败: ${msg}`);
+          append2FAAudit(reportDir, {
+            phase: "read_settings_failed",
+            allowClicked: true,
+            error: msg,
+          });
           console.log("[2FA] 继续轮询系统弹窗…");
         }
       }

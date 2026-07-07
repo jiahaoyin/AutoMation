@@ -36,8 +36,20 @@ if command -v swiftc >/dev/null 2>&1; then
   else
     echo "⚠ mac-2fa-popup-read 编译失败，2FA 弹窗将回退 AppleScript"
   fi
+  if swiftc -O -o scripts/bin/mac-2fa-click-allow \
+    scripts/swift/mac-2fa-click-allow.swift \
+    -framework ApplicationServices -framework AppKit 2>/dev/null; then
+    chmod +x scripts/bin/mac-2fa-click-allow
+    echo "✓ mac-2fa-click-allow 已编译"
+  else
+    echo "⚠ mac-2fa-click-allow 编译失败，将回退 AppleScript 点允许"
+  fi
 else
   echo "⚠ 未找到 swiftc，将使用 AppleScript 回退"
+fi
+
+if ! command -v cliclick >/dev/null 2>&1; then
+  echo "提示: 可选安装 cliclick 以增强「允许」点击（brew install cliclick）"
 fi
 
 exec node scripts/setup-environment.mjs "$@"

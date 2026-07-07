@@ -100,5 +100,7 @@ export async function fetch2FACodeFromSystemSettings(opts = {}) {
   const screenshot =
     parsed.screenshot && fs.existsSync(parsed.screenshot) ? parsed.screenshot : opts.screenshotPath ?? null;
 
-  return { code, screenshot };
+  const raw = parsed.raw ? String(parsed.raw) : null;
+
+  return { code, raw, screenshot };
 }

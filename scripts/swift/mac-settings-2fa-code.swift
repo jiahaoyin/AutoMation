@@ -12,6 +12,7 @@ struct Output: Codable {
     let code: String?
     let message: String
     let screenshot: String?
+    let raw: String?
 }
 
 let settingsBundleIds = ["com.apple.systempreferences", "com.apple.SystemSettings"]
@@ -71,6 +72,78 @@ func extractSixDigit(_ text: String) -> String? {
     let digits = text.filter(\.isNumber)
     guard digits.count >= 6 else { return nil }
     return String(digits.prefix(6))
+}
+
+func looksLikeFormattedCode(_ text: String) -> Bool {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil
+}
+
+func hasSettingsCodeAlert(_ blob: String) -> Bool {
+    if blob.contains("Apple 账户验证码") { return true }
+    if blob.contains("账户验证码") && (blob.contains("好") || blob.contains("OK")) { return true }
+    if blob.lowercased().contains("verification code") && (blob.contains("OK") || blob.contains("好")) { return true }
+    if blob.contains("验证码") && blob.contains("好") { return true }
+    return false
+}
+
+func blobDeep(_ root: AXUIElement, maxNodes: Int = 800) -> String {
+    var queue: [AXUIElement] = [root]
+    var visited = 0
+    var blob = ""
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        visited += 1
+        blob += " " + axDescription(node)
+        if isContainerRole(axRole(node)) || visited <= 3 {
+            queue.append(contentsOf: axChildren(node))
+        }
+    }
+    return blob
+}
+
+func findFormattedCodeInTree(_ root: AXUIElement, maxNodes: Int = 600) -> (String, String)? {
+    var queue: [AXUIElement] = [root]
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        visited += 1
+        let blob = axDescription(node)
+        if axRole(node) == kAXStaticTextRole as String || axRole(node) == kAXGroupRole as String {
+            if looksLikeFormattedCode(blob), let code = extractSixDigit(blob) {
+                return (code, blob)
+            }
+        }
+        if isContainerRole(axRole(node)) || visited <= 2 {
+            queue.append(contentsOf: axChildren(node))
+        }
+    }
+    return nil
+}
+
+func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
+    var roots: [AXUIElement] = []
+    for w in collectWindows(appElement: appElement) {
+        roots.append(w)
+        for child in axChildren(w) {
+            let role = axRole(child)
+            if role == kAXSheetRole as String || role == "AXDialog" {
+                roots.append(child)
+            }
+        }
+    }
+    return roots
+}
+
+func scanCodeFromAlertOnly(appElement: AXUIElement) -> (String, String)? {
+    for root in collectSheetRoots(appElement) {
+        let blob = blobDeep(root)
+        guard hasSettingsCodeAlert(blob) else { continue }
+        let preview = String(blob.prefix(200)).replacingOccurrences(of: "\n", with: " ")
+        logStep(6, "alert blob: \(preview)")
+        if let hit = findFormattedCodeInTree(root) { return hit }
+    }
+    return nil
 }
 
 func findSettingsApp() -> NSRunningApplication? {
@@ -139,33 +212,13 @@ func collectWindows(appElement: AXUIElement) -> [AXUIElement] {
 }
 
 func findCodeInTree(_ root: AXUIElement, maxNodes: Int = 900) -> String? {
-    var queue: [AXUIElement] = [root]
-    var visited = 0
-    while !queue.isEmpty && visited < maxNodes {
-        let node = queue.removeFirst()
-        visited += 1
-        let blob = axDescription(node)
-        if blob.contains("验证码") || blob.lowercased().contains("verification") {
-            if let code = extractSixDigit(blob) { return code }
-        }
-        if axRole(node) == kAXStaticTextRole as String {
-            if let code = extractSixDigit(blob), blob.filter(\.isNumber).count >= 6 {
-                return code
-            }
-        }
-        if isContainerRole(axRole(node)) || visited <= 2 {
-            queue.append(contentsOf: axChildren(node))
-        }
-    }
-    return nil
+    let blob = blobDeep(root)
+    guard hasSettingsCodeAlert(blob) else { return nil }
+    return findFormattedCodeInTree(root)?.0
 }
 
 func scanCode(appElement: AXUIElement) -> String? {
-    if let c = findCodeInTree(appElement) { return c }
-    for w in collectWindows(appElement: appElement) {
-        if let c = findCodeInTree(w) { return c }
-    }
-    return nil
+    scanCodeFromAlertOnly(appElement: appElement)?.0
 }
 
 func emit(_ output: Output) -> Never {
@@ -176,6 +229,34 @@ func emit(_ output: Output) -> Never {
         FileHandle.standardOutput.write("\n".data(using: .utf8)!)
     }
     exit(output.ok ? 0 : 1)
+}
+
+func captureSheetScreenshot(appElement: AXUIElement, pid: pid_t, path: String) -> Bool {
+    for root in collectSheetRoots(appElement) {
+        let blob = blobDeep(root)
+        guard hasSettingsCodeAlert(blob) else { continue }
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(root, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(root, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posVal = posRef, let sizeVal = sizeRef else { continue }
+        var pt = CGPoint.zero
+        var sz = CGSize.zero
+        guard AXValueGetValue(posVal as! AXValue, .cgPoint, &pt),
+              AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz) else { continue }
+        let rect = CGRect(origin: pt, size: sz)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-x", "-R", "\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height))", path]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            if task.terminationStatus == 0, FileManager.default.fileExists(atPath: path) { return true }
+        } catch {
+            continue
+        }
+    }
+    return captureWindowScreenshot(pid: pid, path: path)
 }
 
 func captureWindowScreenshot(pid: pid_t, path: String) -> Bool {
@@ -233,7 +314,7 @@ openAppleAccountSettings()
 usleep(1_500_000)
 
 guard let app = findSettingsApp() else {
-    emit(Output(ok: false, code: nil, message: "System Settings not found", screenshot: nil))
+    emit(Output(ok: false, code: nil, message: "System Settings not found", screenshot: nil, raw: nil))
 }
 
 app.activate(options: [.activateIgnoringOtherApps])
@@ -248,47 +329,62 @@ let getCodeBtn = ["获取验证码", "Get Verification Code", "Get a Verificatio
 
 logStep(3, "click Sign-In & Security")
 guard clickNamed(in: appElement, names: signInSecurity) else {
-    emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found", screenshot: nil))
+    emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found", screenshot: nil, raw: nil))
 }
 usleep(1_200_000)
 
 logStep(4, "click Two-Factor Authentication")
 guard clickNamed(in: appElement, names: twoFactor) else {
-    emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found", screenshot: nil))
+    emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found", screenshot: nil, raw: nil))
 }
 usleep(1_200_000)
 
 logStep(5, "click Get Verification Code")
 guard clickNamed(in: appElement, names: getCodeBtn) else {
-    emit(Output(ok: false, code: nil, message: "Get Verification Code button not found", screenshot: nil))
+    emit(Output(ok: false, code: nil, message: "Get Verification Code button not found", screenshot: nil, raw: nil))
 }
+
+logStep(6, "waiting for verification code alert…")
+usleep(2_500_000)
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 var code: String?
+var codeRaw: String?
+var stableHits = 0
 while Date() < deadline {
-    usleep(600_000)
-    if let c = scanCode(appElement: appElement) {
-        code = c
-        break
+    usleep(500_000)
+    if let hit = scanCodeFromAlertOnly(appElement: appElement) {
+        if code == hit.0 && codeRaw == hit.1 {
+            stableHits += 1
+        } else {
+            code = hit.0
+            codeRaw = hit.1
+            stableHits = 1
+        }
+        if stableHits >= 2 { break }
+    } else {
+        code = nil
+        codeRaw = nil
+        stableHits = 0
     }
 }
 
-guard let finalCode = code else {
-    emit(Output(ok: false, code: nil, message: "verification code alert not found", screenshot: nil))
+guard let finalCode = code, let finalRaw = codeRaw else {
+    emit(Output(ok: false, code: nil, message: "verification code alert not found", screenshot: nil, raw: nil))
 }
 
-logStep(6, "code=\(finalCode)")
+logStep(7, "code=\(finalCode) raw=\(finalRaw)")
 
 var savedShot: String?
 if let shotPath = screenshotPath {
     usleep(700_000)
-    if captureWindowScreenshot(pid: app.processIdentifier, path: shotPath) {
+    if captureSheetScreenshot(appElement: appElement, pid: app.processIdentifier, path: shotPath) {
         savedShot = shotPath
-        logStep(7, "screenshot=\(shotPath)")
+        logStep(8, "screenshot=\(shotPath)")
     } else {
-        logStep(7, "screenshot failed")
+        logStep(8, "screenshot failed")
     }
 }
 
 _ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
-emit(Output(ok: true, code: finalCode, message: "ok", screenshot: savedShot))
+emit(Output(ok: true, code: finalCode, message: "ok", screenshot: savedShot, raw: finalRaw))

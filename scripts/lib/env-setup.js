@@ -8,7 +8,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { resolveFirefoxExecutable, DEFAULT_FIREFOX } from "./bidi-client.js";
-import { ensureAccessibility, ensureAutomation, getAccessibilityHostApp, isAccessibilityGranted, checkAutomationGranted } from "./accessibility.js";
+import {
+  ensureAccessibility,
+  ensureAutomation,
+  getAccessibilityHostApp,
+  isAccessibilityGranted,
+  checkAutomationGranted,
+  check2FAAutomationGranted,
+} from "./accessibility.js";
 import { ensureMacOS15, getMacOSVersion } from "./macos.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +120,8 @@ export function ensureProjectLayout({ quiet } = {}) {
     "scripts/apple-2fa-wait.scpt",
     "scripts/accessibility-check.applescript",
     "scripts/automation-check.applescript",
+    "scripts/2fa-automation-check.applescript",
+    "scripts/preflight-2fa-permissions.mjs",
     "scripts/mac-settings-apple-login.applescript",
     "scripts/mac-settings-signed-in.applescript",
   ];
@@ -207,6 +216,13 @@ export async function checkEnvironment(options = {}) {
     );
   }
 
+  const twoFaAutomation = await check2FAAutomationGranted();
+  if (!twoFaAutomation.granted) {
+    issues.push(
+      `2FA 自动化未授权（${host.name} → System Events${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
+    );
+  }
+
   const envPath = path.join(PACKAGE_ROOT, ".env");
 
   if (!options.quiet) {
@@ -222,6 +238,12 @@ export async function checkEnvironment(options = {}) {
       automation.granted
         ? `ok（${host.name} → 系统设置）`
         : `未授权（请勾选 ${host.name} → 系统设置）`
+    );
+    console.log(
+      "  2FA 自动化:",
+      twoFaAutomation.granted
+        ? `ok（${host.name} → System Events）`
+        : `未授权（请勾选 ${host.name} → System Events）`
     );
     console.log("  .env:", fs.existsSync(envPath) ? "ok" : "首次运行 ./run.sh 时自动创建");
     if (issues.length) {

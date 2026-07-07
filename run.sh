@@ -10,6 +10,8 @@ if [[ "${SKIP_ENV_SETUP:-}" != "1" ]]; then
   node scripts/setup-environment.mjs --quiet
 fi
 
+node scripts/preflight-2fa-permissions.mjs --quiet
+
 if [[ -f .env ]]; then
   set -a
   # shellcheck disable=SC1091

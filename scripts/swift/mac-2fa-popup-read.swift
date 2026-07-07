@@ -19,6 +19,7 @@ enum Phase: String {
     case dismissStale = "dismiss_stale"
     case preAllow = "pre_allow"
     case readCode = "read_code"
+    case probe = "probe"
     case all = "all"
 }
 
@@ -69,12 +70,8 @@ func extractSixDigits(_ text: String) -> String? {
 }
 
 func looksLikeCodeDisplay(_ text: String) -> Bool {
-    let digits = text.filter(\.isNumber)
-    guard digits.count == 6 else { return false }
     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil { return true }
-    if t.range(of: #"^\d{6}$"#, options: .regularExpression) != nil { return true }
-    return false
+    return t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil
 }
 
 func hasCodeDisplayPrompt(_ blob: String) -> Bool {
@@ -247,11 +244,21 @@ func tryClickAllow(_ windows: [ScannedWindow]) -> (Bool, String?) {
 
 func tryReadCode(_ windows: [ScannedWindow]) -> (String, String, String)? {
     for item in windows where item.scan.hasCodePrompt {
-        if let c = item.scan.code, let raw = item.scan.codeRaw {
+        if let c = item.scan.code, let raw = item.scan.codeRaw, looksLikeCodeDisplay(raw) {
             return (c, item.appName, raw)
         }
     }
     return nil
+}
+
+func probeState(_ windows: [ScannedWindow]) -> (String, String?) {
+    for item in windows where item.scan.hasCodePrompt {
+        return ("has_code_dialog", item.appName)
+    }
+    for item in windows where item.scan.hasAllow || (looksLikeAllowDialog(item.scan.blob) && !item.scan.hasCodePrompt) {
+        return ("has_allow_dialog", item.appName)
+    }
+    return ("idle", nil)
 }
 
 func emit(_ output: Output) -> Never {
@@ -292,6 +299,10 @@ while i < args.count {
 }
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
+var stableCode: String?
+var stableRaw: String?
+var stableSource: String?
+var stableHits = 0
 
 while Date() < deadline {
     let windows = collectPriorityWindows()
@@ -320,9 +331,29 @@ while Date() < deadline {
 
     if phase == .readCode || phase == .all {
         if let (code, src, raw) = tryReadCode(windows) {
-            logStep(1, "code=\(code) source=\(src) raw=\(raw)")
-            emit(Output(ok: true, code: code, action: "read_code", message: "ok", source: src, raw: raw))
+            if stableCode == code && stableRaw == raw {
+                stableHits += 1
+            } else {
+                stableCode = code
+                stableRaw = raw
+                stableSource = src
+                stableHits = 1
+            }
+            if stableHits >= 2 {
+                logStep(1, "code=\(code) source=\(src) raw=\(raw)")
+                emit(Output(ok: true, code: code, action: "read_code", message: "ok", source: src, raw: raw))
+            }
+        } else {
+            stableCode = nil
+            stableRaw = nil
+            stableSource = nil
+            stableHits = 0
         }
+    }
+
+    if phase == .probe {
+        let (state, src) = probeState(windows)
+        emit(Output(ok: state != "idle", code: nil, action: state, message: "ok", source: src, raw: nil))
     }
 
     usleep(400_000)
