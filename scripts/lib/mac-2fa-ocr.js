@@ -52,12 +52,17 @@ function ensureOcrBin() {
 
 /**
  * @param {number} [timeoutSec]
+ * @param {{ debugDir?: string }} [options]
  * @returns {Promise<{ code: string, raw: string|null, source: string }|null>}
  */
-export async function readPopupCodeViaOcr(timeoutSec = 10) {
+export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
   if (!ensureOcrBin()) return null;
+  const args = ["--timeout", String(timeoutSec)];
+  if (options.debugDir) {
+    args.push("--debug-dir", options.debugDir);
+  }
   try {
-    const { stdout, stderr } = await execFileAsync(OCR_BIN, ["--timeout", String(timeoutSec)], {
+    const { stdout, stderr } = await execFileAsync(OCR_BIN, args, {
       timeout: (timeoutSec + 15) * 1000,
       maxBuffer: 256 * 1024,
     });

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
@@ -86,8 +87,11 @@ export async function waitForMac2FACode(options = {}) {
   }
 
   console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
+  const ocrDebugDir = reportDir ? path.join(reportDir, "screenshots") : undefined;
   for (let i = 0; i < 40; i++) {
-    const asRead = await readPopupCode(6);
+    const state = await probe2FAState(2);
+    const preferOcr = state.action === "has_code_dialog";
+    const asRead = await readPopupCode(preferOcr ? 5 : 6, { preferOcr, debugDir: ocrDebugDir });
     if (asRead?.code) {
       if (!dismissedCodes.has(asRead.code)) {
         logCodeResult(asRead.code, {
@@ -107,7 +111,6 @@ export async function waitForMac2FACode(options = {}) {
         return asRead.code;
       }
     }
-    const state = await probe2FAState(2);
     if (state.code && !dismissedCodes.has(state.code)) {
       logCodeResult(state.code, { source: "popup", raw: state.code, allowStrategy });
       console.log("[2FA] 已获取 6 位验证码（probe）");
@@ -134,9 +137,14 @@ export async function waitForMac2FACode(options = {}) {
     }
 
     if (process.platform === "darwin") {
-      let r = await runPopupPhase("read_code", 10);
+      const popupState = await probe2FAState(2);
+      const preferOcr = popupState.action === "has_code_dialog";
+      let r = await runPopupPhase("read_code", preferOcr ? 4 : 10);
       if (!r.code) {
-        const fallback = await readPopupCode(8);
+        const fallback = await readPopupCode(preferOcr ? 6 : 8, {
+          preferOcr,
+          debugDir: reportDir ? path.join(reportDir, "screenshots") : undefined,
+        });
         if (fallback?.code) {
           r = {
             ok: true,

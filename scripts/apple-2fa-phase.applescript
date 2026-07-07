@@ -72,11 +72,13 @@ on collectBlob(el, blobRef)
 		set tx to my elText(el)
 		if tx is not "" then set blobRef to (blobRef & " " & tx) as text
 	end try
-	try
-		repeat with child in (UI elements of el)
-			my collectBlob(child, blobRef)
-		end repeat
-	end try
+	tell application "System Events"
+		try
+			repeat with child in (UI elements of el)
+				my collectBlob(child, blobRef)
+			end repeat
+		end try
+	end tell
 end collectBlob
 
 -- 简化：深度遍历 static text
@@ -140,8 +142,6 @@ on looksLikeAllowDialog(blob)
 	return false
 end looksLikeAllowDialog
 
-end looksLikeAllowDialog
-
 on looksLikeCodeDialog(blob)
 	if my hasCodeDisplayPrompt(blob) then return true
 	if blob contains "验证码以登录" then return true
@@ -152,12 +152,15 @@ end looksLikeCodeDialog
 on looksLikeFormattedCode(txt)
 	if txt is missing value then return false
 	set s to txt as text
-	if (length of s) < 7 or (length of s) > 12 then return false
 	set d to my digitsFromText(s)
-	if d is "" then return false
-	if (length of s) is 7 then
-		set c4 to character 4 of s
-		if c4 is " " or c4 is (character id 160) then return true
+	if d is "" or (length of d) is not 6 then return false
+	if (length of s) is 6 and my isSixDigits(s) then return true
+	if (length of s) is greater than or equal to 7 and (length of s) is less than or equal to 12 then
+		if (length of s) is 7 then
+			set c4 to character 4 of s
+			if c4 is " " or c4 is (character id 160) then return true
+		end if
+		if s contains " " and (length of d) is 6 then return true
 	end if
 	return false
 end looksLikeFormattedCode
@@ -165,7 +168,7 @@ end looksLikeFormattedCode
 on findFormattedCodeInBlob(blob)
 	set i to 1
 	set maxI to (length of blob) - 6
-	repeat while i ≤ maxI
+	repeat while i is less than or equal to maxI
 		try
 			set chunk to text i thru (i + 6) of blob
 			if my looksLikeFormattedCode(chunk) then
@@ -449,7 +452,7 @@ on scanPhase(phase)
 						delay 0.2
 						return my emitJson(true, "", "clicked_allow", pn, "")
 					end try
-				end if
+				end tell
 			end if
 		else if phase is "read_code" then
 			if code is not "" and (isCodeDlg or hasPrompt) then

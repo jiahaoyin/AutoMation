@@ -196,10 +196,10 @@ async function tryCliclickAllow(timeoutSec = 3) {
     const parsed = parseJson(stdout);
     if (parsed?.action === "coords" && parsed.x != null && parsed.y != null) {
       const coord = `${parsed.x},${parsed.y}`;
-      await execFileAsync("cliclick", [`dd:${coord}`], { timeout: 3000 });
-      await sleep(150);
+      await execFileAsync("cliclick", [`m:${coord}`, `dd:${coord}`], { timeout: 3000 });
+      await sleep(320);
       await execFileAsync("cliclick", [`du:${coord}`], { timeout: 3000 });
-      console.log(`[2FA] cliclick 点击允许 (${coord})`);
+      console.log(`[2FA] cliclick 点击允许 (${coord}) source=${parsed.source ?? "?"}`);
       return { action: "clicked_allow", source: parsed.source, strategy: "cliclick" };
     }
   } catch {
@@ -323,12 +323,34 @@ export async function readPopupCodeViaAppleScript(timeoutSec = 12) {
   return null;
 }
 
-/** AppleScript → Vision OCR 读弹窗验证码 */
-export async function readPopupCode(timeoutSec = 10) {
-  const as = await readPopupCodeViaAppleScript(Math.min(timeoutSec, 8));
+/**
+ * 并行读码：code 窗已出现时优先 OCR，避免每轮空等 AppleScript
+ * @param {number} [timeoutSec]
+ * @param {{ preferOcr?: boolean, debugDir?: string }} [options]
+ */
+export async function readPopupCode(timeoutSec = 10, options = {}) {
+  const preferOcr = options.preferOcr ?? false;
+  const asTimeout = preferOcr ? Math.min(2, timeoutSec) : Math.min(timeoutSec, 8);
+  const ocrTimeout = preferOcr ? timeoutSec : timeoutSec;
+
+  if (preferOcr) {
+    const [ocr, as] = await Promise.all([
+      readPopupCodeViaOcr(ocrTimeout, { debugDir: options.debugDir }),
+      readPopupCodeViaAppleScript(asTimeout),
+    ]);
+    if (ocr?.code) {
+      console.log(`[2FA] Vision OCR 读到验证码 ${ocr.code} 原文="${ocr.raw ?? ""}"`);
+      return ocr;
+    }
+    if (as?.code) return as;
+    console.log("[2FA] 并行 OCR/AppleScript 均未读到验证码");
+    return null;
+  }
+
+  const as = await readPopupCodeViaAppleScript(asTimeout);
   if (as?.code) return as;
   console.log("[2FA] AX/AppleScript 未读到验证码，尝试 Vision OCR…");
-  const ocr = await readPopupCodeViaOcr(timeoutSec);
+  const ocr = await readPopupCodeViaOcr(ocrTimeout, { debugDir: options.debugDir });
   if (ocr?.code) {
     console.log(`[2FA] Vision OCR 读到验证码 ${ocr.code} 原文="${ocr.raw ?? ""}"`);
     return ocr;

@@ -52,11 +52,15 @@ func axTexts(_ element: AXUIElement) -> [String] {
 }
 
 func looksLikeAllowDialog(_ blob: String) -> Bool {
-    if blob.contains("正用于登录") && blob.contains("新设备") { return true }
+    if blob.contains("正用于登录") && blob.contains("新设备") && !blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("正被用于") && blob.contains("登录") { return true }
     if blob.contains("不允许") && blob.contains("允许") { return true }
     if blob.lowercased().contains("don't allow") && blob.lowercased().contains("allow") { return true }
     return false
+}
+
+func looksLikeCodeDialog(_ blob: String) -> Bool {
+    blob.contains("在网页上输入此验证码") || (blob.contains("在网页上输入") && blob.contains("验证码"))
 }
 
 func collectBlob(_ root: AXUIElement, depth: Int, maxDepth: Int, blob: inout String) {
@@ -93,44 +97,23 @@ func frameOf(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: pt, size: sz)
 }
 
-/// AX 全局坐标（左上原点）→ CGEvent 屏幕坐标
+/// AX 与 CGEvent 均使用屏幕全局坐标，原点在主屏左上角
 func cgClickPoint(from axFrame: CGRect) -> CGPoint {
-    let axCenter = CGPoint(x: axFrame.midX, y: axFrame.midY)
-    let screens = NSScreen.screens
-    guard !screens.isEmpty else { return axCenter }
-
-    let mainMaxY = screens.map { $0.frame.maxY }.max() ?? 0
-    for screen in screens {
-        let f = screen.frame
-        let topLeftY = mainMaxY - f.maxY
-        let axRect = CGRect(x: f.origin.x, y: topLeftY, width: f.width, height: f.height)
-        if axRect.contains(axCenter) {
-            return axCenter
-        }
-    }
-
-    // 单屏回退：部分系统 AX Y 需翻转
-    if let main = NSScreen.main {
-        let flipped = CGPoint(x: axCenter.x, y: main.frame.height - axCenter.y)
-        logStep("ax center \(Int(axCenter.x)),\(Int(axCenter.y)) → cg \(Int(flipped.x)),\(Int(flipped.y))")
-        return flipped
-    }
-    return axCenter
+    CGPoint(x: axFrame.midX, y: axFrame.midY)
 }
 
-func clickScreenPoint(_ pt: CGPoint) -> Bool {
+func clickScreenPoint(_ pt: CGPoint, holdMs: UInt32 = 280) -> Bool {
     let source = CGEventSource(stateID: .hidSystemState)
     guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) else {
         return false
     }
     down.post(tap: .cghidEventTap)
-    usleep(180_000)
+    usleep(holdMs * 1000)
     guard let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
         return false
     }
     up.post(tap: .cghidEventTap)
-    usleep(60_000)
-    // 防止「按下未弹起」：再发一次 mouseUp
+    usleep(80_000)
     if let up2 = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
         up2.post(tap: .cghidEventTap)
     }
@@ -145,28 +128,24 @@ func postReturnKey() -> Bool {
         return false
     }
     down.post(tap: .cghidEventTap)
-    usleep(80_000)
+    usleep(100_000)
     up.post(tap: .cghidEventTap)
     return true
 }
 
-func clickElementCenter(_ element: AXUIElement) -> CGPoint? {
-    guard let frame = frameOf(element) else { return nil }
-    let pt = cgClickPoint(from: frame)
-    logStep("click at \(Int(pt.x)),\(Int(pt.y))")
-    _ = clickScreenPoint(pt)
-    return pt
+func buttonTitle(_ element: AXUIElement) -> String {
+    axTexts(element).joined(separator: " ")
 }
 
-func probeAllowButton(in root: AXUIElement) -> (AXUIElement, CGPoint)? {
-    if let defaultBtn: AXUIElement = axCopy(root, kAXDefaultButtonAttribute as String),
-       let frame = frameOf(defaultBtn) {
-        return (defaultBtn, cgClickPoint(from: frame))
+func clickElementCenter(_ element: AXUIElement, label: String) -> CGPoint? {
+    guard let frame = frameOf(element) else {
+        logStep("no frame for button \"\(label)\"")
+        return nil
     }
-    if let btn = findAllowButton(in: root), let frame = frameOf(btn) {
-        return (btn, cgClickPoint(from: frame))
-    }
-    return nil
+    let pt = cgClickPoint(from: frame)
+    logStep("click \"\(label)\" at \(Int(pt.x)),\(Int(pt.y)) frame=\(Int(frame.origin.x)),\(Int(frame.origin.y)) \(Int(frame.width))x\(Int(frame.height))")
+    _ = clickScreenPoint(pt)
+    return pt
 }
 
 func findAllowButton(in root: AXUIElement) -> AXUIElement? {
@@ -177,7 +156,7 @@ func findAllowButton(in root: AXUIElement) -> AXUIElement? {
         if depth > 18 { continue }
         if axRole(node) == kAXButtonRole as String {
             buttons.append(node)
-            let title = axTexts(node).joined(separator: " ")
+            let title = buttonTitle(node)
             if title == "允许" || title == "Allow" {
                 return node
             }
@@ -202,38 +181,44 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
     return list
 }
 
+func raiseWindow(_ win: AXUIElement) {
+    AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+}
+
 func tryClickAllowInApp(_ app: NSRunningApplication) -> (Bool, CGPoint?) {
     let appName = app.localizedName ?? ""
     app.activate(options: [.activateIgnoringOtherApps])
-    usleep(200_000)
+    usleep(250_000)
     let appEl = AXUIElementCreateApplication(app.processIdentifier)
     for win in windowsForApp(appEl) {
         let blob = blobOf(win)
+        if looksLikeCodeDialog(blob) { continue }
         guard looksLikeAllowDialog(blob) else { continue }
-        logStep("found allow dialog in \(appName)")
-        _ = postReturnKey()
-        usleep(350_000)
+        logStep("found allow dialog in \(appName): \(blob.prefix(80))")
+        raiseWindow(win)
+        usleep(150_000)
+
         if let defaultBtn: AXUIElement = axCopy(win, kAXDefaultButtonAttribute as String) {
+            let title = buttonTitle(defaultBtn)
+            logStep("default button: \"\(title)\"")
             if probeCoordsOnly, let frame = frameOf(defaultBtn) {
                 return (true, cgClickPoint(from: frame))
             }
-            if let pt = clickElementCenter(defaultBtn) { return (true, pt) }
+            if let pt = clickElementCenter(defaultBtn, label: title) { return (true, pt) }
             if pressButton(defaultBtn) { return (true, nil) }
         }
         if let btn = findAllowButton(in: win) {
+            let title = buttonTitle(btn)
             if probeCoordsOnly, let frame = frameOf(btn) {
                 return (true, cgClickPoint(from: frame))
             }
-            if let pt = clickElementCenter(btn) { return (true, pt) }
+            if let pt = clickElementCenter(btn, label: title) { return (true, pt) }
             if pressButton(btn) { return (true, nil) }
         }
-    }
-    if looksLikeAllowDialog(blobOf(appEl)), let btn = findAllowButton(in: appEl) {
-        if probeCoordsOnly, let frame = frameOf(btn) {
-            return (true, cgClickPoint(from: frame))
-        }
-        if pressButton(btn) { return (true, clickElementCenter(btn)) }
-        if let pt = clickElementCenter(btn) { return (true, pt) }
+        logStep("fallback Return key for \(appName)")
+        _ = postReturnKey()
+        usleep(400_000)
+        return (true, nil)
     }
     return (false, nil)
 }
