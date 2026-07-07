@@ -36,6 +36,14 @@ if command -v swiftc >/dev/null 2>&1; then
   else
     echo "⚠ mac-2fa-popup-read 编译失败，2FA 弹窗将回退 AppleScript"
   fi
+  if swiftc -O -o scripts/bin/mac-2fa-popup-ocr \
+    scripts/swift/mac-2fa-popup-ocr.swift \
+    -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics 2>/dev/null; then
+    chmod +x scripts/bin/mac-2fa-popup-ocr
+    echo "✓ mac-2fa-popup-ocr 已编译"
+  else
+    echo "⚠ mac-2fa-popup-ocr 编译失败，将回退 AppleScript 读码"
+  fi
   if swiftc -O -o scripts/bin/mac-2fa-click-allow \
     scripts/swift/mac-2fa-click-allow.swift \
     -framework ApplicationServices -framework AppKit 2>/dev/null; then

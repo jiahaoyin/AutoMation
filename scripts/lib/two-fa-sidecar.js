@@ -1,7 +1,7 @@
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
-import { waitForAllowClick, readPopupCodeViaAppleScript, probe2FAState } from "./mac-2fa-allow.js";
+import { waitForAllowClick, readPopupCode, probe2FAState } from "./mac-2fa-allow.js";
 import { sleep } from "./prompt.js";
 
 function get2FAConfig() {
@@ -87,7 +87,7 @@ export async function waitForMac2FACode(options = {}) {
 
   console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
   for (let i = 0; i < 40; i++) {
-    const asRead = await readPopupCodeViaAppleScript(4);
+    const asRead = await readPopupCode(6);
     if (asRead?.code) {
       if (!dismissedCodes.has(asRead.code)) {
         logCodeResult(asRead.code, {
@@ -136,16 +136,15 @@ export async function waitForMac2FACode(options = {}) {
     if (process.platform === "darwin") {
       let r = await runPopupPhase("read_code", 10);
       if (!r.code) {
-        const asRead = await readPopupCodeViaAppleScript(8);
-        if (asRead?.code) {
+        const fallback = await readPopupCode(8);
+        if (fallback?.code) {
           r = {
             ok: true,
             action: "read_code",
-            code: asRead.code,
-            source: asRead.source,
-            raw: asRead.raw,
+            code: fallback.code,
+            source: fallback.source,
+            raw: fallback.raw,
           };
-          console.log(`[2FA] AppleScript 读到验证码 ${asRead.code} 原文="${asRead.raw ?? ""}"`);
         }
       }
       if (r.action === "dismissed_stale") {

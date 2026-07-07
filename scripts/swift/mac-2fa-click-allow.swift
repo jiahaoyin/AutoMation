@@ -120,12 +120,32 @@ func cgClickPoint(from axFrame: CGRect) -> CGPoint {
 
 func clickScreenPoint(_ pt: CGPoint) -> Bool {
     let source = CGEventSource(stateID: .hidSystemState)
-    guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
-          let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
+    guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) else {
         return false
     }
     down.post(tap: .cghidEventTap)
-    usleep(50_000)
+    usleep(180_000)
+    guard let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
+        return false
+    }
+    up.post(tap: .cghidEventTap)
+    usleep(60_000)
+    // 防止「按下未弹起」：再发一次 mouseUp
+    if let up2 = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+        up2.post(tap: .cghidEventTap)
+    }
+    return true
+}
+
+func postReturnKey() -> Bool {
+    let source = CGEventSource(stateID: .hidSystemState)
+    let vkReturn: CGKeyCode = 36
+    guard let down = CGEvent(keyboardEventSource: source, virtualKey: vkReturn, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: vkReturn, keyDown: false) else {
+        return false
+    }
+    down.post(tap: .cghidEventTap)
+    usleep(80_000)
     up.post(tap: .cghidEventTap)
     return true
 }
@@ -191,19 +211,21 @@ func tryClickAllowInApp(_ app: NSRunningApplication) -> (Bool, CGPoint?) {
         let blob = blobOf(win)
         guard looksLikeAllowDialog(blob) else { continue }
         logStep("found allow dialog in \(appName)")
+        _ = postReturnKey()
+        usleep(350_000)
         if let defaultBtn: AXUIElement = axCopy(win, kAXDefaultButtonAttribute as String) {
             if probeCoordsOnly, let frame = frameOf(defaultBtn) {
                 return (true, cgClickPoint(from: frame))
             }
-            if pressButton(defaultBtn) { return (true, clickElementCenter(defaultBtn)) }
             if let pt = clickElementCenter(defaultBtn) { return (true, pt) }
+            if pressButton(defaultBtn) { return (true, nil) }
         }
         if let btn = findAllowButton(in: win) {
             if probeCoordsOnly, let frame = frameOf(btn) {
                 return (true, cgClickPoint(from: frame))
             }
-            if pressButton(btn) { return (true, clickElementCenter(btn)) }
             if let pt = clickElementCenter(btn) { return (true, pt) }
+            if pressButton(btn) { return (true, nil) }
         }
     }
     if looksLikeAllowDialog(blobOf(appEl)), let btn = findAllowButton(in: appEl) {

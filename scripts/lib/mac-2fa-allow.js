@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { sleep } from "./prompt.js";
+import { readPopupCodeViaOcr } from "./mac-2fa-ocr.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -99,6 +100,15 @@ function cliclickAvailable() {
   return r.status === 0;
 }
 
+async function releaseMouseButtons() {
+  if (!cliclickAvailable()) return;
+  try {
+    await execFileAsync("cliclick", ["du:."], { timeout: 3000 });
+  } catch {
+    /* ignore */
+  }
+}
+
 async function probe2FAStateSwift(timeoutSec = 2) {
   if (!ensureBin(SWIFT_SRC, SWIFT_BIN)) return { action: "idle" };
   try {
@@ -157,6 +167,14 @@ async function tryCgClickAllow(timeoutSec = 3) {
   return { action: "none" };
 }
 
+async function tryReturnKeyAllow(timeoutSec = 3) {
+  const r = await runAppleScriptPhase("allow_return", timeoutSec);
+  if (r.action === "clicked_allow") {
+    return { action: "clicked_allow", source: r.source ?? undefined, strategy: "return_key" };
+  }
+  return { action: "none" };
+}
+
 async function tryAppleScriptAllow(timeoutSec = 4) {
   const r = await runAppleScriptPhase("pre_allow", timeoutSec);
   if (r.action === "clicked_allow") {
@@ -177,12 +195,15 @@ async function tryCliclickAllow(timeoutSec = 3) {
     );
     const parsed = parseJson(stdout);
     if (parsed?.action === "coords" && parsed.x != null && parsed.y != null) {
-      await execFileAsync("cliclick", [`c:${parsed.x},${parsed.y}`], { timeout: 5000 });
-      console.log(`[2FA] cliclick 点击允许 (${parsed.x},${parsed.y})`);
+      const coord = `${parsed.x},${parsed.y}`;
+      await execFileAsync("cliclick", [`dd:${coord}`], { timeout: 3000 });
+      await sleep(150);
+      await execFileAsync("cliclick", [`du:${coord}`], { timeout: 3000 });
+      console.log(`[2FA] cliclick 点击允许 (${coord})`);
       return { action: "clicked_allow", source: parsed.source, strategy: "cliclick" };
     }
   } catch {
-    /* ignore */
+    await releaseMouseButtons();
   }
   return { action: "none" };
 }
@@ -199,14 +220,18 @@ export async function confirmAllowSuccess() {
 }
 
 export async function tryAllowOnce(timeoutSec = 4) {
-  const strategies = [tryAppleScriptAllow, tryCgClickAllow, tryCliclickAllow];
+  const strategies = [tryReturnKeyAllow, tryAppleScriptAllow, tryCliclickAllow, tryCgClickAllow];
   for (const fn of strategies) {
     const r = await fn(timeoutSec);
     if (r.action === "clicked_allow") {
       const ok = await confirmAllowSuccess();
-      if (ok) return { clicked: true, source: r.source, strategy: r.strategy };
+      if (ok) {
+        await releaseMouseButtons();
+        return { clicked: true, source: r.source, strategy: r.strategy };
+      }
       console.log(`[2FA] 点击后未确认成功 (${r.strategy})，尝试下一策略…`);
     }
+    await releaseMouseButtons();
   }
   return { clicked: false };
 }
@@ -294,6 +319,19 @@ export async function readPopupCodeViaAppleScript(timeoutSec = 12) {
   const r = await runAppleScriptPhase("read_code", timeoutSec);
   if (r.code) {
     return { code: r.code, raw: r.raw, source: r.source ?? "applescript" };
+  }
+  return null;
+}
+
+/** AppleScript → Vision OCR 读弹窗验证码 */
+export async function readPopupCode(timeoutSec = 10) {
+  const as = await readPopupCodeViaAppleScript(Math.min(timeoutSec, 8));
+  if (as?.code) return as;
+  console.log("[2FA] AX/AppleScript 未读到验证码，尝试 Vision OCR…");
+  const ocr = await readPopupCodeViaOcr(timeoutSec);
+  if (ocr?.code) {
+    console.log(`[2FA] Vision OCR 读到验证码 ${ocr.code} 原文="${ocr.raw ?? ""}"`);
+    return ocr;
   }
   return null;
 }

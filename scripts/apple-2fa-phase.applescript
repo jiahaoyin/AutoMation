@@ -200,6 +200,14 @@ on extractCodeFromRoot(root)
 	set pair to my findFormattedCodeInBlob(blob)
 	if item 1 of pair is not "" then return pair
 	tell application "System Events"
+		try
+			repeat with el in (entire contents of root)
+				set tx to my elText(el)
+				if my looksLikeFormattedCode(tx) then
+					return {my digitsFromText(tx), tx}
+				end if
+			end repeat
+		end try
 		set pair to my extractCodeDeep(root, 0)
 		if item 1 of pair is not "" then return pair
 		try
@@ -376,8 +384,17 @@ on tryClickAllow(pn, root, blob)
 			set frontmost of process pn to true
 		end try
 	end tell
-	delay 0.15
+	delay 0.2
 	if my looksLikeAllowDialog(blob) then
+		tell application "System Events"
+			tell process pn
+				try
+					keystroke return
+					delay 0.35
+					return true
+				end try
+			end tell
+		end tell
 		if my clickRightAllow(root) then return true
 	end if
 	if my clickAllowDeep(root) then return true
@@ -418,6 +435,20 @@ on scanPhase(phase)
 			if isAllowDlg then
 				if my tryClickAllow(pn, root, blob) then
 					return my emitJson(true, "", "clicked_allow", pn, "")
+				end if
+			end if
+		else if phase is "allow_return" then
+			if isAllowDlg and not isCodeDlg then
+				tell application "System Events"
+					try
+						set frontmost of process pn to true
+						delay 0.15
+						tell process pn
+							keystroke return
+						end tell
+						delay 0.2
+						return my emitJson(true, "", "clicked_allow", pn, "")
+					end try
 				end if
 			end if
 		else if phase is "read_code" then
