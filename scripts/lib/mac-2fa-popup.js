@@ -140,6 +140,8 @@ function logPhaseResult(phase, r) {
   } else if (r.action === "dismissed_stale") {
     const old = r.code ? ` 旧码=${r.code}` : "";
     console.log(`[2FA] 已关闭残留验证码窗${old}`);
+  } else if (r.action === "dismissed_done") {
+    console.log("[2FA] 已点击「完成」关闭验证码窗，便于填入网页");
   } else if (r.action === "read_code" && r.code) {
     const raw = r.raw ? ` 原文="${String(r.raw).slice(0, 40)}"` : "";
     console.log(`[2FA] 读到验证码 ${r.code}${raw}`);
@@ -203,6 +205,18 @@ export async function dismissStale2FAPopups(maxRounds = 6) {
     }
   }
   return { count: dismissed, codes };
+}
+
+/** 读码后点「完成」关闭系统弹窗，避免遮挡 Firefox 输入 */
+export async function dismissCodePopupForWebFill(timeoutSec = 4) {
+  if (process.platform !== "darwin") return false;
+  const r = await runAppleScriptPhase("dismiss_done", timeoutSec);
+  if (r.action === "dismissed_done") {
+    logPhaseResult("dismiss_done", r);
+    await new Promise((res) => setTimeout(res, 400));
+    return true;
+  }
+  return false;
 }
 
 export async function tryFetchMac2FAPopupAx(timeoutSec = 12) {

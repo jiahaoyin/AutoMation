@@ -458,6 +458,12 @@ on scanPhase(phase)
 			if code is not "" and (isCodeDlg or hasPrompt) then
 				return my emitJson(true, code, "read_code", pn, raw)
 			end if
+		else if phase is "dismiss_done" then
+			if isCodeDlg or hasPrompt then
+				if my clickDoneDeep(root) then
+					return my emitJson(true, code, "dismissed_done", pn, raw)
+				end if
+			end if
 		else if phase is "probe" then
 			if (isCodeDlg or hasPrompt) and code is not "" then
 				return my emitJson(true, code, "has_code_dialog", pn, raw)
