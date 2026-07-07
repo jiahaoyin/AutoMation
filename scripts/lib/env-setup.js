@@ -218,9 +218,15 @@ export async function checkEnvironment(options = {}) {
 
   const twoFaAutomation = await check2FAAutomationGranted();
   if (!twoFaAutomation.granted) {
-    issues.push(
-      `2FA 自动化未授权（${host.name} → System Events${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
-    );
+    if (twoFaAutomation.kind === "accessibility" || twoFaAutomation.code === "-25211") {
+      issues.push(
+        `辅助功能未授权（2FA 需要，${host.name}${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
+      );
+    } else {
+      issues.push(
+        `2FA 自动化未授权（${host.name} → System Events${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
+      );
+    }
   }
 
   const envPath = path.join(PACKAGE_ROOT, ".env");
@@ -243,7 +249,9 @@ export async function checkEnvironment(options = {}) {
       "  2FA 自动化:",
       twoFaAutomation.granted
         ? `ok（${host.name} → System Events）`
-        : `未授权（请勾选 ${host.name} → System Events）`
+        : twoFaAutomation.kind === "accessibility" || twoFaAutomation.code === "-25211"
+          ? `需辅助功能（${host.name}，与自动化是两项）`
+          : `未授权（请勾选 ${host.name} → System Events）`
     );
     console.log("  .env:", fs.existsSync(envPath) ? "ok" : "首次运行 ./run.sh 时自动创建");
     if (issues.length) {

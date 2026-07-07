@@ -378,7 +378,7 @@ export async function withAccessibilityRetry(fn, options = {}) {
 
 /**
  * 检测 Terminal/Cursor 对 System Events / 2FA 弹窗进程的自动化权限
- * @returns {Promise<{ granted: boolean, reason?: string, code?: string, mode?: string }>}
+ * @returns {Promise<{ granted: boolean, reason?: string, code?: string, mode?: string, kind?: 'accessibility'|'automation'|'partial' }>}
  */
 export async function check2FAAutomationGranted() {
   if (process.platform !== "darwin") return { granted: true, mode: "non-darwin" };
@@ -386,12 +386,15 @@ export async function check2FAAutomationGranted() {
     return { granted: false, reason: "missing 2fa-automation-check script" };
   }
 
+  const host = getAccessibilityHostApp();
   const axOk = await isAccessibilityGranted();
   if (!axOk) {
     return {
       granted: false,
       code: "-25211",
-      reason: "辅助功能未授权，无法探测 2FA 自动化",
+      kind: "accessibility",
+      reason:
+        `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」（与「自动化」是两项独立权限，仅开 System Events 不够）`,
     };
   }
 
@@ -407,8 +410,9 @@ export async function check2FAAutomationGranted() {
       return {
         granted: false,
         code: "partial",
+        kind: "partial",
         reason:
-          "2FA 自动化部分授权：可发现弹窗但无法读取 UI（请勾选 Terminal → System Events）",
+          "自动化已部分生效但读 UI 失败：请取消勾选后重新勾选 Terminal → System Events，并完全退出终端后重开",
       };
     }
     const m = line.match(/^no:(-?\d+):(.*)$/);
@@ -419,7 +423,16 @@ export async function check2FAAutomationGranted() {
         return {
           granted: false,
           code,
-          reason: "2FA 自动化未授权（-1743）：需允许终端 App 控制「System Events」",
+          kind: "automation",
+          reason: `自动化未授权（-1743）：请在 自动化 中展开「${host.name}」并勾选「System Events」`,
+        };
+      }
+      if (code === "-25211") {
+        return {
+          granted: false,
+          code,
+          kind: "accessibility",
+          reason: `辅助功能未授权（-25211）：请在 辅助功能 中勾选「${host.name}」（自动化已开时仍需要此项）`,
         };
       }
       return { granted: false, code, reason: detail };
@@ -454,40 +467,54 @@ export async function ensure2FAAutomation(options = {}) {
     return { granted: true, host: host.name, mode: first.mode };
   }
 
-  log(">>> 2FA 自动化权限未就绪，正在引导开启…", quiet);
+  log(">>> 2FA 权限探测未通过，正在引导开启…", quiet);
   if (first.reason) log(`    原因: ${first.reason}`, quiet);
-  log(
-    `    需要允许「${host.name}」控制「System Events」（点击 2FA「允许」弹窗依赖此项）`,
-    quiet
-  );
-  if (first.code === "partial") {
+
+  if (first.kind === "accessibility" || first.code === "-25211") {
     log(
-      "    检测到「已勾选但仍失效」：请取消勾选后重新勾选 System Events，并重启终端",
+      `    「自动化」与「辅助功能」是两项独立权限；您截图中的 System Events 属于自动化，还需勾选辅助功能`,
+      quiet
+    );
+    await triggerAccessibilityPrompt();
+    const opened = openAccessibilitySettings();
+    if (opened) {
+      log("    已打开：系统设置 → 隐私与安全性 → 辅助功能", quiet);
+    }
+    log(`    请勾选「${host.name}」，完成后完全退出终端并重新打开`, quiet);
+  } else {
+    log(
+      `    需要允许「${host.name}」控制「System Events」（点击 2FA「允许」弹窗依赖此项）`,
+      quiet
+    );
+    if (first.code === "partial") {
+      log(
+        "    检测到「已勾选但仍失效」：请取消勾选后重新勾选 System Events，并重启终端",
+        quiet
+      );
+    }
+
+    try {
+      await execFileAsync(
+        "osascript",
+        [
+          "-e",
+          'tell application "System Events" to get name of first application process whose background only is false',
+        ],
+        { timeout: 10_000 }
+      );
+    } catch {
+      /* 触发授权弹窗 */
+    }
+
+    const opened = openAutomationSettings();
+    if (opened) {
+      log("    已打开：系统设置 → 隐私与安全性 → 自动化", quiet);
+    }
+    log(
+      `    请展开「${host.name}」并勾选「System Events」（若出现 FollowUpUI 也一并勾选）`,
       quiet
     );
   }
-
-  try {
-    await execFileAsync(
-      "osascript",
-      [
-        "-e",
-        'tell application "System Events" to get name of first application process whose background only is false',
-      ],
-      { timeout: 10_000 }
-    );
-  } catch {
-    /* 触发授权弹窗 */
-  }
-
-  const opened = openAutomationSettings();
-  if (opened) {
-    log("    已打开：系统设置 → 隐私与安全性 → 自动化", quiet);
-  }
-  log(
-    `    请展开「${host.name}」并勾选「System Events」（若出现 FollowUpUI 也一并勾选）`,
-    quiet
-  );
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -497,6 +524,12 @@ export async function ensure2FAAutomation(options = {}) {
       log(`✓ 2FA 自动化已授权（${host.name} → System Events）`, quiet);
       return { granted: true, host: host.name, mode: check.mode };
     }
+  }
+
+  if (first.kind === "accessibility" || first.code === "-25211") {
+    throw new Error(
+      `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完全退出终端后重新运行 ./run.sh`
+    );
   }
 
   throw new Error(

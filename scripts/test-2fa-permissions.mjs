@@ -22,8 +22,12 @@ console.log(
   `  自动化(系统设置): ${automation.granted ? "ok" : `未授权 ${automation.reason ?? ""}`}`
 );
 console.log(
-  `  2FA 自动化(System Events): ${twoFa.granted ? `ok (${twoFa.mode ?? ""})` : `未授权 ${twoFa.reason ?? ""}`}`
+  `  2FA 自动化(System Events): ${twoFa.granted ? `ok (${twoFa.mode ?? ""})` : `未通过 ${twoFa.reason ?? ""}`}`
 );
+if (!twoFa.granted && (twoFa.kind === "accessibility" || twoFa.code === "-25211")) {
+  console.log("  提示: -25211 表示「辅助功能」未开，不是「自动化」问题");
+  console.log("  请打开: 系统设置 → 隐私与安全性 → 辅助功能 → 勾选 Terminal");
+}
 
 const ok = ax && automation.granted && twoFa.granted;
 process.exit(ok ? 0 : 1);
