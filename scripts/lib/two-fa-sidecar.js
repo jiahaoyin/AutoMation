@@ -1,7 +1,7 @@
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
 import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
 import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
-import { waitForAllowClick } from "./mac-2fa-allow.js";
+import { waitForAllowClick, readPopupCodeViaAppleScript } from "./mac-2fa-allow.js";
 import { sleep } from "./prompt.js";
 
 function get2FAConfig() {
@@ -103,7 +103,20 @@ export async function waitForMac2FACode(options = {}) {
     }
 
     if (process.platform === "darwin") {
-      const r = await runPopupPhase("read_code", 10);
+      let r = await runPopupPhase("read_code", 10);
+      if (!r.code) {
+        const asRead = await readPopupCodeViaAppleScript(8);
+        if (asRead?.code) {
+          r = {
+            ok: true,
+            action: "read_code",
+            code: asRead.code,
+            source: asRead.source,
+            raw: asRead.raw,
+          };
+          console.log(`[2FA] AppleScript 读到验证码 ${asRead.code} 原文="${asRead.raw ?? ""}"`);
+        }
+      }
       if (r.action === "dismissed_stale") {
         if (r.code) dismissedCodes.add(r.code);
         console.log("[2FA] 读码前关闭残留窗");

@@ -94,7 +94,9 @@ func walkCollect(_ element: AXUIElement, depth: Int, maxDepth: Int, result: inou
     }
     if axRole(element) == kAXButtonRole as String {
         let title = axTexts(element).joined(separator: " ")
-        if title.contains("允许") || title == "Allow" { result.hasAllow = true }
+        if title == "允许" || title == "Allow" || (title.contains("允许") && !title.contains("不允许")) {
+            result.hasAllow = true
+        }
         if title.contains("完成") || title == "Done" || title == "OK" || title.contains("好") { result.hasDone = true }
     }
     for child in axChildren(element) {
@@ -142,14 +144,20 @@ func clickDone(_ win: AXUIElement) -> Bool {
 
 func clickAllow(_ win: AXUIElement) -> Bool {
     clickButtonInTree(win, matchers: [
-        { $0 == "允许" || $0 == "Allow" || $0.contains("允许") },
+        { t in
+            if t == "允许" || t == "Allow" { return true }
+            if t.contains("允许") && !t.contains("不允许") && !t.lowercased().contains("don't") { return true }
+            return false
+        },
     ])
 }
 
-let priorityApps = ["FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter"]
+let priorityApps = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow"]
 
 func isPriorityApp(_ name: String) -> Bool {
-    priorityApps.contains { name.contains($0) }
+    if priorityApps.contains(where: { name.contains($0) }) { return true }
+    if name.contains("Auth") || name.contains("FollowUp") || name.contains("Security") { return true }
+    return false
 }
 
 func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
@@ -195,23 +203,25 @@ func clickRightmostButton(_ root: AXUIElement) -> Bool {
 }
 
 func collectPriorityWindows() -> [ScannedWindow] {
-    var apps = NSWorkspace.shared.runningApplications.filter {
-        $0.activationPolicy == .regular || $0.activationPolicy == .accessory
-    }
+    var apps = NSWorkspace.shared.runningApplications
     apps.sort { a, b in
         let an = a.localizedName ?? ""
         let bn = b.localizedName ?? ""
         let ar = priorityApps.firstIndex { an.contains($0) } ?? 99
         let br = priorityApps.firstIndex { bn.contains($0) } ?? 99
-        return ar < br
+        if ar != br { return ar < br }
+        return an < bn
     }
     var out: [ScannedWindow] = []
     for app in apps {
         let appName = app.localizedName ?? ""
-        guard isPriorityApp(appName) else { continue }
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         for win in windowsForApp(appEl) {
-            out.append(ScannedWindow(appName: appName, window: win, scan: scanWindow(win)))
+            let scan = scanWindow(win)
+            let relevant = scan.hasAllow || scan.hasCodePrompt || scan.code != nil || looksLikeAllowDialog(scan.blob)
+            if relevant || isPriorityApp(appName) {
+                out.append(ScannedWindow(appName: appName, window: win, scan: scan))
+            }
         }
     }
     return out

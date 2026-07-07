@@ -1,5 +1,6 @@
 /**
- * 统一「允许」点击策略阶梯：CG → AppleScript → cliclick → 手动等待
+ * 统一「允许」点击策略阶梯：AppleScript → CG → cliclick → 手动等待
+ * AppleScript 通过 System Events 遍历全部进程，比 Swift 仅扫 priorityApps 更可靠
  */
 
 import { execFile, spawnSync } from "node:child_process";
@@ -55,18 +56,84 @@ function parseJson(stdout) {
   }
 }
 
+function parsePhaseJson(stdout) {
+  const line = stdout.trim().split("\n").pop() || "";
+  try {
+    const parsed = JSON.parse(line);
+    const code =
+      parsed.code != null && String(parsed.code).length > 0
+        ? String(parsed.code).replace(/\D/g, "").slice(0, 6)
+        : null;
+    return {
+      ok: Boolean(parsed.ok),
+      action: parsed.action ?? "none",
+      code: code?.length === 6 ? code : null,
+      source: parsed.source ? String(parsed.source) : null,
+      raw: parsed.raw ? String(parsed.raw) : null,
+    };
+  } catch {
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+}
+
+async function runAppleScriptPhase(phase, timeoutSec = 3) {
+  if (process.platform !== "darwin" || !fs.existsSync(AS_SCRIPT)) {
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "osascript",
+      [AS_SCRIPT, `--phase=${phase}`, `--timeout=${timeoutSec}`],
+      { timeout: (timeoutSec + 12) * 1000, maxBuffer: 256 * 1024 }
+    );
+    return parsePhaseJson(stdout);
+  } catch (err) {
+    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
+    if (stdout.trim()) return parsePhaseJson(stdout);
+    return { ok: false, action: "none", code: null, source: null, raw: null };
+  }
+}
+
 function cliclickAvailable() {
   const r = spawnSync("which", ["cliclick"], { encoding: "utf-8" });
   return r.status === 0;
 }
 
-/**
- * @returns {Promise<{ action: string, source?: string, strategy?: string }>}
- */
-async function tryCgClickAllow(timeoutSec = 3) {
-  if (!ensureBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) {
-    return { action: "none" };
+async function probe2FAStateSwift(timeoutSec = 2) {
+  if (!ensureBin(SWIFT_SRC, SWIFT_BIN)) return { action: "idle" };
+  try {
+    const { stdout } = await execFileAsync(
+      SWIFT_BIN,
+      ["--phase", "probe", "--timeout", String(timeoutSec)],
+      { timeout: (timeoutSec + 5) * 1000, maxBuffer: 128 * 1024 }
+    );
+    const parsed = parseJson(stdout);
+    if (parsed?.action) {
+      return { action: parsed.action, source: parsed.source ?? undefined, code: parsed.code ?? undefined };
+    }
+  } catch (err) {
+    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
+    const parsed = stdout.trim() ? parseJson(stdout) : null;
+    if (parsed?.action) {
+      return { action: parsed.action, source: parsed.source ?? undefined, code: parsed.code ?? undefined };
+    }
   }
+  return { action: "idle" };
+}
+
+/**
+ * @returns {Promise<{ action: string, source?: string, code?: string }>}
+ */
+export async function probe2FAState(timeoutSec = 2) {
+  const as = await runAppleScriptPhase("probe", timeoutSec);
+  if (as.action !== "none" && as.action !== "idle") {
+    return { action: as.action, source: as.source ?? undefined, code: as.code ?? undefined };
+  }
+  return probe2FAStateSwift(timeoutSec);
+}
+
+async function tryCgClickAllow(timeoutSec = 3) {
+  if (!ensureBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) return { action: "none" };
   try {
     const { stdout, stderr } = await execFileAsync(
       CLICK_ALLOW_BIN,
@@ -74,9 +141,7 @@ async function tryCgClickAllow(timeoutSec = 3) {
       { timeout: (timeoutSec + 8) * 1000, maxBuffer: 128 * 1024 }
     );
     if (stderr?.trim()) {
-      for (const line of stderr.trim().split("\n")) {
-        console.log(`[2FA] ${line}`);
-      }
+      for (const line of stderr.trim().split("\n")) console.log(`[2FA] ${line}`);
     }
     const parsed = parseJson(stdout);
     if (parsed?.action === "clicked_allow") {
@@ -92,56 +157,14 @@ async function tryCgClickAllow(timeoutSec = 3) {
   return { action: "none" };
 }
 
-function parsePhaseJson(stdout) {
-  const line = stdout.trim().split("\n").pop() || "";
-  try {
-    const parsed = JSON.parse(line);
-    return {
-      ok: Boolean(parsed.ok),
-      action: parsed.action ?? "none",
-      source: parsed.source ? String(parsed.source) : null,
-    };
-  } catch {
-    return { ok: false, action: "none", source: null };
-  }
-}
-
-async function runAppleScriptAllow(timeoutSec = 3) {
-  if (process.platform !== "darwin" || !fs.existsSync(AS_SCRIPT)) {
-    return { action: "none" };
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      "osascript",
-      [AS_SCRIPT, "--phase=pre_allow", `--timeout=${timeoutSec}`],
-      { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 }
-    );
-    const r = parsePhaseJson(stdout);
-    if (r.action === "clicked_allow") {
-      return { action: "clicked_allow", source: r.source ?? undefined, strategy: "applescript" };
-    }
-  } catch (err) {
-    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
-    if (stdout.trim()) {
-      const r = parsePhaseJson(stdout);
-      if (r.action === "clicked_allow") {
-        return { action: "clicked_allow", source: r.source ?? undefined, strategy: "applescript" };
-      }
-    }
+async function tryAppleScriptAllow(timeoutSec = 4) {
+  const r = await runAppleScriptPhase("pre_allow", timeoutSec);
+  if (r.action === "clicked_allow") {
+    return { action: "clicked_allow", source: r.source ?? undefined, strategy: "applescript" };
   }
   return { action: "none" };
 }
 
-/**
- * @returns {Promise<{ action: string, source?: string, strategy?: string }>}
- */
-async function tryAppleScriptAllow(timeoutSec = 3) {
-  return runAppleScriptAllow(timeoutSec);
-}
-
-/**
- * @returns {Promise<{ action: string, source?: string, strategy?: string }>}
- */
 async function tryCliclickAllow(timeoutSec = 3) {
   if (!cliclickAvailable() || !ensureBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) {
     return { action: "none" };
@@ -164,67 +187,30 @@ async function tryCliclickAllow(timeoutSec = 3) {
   return { action: "none" };
 }
 
-/**
- * @returns {Promise<{ action: string, source?: string }>}
- */
-export async function probe2FAState(timeoutSec = 2) {
-  if (!ensureBin(SWIFT_SRC, SWIFT_BIN)) {
-    return { action: "idle" };
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      SWIFT_BIN,
-      ["--phase", "probe", "--timeout", String(timeoutSec)],
-      { timeout: (timeoutSec + 5) * 1000, maxBuffer: 128 * 1024 }
-    );
-    const parsed = parseJson(stdout);
-    if (parsed?.action) {
-      return { action: parsed.action, source: parsed.source ?? undefined };
-    }
-  } catch (err) {
-    const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
-    const parsed = stdout.trim() ? parseJson(stdout) : null;
-    if (parsed?.action) {
-      return { action: parsed.action, source: parsed.source ?? undefined };
-    }
-  }
-  return { action: "idle" };
-}
-
-/**
- * 点击后确认：Allow 窗消失或出现验证码窗
- */
 export async function confirmAllowSuccess() {
-  await sleep(2000);
-  const state = await probe2FAState(3);
-  if (state.action === "has_code_dialog") return true;
-  if (state.action === "has_allow_dialog") return false;
+  for (let i = 0; i < 6; i++) {
+    await sleep(i === 0 ? 1500 : 800);
+    const state = await probe2FAState(2);
+    if (state.action === "has_code_dialog") return true;
+    if (state.action === "has_allow_dialog") continue;
+    if (state.action === "idle" && i >= 2) return true;
+  }
   return false;
 }
 
-/**
- * 单轮尝试所有自动策略
- * @returns {Promise<{ clicked: boolean, source?: string, strategy?: string }>}
- */
-export async function tryAllowOnce(timeoutSec = 3) {
-  const strategies = [tryCgClickAllow, tryAppleScriptAllow, tryCliclickAllow];
+export async function tryAllowOnce(timeoutSec = 4) {
+  const strategies = [tryAppleScriptAllow, tryCgClickAllow, tryCliclickAllow];
   for (const fn of strategies) {
     const r = await fn(timeoutSec);
     if (r.action === "clicked_allow") {
       const ok = await confirmAllowSuccess();
-      if (ok) {
-        return { clicked: true, source: r.source, strategy: r.strategy };
-      }
+      if (ok) return { clicked: true, source: r.source, strategy: r.strategy };
+      console.log(`[2FA] 点击后未确认成功 (${r.strategy})，尝试下一策略…`);
     }
   }
   return { clicked: false };
 }
 
-/**
- * 等待用户手动点击「允许」
- * @param {object} [options]
- * @param {number} [options.timeoutMs]
- */
 export async function waitForManualAllow(options = {}) {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
@@ -242,24 +228,12 @@ export async function waitForManualAllow(options = {}) {
         );
         prompted = true;
       }
-    } else if (state.action === "idle" && !prompted) {
-      // 弹窗可能刚消失（用户已点允许），再等一轮确认是否出现验证码窗
-      await sleep(1200);
-      const again = await probe2FAState(2);
-      if (again.action === "has_code_dialog") {
-        return { clicked: true, source: again.source, strategy: "manual" };
-      }
     }
     await sleep(800);
   }
   return { clicked: false };
 }
 
-/**
- * 完整 Allow 等待：自动策略轮询 + 手动回退
- * @param {object} [options]
- * @param {number} [options.timeoutMs]
- */
 export async function waitForAllowClick(options = {}) {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
@@ -269,23 +243,26 @@ export async function waitForAllowClick(options = {}) {
 
   while (Date.now() < deadline) {
     polls += 1;
-    const state = await probe2FAState(2);
+    const state = await probe2FAState(3);
 
     if (state.action === "has_code_dialog") {
-      return { clicked: true, source: state.source, strategy: "already_allowed" };
+      console.log("[2FA] ✓ 验证码窗已出现（允许已生效）");
+      return { clicked: true, source: state.source, strategy: "code_visible" };
     }
 
     if (state.action === "has_allow_dialog" || state.action === "idle") {
       autoAttempts += 1;
-      const r = await tryAllowOnce(3);
+      const r = await tryAllowOnce(5);
       if (r.clicked) {
         console.log(
           `[2FA] ✓ 已点击「允许」(${r.strategy || "auto"}${r.source ? ` / ${r.source}` : ""})`
         );
         return { clicked: true, source: r.source, strategy: r.strategy };
       }
-      if (state.action === "has_allow_dialog" && autoAttempts >= 8 && !manualStarted) {
+
+      if (state.action === "has_allow_dialog" && autoAttempts >= 4 && !manualStarted) {
         manualStarted = true;
+        console.log("[2FA] 自动点击未成功，等待手动点击「允许」…");
         const manual = await waitForManualAllow({ timeoutMs: deadline - Date.now() });
         if (manual.clicked) {
           console.log("[2FA] ✓ 用户已手动点击「允许」");
@@ -295,10 +272,28 @@ export async function waitForAllowClick(options = {}) {
     }
 
     if (polls === 1 || polls % 6 === 0) {
-      console.log("[2FA] 仍在查找「允许」按钮…（请确认终端已获 System Events 自动化权限）");
+      const hint =
+        state.action === "has_allow_dialog"
+          ? "已检测到允许弹窗，正在尝试点击…"
+          : "等待允许弹窗出现…";
+      console.log(`[2FA] ${hint}（请确认终端已获辅助功能 + System Events 自动化）`);
     }
-    await sleep(500);
+    await sleep(600);
+  }
+
+  const last = await probe2FAState(2);
+  if (last.action === "has_code_dialog") {
+    return { clicked: true, source: last.source, strategy: "code_visible_late" };
   }
 
   return { clicked: false, reason: "timeout" };
+}
+
+/** 通过 AppleScript 直接读弹窗验证码（Swift 失败时的可靠回退） */
+export async function readPopupCodeViaAppleScript(timeoutSec = 8) {
+  const r = await runAppleScriptPhase("read_code", timeoutSec);
+  if (r.code) {
+    return { code: r.code, raw: r.raw, source: r.source ?? "applescript" };
+  }
+  return null;
 }

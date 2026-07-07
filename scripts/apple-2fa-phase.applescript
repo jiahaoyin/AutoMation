@@ -180,7 +180,11 @@ on clickAllowDeep(root)
 		try
 			repeat with b in (buttons of root)
 				set bn to my buttonName(b)
-				if bn is "允许" or bn is "Allow" or bn contains "允许" then
+				if bn is "允许" or bn is "Allow" then
+					click b
+					return true
+				end if
+				if bn contains "允许" and bn does not contain "不允许" and bn does not contain "Don't" then
 					click b
 					return true
 				end if
@@ -309,10 +313,10 @@ on tryClickAllow(pn, root, blob)
 		end try
 	end tell
 	delay 0.15
-	if my clickAllowDeep(root) then return true
 	if my looksLikeAllowDialog(blob) then
 		if my clickRightAllow(root) then return true
 	end if
+	if my clickAllowDeep(root) then return true
 	return false
 end tryClickAllow
 
@@ -349,8 +353,21 @@ on scanPhase(phase)
 			if hasPrompt and code is not "" then
 				return my emitJson(true, code, "read_code", pn, raw)
 			end if
+		else if phase is "probe" then
+			if hasPrompt and code is not "" then
+				return my emitJson(true, code, "has_code_dialog", pn, raw)
+			end if
+			if hasPrompt then
+				return my emitJson(true, "", "has_code_dialog", pn, "")
+			end if
+			if isAllowDlg and not hasPrompt then
+				return my emitJson(true, "", "has_allow_dialog", pn, "")
+			end if
 		end if
 	end repeat
+	if phase is "probe" then
+		return my emitJson(false, "", "idle", "", "")
+	end if
 	if phase is "pre_allow" then
 		if my clickAllowViaReturnKey() then
 			return my emitJson(true, "", "clicked_allow", "keystroke", "")
