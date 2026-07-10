@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 
+import { shouldDismissCodeBeforeAllow } from "./lib/mac-2fa-allow.js";
 import { createMac2FACollector } from "./lib/two-fa-sidecar.js";
 
 function deferred() {
@@ -68,16 +69,30 @@ function cancellationError() {
   return error;
 }
 
-function createNativeHarness(clock, { staleCodes = [] } = {}) {
+function createNativeHarness(
+  clock,
+  {
+    staleCodes = [],
+    settingsCancelSettles = true,
+    settingsForceStopSettles = true,
+    popupCloseWait = null,
+    popupPrimaryCloseSucceeds = true,
+    popupFallbackCloseFailures = 0,
+  } = {}
+) {
   let popup = null;
   let allowVisible = false;
+  let fallbackCloseFailuresRemaining = popupFallbackCloseFailures;
   const settingsRequests = [];
   const stats = {
     allowClicks: 0,
     cleanupDismissals: 0,
+    popupWinnerClosures: 0,
     settingsStarts: 0,
     settingsCancels: 0,
     settingsForceStops: 0,
+    allowAttempts: [],
+    fullAllowWaits: 0,
   };
 
   const runtime = {
@@ -97,11 +112,16 @@ function createNativeHarness(clock, { staleCodes = [] } = {}) {
       }
       return { action: "none", code: null };
     },
-    async waitForAllowClick() {
+    async tryAllowOnce(timeoutSec, options) {
+      stats.allowAttempts.push({ timeoutSec, options });
       if (!allowVisible) return { clicked: false, strategy: "none" };
       allowVisible = false;
       stats.allowClicks += 1;
       return { clicked: true, strategy: "test-allow", source: "test" };
+    },
+    async waitForAllowClick() {
+      stats.fullAllowWaits += 1;
+      throw new Error("collector must not enter the full Allow wait loop");
     },
     async readPopupCode() {
       if (!popup) return null;
@@ -112,12 +132,24 @@ function createNativeHarness(clock, { staleCodes = [] } = {}) {
         return { action: "read_code", code: popup.code, raw: popup.raw };
       }
       if (phase === "dismiss_stale" && popup) {
+        if (fallbackCloseFailuresRemaining > 0) {
+          fallbackCloseFailuresRemaining -= 1;
+          return { action: "none", code: null };
+        }
         const code = popup.code;
         popup = null;
         stats.cleanupDismissals += 1;
         return { action: "dismissed_stale", code };
       }
       return { action: "none", code: null };
+    },
+    async dismissCodePopupForWebFill() {
+      if (!popup) return false;
+      if (popupCloseWait) await popupCloseWait.promise;
+      if (!popupPrimaryCloseSucceeds) return false;
+      popup = null;
+      stats.popupWinnerClosures += 1;
+      return true;
     },
     start2FASettingsCodeRequest() {
       stats.settingsStarts += 1;
@@ -138,13 +170,14 @@ function createNativeHarness(clock, { staleCodes = [] } = {}) {
         cancel() {
           if (settled) return false;
           stats.settingsCancels += 1;
+          if (!settingsCancelSettles) return true;
           settled = true;
           result.reject(cancellationError());
           return true;
         },
         forceStop() {
           stats.settingsForceStops += 1;
-          if (!settled) {
+          if (!settled && settingsForceStopSettles) {
             settled = true;
             result.reject(cancellationError());
           }
@@ -193,8 +226,100 @@ async function bufferEarlyPopupTest() {
 
   assert.equal(await collector.getCode(), "123456");
   assert.equal(native.stats.settingsStarts, 0);
+  assert.equal(native.stats.popupWinnerClosures, 1);
   await collector.dispose();
   assert.equal(clock.timers.size, 0);
+}
+
+function preparedBoundaryNeverDismissesCurrentCodeTest() {
+  assert.equal(
+    shouldDismissCodeBeforeAllow({
+      staleBoundaryEstablished: true,
+      sawAllowDialog: false,
+      allowExplicitlyClicked: false,
+    }),
+    false
+  );
+  assert.equal(
+    shouldDismissCodeBeforeAllow({
+      staleBoundaryEstablished: false,
+      sawAllowDialog: false,
+      allowExplicitlyClicked: false,
+    }),
+    true
+  );
+}
+
+async function collectorCarriesPreparationBoundaryIntoAllowFlowTest() {
+  const { clock, native, collector } = createHarness();
+  await collector.prepare();
+  native.setAllowVisible(true);
+  await clock.advance(10);
+
+  assert.equal(native.stats.allowAttempts.length, 1);
+  assert.equal(native.stats.allowAttempts[0].options.confirmClick, false);
+  assert.equal(native.stats.allowAttempts[0].options.maxStrategies, 1);
+  assert.equal(native.stats.allowAttempts[0].options.strategyOffset, 0);
+  assert.equal(native.stats.fullAllowWaits, 0);
+  await collector.dispose();
+}
+
+async function popupCodeWaitsForDialogCleanupTest() {
+  const popupCloseWait = deferred();
+  const { clock, native, collector } = createHarness({ popupCloseWait });
+  await collector.prepare();
+  native.setPopup("343434");
+  await clock.advance(20);
+
+  let returned = false;
+  const codePromise = collector.getCode().then((code) => {
+    returned = true;
+    return code;
+  });
+  await clock.flush();
+  assert.equal(returned, false, "code must wait until the native popup is closed");
+
+  popupCloseWait.resolve();
+  await clock.flush();
+  assert.equal(await codePromise, "343434");
+  await collector.dispose();
+}
+
+async function popupCodeFallsBackToGenericDialogCleanupTest() {
+  const { clock, native, collector } = createHarness({
+    popupPrimaryCloseSucceeds: false,
+  });
+  await collector.prepare();
+  native.setPopup("565656");
+  await clock.advance(20);
+
+  assert.equal(await collector.getCode(), "565656");
+  assert.equal(native.stats.popupWinnerClosures, 0);
+  assert.equal(native.stats.cleanupDismissals, 1);
+  await collector.dispose();
+}
+
+async function popupCodeIsNotPublishedUntilCleanupSucceedsTest() {
+  const { clock, native, collector } = createHarness({
+    popupPrimaryCloseSucceeds: false,
+    popupFallbackCloseFailures: 1,
+  });
+  await collector.prepare();
+  native.setPopup("676767");
+  await clock.advance(20);
+
+  let returned = false;
+  const codePromise = collector.getCode().then((code) => {
+    returned = true;
+    return code;
+  });
+  await clock.flush();
+  assert.equal(returned, false);
+
+  await clock.advance(10);
+  assert.equal(await codePromise, "676767");
+  assert.equal(native.stats.cleanupDismissals, 1);
+  await collector.dispose();
 }
 
 async function settingsGracePeriodTest() {
@@ -225,6 +350,7 @@ async function latePopupBeatsSettingsTest() {
   assert.equal(await codePromise, "246810");
   assert.equal(native.stats.settingsCancels, 1);
   assert.equal(native.stats.settingsForceStops, 0);
+  assert.equal(native.stats.popupWinnerClosures, 1);
   await collector.dispose();
 }
 
@@ -279,6 +405,59 @@ async function providerFailureFallsBackTest() {
   await collector.dispose();
 }
 
+async function popupForcesUnresponsiveSettingsCleanupTest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 20,
+    settingsCancelSettles: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  let returned = false;
+  codePromise.then(() => {
+    returned = true;
+  });
+  await clock.advance(20);
+
+  native.setPopup("121212");
+  await clock.advance(20);
+  assert.equal(native.stats.settingsCancels, 1);
+  assert.equal(returned, false);
+
+  await clock.advance(49);
+  assert.equal(native.stats.settingsForceStops, 0);
+  assert.equal(returned, false);
+  await clock.advance(1);
+  assert.equal(await codePromise, "121212");
+  assert.equal(native.stats.settingsForceStops, 1);
+  await collector.dispose();
+}
+
+async function popupWaitsAfterForceStopForBoundedCloseTest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 20,
+    settingsCancelSettles: false,
+    settingsForceStopSettles: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  let returned = false;
+  codePromise.then(() => {
+    returned = true;
+  });
+  await clock.advance(20);
+  native.setPopup("232323");
+  await clock.advance(20);
+
+  await clock.advance(50);
+  assert.equal(native.stats.settingsForceStops, 1);
+  assert.equal(returned, false);
+  await clock.advance(49);
+  assert.equal(returned, false);
+  await clock.advance(1);
+  assert.equal(await codePromise, "232323");
+  await collector.dispose();
+}
+
 async function disposalStopsAllWorkTest() {
   const { clock, native, collector } = createHarness({ settingsFallbackAfterMs: 20 });
   await collector.prepare();
@@ -293,12 +472,29 @@ async function disposalStopsAllWorkTest() {
   assert.equal(clock.timers.size, 0);
 }
 
+async function disposalClosesVisiblePopupTest() {
+  const { native, collector } = createHarness();
+  await collector.prepare();
+  native.setPopup("998877");
+
+  await collector.dispose();
+  assert.equal(native.stats.cleanupDismissals, 1);
+}
+
+preparedBoundaryNeverDismissesCurrentCodeTest();
 await bufferEarlyPopupTest();
+await collectorCarriesPreparationBoundaryIntoAllowFlowTest();
+await popupCodeWaitsForDialogCleanupTest();
+await popupCodeFallsBackToGenericDialogCleanupTest();
+await popupCodeIsNotPublishedUntilCleanupSucceedsTest();
 await settingsGracePeriodTest();
 await latePopupBeatsSettingsTest();
 await settingsWinnerEnablesCleanupOnlyTest();
 await staleCodeIsRejectedTest();
 await providerFailureFallsBackTest();
+await popupForcesUnresponsiveSettingsCleanupTest();
+await popupWaitsAfterForceStopForBoundedCloseTest();
 await disposalStopsAllWorkTest();
+await disposalClosesVisiblePopupTest();
 
 console.log("two-fa collector: ok");

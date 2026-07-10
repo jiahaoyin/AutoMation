@@ -1,8 +1,12 @@
 import path from "node:path";
 
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
-import { waitForAllowClick, readPopupCode, probe2FAState } from "./mac-2fa-allow.js";
-import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
+import { readPopupCode, probe2FAState, tryAllowOnce } from "./mac-2fa-allow.js";
+import {
+  dismissCodePopupForWebFill,
+  dismissStale2FAPopups,
+  runPopupPhase,
+} from "./mac-2fa-popup.js";
 import { start2FASettingsCodeRequest } from "./mac-settings-2fa.js";
 
 function numberFromEnv(key, fallback) {
@@ -34,9 +38,11 @@ function resolveRuntime(overrides = {}) {
     dismissStale2FAPopups:
       overrides.dismissStale2FAPopups ?? dismissStale2FAPopups,
     probe2FAState: overrides.probe2FAState ?? probe2FAState,
-    waitForAllowClick: overrides.waitForAllowClick ?? waitForAllowClick,
+    tryAllowOnce: overrides.tryAllowOnce ?? tryAllowOnce,
     readPopupCode: overrides.readPopupCode ?? readPopupCode,
     runPopupPhase: overrides.runPopupPhase ?? runPopupPhase,
+    dismissCodePopupForWebFill:
+      overrides.dismissCodePopupForWebFill ?? dismissCodePopupForWebFill,
     start2FASettingsCodeRequest:
       overrides.start2FASettingsCodeRequest ?? start2FASettingsCodeRequest,
   };
@@ -106,9 +112,11 @@ export function createMac2FACollector(options = {}) {
   let lastStableCode = null;
   let stableHits = 0;
   let allowStrategy = "none";
+  let allowAttempt = 0;
   let settingsRequest = null;
   let settingsCompletion = null;
   let settingsStartDelay = null;
+  let settingsCleanupFinished = false;
   let getCodePromise = null;
   let activeAcquisition = null;
 
@@ -186,9 +194,16 @@ export function createMac2FACollector(options = {}) {
     if (popupCandidate) return;
 
     if (state?.action === "has_allow_dialog") {
-      const allow = await runtime.waitForAllowClick({
-        timeoutMs: Math.max(800, config.pollIntervalMs),
-      });
+      const strategyOffset = allowAttempt;
+      allowAttempt += 1;
+      const allow = await runtime.tryAllowOnce(
+        Math.max(1, Math.ceil(Math.min(2_000, config.pollIntervalMs) / 1000)),
+        {
+          confirmClick: false,
+          maxStrategies: 1,
+          strategyOffset,
+        }
+      );
       if (allow?.clicked) {
         allowStrategy = allow.strategy ?? allow.source ?? "auto";
         audit({
@@ -236,20 +251,45 @@ export function createMac2FACollector(options = {}) {
     }
 
     if (stableHits < 2) return;
-    popupCandidate = {
+    const candidate = {
       source: "popup",
       code,
       raw: result?.raw ? String(result.raw) : null,
       allowStrategy,
     };
+    let popupClosed = false;
+    try {
+      popupClosed = await runtime.dismissCodePopupForWebFill(4);
+    } catch (error) {
+      audit({ phase: "popup_winner_close_failed", error: errorMessage(error) });
+    }
+    if (!popupClosed) {
+      try {
+        const fallback = await runtime.runPopupPhase("dismiss_stale", 2);
+        popupClosed = fallback?.action === "dismissed_stale";
+        audit({
+          phase: "popup_winner_close_fallback",
+          action: fallback?.action ?? "none",
+          code: normalizeSixDigitCode(fallback?.code),
+        });
+      } catch (error) {
+        audit({ phase: "popup_winner_close_fallback_failed", error: errorMessage(error) });
+      }
+    }
+    if (!popupClosed) {
+      audit({ phase: "popup_winner_close_pending", code });
+      return;
+    }
     audit({
       phase: "popup_code_buffered",
       code,
-      raw: popupCandidate.raw,
+      raw: candidate.raw,
       allowStrategy,
       source: result?.source ?? "popup",
+      popupClosed,
     });
-    popupReady.resolve(popupCandidate);
+    popupCandidate = candidate;
+    popupReady.resolve(candidate);
   };
 
   const watchPopup = async () => {
@@ -353,7 +393,7 @@ export function createMac2FACollector(options = {}) {
   };
 
   const cancelSettingsProvider = async (reason) => {
-    if (!settingsRequest) return;
+    if (!settingsRequest || settingsCleanupFinished) return;
     const cancelSignalled = settingsRequest.cancel();
     audit({ phase: "settings_provider_cancel", reason, cancelSignalled });
 
@@ -367,7 +407,19 @@ export function createMac2FACollector(options = {}) {
     if (!cleaned) {
       const forceStopped = settingsRequest.forceStop();
       audit({ phase: "settings_provider_force_stop", reason, forceStopped });
+      const forceWait = scheduleDelay(config.cleanupGraceMs);
+      const closedAfterForce = await Promise.race([
+        settingsCompletion.then(() => true),
+        forceWait.promise.then(() => false),
+      ]);
+      forceWait.cancel();
+      audit({
+        phase: "settings_provider_force_stop_cleanup",
+        reason,
+        closedAfterForce,
+      });
     }
+    settingsCleanupFinished = true;
   };
 
   const acquireCode = async () => {
@@ -441,6 +493,21 @@ export function createMac2FACollector(options = {}) {
     disposePromise = (async () => {
       await cancelSettingsProvider("collector_disposed");
       if (popupWatcherPromise) await popupWatcherPromise;
+      if (prepared && runtime.platform === "darwin") {
+        try {
+          const state = await runtime.probe2FAState(2);
+          if (state?.action === "has_code_dialog") {
+            const result = await runtime.runPopupPhase("dismiss_stale", 2);
+            audit({
+              phase: "popup_dispose_cleanup",
+              action: result?.action ?? "none",
+              code: normalizeSixDigitCode(result?.code),
+            });
+          }
+        } catch (error) {
+          audit({ phase: "popup_dispose_cleanup_failed", error: errorMessage(error) });
+        }
+      }
       cancelAllDelays();
     })();
     return disposePromise;

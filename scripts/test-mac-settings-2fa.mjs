@@ -22,6 +22,7 @@ function createHarness() {
   const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-2fa-settings-"));
   const child = createChild();
   let spawnCall = null;
+  const timers = [];
   const runtime = {
     platform: "darwin",
     helperPath: "/tmp/fake-mac-settings-2fa-code",
@@ -29,12 +30,20 @@ function createHarness() {
       spawnCall = { command, args, options };
       return child;
     },
+    setTimeout(callback, delay) {
+      timers.push({ callback, delay, active: true });
+      return timers.length - 1;
+    },
+    clearTimeout(index) {
+      if (timers[index]) timers[index].active = false;
+    },
   };
 
   return {
     child,
     reportDir,
     runtime,
+    timers,
     get spawnCall() {
       return spawnCall;
     },
@@ -150,6 +159,36 @@ async function runInvalidCodeTest() {
   }
 }
 
+async function runTimeoutKeepsMarkerUntilChildClosesTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      timeoutMs: 1_000,
+      verbose: false,
+    });
+    assert.equal(harness.timers.length, 1);
+    let settled = false;
+    request.promise.catch(() => {
+      settled = true;
+    });
+
+    harness.timers[0].callback();
+    await Promise.resolve();
+    assert.deepEqual(harness.child.killSignals, ["SIGKILL"]);
+    assert.equal(fs.existsSync(harness.cancelFile()), true);
+    assert.equal(settled, false);
+
+    const rejected = assert.rejects(request.promise, /超时/);
+    harness.child.emit("close", null, "SIGKILL");
+    await rejected;
+    assert.equal(fs.existsSync(harness.cancelFile()), false);
+  } finally {
+    harness.cleanup();
+  }
+}
+
 function runSwiftCancellationContractTest() {
   const source = fs.readFileSync(
     new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
@@ -158,6 +197,13 @@ function runSwiftCancellationContractTest() {
   assert.match(source, /--cancel-file/);
   assert.match(source, /func stopIfCancelled/);
   assert.match(source, /func closeVerificationCodeAlert/);
+  assert.match(source, /verificationCodeRequested/);
+  assert.match(source, /waitForAlertMs/);
+  assert.match(source, /clickNamed\(in: root, names:/);
+  assert.match(
+    source,
+    /closeVerificationCodeAlert\(appElement: appElement, waitForAlertMs: 2_000\)/
+  );
   assert.ok(
     source.match(/stopIfCancelled\(/g)?.length >= 6,
     "Swift helper must check cancellation throughout navigation and polling"
@@ -168,6 +214,7 @@ await runSuccessTest();
 await runCancelTest();
 await runForceStopTest();
 await runInvalidCodeTest();
+await runTimeoutKeepsMarkerUntilChildClosesTest();
 runSwiftCancellationContractTest();
 
 console.log("mac settings 2fa lifecycle: ok");

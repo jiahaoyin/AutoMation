@@ -17,6 +17,7 @@ struct Output: Codable {
 
 let settingsBundleIds = ["com.apple.systempreferences", "com.apple.SystemSettings"]
 var cancelFilePath: String?
+var verificationCodeRequested = false
 
 let accountUrls = [
     "x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings",
@@ -123,17 +124,18 @@ func findFormattedCodeInTree(_ root: AXUIElement, maxNodes: Int = 600) -> (Strin
 }
 
 func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
-    var roots: [AXUIElement] = []
+    var sheets: [AXUIElement] = []
+    var windows: [AXUIElement] = []
     for w in collectWindows(appElement: appElement) {
-        roots.append(w)
+        windows.append(w)
         for child in axChildren(w) {
             let role = axRole(child)
             if role == kAXSheetRole as String || role == "AXDialog" {
-                roots.append(child)
+                sheets.append(child)
             }
         }
     }
-    return roots
+    return sheets + windows
 }
 
 func scanCodeFromAlertOnly(appElement: AXUIElement) -> (String, String)? {
@@ -232,20 +234,28 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
-func closeVerificationCodeAlert(appElement: AXUIElement) {
-    let alertVisible = collectSheetRoots(appElement).contains {
-        hasSettingsCodeAlert(blobDeep($0))
-    }
-    if alertVisible {
-        _ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
-    }
+func closeVerificationCodeAlert(appElement: AXUIElement, waitForAlertMs: Int = 0) {
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, waitForAlertMs)) / 1000.0)
+    repeat {
+        for root in collectSheetRoots(appElement) {
+            guard hasSettingsCodeAlert(blobDeep(root)) else { continue }
+            if clickNamed(in: root, names: ["好", "OK", "Done", "完成"]) {
+                return
+            }
+        }
+        if Date() >= deadline { return }
+        usleep(100_000)
+    } while true
 }
 
 func stopIfCancelled(appElement: AXUIElement? = nil) {
     guard let path = cancelFilePath,
           FileManager.default.fileExists(atPath: path) else { return }
     if let appElement {
-        closeVerificationCodeAlert(appElement: appElement)
+        closeVerificationCodeAlert(
+            appElement: appElement,
+            waitForAlertMs: verificationCodeRequested ? 3_000 : 0
+        )
     }
     emit(Output(ok: false, code: nil, message: "cancelled", screenshot: nil, raw: nil))
 }
@@ -381,6 +391,7 @@ logStep(5, "click Get Verification Code")
 guard clickNamed(in: appElement, names: getCodeBtn) else {
     emit(Output(ok: false, code: nil, message: "Get Verification Code button not found", screenshot: nil, raw: nil))
 }
+verificationCodeRequested = true
 
 logStep(6, "waiting for verification code alert…")
 cancellablePause(2_500_000, appElement: appElement)
@@ -425,6 +436,6 @@ if let shotPath = screenshotPath {
 }
 
 stopIfCancelled(appElement: appElement)
-_ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
+closeVerificationCodeAlert(appElement: appElement, waitForAlertMs: 2_000)
 stopIfCancelled(appElement: appElement)
 emit(Output(ok: true, code: finalCode, message: "ok", screenshot: savedShot, raw: finalRaw))

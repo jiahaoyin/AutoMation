@@ -92,6 +92,8 @@ function resolveHelperPath(runtime) {
 export function start2FASettingsCodeRequest(opts = {}) {
   const runtime = opts.runtime ?? {};
   const platform = runtime.platform ?? process.platform;
+  const schedule = runtime.setTimeout ?? globalThis.setTimeout;
+  const cancelScheduled = runtime.clearTimeout ?? globalThis.clearTimeout;
   if (platform !== "darwin") {
     throw new Error("2FA 系统设置 helper 不可用: non-darwin");
   }
@@ -127,6 +129,8 @@ export function start2FASettingsCodeRequest(opts = {}) {
   let stderr = "";
   let settled = false;
   let cancelRequested = false;
+  let timeoutRequested = false;
+  let terminalError = null;
   let timeoutTimer = null;
   let resolveResult;
   let rejectResult;
@@ -139,7 +143,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
   const finish = (error, value) => {
     if (settled) return;
     settled = true;
-    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (timeoutTimer != null) cancelScheduled(timeoutTimer);
     removeCancelFile(cancelFile);
     if (error) rejectResult(error);
     else resolveResult(value);
@@ -153,7 +157,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
       } catch {
         /* finish below */
       }
-      finish(new Error(`2FA 系统设置 helper ${label} 输出过大`));
+      terminalError = new Error(`2FA 系统设置 helper ${label} 输出过大`);
       return current;
     }
     return next;
@@ -173,6 +177,15 @@ export function start2FASettingsCodeRequest(opts = {}) {
       for (const line of stderr.trim().split(/\r?\n/)) {
         console.log(`[2FA] ${line}`);
       }
+    }
+
+    if (terminalError) {
+      finish(terminalError);
+      return;
+    }
+    if (timeoutRequested) {
+      finish(new Error(`系统设置获取验证码超时 (${timeoutMs}ms)`));
+      return;
     }
 
     let parsed = null;
@@ -233,9 +246,9 @@ export function start2FASettingsCodeRequest(opts = {}) {
     }
   };
 
-  timeoutTimer = setTimeout(() => {
+  timeoutTimer = schedule(() => {
+    timeoutRequested = true;
     forceStop();
-    finish(new Error(`系统设置获取验证码超时 (${timeoutMs}ms)`));
   }, timeoutMs + 15_000);
 
   return { promise, cancel, forceStop };

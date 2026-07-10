@@ -229,12 +229,18 @@ async function dismissStaleCodeDialogOnce() {
   return null;
 }
 
-export async function tryAllowOnce(timeoutSec = 4) {
+export async function tryAllowOnce(timeoutSec = 4, options = {}) {
   const strategies = [tryReturnKeyAllow, tryAppleScriptAllow, tryCliclickAllow, tryCgClickAllow];
-  for (const fn of strategies) {
+  const offset = Math.max(0, options.strategyOffset ?? 0) % strategies.length;
+  const maxStrategies = Math.max(
+    1,
+    Math.min(strategies.length, options.maxStrategies ?? strategies.length)
+  );
+  for (let index = 0; index < maxStrategies; index += 1) {
+    const fn = strategies[(offset + index) % strategies.length];
     const r = await fn(timeoutSec);
     if (r.action === "clicked_allow") {
-      const ok = await confirmAllowSuccess();
+      const ok = options.confirmClick === false ? true : await confirmAllowSuccess();
       if (ok) {
         await releaseMouseButtons();
         return { clicked: true, source: r.source, strategy: r.strategy };
@@ -271,14 +277,27 @@ export async function waitForManualAllow(options = {}) {
   return { clicked: false };
 }
 
+export function shouldDismissCodeBeforeAllow({
+  staleBoundaryEstablished = false,
+  sawAllowDialog = false,
+  allowExplicitlyClicked = false,
+} = {}) {
+  return !staleBoundaryEstablished && !sawAllowDialog && !allowExplicitlyClicked;
+}
+
 export async function waitForAllowClick(options = {}) {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
   let polls = 0;
   let autoAttempts = 0;
   let manualStarted = false;
-  let sawAllowDialog = false;
+  let sawAllowDialog = options.sawAllowDialog === true;
   let allowExplicitlyClicked = false;
+  const staleBoundaryEstablished = options.staleBoundaryEstablished === true;
+  const allowManual = options.allowManual !== false;
+  const strategyOffset = options.strategyOffset ?? 0;
+  const maxStrategiesPerAttempt = options.maxStrategiesPerAttempt;
+  const confirmClick = options.confirmClick;
 
   while (Date.now() < deadline) {
     polls += 1;
@@ -289,7 +308,11 @@ export async function waitForAllowClick(options = {}) {
     }
 
     if (state.action === "has_code_dialog") {
-      if (!sawAllowDialog && !allowExplicitlyClicked) {
+      if (shouldDismissCodeBeforeAllow({
+        staleBoundaryEstablished,
+        sawAllowDialog,
+        allowExplicitlyClicked,
+      })) {
         console.log("[2FA] 验证码窗在「允许」之前出现，视为残留窗并关闭…");
         await dismissStaleCodeDialogOnce();
         continue;
@@ -300,7 +323,14 @@ export async function waitForAllowClick(options = {}) {
 
     if (state.action === "has_allow_dialog" || state.action === "idle") {
       autoAttempts += 1;
-      const r = await tryAllowOnce(5);
+      const r = await tryAllowOnce(
+        Math.max(1, Math.ceil(Math.min(5_000, timeoutMs) / 1000)),
+        {
+          strategyOffset: strategyOffset + autoAttempts - 1,
+          maxStrategies: maxStrategiesPerAttempt,
+          confirmClick,
+        }
+      );
       if (r.clicked) {
         allowExplicitlyClicked = true;
         console.log(
@@ -309,7 +339,12 @@ export async function waitForAllowClick(options = {}) {
         return { clicked: true, source: r.source, strategy: r.strategy };
       }
 
-      if (state.action === "has_allow_dialog" && autoAttempts >= 4 && !manualStarted) {
+      if (
+        allowManual &&
+        state.action === "has_allow_dialog" &&
+        autoAttempts >= 4 &&
+        !manualStarted
+      ) {
         manualStarted = true;
         console.log("[2FA] 自动点击未成功，等待手动点击「允许」…");
         const manual = await waitForManualAllow({ timeoutMs: deadline - Date.now() });
