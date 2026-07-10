@@ -156,7 +156,7 @@ class FakeActions:
             self.target = self.coordinate_target
         else:
             self.target = element
-        self.pending_human_click = element
+        self.pending_human_click = self.target
         return self
 
     def perform(self):
@@ -717,11 +717,42 @@ class RememberAccountTests(unittest.TestCase):
     def test_checks_remember_account_and_verifies_state(self):
         field = FakeElement()
         field.on_click = lambda: setattr(field.states, "is_checked", True)
-        page = FakePage(frames=[FakePage({"css:#remember-me": [field]})])
+        page = FakePage({"css:#remember-me": [field]})
 
         self.assertTrue(ensure_remember_checked(page, pause=lambda *_: None))
         self.assertEqual(field.clicks, 0)
-        self.assertIn(("human_click", field), field.scope.actions.calls)
+        self.assertIn(("human_click", field), page.actions.calls)
+
+    def test_clicks_hidden_custom_checkbox_label_through_root_context(self):
+        checkbox = FakeElement(displayed=False)
+        label = FakeElement(
+            on_click=lambda: setattr(checkbox.states, "is_checked", True),
+            location={"x": 20, "y": 30},
+            size={"width": 100, "height": 30},
+        )
+        frame = FakePage(
+            {
+                "css:#remember-me": [checkbox],
+                "css:#remember-me-label": [label],
+            }
+        )
+        iframe = FakeElement(
+            attrs={"src": frame.state["href"]},
+            location={"x": 100, "y": 200},
+        )
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=label),
+        )
+        frame.parent = root
+
+        self.assertTrue(
+            ensure_remember_checked(root, pause=lambda *_: None)
+        )
+        self.assertEqual(checkbox.clicks, 0)
+        self.assertEqual(frame.actions.calls, [])
+        self.assertIn(("human_click", {"x": 170, "y": 245}), root.actions.calls)
 
     def test_refuses_to_continue_when_checkbox_is_missing(self):
         with self.assertRaisesRegex(RuntimeError, "remember-account checkbox"):

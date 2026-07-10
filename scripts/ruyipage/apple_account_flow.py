@@ -35,9 +35,22 @@ PASSWORD_SELECTORS = (
     "css:input[type='password']",
 )
 REMEMBER_SELECTORS = (
-    ("css:#remember-me", "css:#remember-me:checked"),
-    ("css:input[name='rememberMe']", "css:input[name='rememberMe']:checked"),
-    ("css:input[name='remember-me']", "css:input[name='remember-me']:checked"),
+    (
+        "css:#remember-me",
+        (
+            "css:#remember-me-label",
+            "css:label[for='remember-me']",
+            "css:.si-remember-password label",
+        ),
+    ),
+    (
+        "css:input[name='rememberMe']",
+        ("css:label[for='rememberMe']", "css:.si-remember-password label"),
+    ),
+    (
+        "css:input[name='remember-me']",
+        ("css:label[for='remember-me']", "css:.si-remember-password label"),
+    ),
 )
 CODE_FIELD_SELECTORS = (
     ("css:input[autocomplete='one-time-code']", True),
@@ -305,27 +318,52 @@ def ensure_remember_checked(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
-    for selector, _checked_selector in REMEMBER_SELECTORS:
-        found = find_scoped_elements(page, selector)
-        fields = [element for _scope, element in found]
-        if not fields:
-            continue
-        scope = found[0][0]
-        validate_apple_scope(scope)
-        try:
-            if fields[0].states.is_checked:
-                return True
-        except Exception:
-            pass
-        human_click(scope, fields[0], pause=pause)
-        pause(180, 420)
-        try:
-            checked = bool(fields[0].states.is_checked)
-        except Exception:
-            checked = False
-        if not checked:
-            raise RuntimeError("remember-account checkbox did not become checked")
-        return True
+    state_found = False
+    for state_selector, click_selectors in REMEMBER_SELECTORS:
+        for scope in iter_page_scopes(page):
+            fields = safe_elements(scope, state_selector)
+            if not fields:
+                continue
+            state_found = True
+            field = fields[0]
+            validate_apple_scope(scope)
+            try:
+                if field.states.is_checked:
+                    return True
+            except Exception:
+                pass
+
+            click_target = field if element_is_interactable(field) else None
+            if click_target is None:
+                for click_selector in click_selectors:
+                    candidates = [
+                        element
+                        for element in safe_elements(scope, click_selector)
+                        if element_is_interactable(element)
+                    ]
+                    if candidates:
+                        click_target = candidates[0]
+                        break
+            if click_target is None:
+                continue
+
+            if scope is page:
+                action_scope = scope
+                action_target = click_target
+            else:
+                action_scope = page
+                action_target = root_viewport_center(page, scope, click_target)
+            human_click(action_scope, action_target, pause=pause)
+            pause(180, 420)
+            try:
+                checked = bool(field.states.is_checked)
+            except Exception:
+                checked = False
+            if not checked:
+                raise RuntimeError("remember-account checkbox did not become checked")
+            return True
+    if state_found:
+        raise RuntimeError("remember-account checkbox is not interactable")
     raise RuntimeError("remember-account checkbox not found")
 
 
