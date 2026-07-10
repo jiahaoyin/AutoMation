@@ -6,6 +6,111 @@ BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_ROOT="$(cd "$BOOTSTRAP_DIR/.." && pwd)"
 LOCAL_NODE_DIR="$PACKAGE_ROOT/.runtime/node"
 LOCAL_NODE_VERSION="${LOCAL_NODE_VERSION:-22.14.0}"
+LOCAL_PYTHON_VERSION="${PYTHON_BOOTSTRAP_VERSION:-3.12.10}"
+PYTHON_DOWNLOAD_DIR="$PACKAGE_ROOT/.runtime/downloads"
+PYTHON_BOOTSTRAP_PKG_URL="${PYTHON_BOOTSTRAP_PKG_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg}"
+PYTHON_FRAMEWORK_BIN="/Library/Frameworks/Python.framework/Versions/3.12/bin"
+
+python_version_supported() {
+  local command_path="$1"
+  local version major minor
+  version="$("$command_path" --version 2>&1)" || return 1
+  if [[ "$version" =~ Python[[:space:]]+([0-9]+)\.([0-9]+) ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    (( major > 3 || (major == 3 && minor >= 10) ))
+    return
+  fi
+  return 1
+}
+
+resolve_supported_python() {
+  local candidate command_path
+  local candidates=()
+  if [[ -n "${PYTHON_BOOTSTRAP_EXECUTABLE:-}" ]]; then
+    candidates+=("$PYTHON_BOOTSTRAP_EXECUTABLE")
+  fi
+  candidates+=(
+    "python3"
+    "python"
+    "/usr/local/bin/python3"
+    "$PYTHON_FRAMEWORK_BIN/python3"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    command_path="$candidate"
+    if [[ "$candidate" != */* ]]; then
+      command_path="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    if [[ -n "$command_path" && -x "$command_path" ]] &&
+      python_version_supported "$command_path"; then
+      printf '%s\n' "$command_path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+acquire_admin_authorization() {
+  echo "==> 需要管理员权限安装受信任的 Python 运行环境"
+  echo "    密码仅由 sudo 读取，项目不会保存或记录密码"
+  if ! sudo -v; then
+    echo "错误: 未获得管理员授权，安装已停止"
+    exit 1
+  fi
+}
+
+install_python_official_pkg() {
+  local pkg partial signature
+  mkdir -p "$PYTHON_DOWNLOAD_DIR"
+  pkg="$PYTHON_DOWNLOAD_DIR/python-${LOCAL_PYTHON_VERSION}-macos11.pkg"
+  partial="${pkg}.part"
+
+  if [[ ! -f "$pkg" ]]; then
+    echo ">>> 从 python.org 下载官方 Python ${LOCAL_PYTHON_VERSION} universal2 安装包"
+    if ! curl --fail --location --retry 3 --output "$partial" "$PYTHON_BOOTSTRAP_PKG_URL"; then
+      rm -f "$partial"
+      echo "错误: Python 安装包下载失败: $PYTHON_BOOTSTRAP_PKG_URL"
+      return 1
+    fi
+    mv "$partial" "$pkg"
+  fi
+
+  signature="$(pkgutil --check-signature "$pkg" 2>&1)" || {
+    echo "$signature"
+    echo "错误: Python 安装包签名验证失败: $pkg"
+    return 1
+  }
+  if [[ "$signature" != *"Python Software Foundation"* ]]; then
+    echo "$signature"
+    echo "错误: Python 安装包签名不是 Python Software Foundation"
+    return 1
+  fi
+
+  echo ">>> 安装已验证签名的 Python ${LOCAL_PYTHON_VERSION}"
+  sudo installer -pkg "$pkg" -target /
+}
+
+ensure_python() {
+  local python_path
+  if python_path="$(resolve_supported_python)"; then
+    export PATH="$(dirname "$python_path"):$PATH"
+    echo "✓ Python $("$python_path" --version 2>&1) ($python_path)"
+    return 0
+  fi
+
+  echo ">>> 未检测到 Python 3.10+，开始自动安装"
+  install_python_official_pkg
+
+  if ! python_path="$(resolve_supported_python)"; then
+    echo "错误: Python 安装完成后仍未检测到 Python 3.10+"
+    echo "已检查 python3、python、/usr/local/bin/python3 与 $PYTHON_FRAMEWORK_BIN/python3"
+    return 1
+  fi
+
+  export PATH="$(dirname "$python_path"):$PATH"
+  echo "✓ Python $("$python_path" --version 2>&1) ($python_path)"
+}
 
 node_major_version() {
   if ! command -v node >/dev/null 2>&1; then
@@ -82,5 +187,15 @@ bootstrap_macos_runtime() {
     echo "错误: 仅支持 macOS"
     exit 1
   fi
+  ensure_node
+}
+
+bootstrap_macos_install_runtime() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "错误: 仅支持 macOS"
+    exit 1
+  fi
+  acquire_admin_authorization
+  ensure_python
   ensure_node
 }

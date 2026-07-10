@@ -313,7 +313,7 @@ echo "==> Apple ID 自动化包 环境安装 (v${version})"
 
 # shellcheck disable=SC1091
 source "$(dirname "$0")/scripts/bootstrap-macos.sh"
-bootstrap_macos_runtime
+bootstrap_macos_install_runtime
 
 echo "==> 编译 Swift AX 填表 helper"
 if command -v swiftc >/dev/null 2>&1; then

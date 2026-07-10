@@ -28,6 +28,7 @@
     "test:ruyipage-runtime": "node scripts/test-ruyipage-runtime.mjs",
     "test:ruyipage-protocol": "node scripts/test-ruyipage-protocol.mjs",
     "test:ruyipage-flow": "node scripts/test-ruyipage-flow.mjs",
+    "test:python-bootstrap": "node scripts/test-python-bootstrap.mjs",
     "test:firefox-profile": "node scripts/test-firefox-profile-mode.mjs",
     "test:release-copy-paths": "node scripts/test-release-copy-paths.mjs"
   }
