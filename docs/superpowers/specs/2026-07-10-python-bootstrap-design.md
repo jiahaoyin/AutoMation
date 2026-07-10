@@ -51,14 +51,15 @@ The bootstrap checks candidates in this order:
 4. `/usr/local/bin/python3`.
 5. `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`.
 
-A candidate is resolved to its real absolute path before it is executed. The
-binary and every directory in its resolved path must be owned by root and must
-not be group- or world-writable. This prevents a user-replaceable interpreter
-from running while the sudo timestamp is valid. A candidate that passes this
-trust gate is accepted only when `--version` reports Python 3.10 or newer;
-otherwise the pinned official Python is installed. The selected interpreter is
-passed explicitly to the Node ruyiPage runtime installer, which uses it only to
-create the project-local virtual environment.
+The fixed Python.org Framework path is version-checked directly because it is
+created by the digest- and signature-verified package below. Every other
+candidate is resolved to its real absolute path before execution; the binary
+and each directory in that path must be owned by root and must not be group- or
+world-writable. This prevents a user-replaceable interpreter from running while
+the sudo timestamp is valid. A candidate is accepted only when `--version`
+reports Python 3.10 or newer; otherwise the pinned official Python is installed.
+The selected interpreter is passed explicitly to the Node ruyiPage runtime
+installer, which uses it only to create the project-local virtual environment.
 
 ### Official Installer
 

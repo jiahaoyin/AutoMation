@@ -68,10 +68,14 @@ const resolveFunction = bootstrap.match(
 )?.[1];
 assert.ok(resolveFunction, "supported Python resolver is required");
 const trustIndex = resolveFunction.indexOf("python_path_is_admin_trusted");
-const versionIndex = resolveFunction.indexOf("python_version_supported");
+const versionIndex = resolveFunction.indexOf("python_version_supported", trustIndex);
 assert.ok(
   trustIndex >= 0 && trustIndex < versionIndex,
-  "candidate ownership must be checked before executing Python"
+  "non-framework candidate ownership must be checked before executing Python"
+);
+assert.match(
+  resolveFunction,
+  /candidate" == "\$PYTHON_FRAMEWORK_BIN\/python3"[\s\S]*python_version_supported/
 );
 for (const line of bootstrap.split(/\r?\n/).filter((line) => line.includes("/usr/bin/sudo"))) {
   assert.match(
@@ -99,9 +103,13 @@ function bashQuote(value) {
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "python-bootstrap-test-"));
 const oldPython = path.join(tempDir, "python-old");
 const supportedPython = path.join(tempDir, "python-supported");
+const frameworkBin = path.join(tempDir, "framework-bin");
+const frameworkPython = path.join(frameworkBin, "python3");
 try {
+  fs.mkdirSync(frameworkBin);
   fs.writeFileSync(oldPython, "#!/bin/bash\necho 'Python 3.9.18'\n", { mode: 0o755 });
   fs.writeFileSync(supportedPython, "#!/bin/bash\necho 'Python 3.12.10'\n", { mode: 0o755 });
+  fs.writeFileSync(frameworkPython, "#!/bin/bash\necho 'Python 3.12.10'\n", { mode: 0o755 });
   const bootstrapPath = fileURLToPath(new URL("./bootstrap-macos.sh", import.meta.url));
   const source = `source ${bashQuote(toBashPath(bootstrapPath))}`;
   const signatureFor = (identity) => `Package "python.pkg":
@@ -151,6 +159,20 @@ try {
   );
   assert.equal(supportedResult.status, 0, supportedResult.stderr);
 
+  const frameworkResult = spawnSync(
+    bash,
+    [
+      "-lc",
+      `${source}; python_path_is_admin_trusted() { return 1; }; ` +
+        `PYTHON_BOOTSTRAP_EXECUTABLE=''; ` +
+        `PYTHON_FRAMEWORK_BIN=${bashQuote(toBashPath(frameworkBin))}; ` +
+        "resolve_supported_python",
+    ],
+    { encoding: "utf-8" }
+  );
+  assert.equal(frameworkResult.status, 0, frameworkResult.stderr);
+  assert.equal(frameworkResult.stdout.trim(), toBashPath(frameworkPython));
+
   const untrustedResult = spawnSync(
     bash,
     [
@@ -195,6 +217,8 @@ try {
 } finally {
   if (fs.existsSync(oldPython)) fs.unlinkSync(oldPython);
   if (fs.existsSync(supportedPython)) fs.unlinkSync(supportedPython);
+  if (fs.existsSync(frameworkPython)) fs.unlinkSync(frameworkPython);
+  if (fs.existsSync(frameworkBin)) fs.rmdirSync(frameworkBin);
   fs.rmdirSync(tempDir);
 }
 

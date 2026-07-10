@@ -72,6 +72,11 @@ resolve_supported_python() {
     if [[ "$candidate" != */* ]]; then
       command_path="$(command -v "$candidate" 2>/dev/null || true)"
     fi
+    if [[ "$candidate" == "$PYTHON_FRAMEWORK_BIN/python3" && -x "$command_path" ]] &&
+      python_version_supported "$command_path"; then
+      printf '%s\n' "$command_path"
+      return 0
+    fi
     if [[ -n "$command_path" ]] &&
       trusted_path="$(python_path_is_admin_trusted "$command_path")" &&
       python_version_supported "$trusted_path"; then
@@ -224,7 +229,7 @@ ensure_python() {
     return 0
   fi
 
-  echo ">>> 未检测到 Python 3.10+，开始自动安装"
+  echo ">>> 未检测到符合要求的 Python 3.10+，开始自动安装"
   install_python_official_pkg
 
   if ! python_path="$(resolve_supported_python)"; then
