@@ -49,7 +49,7 @@ assert.match(
 );
 assert.match(
   bootstrap,
-  /Developer ID Installer: Python Software Foundation \(DJ3H93M7VJ\)/
+  /Developer ID Installer: Python Software Foundation \(BMM5U3QVKW\)/
 );
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/pkgutil --check-signature/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/installer -pkg/);
