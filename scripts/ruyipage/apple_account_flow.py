@@ -321,6 +321,28 @@ def submit_with_enter(
     scope.actions.press(keys.ENTER).perform()
 
 
+def submit_element_with_enter(
+    root_page: Any,
+    scope: Any,
+    element: Any,
+    keys: Any,
+    pause: Callable[[int, int], None] = human_pause,
+    min_ms: int = 350,
+    max_ms: int = 800,
+) -> None:
+    validate_apple_scope(scope)
+    if scope is root_page:
+        action_scope = scope
+        click_target = element
+    else:
+        validate_apple_scope(root_page)
+        action_scope = root_page
+        click_target = root_viewport_center(root_page, scope, element)
+
+    human_click(action_scope, click_target, pause=pause)
+    submit_with_enter(action_scope, keys, pause=pause, min_ms=min_ms, max_ms=max_ms)
+
+
 def ensure_remember_checked(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
@@ -863,7 +885,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                 PASSWORD_SELECTORS,
                 timeout_s=45,
             )
-            password_action_scope = input_and_verify(
+            input_and_verify(
                 password_scope,
                 password_field,
                 password,
@@ -873,7 +895,14 @@ def browser_flow(args: argparse.Namespace) -> int:
             )
             remember_checked = ensure_remember_checked(page)
             request_two_factor_preparation()
-            submit_with_enter(password_action_scope, Keys, min_ms=420, max_ms=900)
+            submit_element_with_enter(
+                page,
+                password_scope,
+                password_field,
+                Keys,
+                min_ms=420,
+                max_ms=900,
+            )
 
             login_state = wait_for_2fa_or_session(page)
             if login_state.get("trusted"):

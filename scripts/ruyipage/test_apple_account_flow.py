@@ -11,6 +11,7 @@ if RUYIPAGE_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, RUYIPAGE_SCRIPT_DIR)
 
 from apple_account_flow import (
+    browser_flow,
     click_trust_browser,
     click_two_factor_submit,
     collect_personal_info,
@@ -23,6 +24,7 @@ from apple_account_flow import (
     parse_args,
     pop_browser_credentials,
     request_two_factor_preparation,
+    submit_element_with_enter,
     submit_with_enter,
     validate_apple_url,
     validate_apple_scope,
@@ -301,6 +303,57 @@ class InputTests(unittest.TestCase):
         )
         self.assertEqual(field.value, "person@example.com")
 
+    def test_password_submit_refocuses_field_after_remember_checkbox_click(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
+        password = FakeElement(
+            location={"x": 260, "y": 117},
+            size={"width": 460, "height": 56},
+        )
+        remember = FakeElement(
+            location={"x": 260, "y": 200},
+            size={"width": 24, "height": 24},
+        )
+        iframe = FakeElement(
+            attrs={"src": auth_url},
+            location={"x": 150, "y": 378},
+            size={"width": 980, "height": 411},
+        )
+        root_actions = FakeActions(coordinate_target=password)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=root_actions,
+        )
+        frame = FakePage(
+            {
+                "css:input[type='password']": [password],
+                "css:#remember-me": [remember],
+            },
+            state={"href": auth_url},
+            parent=root,
+        )
+        root.frames = [frame]
+
+        root_actions.target = remember
+        submit_element_with_enter(
+            root,
+            frame,
+            password,
+            FakeKeys,
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(root_actions.target, password)
+        self.assertEqual(
+            root_actions.calls[-4:],
+            [
+                ("human_click", {"x": 640, "y": 523}),
+                ("perform",),
+                ("press", "ENTER"),
+                ("perform",),
+            ],
+        )
+
     def test_frame_input_maps_a_unique_apple_iframe_after_in_frame_navigation(self):
         iframe = FakeElement(
             attrs={"src": "https://idmsa.apple.com/appleauth/auth/signin"},
@@ -438,6 +491,101 @@ class InputTests(unittest.TestCase):
 
         self.assertEqual(field.clicks, 0)
         self.assertEqual(scope.actions.calls, [])
+
+
+class BrowserFlowTests(unittest.TestCase):
+    def test_browser_flow_refocuses_password_after_remember_before_submit(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
+        email = FakeElement()
+        password = FakeElement(
+            location={"x": 260, "y": 117},
+            size={"width": 460, "height": 56},
+        )
+        remember = FakeElement(
+            location={"x": 260, "y": 200},
+            size={"width": 24, "height": 24},
+        )
+        remember.on_click = lambda: setattr(remember.states, "is_checked", True)
+        iframe = FakeElement(
+            attrs={"src": auth_url},
+            location={"x": 150, "y": 378},
+            size={"width": 980, "height": 411},
+        )
+        root_actions = FakeActions(coordinate_target=[password, remember, password])
+        root = FakePage(
+            {
+                "css:#account_name_text_field": [email],
+                "css:iframe": [iframe],
+            },
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=root_actions,
+        )
+        frame = FakePage(
+            {
+                "css:input[type='password']": [password],
+                "css:#remember-me": [remember],
+            },
+            state={"href": auth_url},
+            parent=root,
+        )
+        root.frames = [frame]
+        root.get = lambda *_: None
+        root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        root.quit = lambda: None
+
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        def mark_prepared():
+            root_actions.calls.append(("prepare",))
+
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=[{"trusted": False}, {"trusted": True}],
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation",
+            side_effect=mark_prepared,
+        ), patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value={"trusted": True},
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.collect_personal_info",
+            return_value={"fullName": "Person", "birthday": None},
+        ), patch(
+            "apple_account_flow.human_pause",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.time.sleep",
+            return_value=None,
+        ), patch("apple_account_flow.emit"):
+            self.assertEqual(browser_flow(args), 0)
+
+        prepare_index = root_actions.calls.index(("prepare",))
+        self.assertEqual(
+            root_actions.calls[prepare_index - 2 : prepare_index + 5],
+            [
+                ("human_click", {"x": 422, "y": 590}),
+                ("perform",),
+                ("prepare",),
+                ("human_click", {"x": 640, "y": 523}),
+                ("perform",),
+                ("press", "ENTER"),
+                ("perform",),
+            ],
+        )
+        self.assertIs(root_actions.target, password)
 
 
 class SecurityCodeTests(unittest.TestCase):
