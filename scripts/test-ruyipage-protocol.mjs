@@ -107,18 +107,23 @@ async function runNodeRunnerSelfTest() {
   });
 
   const events = [];
+  let prepared = false;
   const result = await runner.run({
     creds: { appleId: "person@example.com", password: "secret" },
     reportDir: "data/reports/protocol-test",
     onEvent(event) {
       events.push(event.event);
     },
+    async prepare2FA() {
+      prepared = true;
+    },
     async get2FACode() {
+      assert.equal(prepared, true, "2FA code must not be requested before preparation");
       return "123456";
     },
   });
 
-  assert.deepEqual(events, ["ready", "need_2fa", "result"]);
+  assert.deepEqual(events, ["ready", "prepare_2fa", "need_2fa", "result"]);
   assert.equal(result.success, true);
   assert.equal(result.twoFaCodeLength, 6);
   assert.equal(result.credentialsInArgv, false);
@@ -136,6 +141,7 @@ async function runNodeRunner2FAFailureSelfTest() {
     runner.run({
       creds: { appleId: "person@example.com", password: "secret" },
       reportDir: "data/reports/protocol-test",
+      async prepare2FA() {},
       async get2FACode() {
         throw new Error("2fa failed");
       },
@@ -146,6 +152,36 @@ async function runNodeRunner2FAFailureSelfTest() {
   ]);
 
   await assert.rejects(guarded, /2fa failed/);
+}
+
+async function runNodeRunnerPreparationFailureSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python,
+    script,
+    cwd: root,
+    args: ["--node-self-test"],
+  });
+
+  let codeRequested = false;
+  const guarded = Promise.race([
+    runner.run({
+      creds: { appleId: "person@example.com", password: "secret" },
+      reportDir: "data/reports/protocol-test",
+      async prepare2FA() {
+        throw new Error("preparation failed");
+      },
+      async get2FACode() {
+        codeRequested = true;
+        return "123456";
+      },
+    }),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("runner hung after preparation failure")), 2000);
+    }),
+  ]);
+
+  await assert.rejects(guarded, /preparation failed/);
+  assert.equal(codeRequested, false);
 }
 
 async function runNodeRunnerTimeoutSelfTest() {
@@ -222,6 +258,7 @@ runBackendTimeoutConfigTest();
 runChildStopperSelfTest();
 await runProtocolSelfTest();
 await runNodeRunnerSelfTest();
+await runNodeRunnerPreparationFailureSelfTest();
 await runNodeRunner2FAFailureSelfTest();
 await runNodeRunnerTimeoutSelfTest();
 await runNodeRunnerForcedTimeoutSelfTest();

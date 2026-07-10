@@ -59,6 +59,7 @@ export function createRuyiPageBackendRunner(options = {}) {
      * @param {{ appleId: string, password: string }} params.creds
      * @param {string} params.reportDir
      * @param {(event: object) => void|Promise<void>} [params.onEvent]
+     * @param {() => Promise<void>} params.prepare2FA
      * @param {() => Promise<string>} params.get2FACode
      */
     run(params) {
@@ -132,6 +133,7 @@ async function runRuyiPageBackend({
   creds,
   reportDir,
   onEvent,
+  prepare2FA,
   get2FACode,
 }) {
   const child = spawn(
@@ -164,6 +166,7 @@ async function runRuyiPageBackend({
   let exitCode = null;
   let processingError = null;
   let timedOut = false;
+  let twoFaPrepared = false;
   /** @type {Promise<void>} */
   let processing = Promise.resolve();
   const stopper = createChildStopper(child, { graceMs: killGraceMs });
@@ -186,7 +189,20 @@ async function runRuyiPageBackend({
         .then(async () => {
           const event = parseJsonLine(line);
           if (onEvent) await onEvent(event);
-          if (event.event === "need_2fa") {
+          if (event.event === "prepare_2fa") {
+            if (twoFaPrepared) {
+              throw new Error("ruyipage backend requested duplicate 2FA preparation");
+            }
+            if (typeof prepare2FA !== "function") {
+              throw new Error("ruyipage backend requested 2FA preparation without a handler");
+            }
+            await prepare2FA();
+            twoFaPrepared = true;
+            child.stdin.write(JSON.stringify({ type: "2fa_prepared" }) + "\n");
+          } else if (event.event === "need_2fa") {
+            if (!twoFaPrepared) {
+              throw new Error("ruyipage backend requested a 2FA code before preparation");
+            }
             const code = await get2FACode();
             child.stdin.write(JSON.stringify({ type: "2fa_code", code }) + "\n");
           }

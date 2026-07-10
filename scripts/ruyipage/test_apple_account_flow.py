@@ -22,6 +22,7 @@ from apple_account_flow import (
     input_and_verify,
     parse_args,
     pop_browser_credentials,
+    request_two_factor_preparation,
     submit_with_enter,
     validate_apple_url,
     validate_apple_scope,
@@ -29,6 +30,24 @@ from apple_account_flow import (
     wait_for_2fa_or_session,
     wait_for_signed_in,
 )
+
+
+class TwoFactorPreparationTests(unittest.TestCase):
+    def test_accepts_only_two_factor_prepared_ack(self):
+        with patch("apple_account_flow.emit") as emit_event, patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_prepared"},
+        ):
+            request_two_factor_preparation()
+
+        emit_event.assert_called_once_with({"event": "prepare_2fa"})
+
+    def test_rejects_unexpected_preparation_command(self):
+        with patch("apple_account_flow.emit"), patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_code", "code": "123456"},
+        ), self.assertRaisesRegex(RuntimeError, "2FA preparation"):
+            request_two_factor_preparation()
 
 
 class FakeStates:

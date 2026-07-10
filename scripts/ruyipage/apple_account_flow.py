@@ -81,6 +81,13 @@ def read_command() -> dict[str, Any]:
     return json.loads(line)
 
 
+def request_two_factor_preparation() -> None:
+    emit({"event": "prepare_2fa"})
+    command = read_command()
+    if not isinstance(command, dict) or command.get("type") != "2fa_prepared":
+        raise RuntimeError("2FA preparation acknowledgement was not received")
+
+
 def human_pause(min_ms: int = 250, max_ms: int = 900) -> None:
     time.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
@@ -734,6 +741,7 @@ def protocol_self_test() -> int:
 
 def node_self_test() -> int:
     emit({"event": "ready", "mode": "node-self-test"})
+    request_two_factor_preparation()
     emit({"event": "need_2fa"})
     command = read_command()
     code = "".join(ch for ch in str(command.get("code", "")) if ch.isdigit())[:6]
@@ -864,6 +872,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                 root_page=page,
             )
             remember_checked = ensure_remember_checked(page)
+            request_two_factor_preparation()
             submit_with_enter(password_action_scope, Keys, min_ms=420, max_ms=900)
 
             login_state = wait_for_2fa_or_session(page)
