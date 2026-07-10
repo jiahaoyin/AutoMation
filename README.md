@@ -41,6 +41,9 @@ SHA-256 和 Python Software Foundation Developer ID 签名，再从 root 私有�
 | `npm run test:browser-backend` | 浏览器后端选择逻辑测试 |
 | `npm run test:ruyipage-protocol` | ruyipage JSONL 协议自测 |
 | `npm run test:ruyipage-flow` | ruyiPage Python 流程与安全边界测试 |
+| `npm run test:2fa-sidecar` | popup 与系统设置双通道竞速测试 |
+| `npm run test:2fa-settings-unit` | 可取消系统设置 helper 生命周期测试 |
+| `npm run test:account-browser-flow` | 浏览器运行与 2FA collector 生命周期测试 |
 | `npm run test:python-bootstrap` | Python 自动安装与提权入口合同测试 |
 | `npm run package` | 本地打包 `dist/`（保留 zip） |
 | `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
@@ -83,7 +86,16 @@ RUYIPAGE_PYTHON=python3           # 可选；默认使用 .runtime/ruyipage-venv
 BROWSER_PROFILE_MODE=persistent   # persistent | fresh
 RUYIPAGE_BACKEND_TIMEOUT_MS=720000
 RUYIPAGE_KILL_GRACE_MS=5000
+BROWSER_2FA_SETTINGS_AFTER_MS=8000
+BROWSER_2FA_SETTINGS_FALLBACK=1
+BROWSER_2FA_POLL_MS=800
 ```
+
+## 2FA 取码优先级
+
+ruyiPage 填好密码和“记住账号”后，会先通过 JSONL 要求 Node 清理旧验证码窗并启动 popup watcher；收到 `2fa_prepared` 后才提交密码。当前登录的验证码即使早于网页 `need_2fa` 状态出现，也会先缓存而不会再被当成旧码关闭。
+
+页面确认需要 2FA 后，popup 默认拥有 8 秒优先窗口。超过该时间仍未取到稳定验证码时，脚本自动打开“系统设置 → 登录与安全性 → 双重认证 → 获取验证码”，并让两个来源继续并行竞速。首个稳定六位码获胜，另一路会取消并关闭自己的验证码窗口；系统设置取码不依赖是否观察到“允许”按钮。
 
 macOS 测试机拉取新版本后建议依次运行：
 
@@ -91,6 +103,9 @@ macOS 测试机拉取新版本后建议依次运行：
 ./install.sh
 npm run check
 npm run test:python-bootstrap
+npm run test:2fa-sidecar
+npm run test:2fa-settings-unit
+npm run test:account-browser-flow
 ./run.sh
 ```
 

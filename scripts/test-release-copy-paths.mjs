@@ -64,6 +64,9 @@ const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.ur
 assert.equal(pkg.scripts["browser:debug"], undefined);
 assert.equal(pkg.scripts["browser:test-session"], undefined);
 assert.match(pkg.scripts["test:ruyipage-flow"], /test-ruyipage-flow\.mjs/);
+assert.match(pkg.scripts["test:2fa-sidecar"], /test-two-fa-sidecar\.mjs/);
+assert.match(pkg.scripts["test:2fa-settings-unit"], /test-mac-settings-2fa\.mjs/);
+assert.match(pkg.scripts["test:account-browser-flow"], /test-account-browser-flow\.mjs/);
 
 const releaseImports = collectRuntimeImports([
   "scripts/apple-id-full-flow.mjs",
@@ -126,10 +129,18 @@ assert.match(bootstrapMacOS, /resolve_trusted_python_signer/);
 assert.doesNotMatch(bootstrapMacOS, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -k/);
 assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)/);
-assert.match(
-  fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8"),
-  /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/
-);
+const envExample = fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8");
+assert.match(envExample, /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/);
+assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
+assert.match(envExample, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
+assert.match(envExample, /BROWSER_2FA_POLL_MS=800/);
+assert.doesNotMatch(envExample, /BROWSER_2FA_POPUP_WAIT_MS/);
+
+const releaseBuilder = fs.readFileSync(new URL("./build-release.mjs", import.meta.url), "utf-8");
+assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
+assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
+assert.match(releaseBuilder, /BROWSER_2FA_POLL_MS=800/);
+assert.doesNotMatch(releaseBuilder, /BROWSER_2FA_POPUP_WAIT_MS/);
 assert.match(
   fs.readFileSync(new URL("../README.md", import.meta.url), "utf-8"),
   /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/

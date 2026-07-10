@@ -228,7 +228,7 @@ cd apple-id-automation-${VERSION}
 1. **Mac 系统设置**：自动填入 Apple ID / 密码；**手机验证码需人工**在系统界面完成
 2. **等待**：脚本轮询直至检测到系统设置已登录（或按 Enter 手动确认）
 3. **Firefox**：启动、导航、页面读取、输入、截图与关闭全部由 ruyiPage 完成，不提供其他浏览器后端
-4. **account.apple.com**：登录 → macOS 2FA 弹窗自动读码 → 采集姓名、生日
+4. **account.apple.com**：登录 → popup 优先、8 秒后系统设置并行取码 → 采集姓名、生日
 5. **输出**：\`data/reports/apple-id-flow-*/report.json\` 与 \`screenshots/\`
 
 ## 命令
@@ -256,6 +256,9 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_BACKEND\` | 可选，固定为 \`ruyipage\`；\`auto\` 仅作旧配置兼容别名 |
 | \`RUYIPAGE_PYTHON\` | 可选，自定义 Python；默认优先项目内隔离虚拟环境 |
 | \`BROWSER_PROFILE_MODE\` | 可选，\`persistent\` / \`fresh\` |
+| \`BROWSER_2FA_SETTINGS_AFTER_MS\` | 可选，默认 \`8000\`；超过 popup 优先窗口后启动系统设置并行取码 |
+| \`BROWSER_2FA_SETTINGS_FALLBACK\` | 可选，默认 \`1\`；设为 \`0\` 禁用系统设置取码 |
+| \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
 
 ## 故障排查
 
@@ -266,7 +269,7 @@ cd apple-id-automation-${VERSION}
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
-- **2FA 超时**：确认 Mac 已登录同一 Apple ID，且弹窗为 FollowUpUI 设备验证
+- **2FA 超时**：确认 Mac 已登录同一 Apple ID，Terminal 已获辅助功能/自动化权限，并查看 \`2fa-audit.jsonl\` 中两个来源的失败原因
 - **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
 
 ## 安全
@@ -292,6 +295,9 @@ APPLE_PASSWORD=your_password
 # BROWSER_PROFILE_MODE=persistent
 # RUYIPAGE_BACKEND_TIMEOUT_MS=720000
 # RUYIPAGE_KILL_GRACE_MS=5000
+# BROWSER_2FA_SETTINGS_AFTER_MS=8000
+# BROWSER_2FA_SETTINGS_FALLBACK=1
+# BROWSER_2FA_POLL_MS=800
 `
   );
 }

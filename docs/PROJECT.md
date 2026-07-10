@@ -9,7 +9,7 @@
 | macOS 系统设置登录 Apple ID | AppleScript / Swift AX | 手机验证码人工输入 |
 | 等待系统登录完成 | 状态轮询 | 必要时 Enter 确认 |
 | Firefox 登录 account.apple.com | **ruyiPage only** | 无 |
-| 浏览器 2FA | macOS FollowUpUI 取码 + ruyiPage 填码 | Mac 已登录同账号 |
+| 浏览器 2FA | FollowUpUI 与系统设置双通道取码 + ruyiPage 填码 | Mac 已登录同账号 |
 | 采集姓名、生日 | ruyiPage 页面读取 | 无 |
 
 浏览器启动、接管、导航、元素定位、页面读取、输入、截图和退出均由 ruyiPage 完成。Node 只负责编排 Python 子进程、macOS 取码和报告，不持有浏览器连接。
@@ -20,8 +20,10 @@
 2. JS 只通过 ruyiPage `page.run_js()` 做无副作用的状态与文本查询。
 3. 元素必须先被识别后才交互；2FA 未识别到单框或六格输入时拒绝盲打。
 4. 登录时必须确认“记住账号”已勾选；控件缺失或状态未生效即停止。
-5. 交互间使用有界随机停顿，避免固定节奏；超时均有上限。
-6. ruyiPage 或 Python 不可用时明确失败，不回退到 Node BiDi、JS 事件或其他页面自动化方案。
+5. 密码提交前必须完成 `prepare_2fa` 握手；旧码只按该边界判定，不能按 `need_2fa` 到达时间猜测。
+6. popup 优先 8 秒，之后与系统设置并行竞速；任一来源失败时继续等待另一路，获胜后清理 loser。
+7. 交互间使用有界随机停顿，避免固定节奏；超时均有上限。
+8. ruyiPage 或 Python 不可用时明确失败，不回退到 Node BiDi、JS 事件或其他页面自动化方案。
 
 ## 3. 运行链路
 
@@ -38,6 +40,7 @@
 ```
 
 账号通过子进程环境变量传入 Python，不出现在进程命令行参数中。密码也只通过环境变量传递。
+密码提交前 Python 发出 `prepare_2fa`；Node 清理准备边界之前的旧窗并启动持续 watcher，回传 `2fa_prepared` 后 Python 才提交。页面确认 2FA 后，Node 从 popup 与可取消的系统设置 helper 中取首个稳定六位码。
 
 ## 4. 环境安装
 
@@ -59,6 +62,9 @@
 - `BROWSER_PROFILE_MODE=fresh`：每次在 `data/firefox-apple-automation-fresh/<run-id>` 创建隔离 Profile，适合切换身份。
 - `FIREFOX_PROFILE_DIR`：覆盖 Profile 根目录。
 - `RUYIPAGE_BACKEND_TIMEOUT_MS=720000`：浏览器阶段总预算 12 分钟，覆盖登录等待、macOS 2FA 取码和登录后采集。
+- `BROWSER_2FA_SETTINGS_AFTER_MS=8000`：从准备完成起为 popup 保留 8 秒优先窗口，之后启动系统设置并行取码。
+- `BROWSER_2FA_SETTINGS_FALLBACK=1`：默认启用系统设置来源；设为 `0` 才禁用。
+- `BROWSER_2FA_POLL_MS=800`：FollowUpUI 状态轮询间隔。
 
 切换账号时优先使用 `fresh`，避免身份和 Cookie 串用。
 
@@ -73,7 +79,8 @@
 | `scripts/lib/ruyipage-runtime.js` | Python/ruyiPage 探测与隔离安装 |
 | `scripts/lib/firefox-runtime.js` | Firefox 路径和 Profile 路径策略；不启动浏览器 |
 | `scripts/lib/env-setup.js` | macOS 环境和权限探测 |
-| `scripts/lib/two-fa-sidecar.js` | macOS 2FA 取码 |
+| `scripts/lib/two-fa-sidecar.js` | macOS popup/系统设置双通道 collector 与 loser 清理 |
+| `scripts/lib/mac-settings-2fa.js` | 可取消的系统设置验证码 helper 子进程 |
 | `scripts/build-release.mjs` | 发布包复制清单与依赖校验 |
 
 ## 7. 常用命令
@@ -83,6 +90,9 @@
 npm run check
 npm run test:python-bootstrap
 npm run test:ruyipage-flow
+npm run test:2fa-sidecar
+npm run test:2fa-settings-unit
+npm run test:account-browser-flow
 ./run.sh
 
 # 仅浏览器；仍由 ruyiPage 完成
@@ -98,10 +108,11 @@ npm run test:ruyipage-flow
 2. `npm run check` 显示 backend 为 `ruyipage`，Firefox 路径正确。
 3. 登录页账号输入后进入密码步骤。
 4. “记住账号”被勾选；若无法确认，流程应报错停止。
-5. 提交密码后，确认页面进入 2FA 才启动 macOS 取码。
-6. 验证码只写入已识别的单框或六格控件。
-7. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
-8. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，姓名/生日结果与页面一致。
+5. 终端在提交密码前显示预备 2FA 监听，且准备失败时密码不会提交。
+6. popup 早到时被缓存；8 秒内没有稳定码时系统设置自动进入双重认证取码，两个来源仍同时有效。
+7. 验证码只写入已识别的单框或六格控件，loser helper/弹窗随后关闭。
+8. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
+9. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，姓名/生日结果与页面一致。
 
 ## 9. 故障排查
 
@@ -111,7 +122,7 @@ npm run test:ruyipage-flow
 | Firefox 未找到 | 安装 Firefox 或设置 `FIREFOX_EXECUTABLE` |
 | 记住账号控件失败 | 保留失败截图，核对 Apple 登录页控件结构 |
 | 2FA 输入框未识别 | 查看 `99-ruyipage-failure.png`，补充 ruyiPage selector；不得改成无焦点输入 |
-| macOS 取码超时 | 确认系统设置已登录同账号，并授予 Terminal 辅助功能/自动化权限 |
+| macOS 取码超时 | 确认系统设置已登录同账号并授予 Terminal 辅助功能/自动化权限；查看 `2fa-audit.jsonl` 中 popup 与 settings 各自失败原因 |
 | 姓名或生日为空 | 查看 `03-account-manage.png`，调整 ruyiPage 页面解析标签 |
 
 ## 10. 安全边界
