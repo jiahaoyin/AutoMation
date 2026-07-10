@@ -1,355 +1,450 @@
 import path from "node:path";
+
 import { append2FAAudit, screenshotPathFor } from "./2fa-audit.js";
-import { fetch2FACodeFromSystemSettings } from "./mac-settings-2fa.js";
-import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
 import { waitForAllowClick, readPopupCode, probe2FAState } from "./mac-2fa-allow.js";
-import { sleep } from "./prompt.js";
+import { dismissStale2FAPopups, runPopupPhase } from "./mac-2fa-popup.js";
+import { start2FASettingsCodeRequest } from "./mac-settings-2fa.js";
 
-function get2FAConfig() {
-  const num = (key, fallback) => {
-    const v = parseInt(process.env[key] ?? "", 10);
-    return Number.isFinite(v) && v >= 0 ? v : fallback;
-  };
+function numberFromEnv(key, fallback) {
+  const value = Number.parseInt(process.env[key] ?? "", 10);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function resolveConfig(options) {
   return {
-    popupFirstMs: num("BROWSER_2FA_POPUP_WAIT_MS", 45_000),
-    settingsFallbackAfterMs: num("BROWSER_2FA_SETTINGS_AFTER_MS", 120_000),
-    settingsFallback: process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
-    pollIntervalMs: num("BROWSER_2FA_POLL_MS", 800),
+    timeoutMs: options.timeoutMs ?? 240_000,
+    settingsFallbackAfterMs:
+      options.settingsFallbackAfterMs ?? numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 8_000),
+    settingsFallback:
+      options.settingsFallback ?? process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
+    pollIntervalMs: Math.max(
+      1,
+      options.pollIntervalMs ?? numberFromEnv("BROWSER_2FA_POLL_MS", 800)
+    ),
+    cleanupGraceMs: options.cleanupGraceMs ?? 5_000,
   };
 }
 
-function logCodeResult(code, { source, raw, allowStrategy }) {
-  const src = source ? ` 来源=${source}` : "";
-  const rawPart = raw ? ` 原文="${String(raw).slice(0, 40)}"` : "";
-  const allowPart = allowStrategy ? ` allow=${allowStrategy}` : "";
-  console.log(`[2FA] ★ 验证码: ${code}${src}${rawPart}${allowPart}`);
+function resolveRuntime(overrides = {}) {
+  return {
+    platform: overrides.platform ?? process.platform,
+    now: overrides.now ?? Date.now,
+    setTimeout: overrides.setTimeout ?? globalThis.setTimeout,
+    clearTimeout: overrides.clearTimeout ?? globalThis.clearTimeout,
+    dismissStale2FAPopups:
+      overrides.dismissStale2FAPopups ?? dismissStale2FAPopups,
+    probe2FAState: overrides.probe2FAState ?? probe2FAState,
+    waitForAllowClick: overrides.waitForAllowClick ?? waitForAllowClick,
+    readPopupCode: overrides.readPopupCode ?? readPopupCode,
+    runPopupPhase: overrides.runPopupPhase ?? runPopupPhase,
+    start2FASettingsCodeRequest:
+      overrides.start2FASettingsCodeRequest ?? start2FASettingsCodeRequest,
+  };
 }
 
-function normalizeCode(code) {
-  return String(code ?? "").replace(/\D/g, "").slice(0, 6);
-}
-
-/** @param {Set<string>} rejected */
-async function snapshotVisiblePopupCodes(rejected) {
-  const state = await probe2FAState(2);
-  if (state.code) rejected.add(normalizeCode(state.code));
-  const r = await runPopupPhase("read_code", 2);
-  if (r.code) rejected.add(normalizeCode(r.code));
-}
-
-/**
- * @param {string} code
- * @param {{ source?: string, raw?: string, allowStrategy?: string }} meta
- * @param {object} audit
- */
-function returnPopupCode(code, meta, audit) {
-  logCodeResult(code, meta);
-  append2FAAudit(audit.reportDir, audit.entry);
-  console.log(`[2FA] 已获取 6 位验证码（${meta.raw ?? code}）`);
-  return code;
-}
-
-/**
- * 等待 2FA：关闭旧窗 → 点允许 → 再读新验证码
- * @param {object} [options]
- */
-export async function waitForMac2FACode(options = {}) {
-  const cfg = get2FAConfig();
-  const timeoutMs = options.timeoutMs ?? 240_000;
-  const popupFirstMs = options.popupFirstMs ?? cfg.popupFirstMs;
-  const settingsAfterMs = options.settingsFallbackAfterMs ?? cfg.settingsFallbackAfterMs;
-  const reportDir = options.reportDir;
-  const startedAt = Date.now();
-  const deadline = startedAt + timeoutMs;
-  let settingsTried = false;
-
-  console.log("[2FA] 分阶段处理系统弹窗（清旧窗 → 允许 → 读码）…");
-
-  /** @type {Set<string>} */
-  const dismissedCodes = new Set();
-
-  if (process.platform === "darwin") {
-    const { count, codes } = await dismissStale2FAPopups(6);
-    for (const c of codes) dismissedCodes.add(c);
-    if (count > 0) {
-      console.log(`[2FA] 已关闭 ${count} 个残留验证码窗（旧码: ${[...dismissedCodes].join(", ") || "无"}）`);
-    } else {
-      console.log("[2FA] 已扫描残留窗（未发现可关闭的旧验证码）");
-    }
-    append2FAAudit(reportDir, {
-      phase: "dismiss_stale",
-      dismissedCount: count,
-      dismissedCodes: [...dismissedCodes],
-    });
-    await snapshotVisiblePopupCodes(dismissedCodes);
-    await sleep(500);
-  }
-
-  console.log("[2FA] 阶段 1/2：等待并点击「允许」…");
-  let allowClicked = false;
-  let allowStrategy = "none";
-  let allowSource;
-
-  if (process.platform === "darwin") {
-    const allow = await waitForAllowClick({
-      timeoutMs: Math.min(deadline - Date.now(), 120_000),
-    });
-    allowClicked = allow.clicked;
-    allowStrategy = allow.strategy ?? (allow.clicked ? "auto" : "none");
-    allowSource = allow.source;
-    append2FAAudit(reportDir, {
-      phase: "wait_allow",
-      allowClicked,
-      allowStrategy,
-      allowSource: allowSource ?? null,
-    });
-  }
-
-  if (!allowClicked) {
-    throw new Error(
-      "请先手动点击系统弹窗「允许」，并确认终端已获 System Events 自动化权限（系统设置 → 隐私与安全性 → 自动化）"
-    );
-  }
-
-  await sleep(800);
-  if (process.platform === "darwin") {
-    await snapshotVisiblePopupCodes(dismissedCodes);
-  }
-
-  console.log("[2FA] 阶段 2/2：等待 6 位验证码展示…");
-  const ocrDebugDir = reportDir ? path.join(reportDir, "screenshots") : undefined;
-  let lastStableCode = null;
-  let stableHits = 0;
-
-  for (let i = 0; i < 40; i++) {
-    const state = await probe2FAState(2);
-    if (state.action === "has_allow_dialog") {
-      lastStableCode = null;
-      stableHits = 0;
-      if (i === 0 || i % 8 === 0) {
-        console.log("[2FA] 仍在等待「允许」流程完成…");
-      }
-      await sleep(500);
-      continue;
-    }
-    if (state.action !== "has_code_dialog") {
-      lastStableCode = null;
-      stableHits = 0;
-      if (i === 0 || i % 10 === 0) {
-        console.log(`[2FA] 等待验证码窗出现… (${i + 1}/40)`);
-      }
-      await sleep(500);
-      continue;
-    }
-
-    const preferOcr = true;
-    const asRead = await readPopupCode(5, {
-      preferOcr,
-      debugDir: ocrDebugDir,
-      rejectCodes: dismissedCodes,
-      requireFormattedRaw: true,
-    });
-    if (asRead?.code && !dismissedCodes.has(asRead.code)) {
-      if (asRead.code === lastStableCode) {
-        stableHits += 1;
-      } else {
-        lastStableCode = asRead.code;
-        stableHits = 1;
-      }
-      if (stableHits >= 2) {
-        return returnPopupCode(asRead.code, {
-          source: "popup",
-          raw: asRead.raw,
-          allowStrategy,
-        }, {
-          reportDir,
-          entry: {
-            phase: "read_popup_fast",
-            allowClicked: true,
-            allowStrategy,
-            code: asRead.code,
-            raw: asRead.raw ?? null,
-            source: asRead.source ?? "applescript",
-          },
-        });
-      }
-      console.log(`[2FA] 验证码 ${asRead.raw ?? asRead.code} 首次读到，等待稳定确认 (${stableHits}/2)…`);
-      await sleep(400);
-      continue;
-    }
-
-    if (state.code && !dismissedCodes.has(state.code)) {
-      const c = normalizeCode(state.code);
-      if (c === lastStableCode) stableHits += 1;
-      else {
-        lastStableCode = c;
-        stableHits = 1;
-      }
-      if (stableHits >= 2) {
-        return returnPopupCode(c, { source: "popup", raw: state.code, allowStrategy }, {
-          reportDir,
-          entry: { phase: "read_popup_probe", allowClicked: true, allowStrategy, code: c },
-        });
-      }
-    }
-    await sleep(500);
-  }
-
-  let polls = 0;
-
-  while (Date.now() < deadline) {
-    polls += 1;
-    const elapsed = Date.now() - startedAt;
-    const inPopupPhase = elapsed < popupFirstMs;
-    const canTrySettings = elapsed >= settingsAfterMs;
-
-    if (polls === 1 || polls % 8 === 0) {
-      const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
-      const phase = inPopupPhase ? "读码" : allowClicked ? "读码+设置" : "读码";
-      console.log(`[2FA] 轮询中（${phase}）… 剩余约 ${left}s`);
-    }
-
-    if (process.platform === "darwin") {
-      const popupState = await probe2FAState(2);
-      if (popupState.action === "has_allow_dialog") {
-        await sleep(cfg.pollIntervalMs);
-        continue;
-      }
-      if (popupState.action !== "has_code_dialog") {
-        await sleep(cfg.pollIntervalMs);
-        continue;
-      }
-      const preferOcr = true;
-      let r = await runPopupPhase("read_code", preferOcr ? 4 : 10);
-      if (!r.code) {
-        const fallback = await readPopupCode(preferOcr ? 6 : 8, {
-          preferOcr,
-          debugDir: reportDir ? path.join(reportDir, "screenshots") : undefined,
-          rejectCodes: dismissedCodes,
-          requireFormattedRaw: true,
-        });
-        if (fallback?.code) {
-          r = {
-            ok: true,
-            action: "read_code",
-            code: fallback.code,
-            source: fallback.source,
-            raw: fallback.raw,
-          };
-        }
-      }
-      if (r.action === "dismissed_stale") {
-        if (r.code) dismissedCodes.add(r.code);
-        console.log("[2FA] 读码前关闭残留窗");
-        continue;
-      }
-      if (r.code) {
-        if (dismissedCodes.has(r.code)) {
-          console.log(`[2FA] 跳过已关闭的旧验证码 ${r.code}，等待本次新码…`);
-          await runPopupPhase("dismiss_stale", 2);
-          continue;
-        }
-        if (r.code === lastStableCode) stableHits += 1;
-        else {
-          lastStableCode = r.code;
-          stableHits = 1;
-        }
-        if (stableHits < 2) {
-          console.log(`[2FA] 验证码 ${r.raw ?? r.code} 首次读到，等待稳定确认 (${stableHits}/2)…`);
-          await sleep(400);
-          continue;
-        }
-        const popupShot = screenshotPathFor(reportDir, "2fa-popup-code.png");
-        return returnPopupCode(r.code, {
-          source: "popup",
-          raw: r.raw,
-          allowStrategy,
-        }, {
-          reportDir,
-          entry: {
-            phase: "read_popup",
-            allowClicked: true,
-            allowStrategy,
-            code: r.code,
-            raw: r.raw ?? null,
-            source: r.source ?? "popup",
-            screenshot: popupShot ?? null,
-          },
-        });
-      }
-    }
-
-    if (
-      cfg.settingsFallback &&
-      allowClicked &&
-      !settingsTried &&
-      canTrySettings &&
-      process.platform === "darwin"
-    ) {
-      const leftMs = deadline - Date.now();
-      const popupStill = await probe2FAState(3);
-      if (popupStill.action === "has_code_dialog") {
-        console.log("[2FA] 弹窗验证码仍在，跳过系统设置回退，继续读弹窗…");
-      } else if (leftMs > 25_000) {
-        settingsTried = true;
-        console.log(
-          "[2FA] 弹窗未及时出现，改从 系统设置 → 登录与安全性 → 双重认证 → 获取验证码…"
-        );
-        try {
-          const screenshotPath = screenshotPathFor(reportDir, "2fa-settings-code.png");
-          const { code, raw, screenshot } = await fetch2FACodeFromSystemSettings({
-            timeoutMs: Math.min(leftMs - 5000, 120_000),
-            screenshotPath,
-          });
-          logCodeResult(code, {
-            source: "settings",
-            raw,
-            allowStrategy,
-          });
-          if (screenshot) {
-            console.log(`[2FA] 系统设置验证码截图已保存: ${screenshot}`);
-          }
-          append2FAAudit(reportDir, {
-            phase: "read_settings",
-            allowClicked: true,
-            allowStrategy,
-            code,
-            raw: raw ?? null,
-            source: "settings",
-            screenshot: screenshot ?? null,
-          });
-          console.log("[2FA] 已获取 6 位验证码（系统设置）");
-          return code;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`[2FA] 系统设置获取验证码失败: ${msg}`);
-          append2FAAudit(reportDir, {
-            phase: "read_settings_failed",
-            allowClicked: true,
-            error: msg,
-          });
-          console.log("[2FA] 继续轮询系统弹窗…");
-        }
-      }
-    }
-
-    await sleep(cfg.pollIntervalMs);
-  }
-
-  throw new Error(
-    "macOS 2FA 验证码获取超时：请确认已点「允许」且验证码窗已出现，并检查辅助功能权限"
-  );
-}
-
-/**
- * @param {object} [options]
- */
-export function startMac2FAWait(options = {}) {
-  const promise = waitForMac2FACode(options);
+function createDeferred() {
+  let resolvePromise;
+  let rejectPromise;
+  let settled = false;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
   return {
     promise,
-    async getCode() {
-      return promise;
+    get settled() {
+      return settled;
+    },
+    resolve(value) {
+      if (settled) return false;
+      settled = true;
+      resolvePromise(value);
+      return true;
+    },
+    reject(error) {
+      if (settled) return false;
+      settled = true;
+      rejectPromise(error);
+      return true;
     },
   };
+}
+
+function normalizeSixDigitCode(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return /^\d{6}$/.test(digits) ? digits : null;
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Pre-arms native popup monitoring and races it with a cancellable System
+ * Settings request after the configured grace period.
+ *
+ * @param {object} [options]
+ * @returns {{ prepare: () => Promise<void>, getCode: () => Promise<string>, dispose: () => Promise<void> }}
+ */
+export function createMac2FACollector(options = {}) {
+  const config = resolveConfig(options);
+  const runtime = resolveRuntime(options.runtime);
+  const reportDir = options.reportDir;
+  const popupDebugDir = reportDir ? path.join(reportDir, "screenshots") : undefined;
+  const rejectedCodes = new Set();
+  const popupReady = createDeferred();
+  const delays = new Set();
+
+  let prepared = false;
+  let preparePromise = null;
+  let preparedAt = 0;
+  let disposed = false;
+  let disposePromise = null;
+  let popupWatcherPromise = null;
+  let popupCandidate = null;
+  let cleanupOnly = false;
+  let lastStableCode = null;
+  let stableHits = 0;
+  let allowStrategy = "none";
+  let settingsRequest = null;
+  let settingsCompletion = null;
+  let settingsStartDelay = null;
+  let getCodePromise = null;
+  let activeAcquisition = null;
+
+  const audit = (entry) => {
+    try {
+      append2FAAudit(reportDir, entry);
+    } catch (error) {
+      console.warn(`[2FA] 写入审计记录失败: ${errorMessage(error)}`);
+    }
+  };
+
+  const scheduleDelay = (delayMs) => {
+    let active = true;
+    let token = null;
+    let resolveDelay;
+    const record = {
+      promise: new Promise((resolve) => {
+        resolveDelay = resolve;
+      }),
+      cancel() {
+        if (!active) return false;
+        active = false;
+        runtime.clearTimeout(token);
+        delays.delete(record);
+        resolveDelay(false);
+        return true;
+      },
+    };
+    token = runtime.setTimeout(() => {
+      if (!active) return;
+      active = false;
+      delays.delete(record);
+      resolveDelay(true);
+    }, Math.max(0, delayMs));
+    delays.add(record);
+    return record;
+  };
+
+  const cancelAllDelays = () => {
+    for (const delay of [...delays]) delay.cancel();
+  };
+
+  const resetStablePopup = () => {
+    lastStableCode = null;
+    stableHits = 0;
+  };
+
+  const dismissRejectedPopup = async (code) => {
+    const result = await runtime.runPopupPhase("dismiss_stale", 2);
+    const dismissedCode = normalizeSixDigitCode(result?.code) || code;
+    if (dismissedCode) rejectedCodes.add(dismissedCode);
+    audit({
+      phase: "dismiss_rejected_popup",
+      code: dismissedCode,
+      action: result?.action ?? "none",
+    });
+    resetStablePopup();
+  };
+
+  const pollPopupOnce = async () => {
+    const state = await runtime.probe2FAState(2);
+
+    if (cleanupOnly) {
+      if (state?.action === "has_code_dialog") {
+        const result = await runtime.runPopupPhase("dismiss_stale", 2);
+        audit({
+          phase: "popup_cleanup_only",
+          action: result?.action ?? "none",
+          code: normalizeSixDigitCode(result?.code),
+        });
+      }
+      return;
+    }
+
+    if (popupCandidate) return;
+
+    if (state?.action === "has_allow_dialog") {
+      const allow = await runtime.waitForAllowClick({
+        timeoutMs: Math.max(800, config.pollIntervalMs),
+      });
+      if (allow?.clicked) {
+        allowStrategy = allow.strategy ?? allow.source ?? "auto";
+        audit({
+          phase: "popup_allow",
+          allowClicked: true,
+          allowStrategy,
+          allowSource: allow.source ?? null,
+        });
+      }
+      resetStablePopup();
+      return;
+    }
+
+    if (state?.action !== "has_code_dialog") {
+      resetStablePopup();
+      return;
+    }
+
+    const stateCode = normalizeSixDigitCode(state.code);
+    if (stateCode && rejectedCodes.has(stateCode)) {
+      await dismissRejectedPopup(stateCode);
+      return;
+    }
+
+    const result = await runtime.readPopupCode(4, {
+      preferOcr: true,
+      debugDir: popupDebugDir,
+      rejectCodes: rejectedCodes,
+      requireFormattedRaw: true,
+    });
+    const code = normalizeSixDigitCode(result?.code);
+    if (!code) {
+      resetStablePopup();
+      return;
+    }
+    if (rejectedCodes.has(code)) {
+      await dismissRejectedPopup(code);
+      return;
+    }
+
+    if (code === lastStableCode) stableHits += 1;
+    else {
+      lastStableCode = code;
+      stableHits = 1;
+    }
+
+    if (stableHits < 2) return;
+    popupCandidate = {
+      source: "popup",
+      code,
+      raw: result?.raw ? String(result.raw) : null,
+      allowStrategy,
+    };
+    audit({
+      phase: "popup_code_buffered",
+      code,
+      raw: popupCandidate.raw,
+      allowStrategy,
+      source: result?.source ?? "popup",
+    });
+    popupReady.resolve(popupCandidate);
+  };
+
+  const watchPopup = async () => {
+    while (!disposed) {
+      try {
+        await pollPopupOnce();
+      } catch (error) {
+        if (!disposed) {
+          audit({ phase: "popup_provider_error", error: errorMessage(error) });
+        }
+      }
+      if (disposed) break;
+      const delay = scheduleDelay(config.pollIntervalMs);
+      if (!(await delay.promise)) break;
+    }
+  };
+
+  const prepare = () => {
+    if (disposed) return Promise.reject(new Error("2FA collector is disposed"));
+    if (prepared) return Promise.resolve();
+    if (preparePromise) return preparePromise;
+
+    preparePromise = (async () => {
+      if (runtime.platform !== "darwin") {
+        throw new Error("macOS 2FA collection requires macOS");
+      }
+
+      const stale = await runtime.dismissStale2FAPopups(6);
+      for (const value of stale?.codes ?? []) {
+        const code = normalizeSixDigitCode(value);
+        if (code) rejectedCodes.add(code);
+      }
+
+      const visible = await runtime.probe2FAState(2);
+      if (visible?.action === "has_code_dialog") {
+        const visibleCode = normalizeSixDigitCode(visible.code);
+        if (visibleCode) rejectedCodes.add(visibleCode);
+        const dismissed = await runtime.runPopupPhase("dismiss_stale", 2);
+        const dismissedCode = normalizeSixDigitCode(dismissed?.code);
+        if (dismissedCode) rejectedCodes.add(dismissedCode);
+      }
+
+      preparedAt = runtime.now();
+      prepared = true;
+      audit({
+        phase: "prepare_2fa",
+        dismissedCount: stale?.count ?? 0,
+        rejectedStaleCodes: [...rejectedCodes],
+      });
+      popupWatcherPromise = watchPopup();
+    })();
+
+    return preparePromise;
+  };
+
+  const startSettingsProvider = async (acquisition) => {
+    if (!config.settingsFallback) return;
+    const waitMs = Math.max(0, preparedAt + config.settingsFallbackAfterMs - runtime.now());
+    if (waitMs > 0) {
+      settingsStartDelay = scheduleDelay(waitMs);
+      const elapsed = await settingsStartDelay.promise;
+      settingsStartDelay = null;
+      if (!elapsed) return;
+    }
+    if (disposed || acquisition.winner.settled) return;
+
+    const remainingMs = Math.max(1, acquisition.deadline - runtime.now());
+    audit({
+      phase: "settings_provider_start",
+      elapsedSincePrepareMs: runtime.now() - preparedAt,
+    });
+    try {
+      settingsRequest = runtime.start2FASettingsCodeRequest({
+        timeoutMs: remainingMs,
+        reportDir,
+        screenshotPath: screenshotPathFor(reportDir, "2fa-settings-code.png"),
+      });
+    } catch (error) {
+      audit({ phase: "settings_provider_failed", error: errorMessage(error) });
+      return;
+    }
+
+    settingsCompletion = settingsRequest.promise
+      .then((result) => {
+        const code = normalizeSixDigitCode(result?.code);
+        if (!code) throw new Error(`验证码格式异常: ${result?.code ?? "empty"}`);
+        acquisition.offer({
+          source: "settings",
+          code,
+          raw: result?.raw ? String(result.raw) : null,
+          screenshot: result?.screenshot ?? null,
+        });
+      })
+      .catch((error) => {
+        const cancelled = error?.code === "2FA_SETTINGS_CANCELLED";
+        audit({
+          phase: cancelled ? "settings_provider_cancelled" : "settings_provider_failed",
+          error: errorMessage(error),
+        });
+      });
+  };
+
+  const cancelSettingsProvider = async (reason) => {
+    if (!settingsRequest) return;
+    const cancelSignalled = settingsRequest.cancel();
+    audit({ phase: "settings_provider_cancel", reason, cancelSignalled });
+
+    if (!settingsCompletion) return;
+    const cleanupTimeout = scheduleDelay(config.cleanupGraceMs);
+    const cleaned = await Promise.race([
+      settingsCompletion.then(() => true),
+      cleanupTimeout.promise.then(() => false),
+    ]);
+    cleanupTimeout.cancel();
+    if (!cleaned) {
+      const forceStopped = settingsRequest.forceStop();
+      audit({ phase: "settings_provider_force_stop", reason, forceStopped });
+    }
+  };
+
+  const acquireCode = async () => {
+    if (!prepared) throw new Error("2FA collector must be prepared before requesting a code");
+    if (disposed) throw new Error("2FA collector is disposed");
+
+    if (popupCandidate) {
+      audit({ phase: "2fa_winner", source: "popup", buffered: true, code: popupCandidate.code });
+      console.log(`[2FA] 已使用提前到达的弹窗验证码 ${popupCandidate.code}`);
+      return popupCandidate.code;
+    }
+
+    const winner = createDeferred();
+    const acquisition = {
+      winner,
+      deadline: runtime.now() + config.timeoutMs,
+      offer(candidate) {
+        if (disposed) return false;
+        return winner.resolve(candidate);
+      },
+    };
+    activeAcquisition = acquisition;
+    popupReady.promise.then((candidate) => acquisition.offer(candidate));
+    if (popupCandidate) acquisition.offer(popupCandidate);
+
+    const deadlineDelay = scheduleDelay(config.timeoutMs);
+    deadlineDelay.promise.then((elapsed) => {
+      if (elapsed) winner.reject(new Error("macOS 2FA 验证码获取超时"));
+    });
+    void startSettingsProvider(acquisition).catch((error) => {
+      audit({ phase: "settings_provider_failed", error: errorMessage(error) });
+    });
+
+    try {
+      const candidate = await winner.promise;
+      settingsStartDelay?.cancel();
+      if (candidate.source === "popup") {
+        await cancelSettingsProvider("popup_won");
+      } else {
+        cleanupOnly = true;
+      }
+
+      audit({
+        phase: "2fa_winner",
+        source: candidate.source,
+        code: candidate.code,
+        raw: candidate.raw ?? null,
+        screenshot: candidate.screenshot ?? null,
+      });
+      console.log(`[2FA] ★ 验证码: ${candidate.code} 来源=${candidate.source}`);
+      return candidate.code;
+    } finally {
+      deadlineDelay.cancel();
+      settingsStartDelay?.cancel();
+      if (activeAcquisition === acquisition) activeAcquisition = null;
+    }
+  };
+
+  const getCode = () => {
+    if (getCodePromise) return getCodePromise;
+    getCodePromise = acquireCode();
+    return getCodePromise;
+  };
+
+  const dispose = () => {
+    if (disposePromise) return disposePromise;
+    disposed = true;
+    activeAcquisition?.winner.reject(new Error("2FA collector was disposed"));
+    cancelAllDelays();
+
+    disposePromise = (async () => {
+      await cancelSettingsProvider("collector_disposed");
+      if (popupWatcherPromise) await popupWatcherPromise;
+      cancelAllDelays();
+    })();
+    return disposePromise;
+  };
+
+  return { prepare, getCode, dispose };
 }
