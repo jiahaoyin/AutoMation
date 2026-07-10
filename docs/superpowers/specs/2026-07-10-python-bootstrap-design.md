@@ -79,8 +79,12 @@ Before installation:
 2. It is copied with mode `0600` into a root-owned private directory under
    `/var/tmp`.
 3. The root-private copy's SHA-256 is checked again.
-4. `pkgutil --check-signature` must succeed on that private copy and contain the
-   exact Python Software Foundation Developer ID Installer identity.
+4. `pkgutil --check-signature` must succeed on that private copy. The leaf
+   certificate subject must be exactly `Developer ID Installer: Python Software
+   Foundation`, followed by a syntactically valid 10-character Team ID. The
+   Team ID is read from each verified package instead of being persisted, so a
+   future Python Software Foundation certificate rotation does not require a
+   code change.
 
 The package is installed with:
 
@@ -132,7 +136,8 @@ generated release installer:
   `bootstrap_macos_runtime`.
 - The bootstrap runs `sudo -v` before Python/Node installation work.
 - Python 3.12.10 and the official Python.org package URL are pinned.
-- The SHA-256 and exact Python Software Foundation signing identity are pinned.
+- The SHA-256 is pinned; the verified leaf certificate must have the exact
+  Python Software Foundation subject and a valid Team ID format.
 - Existing interpreters pass the ownership and path-permission trust gate before
   their version command is executed.
 - `sudo installer -pkg ... -target /` is present.

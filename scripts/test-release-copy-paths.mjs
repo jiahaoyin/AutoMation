@@ -122,10 +122,8 @@ const bootstrapMacOS = fs.readFileSync(
   "utf-8"
 );
 assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -v/);
-assert.match(
-  bootstrapMacOS,
-  /Developer ID Installer: Python Software Foundation \(BMM5U3QVKW\)/
-);
+assert.match(bootstrapMacOS, /resolve_trusted_python_signer/);
+assert.doesNotMatch(bootstrapMacOS, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -k/);
 assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)/);
 assert.match(

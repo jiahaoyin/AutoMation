@@ -47,10 +47,8 @@ assert.match(
   bootstrap,
   /8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4/
 );
-assert.match(
-  bootstrap,
-  /Developer ID Installer: Python Software Foundation \(BMM5U3QVKW\)/
-);
+assert.match(bootstrap, /resolve_trusted_python_signer/);
+assert.doesNotMatch(bootstrap, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/pkgutil --check-signature/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/installer -pkg/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/bin\/mktemp -d/);
@@ -106,6 +104,39 @@ try {
   fs.writeFileSync(supportedPython, "#!/bin/bash\necho 'Python 3.12.10'\n", { mode: 0o755 });
   const bootstrapPath = fileURLToPath(new URL("./bootstrap-macos.sh", import.meta.url));
   const source = `source ${bashQuote(toBashPath(bootstrapPath))}`;
+  const signatureFor = (identity) => `Package "python.pkg":
+   Status: signed by a developer certificate issued by Apple for distribution
+   Notarization: trusted by the Apple notary service
+   Certificate Chain:
+    1. ${identity}
+    2. Developer ID Certification Authority`;
+  for (const teamId of ["BMM5U3QVKW", "DJ3H93M7VJ"]) {
+    const signatureResult = spawnSync(
+      bash,
+      [
+        "-lc",
+        `${source}; resolve_trusted_python_signer ` +
+          `${bashQuote(signatureFor(`Developer ID Installer: Python Software Foundation (${teamId})`))}`,
+      ],
+      { encoding: "utf-8" }
+    );
+    assert.equal(signatureResult.status, 0, signatureResult.stderr);
+    assert.match(signatureResult.stdout, new RegExp(`\\(${teamId}\\)`));
+  }
+  for (const identity of [
+    "Developer ID Installer: Other Publisher (BMM5U3QVKW)",
+    "Developer ID Installer: Python Software Foundation (SHORT1234)",
+  ]) {
+    const signatureResult = spawnSync(
+      bash,
+      [
+        "-lc",
+        `${source}; resolve_trusted_python_signer ${bashQuote(signatureFor(identity))}`,
+      ],
+      { encoding: "utf-8" }
+    );
+    assert.notEqual(signatureResult.status, 0, `unexpectedly trusted: ${identity}`);
+  }
   const oldResult = spawnSync(
     bash,
     ["-lc", `${source}; python_version_supported ${bashQuote(toBashPath(oldPython))}`],

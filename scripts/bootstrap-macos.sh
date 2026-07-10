@@ -11,7 +11,6 @@ PYTHON_BOOTSTRAP_SERIES="${LOCAL_PYTHON_VERSION%.*}"
 PYTHON_DOWNLOAD_DIR="$PACKAGE_ROOT/.runtime/downloads"
 readonly PYTHON_BOOTSTRAP_PKG_URL="https://www.python.org/ftp/python/${LOCAL_PYTHON_VERSION}/python-${LOCAL_PYTHON_VERSION}-macos11.pkg"
 readonly PYTHON_BOOTSTRAP_SHA256="8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4"
-readonly PYTHON_BOOTSTRAP_SIGNER="Developer ID Installer: Python Software Foundation (BMM5U3QVKW)"
 PYTHON_FRAMEWORK_BIN="/Library/Frameworks/Python.framework/Versions/${PYTHON_BOOTSTRAP_SERIES}/bin"
 SUDO_KEEPALIVE_PID=""
 ROOT_PYTHON_STAGE_DIR=""
@@ -140,6 +139,18 @@ verify_python_pkg_hash() {
   fi
 }
 
+resolve_trusted_python_signer() {
+  local signature="$1"
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*1\.[[:space:]]+Developer[[:space:]]ID[[:space:]]Installer:[[:space:]]Python[[:space:]]Software[[:space:]]Foundation[[:space:]]\(([A-Z0-9]{10})\)[[:space:]]*$ ]]; then
+      printf 'Developer ID Installer: Python Software Foundation (%s)\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<< "$signature"
+  return 1
+}
+
 stage_python_pkg_for_install() {
   local pkg="$1"
   local hash_output root_hash
@@ -162,7 +173,7 @@ stage_python_pkg_for_install() {
 }
 
 verify_staged_python_signature() {
-  local signature
+  local signature signer
   signature="$(
     /usr/bin/sudo -n /usr/sbin/pkgutil --check-signature "$ROOT_PYTHON_PKG" 2>&1
   )" || {
@@ -170,11 +181,12 @@ verify_staged_python_signature() {
     echo "错误: Python 安装包签名验证失败"
     return 1
   }
-  if [[ "$signature" != *"$PYTHON_BOOTSTRAP_SIGNER"* ]]; then
+  if ! signer="$(resolve_trusted_python_signer "$signature")"; then
     echo "$signature"
     echo "错误: Python 安装包签名身份不匹配"
     return 1
   fi
+  echo "✓ Python 安装包签名: $signer"
 }
 
 install_python_official_pkg() {
