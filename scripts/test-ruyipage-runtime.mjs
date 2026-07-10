@@ -6,6 +6,7 @@ import {
   getLocalRuyiPagePython,
   isSupportedPythonVersion,
   RUYIPAGE_PACKAGE_SPEC,
+  resolveBasePythonCommand,
   resolvePythonCommand,
 } from "./lib/ruyipage-runtime.js";
 
@@ -56,6 +57,28 @@ assert.equal(
     commandWorks: (command) => command === "python3",
   }),
   "python3"
+);
+
+assert.equal(
+  resolveBasePythonCommand(
+    { PYTHON_BOOTSTRAP_EXECUTABLE: "/opt/python3.12" },
+    { commandWorks: (command) => command === "/opt/python3.12" }
+  ),
+  "/opt/python3.12"
+);
+assert.equal(
+  resolveBasePythonCommand(
+    { PYTHON_BOOTSTRAP_EXECUTABLE: "/missing/python" },
+    { commandWorks: () => false }
+  ),
+  null
+);
+assert.equal(
+  resolveBasePythonCommand(
+    {},
+    { commandWorks: (command) => command === "python" }
+  ),
+  "python"
 );
 
 let probeScript = "";

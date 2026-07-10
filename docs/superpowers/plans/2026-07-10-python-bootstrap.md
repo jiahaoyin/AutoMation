@@ -1,5 +1,11 @@
 # Automatic Python Bootstrap Implementation Plan
 
+> **Status:** Implemented and subsequently security-hardened. The command
+> snippets below preserve the original implementation sequence; the final
+> security contract is defined by
+> `docs/superpowers/specs/2026-07-10-python-bootstrap-design.md` and the current
+> source/tests.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `./install.sh` request administrator authorization immediately, install signed Python 3.12.10 automatically when Python 3.10+ is unavailable, and continue into the isolated ruyiPage installation.

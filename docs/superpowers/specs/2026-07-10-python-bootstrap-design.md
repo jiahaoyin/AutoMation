@@ -33,8 +33,10 @@ That function performs these steps in order:
 
 1. Confirm the host is macOS.
 2. Acquire administrator authorization with `sudo -v`.
-3. Ensure a supported Python is available.
-4. Ensure Node 18 or newer is available.
+3. Reuse an administrator-trusted Python, or install the pinned official
+   Python package.
+4. Stop the authorization keepalive and invalidate the sudo timestamp.
+5. Ensure Node 18 or newer is available without administrator privileges.
 
 The existing `bootstrap_macos_runtime` function remains the lightweight entry
 point used by `run.sh`.
@@ -49,56 +51,70 @@ The bootstrap checks candidates in this order:
 4. `/usr/local/bin/python3`.
 5. `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`.
 
-A candidate is accepted only when `--version` reports Python 3.10 or newer.
-The selected interpreter's directory is prepended to `PATH`, allowing the
-existing Node ruyiPage runtime installer to create the project virtual
-environment without additional configuration.
+A candidate is resolved to its real absolute path before it is executed. The
+binary and every directory in its resolved path must be owned by root and must
+not be group- or world-writable. This prevents a user-replaceable interpreter
+from running while the sudo timestamp is valid. A candidate that passes this
+trust gate is accepted only when `--version` reports Python 3.10 or newer;
+otherwise the pinned official Python is installed. The selected interpreter is
+passed explicitly to the Node ruyiPage runtime installer, which uses it only to
+create the project-local virtual environment.
 
 ### Official Installer
 
-The default pinned runtime is Python 3.12.10. Configuration is exposed through
-environment variables for controlled testing or future maintenance:
-
-- `PYTHON_BOOTSTRAP_VERSION`
-- `PYTHON_BOOTSTRAP_PKG_URL`
-- `PYTHON_BOOTSTRAP_EXECUTABLE`
-
-The default package URL is:
+The fallback runtime, package URL, SHA-256 digest, and signing identity are
+fixed together in the source. The package URL is:
 
 `https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg`
 
-The package is downloaded into `.runtime/downloads` using a temporary `.part`
-file and renamed only after a successful transfer. Before installation:
+`PYTHON_BOOTSTRAP_EXECUTABLE` may nominate an existing interpreter, but it is
+still subject to the administrator-trust and version checks above. It cannot
+override the pinned download.
 
-1. `pkgutil --check-signature` must succeed.
-2. The signature output must identify the Python Software Foundation.
+The package is downloaded into `.runtime/downloads` using HTTPS-only redirects,
+a temporary `.part` file, and an atomic rename after a successful transfer.
+Before installation:
+
+1. Its SHA-256 must equal the pinned digest.
+2. It is copied with mode `0600` into a root-owned private directory under
+   `/var/tmp`.
+3. The root-private copy's SHA-256 is checked again.
+4. `pkgutil --check-signature` must succeed on that private copy and contain the
+   exact Python Software Foundation Developer ID Installer identity.
 
 The package is installed with:
 
 `sudo installer -pkg <package> -target /`
 
-The installer then re-runs Python detection. A successful `installer` exit
-without a supported interpreter is treated as a hard failure.
+The root-private copy cannot be replaced by the invoking user between
+verification and installation. It is removed after installation or by the
+failure trap. The installer then re-runs trusted Python detection. A successful
+`installer` exit without a supported interpreter is treated as a hard failure.
 
 ## Security And Privilege Boundary
 
 - The administrator password is handled exclusively by `sudo`; the project
   never reads, stores, pipes, or logs it.
-- Authorization is requested once at the start. Python installation happens
-  immediately afterward, so no background sudo keepalive process is needed.
-- Only the signed Python.org package is installed with administrator
-  privileges.
+- Authorization is requested once at the start. A background `sudo -n` keepalive
+  covers only trusted Python detection, download, verification, and installation.
+  It is stopped immediately afterward and `sudo -k` invalidates the timestamp
+  before Node, ruyiPage, compilation, or project setup runs.
+- Privileged commands use absolute system paths and non-interactive `sudo -n`.
+  Only staging, verifying, installing, and cleaning the pinned Python.org
+  package run with administrator privileges.
 - Node, ruyiPage, reports, profiles, and generated project files remain under
   the project directory or the current user account.
-- Download or signature failure stops before `sudo installer`.
-- Existing compatible Python installations are not replaced.
+- Download, digest, or signature failure stops before `sudo installer`.
+- Existing compatible Python installations are reused only when their resolved
+  path passes the root ownership and write-permission checks.
 
 ## Failure Handling
 
 - Unsupported macOS/CPU state: stop with a concrete diagnostic.
 - User declines or fails sudo authorization: stop before downloads.
 - Download failure: remove only the incomplete `.part` file and report the URL.
-- Signature mismatch: do not install; retain the package path for inspection.
+- Digest or signature mismatch: do not install; clean the root-private copy and
+  retain the user-owned cached package path for inspection.
 - Installer failure: report the `installer` exit and stop.
 - Python still unavailable after installation: report all checked paths and
   stop.
@@ -116,8 +132,11 @@ generated release installer:
   `bootstrap_macos_runtime`.
 - The bootstrap runs `sudo -v` before Python/Node installation work.
 - Python 3.12.10 and the official Python.org package URL are pinned.
-- Signature verification checks for Python Software Foundation.
+- The SHA-256 and exact Python Software Foundation signing identity are pinned.
+- Existing interpreters pass the ownership and path-permission trust gate before
+  their version command is executed.
 - `sudo installer -pkg ... -target /` is present.
+- The sudo keepalive is stopped and the timestamp invalidated before Node setup.
 - Supported-version detection requires Python 3.10 or newer.
 - The release copy list includes `scripts/bootstrap-macos.sh`.
 

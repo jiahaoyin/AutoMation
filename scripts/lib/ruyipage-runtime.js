@@ -55,6 +55,22 @@ export function resolvePythonCommand(env = process.env, options = {}) {
 }
 
 /**
+ * Resolve the base interpreter used only to create the project-local venv.
+ * @param {NodeJS.ProcessEnv|Record<string,string|undefined>} [env]
+ * @param {{ commandWorks?: (command: string) => boolean }} [options]
+ */
+export function resolveBasePythonCommand(env = process.env, options = {}) {
+  const commandWorks = options.commandWorks ?? defaultCommandWorks;
+  const bootstrapPython = env.PYTHON_BOOTSTRAP_EXECUTABLE?.trim();
+  if (bootstrapPython) {
+    return commandWorks(bootstrapPython) ? bootstrapPython : null;
+  }
+  if (commandWorks("python3")) return "python3";
+  if (commandWorks("python")) return "python";
+  return null;
+}
+
+/**
  * @param {NodeJS.ProcessEnv|Record<string, string|undefined>} env
  * @param {{
  *   resolvePython?: (env: NodeJS.ProcessEnv|Record<string,string|undefined>) => string|null,
@@ -133,11 +149,7 @@ export function installRuyiPage(options = {}) {
   }
 
   if (!python) {
-    const basePython = defaultCommandWorks("python3")
-      ? "python3"
-      : defaultCommandWorks("python")
-        ? "python"
-        : null;
+    const basePython = resolveBasePythonCommand(env);
     if (!basePython) throw new Error("python/python3 not found; install Python 3.10+ first");
 
     const localPython = getLocalRuyiPagePython();

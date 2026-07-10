@@ -24,6 +24,7 @@ for (const rel of [
   "scripts/swift/mac-2fa-popup-ocr.swift",
   "scripts/2fa-automation-check.applescript",
   "scripts/preflight-2fa-permissions.mjs",
+  "scripts/bootstrap-macos.sh",
 ]) {
   assert.ok(COPY_PATHS.includes(rel), `${rel} missing from COPY_PATHS`);
 }
@@ -89,10 +90,13 @@ for (const helper of [
 }
 assert.match(generatedInstallSh, /command -v cliclick/);
 assert.match(generatedInstallSh, /setup-environment\.mjs --install-ruyipage/);
+assert.match(generatedInstallSh, /bootstrap_macos_install_runtime/);
 const generatedRunSh = renderRunSh();
 assert.match(generatedRunSh, /--skip-browser/);
 assert.match(generatedRunSh, /--skip-firefox --skip-ruyipage/);
 assert.match(generatedRunSh, /preflight-2fa-permissions\.mjs --quiet/);
+assert.match(generatedRunSh, /bootstrap_macos_runtime/);
+assert.doesNotMatch(generatedRunSh, /bootstrap_macos_install_runtime/);
 assert.match(
   generatedRunSh,
   /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/,
@@ -102,6 +106,8 @@ assert.match(
 const rootRunSh = fs.readFileSync(new URL("../run.sh", import.meta.url), "utf-8");
 assert.match(rootRunSh, /--skip-browser/);
 assert.match(rootRunSh, /--skip-firefox --skip-ruyipage/);
+assert.match(rootRunSh, /bootstrap_macos_runtime/);
+assert.doesNotMatch(rootRunSh, /bootstrap_macos_install_runtime/);
 assert.match(
   rootRunSh,
   /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/
@@ -111,6 +117,16 @@ const setupEnvironment = fs.readFileSync(
   new URL("./setup-environment.mjs", import.meta.url),
   "utf-8"
 );
+const bootstrapMacOS = fs.readFileSync(
+  new URL("./bootstrap-macos.sh", import.meta.url),
+  "utf-8"
+);
+assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -v/);
+assert.match(
+  bootstrapMacOS,
+  /Developer ID Installer: Python Software Foundation \(DJ3H93M7VJ\)/
+);
+assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -k/);
 assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)/);
 assert.match(
   fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8"),

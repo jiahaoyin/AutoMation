@@ -1,15 +1,21 @@
 #!/bin/bash
-# 引导 Node 运行时（仅用 nodejs.org 官方二进制，不用 Homebrew）
+# 引导 Python 与 Node 运行时（仅用官方发行物，不用 Homebrew）
 set -euo pipefail
 
-BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BOOTSTRAP_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_ROOT="$(cd "$BOOTSTRAP_DIR/.." && pwd)"
 LOCAL_NODE_DIR="$PACKAGE_ROOT/.runtime/node"
 LOCAL_NODE_VERSION="${LOCAL_NODE_VERSION:-22.14.0}"
-LOCAL_PYTHON_VERSION="${PYTHON_BOOTSTRAP_VERSION:-3.12.10}"
+readonly LOCAL_PYTHON_VERSION="3.12.10"
+PYTHON_BOOTSTRAP_SERIES="${LOCAL_PYTHON_VERSION%.*}"
 PYTHON_DOWNLOAD_DIR="$PACKAGE_ROOT/.runtime/downloads"
-PYTHON_BOOTSTRAP_PKG_URL="${PYTHON_BOOTSTRAP_PKG_URL:-https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg}"
-PYTHON_FRAMEWORK_BIN="/Library/Frameworks/Python.framework/Versions/3.12/bin"
+readonly PYTHON_BOOTSTRAP_PKG_URL="https://www.python.org/ftp/python/${LOCAL_PYTHON_VERSION}/python-${LOCAL_PYTHON_VERSION}-macos11.pkg"
+readonly PYTHON_BOOTSTRAP_SHA256="8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4"
+readonly PYTHON_BOOTSTRAP_SIGNER="Developer ID Installer: Python Software Foundation (DJ3H93M7VJ)"
+PYTHON_FRAMEWORK_BIN="/Library/Frameworks/Python.framework/Versions/${PYTHON_BOOTSTRAP_SERIES}/bin"
+SUDO_KEEPALIVE_PID=""
+ROOT_PYTHON_STAGE_DIR=""
+ROOT_PYTHON_PKG=""
 
 python_version_supported() {
   local command_path="$1"
@@ -24,8 +30,33 @@ python_version_supported() {
   return 1
 }
 
+python_path_is_admin_trusted() {
+  local candidate="$1"
+  local resolved current metadata owner mode mode_value
+  resolved="$(/usr/bin/realpath "$candidate" 2>/dev/null)" || return 1
+  [[ -f "$resolved" && -x "$resolved" ]] || return 1
+
+  current="$resolved"
+  while true; do
+    metadata="$(/usr/bin/stat -f '%u %Lp' "$current" 2>/dev/null)" || return 1
+    owner="${metadata%% *}"
+    mode="${metadata##* }"
+    if [[ "$owner" != "0" || ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+      return 1
+    fi
+    mode_value=$((8#$mode))
+    if (( (mode_value & 0022) != 0 )); then
+      return 1
+    fi
+    [[ "$current" == "/" ]] && break
+    current="$(/usr/bin/dirname "$current")"
+  done
+
+  printf '%s\n' "$resolved"
+}
+
 resolve_supported_python() {
-  local candidate command_path
+  local candidate command_path trusted_path
   local candidates=()
   if [[ -n "${PYTHON_BOOTSTRAP_EXECUTABLE:-}" ]]; then
     candidates+=("$PYTHON_BOOTSTRAP_EXECUTABLE")
@@ -42,59 +73,141 @@ resolve_supported_python() {
     if [[ "$candidate" != */* ]]; then
       command_path="$(command -v "$candidate" 2>/dev/null || true)"
     fi
-    if [[ -n "$command_path" && -x "$command_path" ]] &&
-      python_version_supported "$command_path"; then
-      printf '%s\n' "$command_path"
+    if [[ -n "$command_path" ]] &&
+      trusted_path="$(python_path_is_admin_trusted "$command_path")" &&
+      python_version_supported "$trusted_path"; then
+      printf '%s\n' "$trusted_path"
       return 0
     fi
   done
   return 1
 }
 
+cleanup_root_python_stage() {
+  if [[ -n "$ROOT_PYTHON_PKG" ]]; then
+    /usr/bin/sudo -n /bin/rm -f "$ROOT_PYTHON_PKG" 2>/dev/null || true
+    ROOT_PYTHON_PKG=""
+  fi
+  if [[ -n "$ROOT_PYTHON_STAGE_DIR" ]]; then
+    /usr/bin/sudo -n /bin/rmdir "$ROOT_PYTHON_STAGE_DIR" 2>/dev/null || true
+    ROOT_PYTHON_STAGE_DIR=""
+  fi
+}
+
+release_admin_authorization() {
+  cleanup_root_python_stage
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+  fi
+  /usr/bin/sudo -k 2>/dev/null || true
+}
+
+finish_admin_authorization() {
+  release_admin_authorization
+  trap - EXIT INT TERM
+}
+
 acquire_admin_authorization() {
   echo "==> 需要管理员权限安装受信任的 Python 运行环境"
-  echo "    密码仅由 sudo 读取，项目不会保存或记录密码"
-  if ! sudo -v; then
+  echo "    密码仅由系统 sudo 读取，项目不会保存或记录密码"
+  if ! /usr/bin/sudo -v; then
     echo "错误: 未获得管理员授权，安装已停止"
     exit 1
+  fi
+  (
+    while /usr/bin/sudo -n /usr/bin/true 2>/dev/null; do
+      /bin/sleep 30
+    done
+  ) &
+  SUDO_KEEPALIVE_PID="$!"
+  trap release_admin_authorization EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+verify_python_pkg_hash() {
+  local pkg="$1"
+  local hash_output actual_hash
+  hash_output="$(/usr/bin/shasum -a 256 "$pkg")" || return 1
+  actual_hash="${hash_output%% *}"
+  if [[ "$actual_hash" != "$PYTHON_BOOTSTRAP_SHA256" ]]; then
+    echo "错误: Python 安装包 SHA-256 不匹配"
+    echo "    期望: $PYTHON_BOOTSTRAP_SHA256"
+    echo "    实际: $actual_hash"
+    return 1
+  fi
+}
+
+stage_python_pkg_for_install() {
+  local pkg="$1"
+  local hash_output root_hash
+  ROOT_PYTHON_STAGE_DIR="$(
+    /usr/bin/sudo -n /usr/bin/mktemp -d /var/tmp/apple-automation-python.XXXXXX
+  )" || return 1
+  ROOT_PYTHON_PKG="$ROOT_PYTHON_STAGE_DIR/python-${LOCAL_PYTHON_VERSION}-macos11.pkg"
+  /usr/bin/sudo -n /usr/bin/install \
+    -o root -g wheel -m 0600 \
+    "$pkg" "$ROOT_PYTHON_PKG"
+
+  hash_output="$(
+    /usr/bin/sudo -n /usr/bin/shasum -a 256 "$ROOT_PYTHON_PKG"
+  )" || return 1
+  root_hash="${hash_output%% *}"
+  if [[ "$root_hash" != "$PYTHON_BOOTSTRAP_SHA256" ]]; then
+    echo "错误: root 暂存 Python 安装包 SHA-256 不匹配"
+    return 1
+  fi
+}
+
+verify_staged_python_signature() {
+  local signature
+  signature="$(
+    /usr/bin/sudo -n /usr/sbin/pkgutil --check-signature "$ROOT_PYTHON_PKG" 2>&1
+  )" || {
+    echo "$signature"
+    echo "错误: Python 安装包签名验证失败"
+    return 1
+  }
+  if [[ "$signature" != *"$PYTHON_BOOTSTRAP_SIGNER"* ]]; then
+    echo "$signature"
+    echo "错误: Python 安装包签名身份不匹配"
+    return 1
   fi
 }
 
 install_python_official_pkg() {
-  local pkg partial signature
-  mkdir -p "$PYTHON_DOWNLOAD_DIR"
+  local pkg partial
+  /bin/mkdir -p "$PYTHON_DOWNLOAD_DIR"
   pkg="$PYTHON_DOWNLOAD_DIR/python-${LOCAL_PYTHON_VERSION}-macos11.pkg"
   partial="${pkg}.part"
 
   if [[ ! -f "$pkg" ]]; then
     echo ">>> 从 python.org 下载官方 Python ${LOCAL_PYTHON_VERSION} universal2 安装包"
-    if ! curl --fail --location --retry 3 --output "$partial" "$PYTHON_BOOTSTRAP_PKG_URL"; then
-      rm -f "$partial"
+    if ! /usr/bin/curl \
+      --fail --location --retry 3 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --output "$partial" "$PYTHON_BOOTSTRAP_PKG_URL"; then
+      /bin/rm -f "$partial"
       echo "错误: Python 安装包下载失败: $PYTHON_BOOTSTRAP_PKG_URL"
       return 1
     fi
-    mv "$partial" "$pkg"
+    /bin/mv "$partial" "$pkg"
   fi
 
-  signature="$(pkgutil --check-signature "$pkg" 2>&1)" || {
-    echo "$signature"
-    echo "错误: Python 安装包签名验证失败: $pkg"
-    return 1
-  }
-  if [[ "$signature" != *"Python Software Foundation"* ]]; then
-    echo "$signature"
-    echo "错误: Python 安装包签名不是 Python Software Foundation"
-    return 1
-  fi
-
-  echo ">>> 安装已验证签名的 Python ${LOCAL_PYTHON_VERSION}"
-  sudo installer -pkg "$pkg" -target /
+  verify_python_pkg_hash "$pkg"
+  stage_python_pkg_for_install "$pkg"
+  verify_staged_python_signature
+  echo ">>> 安装已验证摘要与签名的 Python ${LOCAL_PYTHON_VERSION}"
+  /usr/bin/sudo -n /usr/sbin/installer -pkg "$ROOT_PYTHON_PKG" -target /
+  cleanup_root_python_stage
 }
 
 ensure_python() {
   local python_path
   if python_path="$(resolve_supported_python)"; then
-    export PATH="$(dirname "$python_path"):$PATH"
+    export PATH="$(/usr/bin/dirname "$python_path"):$PATH"
+    export PYTHON_BOOTSTRAP_EXECUTABLE="$python_path"
     echo "✓ Python $("$python_path" --version 2>&1) ($python_path)"
     return 0
   fi
@@ -108,7 +221,8 @@ ensure_python() {
     return 1
   fi
 
-  export PATH="$(dirname "$python_path"):$PATH"
+  export PATH="$(/usr/bin/dirname "$python_path"):$PATH"
+  export PYTHON_BOOTSTRAP_EXECUTABLE="$python_path"
   echo "✓ Python $("$python_path" --version 2>&1) ($python_path)"
 }
 
@@ -183,7 +297,7 @@ ensure_node() {
 }
 
 bootstrap_macos_runtime() {
-  if [[ "$(uname)" != "Darwin" ]]; then
+  if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
     echo "错误: 仅支持 macOS"
     exit 1
   fi
@@ -191,11 +305,12 @@ bootstrap_macos_runtime() {
 }
 
 bootstrap_macos_install_runtime() {
-  if [[ "$(uname)" != "Darwin" ]]; then
+  if [[ "$(/usr/bin/uname)" != "Darwin" ]]; then
     echo "错误: 仅支持 macOS"
     exit 1
   fi
   acquire_admin_authorization
   ensure_python
+  finish_admin_authorization
   ensure_node
 }

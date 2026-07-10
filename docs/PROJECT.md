@@ -43,13 +43,15 @@
 
 `./install.sh` 执行：
 
-1. 检查 Node 18+；缺失时下载 nodejs.org 官方二进制到 `.runtime/node`。
-2. 使用系统已有的 Python 3.10+ 创建 `.runtime/ruyipage-venv`；脚本不使用高权限安装器改动系统 Python。
-3. 在隔离虚拟环境中执行 `python -m pip install --upgrade ruyiPage==1.2.45`。
-4. 检查 Firefox；自定义路径使用 `FIREFOX_EXECUTABLE`。
-5. 编译 Swift AX/2FA helper，并引导辅助功能与自动化授权。
+1. 立即执行 `sudo -v`，由 `sudo` 读取一次管理员密码；项目不保存或记录密码。
+2. 检测 Python 3.10+；缺失时下载 Python.org 官方 Python 3.12.10 universal2 PKG，核对固定 SHA-256，并在 root 私有暂存目录中使用系统 `pkgutil` 验证 Python Software Foundation Developer ID 签名后执行安装。
+3. 检查 Node 18+；缺失时下载 nodejs.org 官方二进制到 `.runtime/node`。
+4. 使用已检测或刚安装的 Python 创建 `.runtime/ruyipage-venv`。
+5. 在隔离虚拟环境中执行 `python -m pip install --upgrade ruyiPage==1.2.45`。
+6. 检查 Firefox、编译 Swift AX/2FA helper，并引导辅助功能与自动化授权。
 
 项目显式使用本机 Firefox，因此不额外执行 `python -m ruyipage install` 下载配套 runtime。
+日常执行 `./run.sh` 不使用提权安装入口，也不会重复请求管理员密码。
 
 ## 5. Profile 策略
 
@@ -79,6 +81,7 @@
 ```bash
 ./install.sh
 npm run check
+npm run test:python-bootstrap
 npm run test:ruyipage-flow
 ./run.sh
 
@@ -104,7 +107,7 @@ npm run test:ruyipage-flow
 
 | 现象 | 处理 |
 |------|------|
-| ruyiPage 未就绪 | 先安装 Python 3.10+，再运行 `./install.sh`；检查 `python3 -m venv` 是否可用 |
+| ruyiPage 未就绪 | 运行 `./install.sh`；脚本会自动安装 Python 3.12.10（如需要）并创建项目 venv |
 | Firefox 未找到 | 安装 Firefox 或设置 `FIREFOX_EXECUTABLE` |
 | 记住账号控件失败 | 保留失败截图，核对 Apple 登录页控件结构 |
 | 2FA 输入框未识别 | 查看 `99-ruyipage-failure.png`，补充 ruyiPage selector；不得改成无焦点输入 |

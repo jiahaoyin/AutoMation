@@ -11,15 +11,21 @@
 ## 快速开始
 
 ```bash
-./install.sh    # Node 检测、辅助功能授权引导
+./install.sh    # 前置管理员授权、Python/Node 自动安装、辅助功能引导
 ./run.sh        # 终端输入账号密码 → 自动备份 .env → 执行流程
 ```
+
+`./install.sh` 启动后会立即请求一次管理员密码授权。若没有 Python 3.10+，
+安装器会下载 Python.org 官方 Python 3.12.10 universal2 PKG，核对固定
+SHA-256 和 Python Software Foundation Developer ID 签名，再从 root 私有暂存
+目录完成系统安装并继续创建 `.runtime/ruyipage-venv`，无需重新运行脚本。
+管理员密码仅由系统 `/usr/bin/sudo` 读取；日常运行 `./run.sh` 不会请求管理员授权。
 
 ## 环境
 
 - macOS 15（推荐）
 - Node.js 18+（[nodejs.org](https://nodejs.org) 或 `install.sh` 下载官方包）
-- Python 3.10+（低风险前置；`install.sh` 会把 `ruyiPage==1.2.45` 安装到项目内隔离虚拟环境）
+- Python 3.10+（`install.sh` 自动检测；缺失时安装已验签的官方 Python 3.12.10）
 - Firefox（[mozilla.org/firefox](https://www.mozilla.org/firefox/)）
 - 终端「辅助功能」权限（`install.sh` 会引导）
 
@@ -27,7 +33,7 @@
 
 | 命令 | 说明 |
 |------|------|
-| `./install.sh` | 环境安装与辅助功能检测 |
+| `./install.sh` | 前置授权；自动安装 Python/Node、ruyiPage 与辅助功能检测 |
 | `./run.sh` | 完整流程 |
 | `./run.sh --skip-mac` | 仅浏览器 |
 | `./run.sh --skip-browser` | 仅系统设置 |
@@ -35,6 +41,7 @@
 | `npm run test:browser-backend` | 浏览器后端选择逻辑测试 |
 | `npm run test:ruyipage-protocol` | ruyipage JSONL 协议自测 |
 | `npm run test:ruyipage-flow` | ruyiPage Python 流程与安全边界测试 |
+| `npm run test:python-bootstrap` | Python 自动安装与提权入口合同测试 |
 | `npm run package` | 本地打包 `dist/`（保留 zip） |
 | `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
 
@@ -83,6 +90,7 @@ macOS 测试机拉取新版本后建议依次运行：
 ```bash
 ./install.sh
 npm run check
+npm run test:python-bootstrap
 ./run.sh
 ```
 

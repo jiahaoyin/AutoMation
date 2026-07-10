@@ -203,7 +203,7 @@ function buildReadme(destRoot) {
 
 - **macOS 15 Sequoia**（推荐 / 测试平台）
 - **Node.js 18+**（[nodejs.org](https://nodejs.org) 官方安装包，或 \`./install.sh\` 自动下载官方二进制）
-- **Python 3.10+** 与 **ruyiPage==1.2.45**（\`./install.sh\` 会安装到项目内 \`.runtime/ruyipage-venv\`）
+- **Python**：\`./install.sh\` 会自动检测 Python 3.10+；缺失时请求管理员授权，核对 Python.org Python 3.12.10 universal2 PKG 的固定 SHA-256 与 Python Software Foundation Developer ID 签名，再把 ruyiPage 安装到项目内 \`.runtime/ruyipage-venv\`
 - **Firefox**（[mozilla.org/firefox](https://www.mozilla.org/firefox/) 手动安装）
 - **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时将打开系统设置并等待你勾选终端 App（如 Terminal / iTerm）
 
@@ -213,12 +213,15 @@ function buildReadme(destRoot) {
 # 1. 解压后进入目录
 cd apple-id-automation-${VERSION}
 
-# 2. 安装 Node（若尚未安装）：从 nodejs.org 安装，或运行 ./install.sh 下载官方包
+# 2. 立即授权并自动安装缺失的 Python/Node、ruyiPage 与辅助工具
 ./install.sh
 
 # 3. 运行（终端按提示输入账号密码，自动备份至 .env）
 ./run.sh
 \`\`\`
+
+\`./install.sh\` 启动后会立即请求一次管理员授权；密码仅由 \`sudo\` 读取。
+安装完成后的日常 \`./run.sh\` 不会再次请求管理员密码。
 
 ## 流程说明
 
@@ -232,7 +235,7 @@ cd apple-id-automation-${VERSION}
 
 | 命令 | 说明 |
 |------|------|
-| \`./install.sh\` | 检测 Node；配置辅助功能；缺失 Node 时下载官方包 |
+| \`./install.sh\` | 前置管理员授权；自动安装缺失的 Python/Node、ruyiPage，并配置辅助功能 |
 | \`./run.sh\` | 完整流程；**终端输入**账号密码并备份至 \`.env\` |
 | \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器） |
 | \`./run.sh --skip-browser\` | 仅 Mac 设置登录 |
@@ -307,12 +310,12 @@ data/
 export function renderInstallSh(version) {
   return `#!/bin/bash
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(/usr/bin/dirname "$0")"
 
-echo "==> Apple ID 自动化包 环境安装 (v${version})"
+echo "==> Apple ID 自动化包 环境安装"
 
 # shellcheck disable=SC1091
-source "$(dirname "$0")/scripts/bootstrap-macos.sh"
+source "$(/usr/bin/dirname "$0")/scripts/bootstrap-macos.sh"
 bootstrap_macos_install_runtime
 
 echo "==> 编译 Swift AX 填表 helper"
