@@ -193,7 +193,7 @@ export function createMac2FACollector(options = {}) {
         allowStrategy = allow.strategy ?? allow.source ?? "auto";
         audit({
           phase: "popup_allow",
-          allowClicked: true,
+          allowObserved: true,
           allowStrategy,
           allowSource: allow.source ?? null,
         });
