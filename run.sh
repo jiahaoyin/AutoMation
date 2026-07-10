@@ -6,11 +6,25 @@ cd "$(dirname "$0")"
 source "$(dirname "$0")/scripts/bootstrap-macos.sh"
 bootstrap_macos_runtime
 
+skip_browser=0
+for arg in "$@"; do
+  if [[ "${arg}" == "--skip-browser" ]]; then
+    skip_browser=1
+    break
+  fi
+done
+
 if [[ "${SKIP_ENV_SETUP:-}" != "1" ]]; then
-  node scripts/setup-environment.mjs --quiet
+  setup_args=(--quiet)
+  if [[ "${skip_browser}" == "1" ]]; then
+    setup_args+=(--skip-firefox --skip-ruyipage)
+  fi
+  node scripts/setup-environment.mjs "${setup_args[@]}"
 fi
 
-node scripts/preflight-2fa-permissions.mjs --quiet
+if [[ "${skip_browser}" != "1" ]]; then
+  node scripts/preflight-2fa-permissions.mjs --quiet
+fi
 
 if [[ -f .env ]]; then
   set -a

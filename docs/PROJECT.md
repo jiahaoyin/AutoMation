@@ -1,201 +1,119 @@
-# Apple ID Automation — 项目上下文文档
+# Apple ID Automation 项目上下文
 
-> **用途**：新开会话 / 新协作者快速了解本项目。  
-> **仓库**：独立项目，与 `ChromeTest`（浏览器指纹探针）分离维护。  
-> **本地路径**：`/Users/yu/Apple-AutoMation`  
-> **目标系统**：macOS 15 Sequoia
-
----
+> 目标系统：macOS 15 Sequoia。Windows 仅用于纯逻辑、协议和语法测试。
 
 ## 1. 项目目标
 
-自动化完成以下流程（测试/运维场景）：
-
-| 阶段 | 方式 | 人工介入 |
+| 阶段 | 实现 | 人工介入 |
 |------|------|----------|
-| Mac 系统设置登录 Apple ID | AppleScript GUI | **手机 SMS 验证码** |
-| 等待 Mac 登录完成 | 轮询 + 可选 Enter 确认 | 验证码输入后等待 |
-| Firefox 打开 account.apple.com | WebDriver BiDi + 拟人输入 | — |
-| 浏览器 2FA | macOS `FollowUpUI` 弹窗读码 | 需 Mac 已登录同账号 |
-| 采集个人信息 | 页面解析 | — |
+| macOS 系统设置登录 Apple ID | AppleScript / Swift AX | 手机验证码人工输入 |
+| 等待系统登录完成 | 状态轮询 | 必要时 Enter 确认 |
+| Firefox 登录 account.apple.com | **ruyiPage only** | 无 |
+| 浏览器 2FA | macOS FollowUpUI 取码 + ruyiPage 填码 | Mac 已登录同账号 |
+| 采集姓名、生日 | ruyiPage 页面读取 | 无 |
 
-**未实现 / 后续**：`developer.apple.com`、`appstoreconnect.apple.com` 多标签流程。
+浏览器启动、接管、导航、元素定位、页面读取、输入、截图和退出均由 ruyiPage 完成。Node 只负责编排 Python 子进程、macOS 取码和报告，不持有浏览器连接。
 
----
+## 2. 优先级与失败策略
 
-## 2. 技术选型（为何不用 Chrome/Playwright）
+1. 敏感输入使用 ruyiPage `scope.actions` 原生 BiDi 动作；macOS 通过 `Command+A`、Delete 和带间隔键入清空并填写。
+2. JS 只通过 ruyiPage `page.run_js()` 做无副作用的状态与文本查询。
+3. 元素必须先被识别后才交互；2FA 未识别到单框或六格输入时拒绝盲打。
+4. 登录时必须确认“记住账号”已勾选；控件缺失或状态未生效即停止。
+5. 交互间使用有界随机停顿，避免固定节奏；超时均有上限。
+6. ruyiPage 或 Python 不可用时明确失败，不回退到 Node BiDi、JS 事件或其他页面自动化方案。
 
-| 层级 | 选型 | 原因 |
-|------|------|------|
-| Mac 2FA 弹窗 | `scripts/apple-2fa-wait.scpt` | 读 `FollowUpUI` 六位码 |
-| 系统设置填表 | AppleScript + System Events | 必须控制原生 UI |
-| 浏览器 | **Firefox** 独立 Profile | BiDi + `input.performActions` 拟人输入 |
-| 协议 | WebDriver BiDi（`ws://127.0.0.1:PORT/session`） | 非 CDP，降低检测面 |
-| Node 依赖 | 无 npm 第三方包 | 原生 WebSocket、`child_process` |
-| 安装 | **不用 Homebrew** | Node 用 nodejs.org 官方包；Firefox 手动安装 |
+## 3. 运行链路
 
----
-
-## 3. 目录结构
-
-```
-Apple-AutoMation/
-├── install.sh              # 环境安装（Node + 辅助功能）
-├── run.sh                  # 主入口
-├── package.json            # 版本号 = 发布版本
-├── .env.example
-├── docs/
-│   └── PROJECT.md          # 本文件
-├── scripts/
-│   ├── apple-id-full-flow.mjs      # 主编排
-│   ├── setup-environment.mjs
-│   ├── check-environment.mjs
-│   ├── bootstrap-macos.sh          # Node 官方包引导
-│   ├── build-release.mjs           # 打 zip 并可选上传 GitHub Releases
-│   ├── fetch-latest.sh             # 从 Releases 下载最新 zip
-│   ├── bump-patch-version.mjs
-│   ├── apple-2fa-wait.scpt
-│   ├── mac-settings-apple-login.applescript
-│   ├── mac-settings-signed-in.applescript
-│   ├── accessibility-check.applescript
-│   └── lib/
-│       ├── credentials.js          # 终端输入 → 备份 .env
-│       ├── accessibility.js        # 辅助功能检测/引导
-│       ├── mac-settings-login.js
-│       ├── account-browser-flow.js
-│       ├── bidi-client.js
-│       ├── human-input-bidi.js
-│       ├── two-fa-sidecar.js
-│       ├── env-setup.js
-│       ├── macos.js                # Sequoia 版本/深链
-│       ├── prompt.js
-│       └── report.js
-└── dist/                   # npm run package 输出（gitignore）
-```
-
----
-
-## 4. 运行流程（数据流）
-
-```
+```text
 ./run.sh
-  → bootstrap（确保 Node 18+）
-  → setup-environment（Firefox、辅助功能等）
-  → promptAppleCredentials（终端输入 → 写 .env 600）
-  → [Mac] mac-settings-apple-login.applescript（env: APPLE_SCRIPT_*）
-  → waitForMacSettingsLoginComplete（轮询 signed-in）
-  → [Browser] 启动 Firefox --profile --remote-debugging-port=0
-  → BiDi session → account.apple.com 登录
-  → two-fa-sidecar + apple-2fa-wait.scpt
-  → 抓取姓名/生日 → data/reports/apple-id-flow-*/report.json
+  -> bootstrap-macos.sh（Node 18+）
+  -> setup-environment.mjs（Firefox、隔离 Python/ruyiPage、macOS 权限）
+  -> 终端读取账号密码并写入权限 600 的 .env
+  -> macOS 系统设置登录
+  -> account-browser-flow.js（仅进程与 2FA 编排）
+  -> ruyipage-backend-runner.js（JSONL 协议）
+  -> apple_account_flow.py（全部浏览器和页面操作）
+  -> report.json + screenshots/
 ```
 
-### 凭证传递
+账号通过子进程环境变量传入 Python，不出现在进程命令行参数中。密码也只通过环境变量传递。
 
-- **不再**通过 AppleScript argv 传密码（`@` 等特殊字符会编译失败）
-- Node 设置环境变量：`APPLE_SCRIPT_APPLE_ID`、`APPLE_SCRIPT_PASSWORD`
-- AppleScript 内 `system attribute` 读取
+## 4. 环境安装
 
-### AppleScript 要点
+`./install.sh` 执行：
 
-- 所有 `click` / `keystroke` 必须在 `tell application "System Events"` 内，否则 **osacompile 失败**
-- Sequoia 深链：`x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings`
+1. 检查 Node 18+；缺失时下载 nodejs.org 官方二进制到 `.runtime/node`。
+2. 使用系统已有的 Python 3.10+ 创建 `.runtime/ruyipage-venv`；脚本不使用高权限安装器改动系统 Python。
+3. 在隔离虚拟环境中执行 `python -m pip install --upgrade ruyiPage==1.2.45`。
+4. 检查 Firefox；自定义路径使用 `FIREFOX_EXECUTABLE`。
+5. 编译 Swift AX/2FA helper，并引导辅助功能与自动化授权。
 
----
+项目显式使用本机 Firefox，因此不额外执行 `python -m ruyipage install` 下载配套 runtime。
 
-## 5. 环境与安装
+## 5. Profile 策略
 
-### install.sh
+- `BROWSER_PROFILE_MODE=persistent`：默认。复用 `data/firefox-apple-automation`，适合测试同一账号并保留“记住账号”结果。
+- `BROWSER_PROFILE_MODE=fresh`：每次在 `data/firefox-apple-automation-fresh/<run-id>` 创建隔离 Profile，适合切换身份。
+- `FIREFOX_PROFILE_DIR`：覆盖 Profile 根目录。
+- `RUYIPAGE_BACKEND_TIMEOUT_MS=720000`：浏览器阶段总预算 12 分钟，覆盖登录等待、macOS 2FA 取码和登录后采集。
 
-1. 检测 Node 18+；无则下载 nodejs.org 官方 tar 到 `.runtime/node`
-2. `setup-environment.mjs`：检查 Firefox、辅助功能
-3. 辅助功能未授权 → 打开系统设置 → 轮询等待（最长 3 分钟）
+切换账号时优先使用 `fresh`，避免身份和 Cookie 串用。
 
-### 账号密码
+## 6. 关键文件
 
-- **每次** `./run.sh` 终端交互输入
-- 自动写入 `.env`（权限 600）
-- 不要提交 `.env` 到 git
+| 文件 | 职责 |
+|------|------|
+| `scripts/apple-id-full-flow.mjs` | 总流程与报告 |
+| `scripts/lib/account-browser-flow.js` | ruyiPage 子进程、macOS 2FA 编排 |
+| `scripts/lib/ruyipage-backend-runner.js` | JSONL、超时、子进程错误处理 |
+| `scripts/ruyipage/apple_account_flow.py` | 唯一浏览器实现 |
+| `scripts/lib/ruyipage-runtime.js` | Python/ruyiPage 探测与隔离安装 |
+| `scripts/lib/firefox-runtime.js` | Firefox 路径和 Profile 路径策略；不启动浏览器 |
+| `scripts/lib/env-setup.js` | macOS 环境和权限探测 |
+| `scripts/lib/two-fa-sidecar.js` | macOS 2FA 取码 |
+| `scripts/build-release.mjs` | 发布包复制清单与依赖校验 |
 
----
-
-## 6. 打包与发布
+## 7. 常用命令
 
 ```bash
-npm run package          # 仅本地打包（保留 dist/）
-npm run package:no-bump  # 不递增版本
-npm run release          # patch+1 → 打包 → 上传 GitHub Releases → 清理本地 dist/
-npm run release:no-bump  # 不递增版本，直接发布当前版本
+./install.sh
+npm run check
+npm run test:ruyipage-flow
+./run.sh
+
+# 仅浏览器；仍由 ruyiPage 完成
+./run.sh --skip-mac
+
+# 仅系统设置；不要求 ruyiPage
+./run.sh --skip-browser
 ```
 
-本地打包输出：`dist/apple-id-automation-{version}/` 与 `dist/apple-id-automation-{version}-macos.zip`
+## 8. macOS 测试检查点
 
-**推荐发布流程**：改完代码后执行 `npm run release`，zip 上传至 [GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases)，本地 `dist/` 自动清理。
+1. `./install.sh` 显示项目虚拟环境中的 ruyiPage 版本。
+2. `npm run check` 显示 backend 为 `ruyipage`，Firefox 路径正确。
+3. 登录页账号输入后进入密码步骤。
+4. “记住账号”被勾选；若无法确认，流程应报错停止。
+5. 提交密码后，确认页面进入 2FA 才启动 macOS 取码。
+6. 验证码只写入已识别的单框或六格控件。
+7. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
+8. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，姓名/生日结果与页面一致。
 
-**其他机器拉取**（无需 clone，下载解压即用）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jiahaoyin/Apple-AutoMation/main/scripts/fetch-latest.sh | bash
-cd apple-id-automation-latest/apple-id-automation-*/
-./install.sh && ./run.sh
-```
-
-已 clone 仓库时也可运行 `./scripts/fetch-latest.sh`；有 `gh` 时优先用 gh，否则自动 fallback 到 curl。
-
-`build-release.mjs` 会在打包前 **校验 COPY_PATHS 是否包含所有 lib 依赖**（避免漏文件如 `macos.js`）。
-
----
-
-## 7. 常见问题
+## 9. 故障排查
 
 | 现象 | 处理 |
 |------|------|
-| `Cannot find module .../macos.js` | 旧 zip 缺文件，用新版本或补拷 `scripts/lib/macos.js` |
-| AppleScript `-2741` 语法错误 | 升级脚本；确认 UI 命令在 System Events tell 内 |
-| Homebrew Permission denied | 本项目**不依赖** brew；用 nodejs.org 装 Node |
-| 系统设置填表失败 | 辅助功能授权；手动打开 Apple Account 页 |
-| 2FA 超时 | Mac 系统设置需已登录；确认 FollowUpUI 弹窗 |
+| ruyiPage 未就绪 | 先安装 Python 3.10+，再运行 `./install.sh`；检查 `python3 -m venv` 是否可用 |
+| Firefox 未找到 | 安装 Firefox 或设置 `FIREFOX_EXECUTABLE` |
+| 记住账号控件失败 | 保留失败截图，核对 Apple 登录页控件结构 |
+| 2FA 输入框未识别 | 查看 `99-ruyipage-failure.png`，补充 ruyiPage selector；不得改成无焦点输入 |
+| macOS 取码超时 | 确认系统设置已登录同账号，并授予 Terminal 辅助功能/自动化权限 |
+| 姓名或生日为空 | 查看 `03-account-manage.png`，调整 ruyiPage 页面解析标签 |
 
----
+## 10. 安全边界
 
-## 8. 与 ChromeTest 的关系
-
-- **ChromeTest**（`/Users/yu/ChromeTest`）：浏览器指纹 / 交互风险**探针**平台（前后端 + Playwright/Puppeteer/Firefox BiDi probe）
-- **本仓库**：仅 Apple ID macOS + Firefox 自动化，从 ChromeTest 的 `scripts/` 拆出（2025-07）
-- 两仓库**独立版本号、独立推送**，互不影响
-
-**正式跑 `./run.sh` 前**，建议在执行机跑探针门禁（云端或本地）：
-
-```bash
-export PROBE_BASE=https://your-probe-server
-cd /path/to/ChromeTest && npm run probe:gate:firefox
-# PASS 后再执行本仓库 ./run.sh
-```
-
-探针配置手册：`ChromeTest/docs/AUTOMATION_PLAYBOOK.md`
-
----
-
-## 9. 开发备忘
-
-- 改功能后：`npm run release` 发布至 GitHub Releases
-- 每次发布默认 **patch 版本 +1**（1.0.2 → 1.0.3）
-- 测试机：macOS 15.6+，Terminal 需辅助功能
-- 勿在仓库中提交：`.env`、`data/`、`.runtime/`、`dist/`
-
----
-
-## 10. 关键入口文件速查
-
-| 需求 | 文件 |
-|------|------|
-| 改总流程 | `scripts/apple-id-full-flow.mjs` |
-| 改系统设置登录 | `scripts/mac-settings-apple-login.applescript` |
-| 改浏览器登录/采集 | `scripts/lib/account-browser-flow.js` |
-| 改 2FA 读码 | `scripts/apple-2fa-wait.scpt` |
-| 改安装/环境 | `scripts/lib/env-setup.js`, `install.sh` |
-| 改打包/发布 | `scripts/build-release.mjs` → `COPY_PATHS`；`npm run release` |
-
----
-
-*最后更新：2025-07-02，版本 1.0.2*
+- 不提交 `.env`、`data/`、`.runtime/`、`dist/`。
+- 不在日志、命令行参数或报告中写明文密码。
+- 不使用 JS 设置敏感输入值或派发输入事件。
+- 不在运行时切换到未审核的浏览器后端。

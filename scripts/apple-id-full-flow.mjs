@@ -2,7 +2,7 @@
 /**
  * Apple ID 完整流程：
  * 1) macOS 系统设置登录（自动填账号密码，手机验证码人工，等待登录完成）
- * 2) Firefox BiDi 访问 account.apple.com（人工模拟输入 + macOS 2FA Sidecar）
+ * 2) ruyiPage 控制 Firefox 访问 account.apple.com（拟人输入 + macOS 2FA Sidecar）
  * 3) 采集姓名、生日，输出 report.json + 截图
  *
  * 用法:
@@ -28,7 +28,11 @@ async function main() {
   console.log("═══════════════════════════════════════════\n");
 
   if (!skipSetup) {
-    await ensureEnvironment({ quiet: false, skipFirefox: skipBrowser });
+    await ensureEnvironment({
+      quiet: false,
+      skipFirefox: skipBrowser,
+      skipRuyiPage: skipBrowser,
+    });
     console.log("");
   }
 
@@ -39,41 +43,50 @@ async function main() {
     appleId: creds.appleId.replace(/(.{2}).+(@.+)/, "$1***$2"),
     phases: {},
   };
+  let reportFile = null;
 
-  if (!skipMac) {
-    try {
-      report.phases.macSettings = await runMacSettingsLoginPhase(creds);
-    } catch (e) {
-      report.phases.macSettings = {
-        success: false,
-        error: e instanceof Error ? e.message : String(e),
-      };
-      throw e;
+  try {
+    if (!skipMac) {
+      try {
+        report.phases.macSettings = await runMacSettingsLoginPhase(creds);
+      } catch (e) {
+        report.phases.macSettings = {
+          success: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+        throw e;
+      }
+    } else {
+      console.log("[Mac 设置] --skip-mac：跳过系统设置登录阶段\n");
+      report.phases.macSettings = { skipped: true };
     }
-  } else {
-    console.log("[Mac 设置] --skip-mac：跳过系统设置登录阶段\n");
-    report.phases.macSettings = { skipped: true };
+
+    if (!skipBrowser) {
+      try {
+        report.phases.accountBrowser = await runAccountBrowserPhase({
+          creds,
+          reportDir,
+        });
+      } catch (e) {
+        report.phases.accountBrowser = {
+          success: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+        throw e;
+      }
+    } else {
+      console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
+      report.phases.accountBrowser = { skipped: true };
+    }
+
+    reportFile = writeReport(reportDir, report);
+  } catch (e) {
+    report.error = e instanceof Error ? e.message : String(e);
+    reportFile = writeReport(reportDir, report);
+    console.error(`\n[报告] 失败报告已保存: ${reportFile}`);
+    throw e;
   }
 
-  if (!skipBrowser) {
-    try {
-      report.phases.accountBrowser = await runAccountBrowserPhase({
-        creds,
-        reportDir,
-      });
-    } catch (e) {
-      report.phases.accountBrowser = {
-        success: false,
-        error: e instanceof Error ? e.message : String(e),
-      };
-      throw e;
-    }
-  } else {
-    console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
-    report.phases.accountBrowser = { skipped: true };
-  }
-
-  const reportFile = writeReport(reportDir, report);
   console.log("\n═══════════════════════════════════════════");
   console.log(" 完成");
   console.log(` 报告: ${reportFile}`);

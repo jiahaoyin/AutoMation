@@ -3,7 +3,7 @@
 在 **macOS 15 Sequoia** 上自动化完成 Apple ID 登录与信息采集：
 
 1. **系统设置** → Apple Account 自动填表（手机验证码人工）
-2. **Firefox** + WebDriver BiDi → `account.apple.com` 登录与 2FA
+2. **Firefox** + ruyiPage → `account.apple.com` 登录与 2FA
 3. 采集**姓名、生日**，输出报告与截图
 
 与 [ChromeTest](https://github.com) 探针项目**完全独立**，本仓库单独维护。
@@ -19,6 +19,7 @@
 
 - macOS 15（推荐）
 - Node.js 18+（[nodejs.org](https://nodejs.org) 或 `install.sh` 下载官方包）
+- Python 3.10+（低风险前置；`install.sh` 会把 `ruyiPage==1.2.45` 安装到项目内隔离虚拟环境）
 - Firefox（[mozilla.org/firefox](https://www.mozilla.org/firefox/)）
 - 终端「辅助功能」权限（`install.sh` 会引导）
 
@@ -31,6 +32,9 @@
 | `./run.sh --skip-mac` | 仅浏览器 |
 | `./run.sh --skip-browser` | 仅系统设置 |
 | `npm run check` | 环境自检 |
+| `npm run test:browser-backend` | 浏览器后端选择逻辑测试 |
+| `npm run test:ruyipage-protocol` | ruyipage JSONL 协议自测 |
+| `npm run test:ruyipage-flow` | ruyiPage Python 流程与安全边界测试 |
 | `npm run package` | 本地打包 `dist/`（保留 zip） |
 | `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
 
@@ -61,6 +65,26 @@ cd apple-id-automation-latest/apple-id-automation-*/
 ## 文档
 
 - **[docs/PROJECT.md](docs/PROJECT.md)** — 架构、文件说明、故障排查（新会话必读）
+
+## 浏览器后端
+
+浏览器启动、导航、页面读取、接管、输入、截图与关闭全部由 Python `ruyiPage` 完成。项目不再包含 Node BiDi 或其他页面自动化回退；ruyiPage 未就绪时会明确停止并提示运行 `./install.sh`。
+
+```bash
+BROWSER_BACKEND=ruyipage          # 唯一后端；auto 仅兼容旧 .env
+RUYIPAGE_PYTHON=python3           # 可选；默认使用 .runtime/ruyipage-venv
+BROWSER_PROFILE_MODE=persistent   # persistent | fresh
+RUYIPAGE_BACKEND_TIMEOUT_MS=720000
+RUYIPAGE_KILL_GRACE_MS=5000
+```
+
+macOS 测试机拉取新版本后建议依次运行：
+
+```bash
+./install.sh
+npm run check
+./run.sh
+```
 
 ## 安全
 

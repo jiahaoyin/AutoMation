@@ -60,4 +60,4 @@ if ! command -v cliclick >/dev/null 2>&1; then
   echo "提示: 可选安装 cliclick 以增强「允许」点击（brew install cliclick）"
 fi
 
-exec node scripts/setup-environment.mjs "$@"
+exec node scripts/setup-environment.mjs --install-ruyipage "$@"

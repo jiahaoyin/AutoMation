@@ -19,80 +19,105 @@ import { fileURLToPath } from "node:url";
 
 import { bumpPatchVersion, readPkgVersion, writePkgVersion } from "./bump-patch-version.mjs";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
-
-const noBump = process.argv.includes("--no-bump");
-const uploadRelease = process.argv.includes("--upload");
-const cleanLocal = process.argv.includes("--clean");
-if (!noBump && !process.env.RELEASE_VERSION) {
-  const current = readPkgVersion();
-  const next = bumpPatchVersion(current);
-  writePkgVersion(next);
-  console.log(`版本递增: ${current} → ${next}`);
-}
-
-const VERSION = process.env.RELEASE_VERSION ?? readPkgVersion();
-const RELEASE_NAME = `apple-id-automation-${VERSION}`;
-const OUT_DIR = path.join(ROOT, "dist", RELEASE_NAME);
-const ZIP_PATH = path.join(ROOT, "dist", `${RELEASE_NAME}-macos.zip`);
+let VERSION = null;
+let RELEASE_NAME = null;
+let OUT_DIR = null;
+let ZIP_PATH = null;
+let uploadRelease = false;
+let cleanLocal = false;
 
 /** @type {string[]} 相对仓库根目录 */
-const COPY_PATHS = [
+export const COPY_PATHS = [
   "scripts/apple-id-full-flow.mjs",
   "scripts/apple-2fa-wait.scpt",
+  "scripts/apple-2fa-phase.applescript",
   "scripts/mac-settings-apple-login.applescript",
   "scripts/mac-settings-ui-dump.applescript",
   "scripts/mac-settings-signed-in.applescript",
   "scripts/swift/mac-settings-ax-fill.swift",
   "scripts/swift/mac-settings-2fa-code.swift",
+  "scripts/swift/mac-2fa-click-allow.swift",
+  "scripts/swift/mac-2fa-popup-read.swift",
+  "scripts/swift/mac-2fa-popup-ocr.swift",
   "scripts/fill-debug.mjs",
-  "scripts/browser-fill-debug.mjs",
   "scripts/lib/mac-settings-ax-fill.js",
   "scripts/lib/mac-settings-2fa.js",
-  "scripts/lib/bidi-client.js",
-  "scripts/lib/human-input-bidi.js",
+  "scripts/lib/browser-backend.js",
+  "scripts/lib/firefox-runtime.js",
   "scripts/lib/mac-settings-login.js",
   "scripts/lib/account-browser-flow.js",
-  "scripts/lib/anti-automation.js",
-  "scripts/lib/browser-input.js",
-  "scripts/lib/browser-session.js",
   "scripts/lib/credentials.js",
   "scripts/lib/prompt.js",
+  "scripts/lib/ruyipage-backend-runner.js",
+  "scripts/lib/ruyipage-runtime.js",
   "scripts/lib/two-fa-sidecar.js",
+  "scripts/lib/2fa-audit.js",
+  "scripts/lib/mac-2fa-allow.js",
+  "scripts/lib/mac-2fa-ocr.js",
+  "scripts/lib/mac-2fa-popup.js",
   "scripts/lib/report.js",
+  "scripts/ruyipage/apple_account_flow.py",
   "scripts/check-environment.mjs",
   "scripts/setup-environment.mjs",
+  "scripts/preflight-2fa-permissions.mjs",
   "scripts/bootstrap-macos.sh",
   "scripts/lib/env-setup.js",
   "scripts/lib/macos.js",
   "scripts/bump-patch-version.mjs",
   "scripts/accessibility-check.applescript",
   "scripts/automation-check.applescript",
+  "scripts/2fa-automation-check.applescript",
   "scripts/lib/accessibility.js",
 ];
 
-/** 从入口脚本递归收集 ./lib/*.js 依赖，打包前校验 COPY_PATHS 无遗漏 */
-function collectLibImports(entryRelPaths) {
-  const libFiles = new Set();
-  const queue = [...entryRelPaths];
-  const importRe = /from\s+["']\.\/lib\/([^"']+)["']/g;
+function normalizeRelPath(relPath) {
+  return relPath.replace(/\\/g, "/");
+}
+
+function resolveRelativeImport(importerRel, specifier) {
+  const importerDir = path.dirname(importerRel);
+  const candidate = normalizeRelPath(path.normalize(path.join(importerDir, specifier)));
+  const candidates = path.extname(candidate)
+    ? [candidate]
+    : [`${candidate}.js`, `${candidate}.mjs`, `${candidate}.json`, `${candidate}/index.js`];
+
+  return candidates.find((rel) => fs.existsSync(path.join(ROOT, rel))) ?? candidate;
+}
+
+/** 从入口脚本递归收集 runtime 相对 import，打包前校验 COPY_PATHS 无遗漏 */
+export function collectRuntimeImports(entryRelPaths) {
+  const runtimeFiles = new Set();
+  const scanned = new Set();
+  const queue = entryRelPaths.map(normalizeRelPath);
+  const importRe =
+    /(?:from\s+["'](\.{1,2}\/[^"']+)["']|import\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)|import\s+["'](\.{1,2}\/[^"']+)["'])/g;
 
   while (queue.length) {
-    const rel = queue.pop();
+    const rel = normalizeRelPath(queue.pop());
+    if (scanned.has(rel)) continue;
+    scanned.add(rel);
+
     const abs = path.join(ROOT, rel);
-    if (!fs.existsSync(abs)) continue;
+    if (!fs.existsSync(abs) || !/\.(?:js|mjs)$/i.test(rel)) continue;
+
     const src = fs.readFileSync(abs, "utf-8");
+    importRe.lastIndex = 0;
     let m;
     while ((m = importRe.exec(src))) {
-      const libRel = `scripts/lib/${m[1]}`;
-      if (!libFiles.has(libRel)) {
-        libFiles.add(libRel);
-        queue.push(libRel);
+      const specifier = m[1] || m[2] || m[3];
+      const importedRel = resolveRelativeImport(rel, specifier);
+      if (!importedRel.startsWith("scripts/")) continue;
+      if (!runtimeFiles.has(importedRel)) {
+        runtimeFiles.add(importedRel);
+        queue.push(importedRel);
       }
     }
   }
-  return libFiles;
+
+  return runtimeFiles;
 }
 
 function validateCopyPaths() {
@@ -101,7 +126,7 @@ function validateCopyPaths() {
     "scripts/setup-environment.mjs",
     "scripts/check-environment.mjs",
   ];
-  const requiredLibs = collectLibImports(entries);
+  const requiredLibs = collectRuntimeImports(entries);
   const copySet = new Set(COPY_PATHS);
   const missing = [...requiredLibs].filter((p) => !copySet.has(p));
 
@@ -143,7 +168,7 @@ function buildPackageJson(destRoot) {
     version: VERSION,
     private: true,
     description:
-      "macOS 系统设置 Apple ID 登录 + Firefox BiDi account.apple.com 采集（独立分发包）",
+      "macOS 系统设置 Apple ID 登录 + ruyiPage-only account.apple.com 采集（独立分发包）",
     type: "module",
     engines: { node: ">=18" },
     scripts: {
@@ -178,6 +203,7 @@ function buildReadme(destRoot) {
 
 - **macOS 15 Sequoia**（推荐 / 测试平台）
 - **Node.js 18+**（[nodejs.org](https://nodejs.org) 官方安装包，或 \`./install.sh\` 自动下载官方二进制）
+- **Python 3.10+** 与 **ruyiPage==1.2.45**（\`./install.sh\` 会安装到项目内 \`.runtime/ruyipage-venv\`）
 - **Firefox**（[mozilla.org/firefox](https://www.mozilla.org/firefox/) 手动安装）
 - **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时将打开系统设置并等待你勾选终端 App（如 Terminal / iTerm）
 
@@ -198,7 +224,7 @@ cd apple-id-automation-${VERSION}
 
 1. **Mac 系统设置**：自动填入 Apple ID / 密码；**手机验证码需人工**在系统界面完成
 2. **等待**：脚本轮询直至检测到系统设置已登录（或按 Enter 手动确认）
-3. **Firefox**：独立 Profile + WebDriver BiDi + 人工模拟输入
+3. **Firefox**：启动、导航、页面读取、输入、截图与关闭全部由 ruyiPage 完成，不提供其他浏览器后端
 4. **account.apple.com**：登录 → macOS 2FA 弹窗自动读码 → 采集姓名、生日
 5. **输出**：\`data/reports/apple-id-flow-*/report.json\` 与 \`screenshots/\`
 
@@ -224,6 +250,9 @@ cd apple-id-automation-${VERSION}
 | \`APPLE_PASSWORD\` | 密码 |
 | \`FIREFOX_EXECUTABLE\` | 可选，非默认 Firefox 路径 |
 | \`FIREFOX_PROFILE_DIR\` | 可选，默认 \`./data/firefox-apple-automation\` |
+| \`BROWSER_BACKEND\` | 可选，固定为 \`ruyipage\`；\`auto\` 仅作旧配置兼容别名 |
+| \`RUYIPAGE_PYTHON\` | 可选，自定义 Python；默认优先项目内隔离虚拟环境 |
+| \`BROWSER_PROFILE_MODE\` | 可选，\`persistent\` / \`fresh\` |
 
 ## 故障排查
 
@@ -232,6 +261,7 @@ cd apple-id-automation-${VERSION}
 - **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`npm run dump:mac-ui\` 查看 AX 树（v1.0.22 修复 tell 上下文 + 自动化预检）
 - **调试 UI 结构**：\`osascript scripts/mac-settings-ui-dump.applescript\`（登录页打开后运行）
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
+- **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
 - **2FA 超时**：确认 Mac 已登录同一 Apple ID，且弹窗为 FollowUpUI 设备验证
 - **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
@@ -254,6 +284,11 @@ APPLE_PASSWORD=your_password
 # 可选
 # FIREFOX_EXECUTABLE=/Applications/Firefox.app/Contents/MacOS/firefox
 # FIREFOX_PROFILE_DIR=./data/firefox-apple-automation
+# BROWSER_BACKEND=ruyipage
+# RUYIPAGE_PYTHON=python3
+# BROWSER_PROFILE_MODE=persistent
+# RUYIPAGE_BACKEND_TIMEOUT_MS=720000
+# RUYIPAGE_KILL_GRACE_MS=5000
 `
   );
 }
@@ -269,14 +304,12 @@ data/
   );
 }
 
-function buildInstallSh(destRoot) {
-  writeExecutable(
-    path.join(destRoot, "install.sh"),
-    `#!/bin/bash
+export function renderInstallSh(version) {
+  return `#!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> Apple ID 自动化包 环境安装 (v${VERSION})"
+echo "==> Apple ID 自动化包 环境安装 (v${version})"
 
 # shellcheck disable=SC1091
 source "$(dirname "$0")/scripts/bootstrap-macos.sh"
@@ -301,19 +334,48 @@ if command -v swiftc >/dev/null 2>&1; then
   else
     echo "⚠ mac-settings-2fa-code 编译失败，2FA 将仅依赖系统弹窗"
   fi
+  if swiftc -O -o scripts/bin/mac-2fa-popup-read \
+    scripts/swift/mac-2fa-popup-read.swift \
+    -framework ApplicationServices -framework AppKit 2>/dev/null; then
+    chmod +x scripts/bin/mac-2fa-popup-read
+    echo "✓ mac-2fa-popup-read 已编译"
+  else
+    echo "⚠ mac-2fa-popup-read 编译失败，2FA 弹窗将回退 AppleScript"
+  fi
+  if swiftc -O -o scripts/bin/mac-2fa-popup-ocr \
+    scripts/swift/mac-2fa-popup-ocr.swift \
+    -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics 2>/dev/null; then
+    chmod +x scripts/bin/mac-2fa-popup-ocr
+    echo "✓ mac-2fa-popup-ocr 已编译"
+  else
+    echo "⚠ mac-2fa-popup-ocr 编译失败，将回退 AppleScript 读码"
+  fi
+  if swiftc -O -o scripts/bin/mac-2fa-click-allow \
+    scripts/swift/mac-2fa-click-allow.swift \
+    -framework ApplicationServices -framework AppKit 2>/dev/null; then
+    chmod +x scripts/bin/mac-2fa-click-allow
+    echo "✓ mac-2fa-click-allow 已编译"
+  else
+    echo "⚠ mac-2fa-click-allow 编译失败，将回退 AppleScript 点允许"
+  fi
 else
   echo "⚠ 未找到 swiftc，将使用 AppleScript 回退"
 fi
 
-exec node scripts/setup-environment.mjs "$@"
-`
-  );
+if ! command -v cliclick >/dev/null 2>&1; then
+  echo "提示: 可选安装 cliclick 以增强「允许」点击（brew install cliclick）"
+fi
+
+exec node scripts/setup-environment.mjs --install-ruyipage "$@"
+`;
 }
 
-function buildRunSh(destRoot) {
-  writeExecutable(
-    path.join(destRoot, "run.sh"),
-    `#!/bin/bash
+function buildInstallSh(destRoot) {
+  writeExecutable(path.join(destRoot, "install.sh"), renderInstallSh(VERSION));
+}
+
+export function renderRunSh() {
+  return `#!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -321,8 +383,24 @@ cd "$(dirname "$0")"
 source "$(dirname "$0")/scripts/bootstrap-macos.sh"
 bootstrap_macos_runtime
 
+skip_browser=0
+for arg in "$@"; do
+  if [[ "\${arg}" == "--skip-browser" ]]; then
+    skip_browser=1
+    break
+  fi
+done
+
 if [[ "\${SKIP_ENV_SETUP:-}" != "1" ]]; then
-  node scripts/setup-environment.mjs --quiet
+  setup_args=(--quiet)
+  if [[ "\${skip_browser}" == "1" ]]; then
+    setup_args+=(--skip-firefox --skip-ruyipage)
+  fi
+  node scripts/setup-environment.mjs "\${setup_args[@]}"
+fi
+
+if [[ "\${skip_browser}" != "1" ]]; then
+  node scripts/preflight-2fa-permissions.mjs --quiet
 fi
 
 if [[ -f .env ]]; then
@@ -333,8 +411,11 @@ if [[ -f .env ]]; then
 fi
 
 exec node scripts/apple-id-full-flow.mjs --skip-setup "$@"
-`
-  );
+`;
+}
+
+function buildRunSh(destRoot) {
+  writeExecutable(path.join(destRoot, "run.sh"), renderRunSh());
 }
 
 function createZip(sourceDir, zipPath) {
@@ -462,7 +543,22 @@ function cleanLocalArtifacts(outDir, zipPath) {
   console.log("已清理本地打包产物");
 }
 
-function main() {
+function main(argv = process.argv.slice(2)) {
+  const noBump = argv.includes("--no-bump");
+  uploadRelease = argv.includes("--upload");
+  cleanLocal = argv.includes("--clean");
+  if (!noBump && !process.env.RELEASE_VERSION) {
+    const current = readPkgVersion();
+    const next = bumpPatchVersion(current);
+    writePkgVersion(next);
+    console.log(`版本递增: ${current} → ${next}`);
+  }
+
+  VERSION = process.env.RELEASE_VERSION ?? readPkgVersion();
+  RELEASE_NAME = `apple-id-automation-${VERSION}`;
+  OUT_DIR = path.join(ROOT, "dist", RELEASE_NAME);
+  ZIP_PATH = path.join(ROOT, "dist", `${RELEASE_NAME}-macos.zip`);
+
   validateCopyPaths();
   console.log(`打包 ${RELEASE_NAME} …`);
   rimraf(OUT_DIR);
@@ -516,4 +612,6 @@ function main() {
   }
 }
 
-main();
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main();
+}
