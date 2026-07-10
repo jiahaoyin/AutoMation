@@ -173,6 +173,16 @@ def input_and_verify(
         actual = field.value
     except Exception:
         return
+    if actual is None or str(actual) == value:
+        return
+
+    pause(180, 420)
+    field.input(value, clear=True)
+    pause(280, 680)
+    try:
+        actual = field.value
+    except Exception:
+        return
     if actual is not None and str(actual) != value:
         detail = f"length {len(str(actual))}" if label == "password" else repr(str(actual))
         raise RuntimeError(f"{label} input verification failed: {detail}")

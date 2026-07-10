@@ -58,6 +58,7 @@ class FakeElement:
 
     def input(self, value, clear=True):
         self.inputs.append((value, clear))
+        self.value = value if clear else self.value + value
         return self
 
 
@@ -92,13 +93,14 @@ class FakePage:
 
 
 class FakeActions:
-    def __init__(self):
+    def __init__(self, apply_typed_text=True):
         self.calls = []
         self.target = None
         self.pending_human_click = None
         self.pending_text = None
         self.select_all = False
         self.delete_selection = False
+        self.apply_typed_text = apply_typed_text
 
     def combo(self, *keys):
         self.calls.append(("combo", keys))
@@ -135,7 +137,8 @@ class FakeActions:
             self.select_all = False
             self.delete_selection = False
         if self.target is not None and self.pending_text is not None:
-            self.target.value = self.pending_text
+            if self.apply_typed_text:
+                self.target.value = self.pending_text
             self.pending_text = None
         return self
 
@@ -184,6 +187,23 @@ class InputTests(unittest.TestCase):
         self.assertGreaterEqual(actions.calls[5][2], 40)
         self.assertLessEqual(actions.calls[5][2], 180)
         self.assertEqual(actions.calls[6], ("perform",))
+        self.assertEqual(field.value, "person@example.com")
+
+    def test_input_falls_back_to_element_bidi_input_when_actions_lose_focus(self):
+        field = FakeElement()
+        actions = FakeActions(apply_typed_text=False)
+        scope = FakePage({"css:input": [field]}, actions=actions)
+
+        input_and_verify(
+            scope,
+            field,
+            "person@example.com",
+            "email",
+            FakeKeys,
+            pause=lambda *_: None,
+        )
+
+        self.assertEqual(field.inputs, [("person@example.com", True)])
         self.assertEqual(field.value, "person@example.com")
 
     def test_submit_enter_uses_the_element_scope_actions(self):
