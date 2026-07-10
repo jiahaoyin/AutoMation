@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
@@ -145,6 +145,95 @@ def wait_for_element(
     raise RuntimeError(f"page element did not appear: {', '.join(selectors)}")
 
 
+def normalized_apple_frame_url(url: str) -> str | None:
+    parsed = parse_valid_apple_url(url)
+    if parsed is None:
+        return None
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    netloc = host if port in (None, 443) else f"{host}:{port}"
+    return parsed._replace(netloc=netloc, fragment="").geturl()
+
+
+def find_hosting_frame_element(frame_scope: Any) -> tuple[Any, Any]:
+    parent = getattr(frame_scope, "parent", None)
+    if parent is None:
+        raise RuntimeError("ruyiPage frame has no parent context for trusted input")
+
+    parent_url = validate_apple_scope(parent)
+    frame_url = normalized_apple_frame_url(validate_apple_scope(frame_scope))
+    frame_parts = urlsplit(frame_url or "")
+    exact_matches: list[Any] = []
+    same_path_matches: list[Any] = []
+    parent_path_matches: list[Any] = []
+    same_host_matches: list[Any] = []
+    for candidate in safe_elements(parent, "css:iframe"):
+        if not element_is_interactable(candidate):
+            continue
+        try:
+            candidate_url = normalized_apple_frame_url(
+                urljoin(parent_url, str(candidate.attr("src") or ""))
+            )
+        except Exception:
+            continue
+        if not candidate_url or not frame_url:
+            continue
+        candidate_parts = urlsplit(candidate_url)
+        if candidate_parts.hostname != frame_parts.hostname:
+            continue
+        same_host_matches.append(candidate)
+        if candidate_url == frame_url:
+            exact_matches.append(candidate)
+        elif candidate_parts.path == frame_parts.path:
+            same_path_matches.append(candidate)
+        else:
+            candidate_path = candidate_parts.path.rstrip("/")
+            if candidate_path and frame_parts.path.startswith(f"{candidate_path}/"):
+                parent_path_matches.append(candidate)
+
+    # Use the strongest unique relation and never guess within an ambiguous tier.
+    for matches in (
+        exact_matches,
+        same_path_matches,
+        parent_path_matches,
+        same_host_matches,
+    ):
+        if not matches:
+            continue
+        if len(matches) == 1:
+            return parent, matches[0]
+        break
+    raise RuntimeError("unable to map ruyiPage frame to its visible iframe element")
+
+
+def root_viewport_center(root_page: Any, scope: Any, field: Any) -> dict[str, int]:
+    try:
+        location = field.location
+        size = field.size
+        x = float(location["x"]) + float(size["width"]) / 2
+        y = float(location["y"]) + float(size["height"]) / 2
+    except Exception as exc:
+        raise RuntimeError("unable to read ruyiPage field geometry") from exc
+
+    current = scope
+    seen: set[int] = set()
+    while current is not root_page:
+        identity = id(current)
+        if identity in seen:
+            raise RuntimeError("cycle detected in ruyiPage frame hierarchy")
+        seen.add(identity)
+        parent, iframe = find_hosting_frame_element(current)
+        try:
+            iframe_location = iframe.location
+            x += float(iframe_location["x"])
+            y += float(iframe_location["y"])
+        except Exception as exc:
+            raise RuntimeError("unable to read ruyiPage iframe geometry") from exc
+        current = parent
+
+    return {"x": round(x), "y": round(y)}
+
+
 def human_click(
     scope: Any,
     element: Any,
@@ -161,31 +250,44 @@ def input_and_verify(
     label: str,
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
-) -> None:
+    root_page: Any | None = None,
+) -> Any:
     validate_apple_scope(scope)
-    human_click(scope, field, pause=pause)
-    pause(180, 480)
-    scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
-    pause(120, 320)
-    scope.actions.type(value, interval=random.randint(55, 145)).perform()
-    pause(280, 680)
-    try:
-        actual = field.value
-    except Exception:
-        return
-    if actual is None or str(actual) == value:
-        return
+    root_page = root_page or scope
+    if scope is root_page:
+        action_scope = scope
+        click_target = field
+    else:
+        # Firefox routes iframe keyboard input only after a top-context pointer focus.
+        validate_apple_scope(root_page)
+        action_scope = root_page
+        click_target = root_viewport_center(root_page, scope, field)
 
-    pause(180, 420)
-    field.input(value, clear=True)
+    human_click(action_scope, click_target, pause=pause)
+    pause(180, 480)
+    action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+    pause(120, 320)
+    action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
     pause(280, 680)
     try:
         actual = field.value
     except Exception:
-        return
+        return action_scope
+    if actual is None or str(actual) == value:
+        return action_scope
+
+    if action_scope is scope:
+        pause(180, 420)
+        field.input(value, clear=True)
+        pause(280, 680)
+        try:
+            actual = field.value
+        except Exception:
+            return action_scope
     if actual is not None and str(actual) != value:
         detail = f"length {len(str(actual))}" if label == "password" else repr(str(actual))
         raise RuntimeError(f"{label} input verification failed: {detail}")
+    return action_scope
 
 
 def submit_with_enter(
@@ -258,11 +360,27 @@ def fill_security_code(
 
     if len(fields) == 1:
         scope, field = fields[0]
-        input_and_verify(scope, field, digits, "2FA code", keys, pause=pause)
+        input_and_verify(
+            scope,
+            field,
+            digits,
+            "2FA code",
+            keys,
+            pause=pause,
+            root_page=page,
+        )
         return
 
     for (scope, field), digit in zip(fields, digits):
-        input_and_verify(scope, field, digit, "2FA digit", keys, pause=pause)
+        input_and_verify(
+            scope,
+            field,
+            digit,
+            "2FA digit",
+            keys,
+            pause=pause,
+            root_page=page,
+        )
         pause(80, 220)
 
 
@@ -684,17 +802,31 @@ def browser_flow(args: argparse.Namespace) -> int:
 
         if not skipped_login:
             email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
-            input_and_verify(email_scope, email, apple_id, "email", Keys)
-            submit_with_enter(email_scope, Keys)
+            email_action_scope = input_and_verify(
+                email_scope,
+                email,
+                apple_id,
+                "email",
+                Keys,
+                root_page=page,
+            )
+            submit_with_enter(email_action_scope, Keys)
 
             password_scope, password_field = wait_for_element(
                 page,
                 PASSWORD_SELECTORS,
                 timeout_s=45,
             )
-            input_and_verify(password_scope, password_field, password, "password", Keys)
+            password_action_scope = input_and_verify(
+                password_scope,
+                password_field,
+                password,
+                "password",
+                Keys,
+                root_page=page,
+            )
             remember_checked = ensure_remember_checked(page)
-            submit_with_enter(password_scope, Keys, min_ms=420, max_ms=900)
+            submit_with_enter(password_action_scope, Keys, min_ms=420, max_ms=900)
 
             login_state = wait_for_2fa_or_session(page)
             if login_state.get("trusted"):

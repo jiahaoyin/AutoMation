@@ -39,7 +39,17 @@ class FakeStates:
 
 
 class FakeElement:
-    def __init__(self, text="", on_click=None, checked=False, displayed=True, enabled=True):
+    def __init__(
+        self,
+        text="",
+        on_click=None,
+        checked=False,
+        displayed=True,
+        enabled=True,
+        attrs=None,
+        location=None,
+        size=None,
+    ):
         self.text = text
         self.on_click = on_click
         self.states = FakeStates(checked=checked, displayed=displayed, enabled=enabled)
@@ -47,6 +57,9 @@ class FakeElement:
         self.clicks = 0
         self.value = ""
         self.scope = None
+        self.attrs = attrs or {}
+        self.location = location or {"x": 0, "y": 0}
+        self.size = size or {"width": 100, "height": 30}
 
     def click_self(self):
         self.clicks += 1
@@ -61,12 +74,24 @@ class FakeElement:
         self.value = value if clear else self.value + value
         return self
 
+    def attr(self, name):
+        return self.attrs.get(name)
+
 
 class FakePage:
-    def __init__(self, elements_by_selector=None, buttons=None, frames=None, state=None, actions=None):
+    def __init__(
+        self,
+        elements_by_selector=None,
+        buttons=None,
+        frames=None,
+        state=None,
+        actions=None,
+        parent=None,
+    ):
         self.elements_by_selector = elements_by_selector or {}
         self.buttons = buttons or []
         self.frames = frames or []
+        self.parent = parent
         self.state = {
             "href": "https://idmsa.apple.com/appleauth/auth/signin",
             **(state or {}),
@@ -93,7 +118,7 @@ class FakePage:
 
 
 class FakeActions:
-    def __init__(self, apply_typed_text=True):
+    def __init__(self, apply_typed_text=True, coordinate_target=None):
         self.calls = []
         self.target = None
         self.pending_human_click = None
@@ -101,6 +126,10 @@ class FakeActions:
         self.select_all = False
         self.delete_selection = False
         self.apply_typed_text = apply_typed_text
+        self.coordinate_target = coordinate_target
+        self.coordinate_targets = (
+            list(coordinate_target) if isinstance(coordinate_target, list) else None
+        )
 
     def combo(self, *keys):
         self.calls.append(("combo", keys))
@@ -121,7 +150,12 @@ class FakeActions:
 
     def human_click(self, element):
         self.calls.append(("human_click", element))
-        self.target = element
+        if isinstance(element, dict) and self.coordinate_targets is not None:
+            self.target = self.coordinate_targets.pop(0)
+        elif isinstance(element, dict) and self.coordinate_target is not None:
+            self.target = self.coordinate_target
+        else:
+            self.target = element
         self.pending_human_click = element
         return self
 
@@ -130,8 +164,9 @@ class FakeActions:
         if self.pending_human_click is not None:
             element = self.pending_human_click
             self.pending_human_click = None
-            if element.on_click:
-                element.on_click()
+            on_click = getattr(element, "on_click", None)
+            if on_click:
+                on_click()
         if self.target is not None and self.delete_selection:
             self.target.value = ""
             self.select_all = False
@@ -206,6 +241,156 @@ class InputTests(unittest.TestCase):
         self.assertEqual(field.inputs, [("person@example.com", True)])
         self.assertEqual(field.value, "person@example.com")
 
+    def test_frame_input_clicks_and_types_through_the_root_context(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
+        iframe = FakeElement(
+            attrs={"src": auth_url},
+            location={"x": 150, "y": 378},
+            size={"width": 980, "height": 411},
+        )
+        field = FakeElement(
+            location={"x": 260, "y": 117},
+            size={"width": 460, "height": 56},
+        )
+        root_actions = FakeActions(coordinate_target=field)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=root_actions,
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        action_scope = input_and_verify(
+            frame,
+            field,
+            "person@example.com",
+            "email",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=root,
+        )
+
+        self.assertIs(action_scope, root)
+        self.assertEqual(frame.actions.calls, [])
+        self.assertEqual(
+            root_actions.calls[0],
+            ("human_click", {"x": 640, "y": 523}),
+        )
+        self.assertEqual(field.value, "person@example.com")
+
+    def test_frame_input_maps_a_unique_apple_iframe_after_in_frame_navigation(self):
+        iframe = FakeElement(
+            attrs={"src": "https://idmsa.apple.com/appleauth/auth/signin"},
+            location={"x": 150, "y": 378},
+        )
+        field = FakeElement(
+            location={"x": 260, "y": 117},
+            size={"width": 460, "height": 56},
+        )
+        root_actions = FakeActions(coordinate_target=field)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=root_actions,
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/authorize/verify/phone"
+            },
+            parent=root,
+        )
+
+        action_scope = input_and_verify(
+            frame,
+            field,
+            "person@example.com",
+            "email",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=root,
+        )
+
+        self.assertIs(action_scope, root)
+        self.assertEqual(field.value, "person@example.com")
+
+    def test_frame_input_prefers_an_exact_url_over_a_broader_path_match(self):
+        frame_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
+        broad_iframe = FakeElement(
+            attrs={"src": "https://idmsa.apple.com/appleauth/auth"},
+            location={"x": 600, "y": 100},
+        )
+        exact_iframe = FakeElement(
+            attrs={"src": frame_url},
+            location={"x": 150, "y": 378},
+        )
+        field = FakeElement(
+            location={"x": 260, "y": 117},
+            size={"width": 460, "height": 56},
+        )
+        root_actions = FakeActions(coordinate_target=field)
+        root = FakePage(
+            {"css:iframe": [broad_iframe, exact_iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=root_actions,
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": frame_url},
+            parent=root,
+        )
+
+        input_and_verify(
+            frame,
+            field,
+            "person@example.com",
+            "email",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=root,
+        )
+
+        self.assertEqual(
+            root_actions.calls[0],
+            ("human_click", {"x": 640, "y": 523}),
+        )
+        self.assertEqual(field.value, "person@example.com")
+
+    def test_frame_input_refuses_an_ambiguous_same_host_iframe_mapping(self):
+        iframes = [
+            FakeElement(
+                attrs={"src": f"https://idmsa.apple.com/appleauth/auth/signin/{index}"}
+            )
+            for index in range(2)
+        ]
+        field = FakeElement()
+        root = FakePage(
+            {"css:iframe": iframes},
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": "https://idmsa.apple.com/appleauth/auth/verify/phone"},
+            parent=root,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unable to map"):
+            input_and_verify(
+                frame,
+                field,
+                "person@example.com",
+                "email",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=root,
+            )
+
+        self.assertEqual(root.actions.calls, [])
+
     def test_submit_enter_uses_the_element_scope_actions(self):
         root = FakePage()
         frame = FakePage()
@@ -238,28 +423,53 @@ class InputTests(unittest.TestCase):
 
 class SecurityCodeTests(unittest.TestCase):
     def test_fills_six_visible_digit_fields_individually(self):
-        fields = [FakeElement() for _ in range(6)]
+        fields = [
+            FakeElement(location={"x": 20 + index * 45, "y": 30})
+            for index in range(6)
+        ]
         frame = FakePage({"css:input[maxlength='1']": fields})
-        page = FakePage(frames=[frame])
+        iframe = FakeElement(
+            attrs={"src": frame.state["href"]},
+            location={"x": 100, "y": 200},
+        )
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
+        frame.parent = page
 
         fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertTrue(all(not field.inputs for field in fields))
         self.assertTrue(all(field.clicks == 0 for field in fields))
+        self.assertEqual(frame.actions.calls, [])
         self.assertEqual(
-            [call for call in frame.actions.calls if call[0] == "human_click"],
-            [("human_click", field) for field in fields],
+            len([call for call in page.actions.calls if call[0] == "human_click"]),
+            6,
         )
 
     def test_ignores_outer_single_character_noise_before_six_digit_frame(self):
         outer_noise = FakeElement()
-        fields = [FakeElement() for _ in range(6)]
+        fields = [
+            FakeElement(location={"x": 20 + index * 45, "y": 30})
+            for index in range(6)
+        ]
         frame = FakePage({"css:input[maxlength='1']": fields})
-        page = FakePage(
-            {"css:input[maxlength='1']": [outer_noise]},
-            frames=[frame],
+        iframe = FakeElement(
+            attrs={"src": frame.state["href"]},
+            location={"x": 100, "y": 200},
         )
+        page = FakePage(
+            {
+                "css:input[maxlength='1']": [outer_noise],
+                "css:iframe": [iframe],
+            },
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
+        frame.parent = page
 
         fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
