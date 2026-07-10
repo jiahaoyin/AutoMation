@@ -16,6 +16,7 @@ struct Output: Codable {
 }
 
 let settingsBundleIds = ["com.apple.systempreferences", "com.apple.SystemSettings"]
+var cancelFilePath: String?
 
 let accountUrls = [
     "x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings",
@@ -231,6 +232,35 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
+func closeVerificationCodeAlert(appElement: AXUIElement) {
+    let alertVisible = collectSheetRoots(appElement).contains {
+        hasSettingsCodeAlert(blobDeep($0))
+    }
+    if alertVisible {
+        _ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
+    }
+}
+
+func stopIfCancelled(appElement: AXUIElement? = nil) {
+    guard let path = cancelFilePath,
+          FileManager.default.fileExists(atPath: path) else { return }
+    if let appElement {
+        closeVerificationCodeAlert(appElement: appElement)
+    }
+    emit(Output(ok: false, code: nil, message: "cancelled", screenshot: nil, raw: nil))
+}
+
+func cancellablePause(_ microseconds: UInt32, appElement: AXUIElement? = nil) {
+    var remaining = microseconds
+    while remaining > 0 {
+        stopIfCancelled(appElement: appElement)
+        let step = min(remaining, 100_000)
+        usleep(step)
+        remaining -= step
+    }
+    stopIfCancelled(appElement: appElement)
+}
+
 func captureSheetScreenshot(appElement: AXUIElement, pid: pid_t, path: String) -> Bool {
     for root in collectSheetRoots(appElement) {
         let blob = blobDeep(root)
@@ -306,53 +336,61 @@ while i < args.count {
         i += 2
         continue
     }
+    if args[i] == "--cancel-file", i + 1 < args.count {
+        cancelFilePath = args[i + 1]
+        i += 2
+        continue
+    }
     i += 1
 }
 
+stopIfCancelled()
 logStep(1, "opening Apple Account settings")
 openAppleAccountSettings()
-usleep(1_500_000)
+cancellablePause(1_500_000)
 
 guard let app = findSettingsApp() else {
     emit(Output(ok: false, code: nil, message: "System Settings not found", screenshot: nil, raw: nil))
 }
 
 app.activate(options: [.activateIgnoringOtherApps])
-usleep(900_000)
-
 let appElement = AXUIElementCreateApplication(app.processIdentifier)
+cancellablePause(900_000, appElement: appElement)
 logStep(2, "pid=\(app.processIdentifier)")
 
 let signInSecurity = ["登录与安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性"]
 let twoFactor = ["双重认证", "Two-Factor Authentication", "双因素认证"]
 let getCodeBtn = ["获取验证码", "Get Verification Code", "Get a Verification Code"]
 
+stopIfCancelled(appElement: appElement)
 logStep(3, "click Sign-In & Security")
 guard clickNamed(in: appElement, names: signInSecurity) else {
     emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found", screenshot: nil, raw: nil))
 }
-usleep(1_200_000)
+cancellablePause(1_200_000, appElement: appElement)
 
+stopIfCancelled(appElement: appElement)
 logStep(4, "click Two-Factor Authentication")
 guard clickNamed(in: appElement, names: twoFactor) else {
     emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found", screenshot: nil, raw: nil))
 }
-usleep(1_200_000)
+cancellablePause(1_200_000, appElement: appElement)
 
+stopIfCancelled(appElement: appElement)
 logStep(5, "click Get Verification Code")
 guard clickNamed(in: appElement, names: getCodeBtn) else {
     emit(Output(ok: false, code: nil, message: "Get Verification Code button not found", screenshot: nil, raw: nil))
 }
 
 logStep(6, "waiting for verification code alert…")
-usleep(2_500_000)
+cancellablePause(2_500_000, appElement: appElement)
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 var code: String?
 var codeRaw: String?
 var stableHits = 0
 while Date() < deadline {
-    usleep(500_000)
+    cancellablePause(500_000, appElement: appElement)
     if let hit = scanCodeFromAlertOnly(appElement: appElement) {
         if code == hit.0 && codeRaw == hit.1 {
             stableHits += 1
@@ -377,7 +415,7 @@ logStep(7, "code=\(finalCode) raw=\(finalRaw)")
 
 var savedShot: String?
 if let shotPath = screenshotPath {
-    usleep(700_000)
+    cancellablePause(700_000, appElement: appElement)
     if captureSheetScreenshot(appElement: appElement, pid: app.processIdentifier, path: shotPath) {
         savedShot = shotPath
         logStep(8, "screenshot=\(shotPath)")
@@ -386,5 +424,7 @@ if let shotPath = screenshotPath {
     }
 }
 
+stopIfCancelled(appElement: appElement)
 _ = clickNamed(in: appElement, names: ["好", "OK", "Done", "完成"])
+stopIfCancelled(appElement: appElement)
 emit(Output(ok: true, code: finalCode, message: "ok", screenshot: savedShot, raw: finalRaw))
