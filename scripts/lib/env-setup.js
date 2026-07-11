@@ -26,7 +26,6 @@ import {
   getAccessibilityHostApp,
   isAccessibilityGranted,
   checkAutomationGranted,
-  check2FAAutomationGranted,
 } from "./accessibility.js";
 import { ensureMacOS15, getMacOSVersion } from "./macos.js";
 
@@ -174,10 +173,7 @@ export function ensureProjectLayout({ quiet } = {}) {
     "scripts/bootstrap-macos.sh",
     "scripts/apple-id-full-flow.mjs",
     "scripts/setup-environment.mjs",
-    "scripts/apple-2fa-wait.scpt",
-    "scripts/accessibility-check.applescript",
     "scripts/automation-check.applescript",
-    "scripts/2fa-automation-check.applescript",
     "scripts/preflight-2fa-permissions.mjs",
     "scripts/mac-settings-apple-login.applescript",
     "scripts/mac-settings-signed-in.applescript",
@@ -282,24 +278,12 @@ export async function checkEnvironment(options = {}) {
     issues.push(`辅助功能未授权（需勾选 ${host.name}）`);
   }
 
-  const automation = await checkAutomationGranted();
-  if (!automation.granted) {
-    issues.push(
-      `自动化未授权（${host.name} → 系统设置${automation.code ? `，${automation.code}` : ""}）`
-    );
-  }
-
-  const twoFaAutomation = options.skip2FAAutomation
-    ? { granted: true, skipped: true }
-    : await check2FAAutomationGranted();
-  if (!options.skip2FAAutomation && !twoFaAutomation.granted) {
-    if (twoFaAutomation.kind === "accessibility" || twoFaAutomation.code === "-25211") {
+  let automation = { granted: true, skipped: true };
+  if (!options.skipAutomation) {
+    automation = await checkAutomationGranted();
+    if (!automation.granted) {
       issues.push(
-        `辅助功能未授权（2FA 需要，${host.name}${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
-      );
-    } else {
-      issues.push(
-        `2FA 自动化未授权（${host.name} → System Events${twoFaAutomation.code ? `，${twoFaAutomation.code}` : ""}）`
+        `自动化未授权（${host.name} → 系统设置${automation.code ? `，${automation.code}` : ""}）`
       );
     }
   }
@@ -335,22 +319,14 @@ export async function checkEnvironment(options = {}) {
       );
       console.log(
         "  自动化:",
-        automation.granted
-          ? `ok（${host.name} → 系统设置）`
-          : `未授权（请勾选 ${host.name} → 系统设置）`
-      );
-      console.log(
-        "  2FA 自动化:",
-        options.skip2FAAutomation
-          ? "跳过（浏览器阶段已禁用）"
-          : twoFaAutomation.granted
-            ? `ok（${host.name} → System Events）`
-            : twoFaAutomation.kind === "accessibility" || twoFaAutomation.code === "-25211"
-              ? `需辅助功能（${host.name}，与自动化是两项）`
-              : `未授权（请勾选 ${host.name} → System Events）`
+        options.skipAutomation
+          ? "跳过（Mac 设置登录阶段已禁用）"
+          : automation.granted
+            ? `ok（${host.name} → 系统设置）`
+            : `未授权（请勾选 ${host.name} → 系统设置）`
       );
     } else {
-      console.log("  辅助功能/自动化/2FA 自动化: 跳过（仅 macOS 运行机检测）");
+      console.log("  辅助功能/自动化: 跳过（仅 macOS 运行机检测）");
     }
     console.log("  .env:", fs.existsSync(envPath) ? "ok" : "首次运行 ./run.sh 时自动创建");
     if (issues.length) {

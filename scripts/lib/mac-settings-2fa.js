@@ -12,41 +12,83 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-settings-2fa-code.swift");
 const BIN = path.resolve(__dirname, "../bin/mac-settings-2fa-code");
+const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
 
-function swiftNeedsRecompile() {
-  if (!fs.existsSync(BIN)) return true;
-  if (!fs.existsSync(SWIFT_SRC)) return false;
-  return fs.statSync(SWIFT_SRC).mtimeMs > fs.statSync(BIN).mtimeMs;
+function swiftNeedsRecompile(sourcePath = SWIFT_SRC, binaryPath = BIN) {
+  if (!fs.existsSync(sourcePath)) return true;
+  if (!fs.existsSync(binaryPath)) return true;
+  return fs.statSync(sourcePath).mtimeMs > fs.statSync(binaryPath).mtimeMs;
+}
+
+function binaryIsExecutable(binaryPath, options = {}) {
+  const statSync = options.statSync ?? fs.statSync;
+  const accessSync = options.accessSync ?? fs.accessSync;
+  try {
+    if (!statSync(binaryPath).isFile()) return false;
+    accessSync(binaryPath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function compile2FASettingsHelper(options = {}) {
   const { quiet = false } = options;
-  if (process.platform !== "darwin") return { ok: false, reason: "non-darwin" };
-  if (!fs.existsSync(SWIFT_SRC)) return { ok: false, reason: "missing swift source" };
+  const platform = options.platform ?? process.platform;
+  const sourcePath = options.sourcePath ?? SWIFT_SRC;
+  const binaryPath = options.binaryPath ?? BIN;
+  const runCompiler = options.spawnSync ?? spawnSync;
+  if (platform !== "darwin") return { ok: false, reason: "non-darwin" };
+  if (!fs.existsSync(sourcePath)) return { ok: false, reason: "missing swift source" };
 
-  fs.mkdirSync(path.dirname(BIN), { recursive: true });
-  const r = spawnSync(
-    "swiftc",
-    ["-O", "-o", BIN, SWIFT_SRC, "-framework", "ApplicationServices", "-framework", "AppKit"],
-    { encoding: "utf-8" }
-  );
-  if (r.status !== 0) {
-    if (!quiet) console.warn("[2FA] Swift settings helper 编译失败:", r.stderr?.trim() || r.error);
-    return { ok: false, reason: r.stderr?.trim() || String(r.error) };
-  }
+  const temporaryBin = `${binaryPath}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    fs.chmodSync(BIN, 0o755);
+    fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
+    const r = runCompiler(
+      "/usr/bin/xcrun",
+      [
+        "swiftc",
+        "-O",
+        "-o",
+        temporaryBin,
+        sourcePath,
+        "-framework",
+        "ApplicationServices",
+        "-framework",
+        "AppKit",
+      ],
+      { encoding: "utf-8" }
+    );
+    if (r.status !== 0 || !binaryIsExecutable(temporaryBin, options)) {
+      if (!quiet) console.warn("[2FA] Swift settings helper compilation failed");
+      return { ok: false, reason: "compilation failed" };
+    }
+    fs.renameSync(temporaryBin, binaryPath);
+    if (!binaryIsExecutable(binaryPath, options)) {
+      return { ok: false, reason: "compilation failed" };
+    }
+    return { ok: true, bin: binaryPath };
   } catch {
-    /* ignore */
+    if (!quiet) console.warn("[2FA] Swift settings helper compilation failed");
+    return { ok: false, reason: "compilation failed" };
+  } finally {
+    try {
+      if (fs.existsSync(temporaryBin)) fs.unlinkSync(temporaryBin);
+    } catch {
+      /* best-effort cleanup of one failed compiler output */
+    }
   }
-  return { ok: true, bin: BIN };
 }
 
-export function is2FASettingsHelperAvailable() {
-  if (swiftNeedsRecompile()) {
-    compile2FASettingsHelper({ quiet: true });
+export function is2FASettingsHelperAvailable(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const sourcePath = options.sourcePath ?? SWIFT_SRC;
+  const binaryPath = options.binaryPath ?? BIN;
+  if (platform !== "darwin") return false;
+  if (swiftNeedsRecompile(sourcePath, binaryPath)) {
+    return compile2FASettingsHelper({ ...options, quiet: true }).ok;
   }
-  return process.platform === "darwin" && fs.existsSync(BIN) && fs.statSync(BIN).isFile();
+  return binaryIsExecutable(binaryPath, options);
 }
 
 function removeCancelFile(cancelFile) {
@@ -68,7 +110,7 @@ function resolveHelperPath(runtime) {
   if (!is2FASettingsHelperAvailable()) {
     const built = compile2FASettingsHelper({ quiet: true });
     if (!built.ok) {
-      throw new Error(`2FA 系统设置 helper 不可用: ${built.reason}`);
+      throw new Error("2FA settings helper is unavailable");
     }
   }
   return BIN;
@@ -78,13 +120,12 @@ function resolveHelperPath(runtime) {
  * @param {{
  *   timeoutMs?: number,
  *   verbose?: boolean,
- *   screenshotPath?: string,
  *   reportDir?: string,
  *   cancelFile?: string,
  *   runtime?: { platform?: string, helperPath?: string, spawn?: typeof spawn }
  * }} [opts]
  * @returns {{
- *   promise: Promise<{ code: string, raw: string|null, screenshot: string|null }>,
+ *   promise: Promise<{ code: string }>,
  *   cancel: () => boolean,
  *   forceStop: () => boolean
  * }}
@@ -109,10 +150,6 @@ export function start2FASettingsCodeRequest(opts = {}) {
   removeCancelFile(cancelFile);
 
   const args = ["--timeout", String(timeoutSec), "--cancel-file", cancelFile];
-  if (opts.screenshotPath) {
-    fs.mkdirSync(path.dirname(opts.screenshotPath), { recursive: true });
-    args.push("--screenshot", opts.screenshotPath);
-  }
 
   const spawnProcess = runtime.spawn ?? spawn;
   let child;
@@ -120,18 +157,20 @@ export function start2FASettingsCodeRequest(opts = {}) {
     child = spawnProcess(helperPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
-  } catch (error) {
+  } catch {
     removeCancelFile(cancelFile);
-    throw error;
+    throw new Error("2FA settings helper failed to start");
   }
 
   let stdout = "";
-  let stderr = "";
+  let stderrBytes = 0;
+  let helperReportedDiagnostics = false;
   let settled = false;
   let cancelRequested = false;
   let timeoutRequested = false;
   let terminalError = null;
   let timeoutTimer = null;
+  let forceKillTimer = null;
   let resolveResult;
   let rejectResult;
 
@@ -143,7 +182,14 @@ export function start2FASettingsCodeRequest(opts = {}) {
   const finish = (error, value) => {
     if (settled) return;
     settled = true;
-    if (timeoutTimer != null) cancelScheduled(timeoutTimer);
+    if (timeoutTimer != null) {
+      cancelScheduled(timeoutTimer);
+      timeoutTimer = null;
+    }
+    if (forceKillTimer != null) {
+      cancelScheduled(forceKillTimer);
+      forceKillTimer = null;
+    }
     removeCancelFile(cancelFile);
     if (error) rejectResult(error);
     else resolveResult(value);
@@ -167,16 +213,25 @@ export function start2FASettingsCodeRequest(opts = {}) {
     stdout = appendOutput(stdout, chunk, "stdout");
   });
   child.stderr.on("data", (chunk) => {
-    stderr = appendOutput(stderr, chunk, "stderr");
+    const bytes = Buffer.byteLength(chunk);
+    helperReportedDiagnostics ||= bytes > 0;
+    if (stderrBytes + bytes > 512 * 1024) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* finish below */
+      }
+      terminalError = new Error("2FA settings helper stderr output exceeded the limit");
+      return;
+    }
+    stderrBytes += bytes;
   });
-  child.once("error", (error) => finish(error));
+  child.once("error", () => finish(new Error("2FA settings helper failed to run")));
   child.once("close", (exitCode, signal) => {
     if (settled) return;
 
-    if (opts.verbose !== false && stderr.trim()) {
-      for (const line of stderr.trim().split(/\r?\n/)) {
-        console.log(`[2FA] ${line}`);
-      }
+    if (opts.verbose !== false && helperReportedDiagnostics) {
+      console.log("[2FA] helper reported diagnostics");
     }
 
     if (terminalError) {
@@ -184,44 +239,46 @@ export function start2FASettingsCodeRequest(opts = {}) {
       return;
     }
     if (timeoutRequested) {
-      finish(new Error(`系统设置获取验证码超时 (${timeoutMs}ms)`));
+      finish(new Error("系统设置获取验证码超时"));
       return;
     }
 
     let parsed = null;
+    let parsedOutput = false;
     try {
       const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
-      parsed = JSON.parse(lines.at(-1) || "{}");
+      parsed = JSON.parse(lines.at(-1));
+      parsedOutput = parsed != null && typeof parsed === "object";
     } catch {
       parsed = null;
     }
 
-    if (cancelRequested || parsed?.message === "cancelled") {
+    if (cancelRequested || (parsedOutput && parsed?.message === "cancelled")) {
       finish(cancelledError());
       return;
     }
+    const suffix =
+      typeof signal === "string" && /^SIG[A-Z0-9]+$/.test(signal)
+        ? ` (signal ${signal})`
+        : Number.isInteger(exitCode)
+          ? ` (exit ${exitCode})`
+          : "";
+    if (!parsedOutput) {
+      finish(new Error(`2FA settings helper returned invalid output${suffix}`));
+      return;
+    }
     if (!parsed?.ok || parsed.code == null) {
-      const detail = parsed?.message || stdout.trim() || stderr.trim();
-      const suffix = signal ? ` (signal ${signal})` : ` (exit ${exitCode})`;
-      finish(new Error(`${detail || "系统设置获取验证码失败"}${suffix}`));
+      finish(new Error(`2FA settings helper failed${suffix}`));
       return;
     }
 
     const code = String(parsed.code).replace(/\D/g, "");
     if (!/^\d{6}$/.test(code)) {
-      finish(new Error(`验证码格式异常: ${parsed.code}`));
+      finish(new Error("2FA settings helper returned an invalid verification code"));
       return;
     }
 
-    const screenshot =
-      parsed.screenshot && fs.existsSync(parsed.screenshot)
-        ? String(parsed.screenshot)
-        : null;
-    finish(null, {
-      code,
-      raw: parsed.raw ? String(parsed.raw) : null,
-      screenshot,
-    });
+    finish(null, { code });
   });
 
   const cancel = () => {
@@ -236,27 +293,41 @@ export function start2FASettingsCodeRequest(opts = {}) {
     }
   };
 
-  const forceStop = () => {
+  const beginForceStop = (graceMs) => {
     if (settled) return false;
     cancel();
-    try {
-      return child.kill("SIGKILL");
-    } catch {
-      return false;
-    }
+    if (forceKillTimer != null) return false;
+    const boundedGraceMs = Math.max(
+      0,
+      Math.min(FORCE_STOP_CLEANUP_GRACE_MS, graceMs)
+    );
+    forceKillTimer = schedule(() => {
+      forceKillTimer = null;
+      if (settled) return;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* child close/error remains the settlement boundary */
+      }
+    }, boundedGraceMs);
+    if (typeof forceKillTimer?.unref === "function") forceKillTimer.unref();
+    return true;
   };
 
+  const forceStop = () => beginForceStop(FORCE_STOP_CLEANUP_GRACE_MS);
+
+  const timeoutCleanupGraceMs = Math.min(FORCE_STOP_CLEANUP_GRACE_MS, timeoutMs);
   timeoutTimer = schedule(() => {
     timeoutRequested = true;
-    forceStop();
-  }, timeoutMs + 15_000);
+    beginForceStop(timeoutCleanupGraceMs);
+  }, Math.max(0, timeoutMs - timeoutCleanupGraceMs));
 
   return { promise, cancel, forceStop };
 }
 
 /**
- * @param {{ timeoutMs?: number, verbose?: boolean, screenshotPath?: string }} [opts]
- * @returns {Promise<{ code: string, screenshot: string|null }>}
+ * @param {{ timeoutMs?: number, verbose?: boolean }} [opts]
+ * @returns {Promise<{ code: string }>}
  */
 export async function fetch2FACodeFromSystemSettings(opts = {}) {
   return start2FASettingsCodeRequest(opts).promise;

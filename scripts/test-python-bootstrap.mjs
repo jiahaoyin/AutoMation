@@ -18,6 +18,22 @@ const generatedRun = renderRunSh();
 
 assert.match(rootInstall, /bootstrap_macos_install_runtime/);
 assert.match(generatedInstall, /bootstrap_macos_install_runtime/);
+assert.equal(generatedInstall, rootInstall, "release install.sh must match the repository source");
+for (const source of [rootInstall, generatedInstall]) {
+  assert.match(source, /swiftc_usable\(\)/);
+  assert.match(source, /ensure_swiftc\(\)/);
+  assert.match(source, /\/usr\/bin\/xcrun --find swiftc/);
+  assert.match(source, /"\$swiftc_path" --version/);
+  assert.doesNotMatch(source, /command -v swiftc/);
+  assert.match(source, /\/usr\/bin\/xcode-select --install/);
+  assert.match(source, /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/);
+  assert.match(source, /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/);
+  assert.match(
+    source,
+    /错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 \.\/install\.sh。/
+  );
+  assert.doesNotMatch(source, /xcodebuild[^\n]*license|softwareupdate[^\n]*--install/i);
+}
 assert.doesNotMatch(
   rootInstall.slice(0, rootInstall.indexOf("bootstrap_macos_install_runtime")),
   /\bnode\b/
@@ -98,6 +114,199 @@ function toBashPath(filePath) {
 
 function bashQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function shellFunction(source, name) {
+  return source.match(new RegExp(`${name}\\(\\) \\{[\\s\\S]*?\\n\\}`))?.[0] ?? null;
+}
+
+function removeTreeOneFileAtATime(directory) {
+  if (!fs.existsSync(directory)) return;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) removeTreeOneFileAtATime(entryPath);
+    else fs.unlinkSync(entryPath);
+  }
+  fs.rmdirSync(directory);
+}
+
+const ensureSwiftcFunction = shellFunction(rootInstall, "ensure_swiftc");
+assert.ok(ensureSwiftcFunction, "ensure_swiftc shell function is required");
+const swiftcUsableFunction = shellFunction(rootInstall, "swiftc_usable") ?? "";
+const harnessEnsureSwiftc = `${swiftcUsableFunction}\n${ensureSwiftcFunction}`
+  .replace(
+    "if [[ -x /usr/bin/xcode-select ]]; then",
+    "if fake_xcode_select_available; then"
+  )
+  .replaceAll("/usr/bin/xcrun", "fake_xcrun")
+  .replaceAll("/usr/bin/xcode-select", "fake_xcode_select")
+  .replaceAll("/bin/sleep", "fake_sleep");
+
+const triggeredInstall = spawnSync(
+  bash,
+  [
+    "-lc",
+    `SWIFTC_INSTALL_MAX_ATTEMPTS=3; SWIFTC_INSTALL_POLL_SECONDS=1; ` +
+      `SWIFTC_BIN=''; swift_available=0; xcode_select_calls=0; sleep_calls=0; ` +
+      `command() { if [[ "$1" == "-v" && "$2" == "swiftc" ]]; then ` +
+      `return 0; fi; builtin command "$@"; }; ` +
+      `fake_xcrun() { if (( swift_available == 1 )); then printf '/usr/bin/true\n'; ` +
+      `else printf '/usr/bin/false\n'; fi; }; ` +
+      `fake_xcode_select_available() { return 0; }; ` +
+      `fake_xcode_select() { (( xcode_select_calls += 1 )); swift_available=1; }; ` +
+      `fake_sleep() { (( sleep_calls += 1 )); }; ` +
+      `${harnessEnsureSwiftc}; ensure_swiftc; status=$?; ` +
+      `printf '%s %s %s %s' "$status" "$xcode_select_calls" "$sleep_calls" "$SWIFTC_BIN"`,
+  ],
+  { encoding: "utf8" }
+);
+assert.equal(triggeredInstall.status, 0, triggeredInstall.stderr);
+assert.equal(
+  triggeredInstall.stdout.trim().split(/\r?\n/).at(-1),
+  "0 1 1 /usr/bin/true"
+);
+
+const unavailableInstall = spawnSync(
+  bash,
+  [
+    "-lc",
+    `SWIFTC_INSTALL_MAX_ATTEMPTS=3; SWIFTC_INSTALL_POLL_SECONDS=1; ` +
+      `SWIFTC_BIN=''; xcode_select_calls=0; sleep_calls=0; ` +
+      `command() { if [[ "$1" == "-v" && "$2" == "swiftc" ]]; then ` +
+      `return 0; fi; builtin command "$@"; }; ` +
+      `fake_xcrun() { printf '/usr/bin/false\n'; }; ` +
+      `fake_xcode_select_available() { return 0; }; ` +
+      `fake_xcode_select() { (( xcode_select_calls += 1 )); return 1; }; ` +
+      `fake_sleep() { (( sleep_calls += 1 )); }; ` +
+      `${harnessEnsureSwiftc}; ensure_swiftc; status=$?; ` +
+      `printf '%s %s %s' "$status" "$xcode_select_calls" "$sleep_calls"`,
+  ],
+  { encoding: "utf8" }
+);
+assert.equal(unavailableInstall.status, 0, unavailableInstall.stderr);
+assert.equal(unavailableInstall.stdout.trim().split(/\r?\n/).at(-1), "1 1 3");
+assert.match(
+  unavailableInstall.stderr,
+  /错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 \.\/install\.sh。/
+);
+
+const swiftHelpers = [
+  "mac-settings-ax-fill",
+  "mac-settings-2fa-code",
+  "mac-2fa-popup-read",
+  "mac-2fa-popup-ocr",
+  "mac-2fa-click-allow",
+];
+const requiredSwiftHelpers = swiftHelpers.slice(1);
+const installCompileFunctions = [
+  "swift_product_is_executable",
+  "cleanup_swift_helper_temp_dir",
+  "compile_swift_helper",
+  "compile_swift_helpers",
+]
+  .map((name) => shellFunction(rootInstall, name))
+  .filter(Boolean)
+  .join("\n");
+assert.match(installCompileFunctions, /compile_swift_helpers\(\)/);
+
+function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "") {
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "swift-install-test-"));
+  const scriptsDir = path.join(fixtureDir, "scripts");
+  const sourceDir = path.join(scriptsDir, "swift");
+  const binaryDir = path.join(scriptsDir, "bin");
+  const precreatedMarker = path.join(fixtureDir, "precreated-output.txt");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.mkdirSync(binaryDir, { recursive: true });
+  for (const helper of swiftHelpers) {
+    fs.writeFileSync(path.join(sourceDir, `${helper}.swift`), "// fixture\n");
+    fs.writeFileSync(path.join(binaryDir, helper), `old-${helper}\n`, { mode: 0o755 });
+  }
+
+  const script = [
+    `cd ${bashQuote(toBashPath(fixtureDir))}`,
+    `REQUIRED_SWIFT_HELPERS=(${requiredSwiftHelpers.map(bashQuote).join(" ")})`,
+    `COMPILED_SWIFT_HELPERS=(${swiftHelpers.map(bashQuote).join(" ")})`,
+    `FAILURE_MODE=${bashQuote(failureMode)}`,
+    `FAILING_HELPER=${bashQuote(failingHelper)}`,
+    `PRECREATED_MARKER=${bashQuote(toBashPath(precreatedMarker))}`,
+    "SWIFTC_BIN=fake_swiftc",
+    "fake_swiftc() {",
+    "  local output=''",
+    "  while (( $# )); do",
+    '    case "$1" in',
+    '      -o) output="$2"; shift 2 ;;',
+    "      *) shift ;;",
+    "    esac",
+    "  done",
+    '  local helper="$(basename "$output")"',
+    '  if [[ -e "$output" ]]; then printf \'%s\\n\' "$output" >> "$PRECREATED_MARKER"; fi',
+    '  if [[ "$helper" == "$FAILING_HELPER" && "$FAILURE_MODE" == "compile" ]]; then',
+    '    printf \'partial-%s\\n\' "$helper" > "$output"',
+    '    /bin/chmod 0755 "$output"',
+    "    return 1",
+    "  fi",
+    '  if [[ "$helper" == "$FAILING_HELPER" && "$FAILURE_MODE" == "incomplete" ]]; then return 0; fi',
+    '  printf \'new-%s\\n\' "$helper" > "$output"',
+    '  if [[ "$helper" == "$FAILING_HELPER" && "$FAILURE_MODE" == "0644" ]]; then',
+    '    /bin/chmod 0644 "$output"',
+    "  else",
+    '    /bin/chmod 0755 "$output"',
+    "  fi",
+    "  return 0",
+    "}",
+    installCompileFunctions,
+    "swift_product_is_executable() {",
+    '  [[ -f "$1" ]] || return 1',
+    '  if [[ "$FAILURE_MODE" == "0644" && "$(basename "$1")" == "$FAILING_HELPER" ]]; then return 1; fi',
+    "  return 0",
+    "}",
+    "compile_swift_helpers >/dev/null",
+  ].join("\n");
+
+  try {
+    const result = spawnSync(bash, ["-lc", script], { encoding: "utf8" });
+    return {
+      result,
+      precreatedOutput: fs.existsSync(precreatedMarker),
+      binaries: Object.fromEntries(
+        swiftHelpers.map((helper) => [
+          helper,
+          fs.readFileSync(path.join(binaryDir, helper), "utf8"),
+        ])
+      ),
+      binaryEntries: fs.readdirSync(binaryDir).sort(),
+    };
+  } finally {
+    removeTreeOneFileAtATime(fixtureDir);
+  }
+}
+
+for (const failingHelper of swiftHelpers) {
+  const outcome = runSwiftInstallCompileHarness("0644", failingHelper);
+  assert.notEqual(outcome.result.status, 0, `${failingHelper} 0644 output was accepted`);
+  assert.equal(outcome.precreatedOutput, false, `${failingHelper} output was pre-created`);
+  assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
+  for (const helper of swiftHelpers) {
+    assert.equal(outcome.binaries[helper], `old-${helper}\n`, `${helper} old binary changed`);
+  }
+}
+
+for (const failureMode of ["compile", "incomplete"]) {
+  const outcome = runSwiftInstallCompileHarness(failureMode, "mac-2fa-popup-read");
+  assert.notEqual(outcome.result.status, 0, `${failureMode} compiler product was accepted`);
+  assert.equal(outcome.precreatedOutput, false, `${failureMode} output was pre-created`);
+  assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
+  for (const helper of swiftHelpers) {
+    assert.equal(outcome.binaries[helper], `old-${helper}\n`, `${helper} old binary changed`);
+  }
+}
+
+const successfulSwiftCompile = runSwiftInstallCompileHarness();
+assert.equal(successfulSwiftCompile.result.status, 0, successfulSwiftCompile.result.stderr);
+assert.equal(successfulSwiftCompile.precreatedOutput, false, "compiler output must not be pre-created");
+assert.deepEqual(successfulSwiftCompile.binaryEntries, [...swiftHelpers].sort());
+for (const helper of swiftHelpers) {
+  assert.equal(successfulSwiftCompile.binaries[helper], `new-${helper}\n`);
 }
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "python-bootstrap-test-"));

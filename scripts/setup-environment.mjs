@@ -22,7 +22,7 @@ async function main() {
       quiet,
       skipFirefox,
       skipRuyiPage,
-      skip2FAAutomation: skipFirefox && skipRuyiPage,
+      skipAutomation,
     });
     process.exit(result.ok ? 0 : 1);
   }
@@ -39,7 +39,7 @@ async function main() {
     quiet,
     skipFirefox,
     skipRuyiPage,
-    skip2FAAutomation: skipFirefox && skipRuyiPage,
+    skipAutomation,
   });
   if (!result.ok && result.issues.some((i) => !i.includes(".env"))) {
     console.warn("警告: 仍有未解决项:", result.issues.join("; "));

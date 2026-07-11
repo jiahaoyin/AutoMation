@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 // 弹窗验证码 OCR（Vision）— AX 读不到大字号 NNN NNN 时的回退
-// JSON: { "ok": true, "code": "757464", "raw": "757 464", "source": "vision" }
+// JSON includes only the minimal internal IPC payload and fixed status fields.
 
 import AppKit
 import ApplicationServices
@@ -11,9 +11,17 @@ import Vision
 struct Output: Codable {
     let ok: Bool
     let code: String?
-    let raw: String?
     let source: String?
     let message: String
+    let capability: String?
+
+    init(ok: Bool, code: String?, source: String?, message: String, capability: String? = nil) {
+        self.ok = ok
+        self.code = code
+        self.source = source
+        self.message = message
+        self.capability = capability
+    }
 }
 
 @_silgen_name("_AXUIElementGetWindow")
@@ -21,6 +29,10 @@ private func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutableP
 
 func logStep(_ msg: String) {
     FileHandle.standardError.write("[2FA-ocr] \(msg)\n".data(using: .utf8)!)
+}
+
+func screenCaptureCapability() -> String {
+    CGPreflightScreenCaptureAccess() ? "available" : "permission_missing"
 }
 
 func axCopy<T>(_ element: AXUIElement, _ attr: String) -> T? {
@@ -72,9 +84,98 @@ func looksLikeCodeDialog(_ blob: String) -> Bool {
     if blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("在网页上输入") && blob.contains("验证码") { return true }
     if blob.contains("验证码以登录") { return true }
+    if blob.contains("在網頁上輸入此驗證碼") { return true }
+    if blob.contains("在網頁上輸入") && blob.contains("驗證碼") { return true }
+    if blob.contains("驗證碼以登入") { return true }
     if blob.contains("Enter this verification code") { return true }
     if blob.contains("正用于登录") && blob.contains("新设备") && (blob.contains("完成") || blob.contains("Done")) { return true }
     return false
+}
+
+let dedicatedAuthExecutables: Set<String> = [
+    "FollowUpUI",
+    "CoreAuthUI",
+    "CoreAuthentication",
+    "AuthenticationServicesAgent",
+]
+let sharedHostExecutables: Set<String> = [
+    "UserNotificationCenter",
+    "loginwindow",
+    "SecurityAgent",
+    "akd",
+]
+let dedicatedAuthBundleIDs: Set<String> = [
+    "com.apple.FollowUpUI",
+    "com.apple.CoreAuthUI",
+    "com.apple.CoreAuthentication",
+    "com.apple.AuthenticationServicesAgent",
+]
+let sharedHostBundleIDs: Set<String> = [
+    "com.apple.UserNotificationCenter",
+    "com.apple.loginwindow",
+    "com.apple.SecurityAgent",
+    "com.apple.akd",
+]
+
+enum CandidateKind {
+    case dedicated
+    case sharedHost
+}
+
+func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
+    guard let path = executableURL?.standardizedFileURL.path else { return false }
+    return path.hasPrefix("/System/Library/") ||
+        path.hasPrefix("/System/Applications/") ||
+        path.hasPrefix("/usr/libexec/")
+}
+
+func candidateKind(for app: NSRunningApplication) -> CandidateKind? {
+    guard let executableURL = app.executableURL,
+          isAppleSystemExecutable(executableURL) else { return nil }
+    let executableName = executableURL.lastPathComponent
+    let bundleIdentifier = app.bundleIdentifier ?? ""
+    if dedicatedAuthExecutables.contains(executableName) ||
+        dedicatedAuthBundleIDs.contains(bundleIdentifier) {
+        return .dedicated
+    }
+    if sharedHostExecutables.contains(executableName) ||
+        sharedHostBundleIDs.contains(bundleIdentifier) {
+        return .sharedHost
+    }
+    return nil
+}
+
+func hasExplicitAppleAccountEvidence(_ blob: String) -> Bool {
+    let lower = blob.lowercased()
+    let markers = [
+        "apple id",
+        "apple account",
+        "apple账户",
+        "apple 账户",
+        "apple帐户",
+        "apple 帐户",
+        "apple帐号",
+        "apple 帐号",
+        "apple帳戶",
+        "apple 帳戶",
+        "apple帳號",
+        "apple 帳號",
+    ]
+    return markers.contains { lower.contains($0) }
+}
+
+func isEligibleCodeWindow(
+    kind: CandidateKind,
+    blob: String,
+    hasCodePrompt: Bool,
+    hasCodeDisplay: Bool = false
+) -> Bool {
+    switch kind {
+    case .dedicated:
+        return hasCodePrompt || hasCodeDisplay
+    case .sharedHost:
+        return hasCodePrompt && hasExplicitAppleAccountEvidence(blob)
+    }
 }
 
 func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
@@ -89,10 +190,52 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
 }
 
 struct DialogTarget {
-    let appName: String
-    let window: AXUIElement
-    let frame: CGRect
     let windowID: CGWindowID?
+}
+
+enum OcrCandidateSource: Equatable {
+    case fullWindow
+    case centerCrop
+}
+
+struct OcrCandidate {
+    let code: String
+    let source: OcrCandidateSource
+
+    var requiresStability: Bool {
+        source == .centerCrop
+    }
+}
+
+struct CenterCandidateState {
+    let code: String
+    let capturePass: Int
+}
+
+struct CenterCandidateTracker {
+    private var states: [CGWindowID: CenterCandidateState] = [:]
+
+    mutating func observeCenterCandidate(
+        windowID: CGWindowID,
+        code: String,
+        capturePass: Int
+    ) -> Bool {
+        let previous = states[windowID]
+        if previous?.code == code && previous?.capturePass == capturePass - 1 {
+            states[windowID] = CenterCandidateState(code: code, capturePass: capturePass)
+            return true
+        }
+        states[windowID] = CenterCandidateState(code: code, capturePass: capturePass)
+        return false
+    }
+
+    mutating func reset(windowID: CGWindowID) {
+        states.removeValue(forKey: windowID)
+    }
+
+    mutating func retainOnly(_ windowIDs: Set<CGWindowID>) {
+        states = states.filter { windowIDs.contains($0.key) }
+    }
 }
 
 func windowIDFor(_ element: AXUIElement) -> CGWindowID? {
@@ -104,87 +247,34 @@ func windowIDFor(_ element: AXUIElement) -> CGWindowID? {
 func findCodeDialogs() -> [DialogTarget] {
     var out: [DialogTarget] = []
     for app in NSWorkspace.shared.runningApplications {
-        let appName = app.localizedName ?? ""
+        guard let kind = candidateKind(for: app) else { continue }
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         for win in windowsForApp(appEl) {
             let blob = blobOf(win)
-            guard looksLikeCodeDialog(blob), let frame = frameOf(win), frame.width > 80, frame.height > 60 else { continue }
-            out.append(DialogTarget(appName: appName, window: win, frame: frame, windowID: windowIDFor(win)))
+            let hasCodePrompt = looksLikeCodeDialog(blob)
+            guard isEligibleCodeWindow(
+                kind: kind,
+                blob: blob,
+                hasCodePrompt: hasCodePrompt
+            ), let frame = frameOf(win), frame.width > 80, frame.height > 60 else { continue }
+            out.append(DialogTarget(windowID: windowIDFor(win)))
         }
     }
     return out
 }
 
 func captureWindowByID(_ wid: CGWindowID) -> CGImage? {
-    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("2fa-ocr-w-\(UUID().uuidString).png")
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    task.arguments = ["-x", "-l", String(wid), path]
-    do {
-        try task.run()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0, let img = NSImage(contentsOfFile: path) else { return nil }
-        defer { try? FileManager.default.removeItem(atPath: path) }
-        var proposed = CGRect(origin: .zero, size: img.size)
-        return img.cgImage(forProposedRect: &proposed, context: nil, hints: nil)
-    } catch {
-        return nil
-    }
-}
-
-func paddedFrame(_ frame: CGRect, pad: CGFloat = 8) -> CGRect {
-    CGRect(
-        x: max(0, frame.origin.x - pad),
-        y: max(0, frame.origin.y - pad),
-        width: frame.width + pad * 2,
-        height: frame.height + pad * 2
+    CGWindowListCreateImage(
+        .null,
+        [.optionIncludingWindow],
+        wid,
+        [.boundsIgnoreFraming, .bestResolution]
     )
 }
 
-func captureRectScreencapture(_ rect: CGRect) -> CGImage? {
-    let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("2fa-ocr-\(UUID().uuidString).png")
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    task.arguments = [
-        "-x", "-R",
-        "\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height))",
-        path,
-    ]
-    do {
-        try task.run()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0, let img = NSImage(contentsOfFile: path) else { return nil }
-        defer { try? FileManager.default.removeItem(atPath: path) }
-        var proposed = CGRect(origin: .zero, size: img.size)
-        guard let cg = img.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else { return nil }
-        return cg
-    } catch {
-        return nil
-    }
-}
-
-func captureDialog(_ target: DialogTarget) -> (CGImage, String)? {
-    if let wid = target.windowID, let img = captureWindowByID(wid) {
-        return (img, "screencapture_window")
-    }
-    let padded = paddedFrame(target.frame)
-    if let img = captureRectScreencapture(padded) {
-        return (img, "screencapture")
-    }
-    if let img = captureRectScreencapture(target.frame) {
-        return (img, "screencapture_exact")
-    }
-    return nil
-}
-
-func saveDebugImage(_ cg: CGImage, dir: String, label: String) {
-    let url = URL(fileURLWithPath: dir).appendingPathComponent("2fa-ocr-\(label)-\(Int(Date().timeIntervalSince1970)).png")
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let rep = NSBitmapImageRep(cgImage: cg)
-    if let data = rep.representation(using: .png, properties: [:]) {
-        try? data.write(to: url)
-        logStep("debug screenshot: \(url.path)")
-    }
+func captureDialog(_ target: DialogTarget) -> CGImage? {
+    guard let wid = target.windowID else { return nil }
+    return captureWindowByID(wid)
 }
 
 func ocrLines(from cgImage: CGImage, level: VNRequestTextRecognitionLevel) -> [String] {
@@ -212,19 +302,14 @@ func ocrLines(from cgImage: CGImage, level: VNRequestTextRecognitionLevel) -> [S
     return lines
 }
 
-func ocrText(from cgImage: CGImage) -> String {
-    let accurate = ocrLines(from: cgImage, level: .accurate).joined(separator: " ")
-    if !accurate.isEmpty { return accurate }
-    return ocrLines(from: cgImage, level: .fast).joined(separator: " ")
-}
+let formattedCodePattern = #"(?<![0-9])[0-9]{3}[\s\u00a0\u2009]+[0-9]{3}(?![0-9])"#
+let contiguousCodePattern = #"(?<![0-9])[0-9]{6}(?![0-9])"#
 
-func findFormattedCode(_ text: String, strictPopup: Bool = true) -> (String, String)? {
-    let patterns = strictPopup
-        ? [#"\d{3}[\s\u00a0\u2009]+\d{3}"#]
-        : [
-            #"\d{3}[\s\u00a0\u2009]+\d{3}"#,
-            #"\d{3}\s*\d{3}"#,
-        ]
+func findFormattedCode(_ text: String, allowContiguous: Bool = false) -> String? {
+    var patterns = [formattedCodePattern]
+    if allowContiguous {
+        patterns.append(contiguousCodePattern)
+    }
     for pattern in patterns {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
         let ns = text as NSString
@@ -232,34 +317,47 @@ func findFormattedCode(_ text: String, strictPopup: Bool = true) -> (String, Str
         if let m = regex.firstMatch(in: text, range: range) {
             let raw = ns.substring(with: m.range)
             let digits = raw.filter(\.isNumber)
-            if digits.count == 6 { return (String(digits), raw) }
-        }
-    }
-    if strictPopup { return nil }
-    // 分行合并：Vision 有时把 "350" 与 "566" 拆成两行（仅非 strict）
-    let chunks = text.split(whereSeparator: { $0.isWhitespace })
-    if chunks.count >= 2 {
-        let a = String(chunks[0]).filter(\.isNumber)
-        let b = String(chunks[1]).filter(\.isNumber)
-        if a.count == 3 && b.count == 3 {
-            return (a + b, "\(a) \(b)")
+            if digits.count == 6 { return String(digits) }
         }
     }
     return nil
 }
 
-func tryOcrOnImage(_ cg: CGImage, label: String) -> (String, String)? {
-    let fullText = ocrText(from: cg)
-    logStep("\(label) ocr: \(fullText.prefix(160))")
-    if let hit = findFormattedCode(fullText) { return hit }
+func firstCode(in lines: [String], allowContiguous: Bool) -> String? {
+    for line in lines {
+        if let hit = findFormattedCode(line, allowContiguous: allowContiguous) {
+            return hit
+        }
+    }
+    return nil
+}
+
+func tryOcrOnImage(_ cg: CGImage) -> OcrCandidate? {
+    let fullLines = ocrLines(from: cg, level: .accurate)
+    if let hit = firstCode(in: fullLines, allowContiguous: false) {
+        return OcrCandidate(code: hit, source: .fullWindow)
+    }
+    if fullLines.isEmpty {
+        let fastLines = ocrLines(from: cg, level: .fast)
+        if let hit = firstCode(in: fastLines, allowContiguous: false) {
+            return OcrCandidate(code: hit, source: .fullWindow)
+        }
+    }
     // 中心裁剪再试（大字号验证码常在中间）
     let w = CGFloat(cg.width)
     let h = CGFloat(cg.height)
     let cropRect = CGRect(x: w * 0.1, y: h * 0.2, width: w * 0.8, height: h * 0.55)
     if let cropped = cg.cropping(to: cropRect) {
-        let cropText = ocrText(from: cropped)
-        logStep("\(label) center-crop ocr: \(cropText.prefix(120))")
-        if let hit = findFormattedCode(cropText) { return hit }
+        let cropLines = ocrLines(from: cropped, level: .accurate)
+        if let hit = firstCode(in: cropLines, allowContiguous: true) {
+            return OcrCandidate(code: hit, source: .centerCrop)
+        }
+        if cropLines.isEmpty {
+            let fastCropLines = ocrLines(from: cropped, level: .fast)
+            if let hit = firstCode(in: fastCropLines, allowContiguous: true) {
+                return OcrCandidate(code: hit, source: .centerCrop)
+            }
+        }
     }
     return nil
 }
@@ -274,47 +372,69 @@ func emit(_ output: Output) -> Never {
 }
 
 var timeoutSec = 8
-var debugDir: String?
+var preflightScreenCapture = false
 var i = 1
 while i < CommandLine.arguments.count {
-    if CommandLine.arguments[i] == "--timeout", i + 1 < CommandLine.arguments.count {
-        timeoutSec = Int(CommandLine.arguments[i + 1]) ?? timeoutSec
-        i += 2
+    if CommandLine.arguments[i] == "--preflight-screen-capture" {
+        preflightScreenCapture = true
+        i += 1
         continue
     }
-    if CommandLine.arguments[i] == "--debug-dir", i + 1 < CommandLine.arguments.count {
-        debugDir = CommandLine.arguments[i + 1]
+    if CommandLine.arguments[i] == "--timeout", i + 1 < CommandLine.arguments.count {
+        timeoutSec = Int(CommandLine.arguments[i + 1]) ?? timeoutSec
         i += 2
         continue
     }
     i += 1
 }
 
+if preflightScreenCapture {
+    emit(Output(
+        ok: true,
+        code: nil,
+        source: nil,
+        message: "preflight",
+        capability: screenCaptureCapability()
+    ))
+}
+
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
-var attempt = 0
+var capturePass = 0
+var centerCandidateTracker = CenterCandidateTracker()
 while Date() < deadline {
-    attempt += 1
+    capturePass += 1
     let dialogs = findCodeDialogs()
+    var capturedWindowIDs = Set<CGWindowID>()
     if dialogs.isEmpty {
-        logStep("no code dialog found (attempt \(attempt))")
+        logStep("no code dialog found")
     }
     for target in dialogs {
-        logStep("dialog \(target.appName) frame \(Int(target.frame.origin.x)),\(Int(target.frame.origin.y)) \(Int(target.frame.width))x\(Int(target.frame.height)) wid=\(target.windowID.map(String.init) ?? "nil")")
-        guard let (cg, method) = captureDialog(target) else {
-            logStep("capture failed for \(target.appName)")
+        guard let wid = target.windowID else { continue }
+        guard capturedWindowIDs.insert(wid).inserted else { continue }
+        logStep("code dialog found")
+        guard let cg = captureDialog(target) else {
+            centerCandidateTracker.reset(windowID: wid)
+            logStep("window capture failed")
             continue
         }
-        if let dir = debugDir {
-            saveDebugImage(cg, dir: dir, label: "capture-\(method)")
+        guard let candidate = tryOcrOnImage(cg) else {
+            centerCandidateTracker.reset(windowID: wid)
+            continue
         }
-        if let (code, raw) = tryOcrOnImage(cg, label: method) {
-            emit(Output(ok: true, code: code, raw: raw, source: "vision", message: "ok"))
+        if candidate.requiresStability {
+            guard centerCandidateTracker.observeCenterCandidate(
+                windowID: wid,
+                code: candidate.code,
+                capturePass: capturePass
+            ) else { continue }
+        } else {
+            centerCandidateTracker.reset(windowID: wid)
         }
-        if let dir = debugDir {
-            saveDebugImage(cg, dir: dir, label: "failed-\(method)")
-        }
+        logStep("verification code acquired")
+        emit(Output(ok: true, code: candidate.code, source: "vision", message: "ok"))
     }
+    centerCandidateTracker.retainOnly(capturedWindowIDs)
     usleep(350_000)
 }
 
-emit(Output(ok: false, code: nil, raw: nil, source: nil, message: "timeout"))
+emit(Output(ok: false, code: nil, source: nil, message: "timeout"))

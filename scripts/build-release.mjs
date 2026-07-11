@@ -32,8 +32,6 @@ let cleanLocal = false;
 /** @type {string[]} 相对仓库根目录 */
 export const COPY_PATHS = [
   "scripts/apple-id-full-flow.mjs",
-  "scripts/apple-2fa-wait.scpt",
-  "scripts/apple-2fa-phase.applescript",
   "scripts/mac-settings-apple-login.applescript",
   "scripts/mac-settings-ui-dump.applescript",
   "scripts/mac-settings-signed-in.applescript",
@@ -58,8 +56,10 @@ export const COPY_PATHS = [
   "scripts/lib/mac-2fa-allow.js",
   "scripts/lib/mac-2fa-ocr.js",
   "scripts/lib/mac-2fa-popup.js",
+  "scripts/lib/manual-2fa-prompt.js",
   "scripts/lib/report.js",
   "scripts/ruyipage/apple_account_flow.py",
+  "scripts/test-2fa-settings-code.mjs",
   "scripts/check-environment.mjs",
   "scripts/setup-environment.mjs",
   "scripts/preflight-2fa-permissions.mjs",
@@ -67,9 +67,7 @@ export const COPY_PATHS = [
   "scripts/lib/env-setup.js",
   "scripts/lib/macos.js",
   "scripts/bump-patch-version.mjs",
-  "scripts/accessibility-check.applescript",
   "scripts/automation-check.applescript",
-  "scripts/2fa-automation-check.applescript",
   "scripts/lib/accessibility.js",
 ];
 
@@ -181,6 +179,7 @@ function buildPackageJson(destRoot) {
       "check:automation": "osascript scripts/automation-check.applescript",
       "dump:mac-ui": "osascript scripts/mac-settings-ui-dump.applescript",
       "fill:debug": "node scripts/fill-debug.mjs",
+      "test:2fa-settings": "node scripts/test-2fa-settings-code.mjs",
     },
   };
   fs.writeFileSync(
@@ -237,7 +236,7 @@ cd apple-id-automation-${VERSION}
 |------|------|
 | \`./install.sh\` | 前置管理员授权；自动安装缺失的 Python/Node、ruyiPage，并配置辅助功能 |
 | \`./run.sh\` | 完整流程；**终端输入**账号密码并备份至 \`.env\` |
-| \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器） |
+| \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器）；仍需辅助功能，不要求自动化 |
 | \`./run.sh --skip-browser\` | 仅 Mac 设置登录 |
 | \`npm run check\` | 环境自检 |
 | \`npm run check:automation\` | 检测终端对「系统设置」的自动化权限 |
@@ -258,6 +257,7 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_PROFILE_MODE\` | 可选，\`persistent\` / \`fresh\` |
 | \`BROWSER_2FA_SETTINGS_AFTER_MS\` | 可选，默认 \`8000\`；超过 popup 优先窗口后启动系统设置并行取码 |
 | \`BROWSER_2FA_SETTINGS_FALLBACK\` | 可选，默认 \`1\`；设为 \`0\` 禁用系统设置取码 |
+| \`BROWSER_2FA_MANUAL_FALLBACK\` | 可选，默认 \`1\`；90 秒后允许在真实 TTY 隐藏手输验证码 |
 | \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
 
 ## 故障排查
@@ -269,7 +269,7 @@ cd apple-id-automation-${VERSION}
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
-- **2FA 超时**：确认 Mac 已登录同一 Apple ID，Terminal 已获辅助功能/自动化权限，并查看 \`2fa-audit.jsonl\` 中两个来源的失败原因
+- **2FA 超时**：确认 Mac 已登录同一 Apple ID，Terminal 已获辅助功能权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
 - **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
 
 ## 安全
@@ -297,6 +297,7 @@ APPLE_PASSWORD=your_password
 # RUYIPAGE_KILL_GRACE_MS=5000
 # BROWSER_2FA_SETTINGS_AFTER_MS=8000
 # BROWSER_2FA_SETTINGS_FALLBACK=1
+# BROWSER_2FA_MANUAL_FALLBACK=1
 # BROWSER_2FA_POLL_MS=800
 `
   );
@@ -313,70 +314,8 @@ data/
   );
 }
 
-export function renderInstallSh(version) {
-  return `#!/bin/bash
-set -euo pipefail
-cd "$(/usr/bin/dirname "$0")"
-
-echo "==> Apple ID 自动化包 环境安装"
-
-# shellcheck disable=SC1091
-source "$(/usr/bin/dirname "$0")/scripts/bootstrap-macos.sh"
-bootstrap_macos_install_runtime
-
-echo "==> 编译 Swift AX 填表 helper"
-if command -v swiftc >/dev/null 2>&1; then
-  mkdir -p scripts/bin
-  if swiftc -O -o scripts/bin/mac-settings-ax-fill \\
-    scripts/swift/mac-settings-ax-fill.swift \\
-    -framework ApplicationServices -framework AppKit 2>/dev/null; then
-    chmod +x scripts/bin/mac-settings-ax-fill
-    echo "✓ mac-settings-ax-fill 已编译"
-  else
-    echo "⚠ Swift 编译失败，将使用 AppleScript 回退"
-  fi
-  if swiftc -O -o scripts/bin/mac-settings-2fa-code \\
-    scripts/swift/mac-settings-2fa-code.swift \\
-    -framework ApplicationServices -framework AppKit 2>/dev/null; then
-    chmod +x scripts/bin/mac-settings-2fa-code
-    echo "✓ mac-settings-2fa-code 已编译"
-  else
-    echo "⚠ mac-settings-2fa-code 编译失败，2FA 将仅依赖系统弹窗"
-  fi
-  if swiftc -O -o scripts/bin/mac-2fa-popup-read \
-    scripts/swift/mac-2fa-popup-read.swift \
-    -framework ApplicationServices -framework AppKit 2>/dev/null; then
-    chmod +x scripts/bin/mac-2fa-popup-read
-    echo "✓ mac-2fa-popup-read 已编译"
-  else
-    echo "⚠ mac-2fa-popup-read 编译失败，2FA 弹窗将回退 AppleScript"
-  fi
-  if swiftc -O -o scripts/bin/mac-2fa-popup-ocr \
-    scripts/swift/mac-2fa-popup-ocr.swift \
-    -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics 2>/dev/null; then
-    chmod +x scripts/bin/mac-2fa-popup-ocr
-    echo "✓ mac-2fa-popup-ocr 已编译"
-  else
-    echo "⚠ mac-2fa-popup-ocr 编译失败，将回退 AppleScript 读码"
-  fi
-  if swiftc -O -o scripts/bin/mac-2fa-click-allow \
-    scripts/swift/mac-2fa-click-allow.swift \
-    -framework ApplicationServices -framework AppKit 2>/dev/null; then
-    chmod +x scripts/bin/mac-2fa-click-allow
-    echo "✓ mac-2fa-click-allow 已编译"
-  else
-    echo "⚠ mac-2fa-click-allow 编译失败，将回退 AppleScript 点允许"
-  fi
-else
-  echo "⚠ 未找到 swiftc，将使用 AppleScript 回退"
-fi
-
-if ! command -v cliclick >/dev/null 2>&1; then
-  echo "提示: 可选安装 cliclick 以增强「允许」点击（brew install cliclick）"
-fi
-
-exec node scripts/setup-environment.mjs --install-ruyipage "$@"
-`;
+export function renderInstallSh(_version) {
+  return fs.readFileSync(path.join(ROOT, "install.sh"), "utf8");
 }
 
 function buildInstallSh(destRoot) {
@@ -384,43 +323,7 @@ function buildInstallSh(destRoot) {
 }
 
 export function renderRunSh() {
-  return `#!/bin/bash
-set -euo pipefail
-cd "$(dirname "$0")"
-
-# shellcheck disable=SC1091
-source "$(dirname "$0")/scripts/bootstrap-macos.sh"
-bootstrap_macos_runtime
-
-skip_browser=0
-for arg in "$@"; do
-  if [[ "\${arg}" == "--skip-browser" ]]; then
-    skip_browser=1
-    break
-  fi
-done
-
-if [[ "\${SKIP_ENV_SETUP:-}" != "1" ]]; then
-  setup_args=(--quiet)
-  if [[ "\${skip_browser}" == "1" ]]; then
-    setup_args+=(--skip-firefox --skip-ruyipage)
-  fi
-  node scripts/setup-environment.mjs "\${setup_args[@]}"
-fi
-
-if [[ "\${skip_browser}" != "1" ]]; then
-  node scripts/preflight-2fa-permissions.mjs --quiet
-fi
-
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
-
-exec node scripts/apple-id-full-flow.mjs --skip-setup "$@"
-`;
+  return fs.readFileSync(path.join(ROOT, "run.sh"), "utf8");
 }
 
 function buildRunSh(destRoot) {

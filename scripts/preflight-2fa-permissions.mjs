@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 2FA 权限预检（run.sh 始终执行，不受 --skip-setup 影响）
+ * 浏览器 2FA 权限预检（浏览器阶段启用时执行，不受 --skip-setup 影响）
  *   node scripts/preflight-2fa-permissions.mjs
  *   node scripts/preflight-2fa-permissions.mjs --quiet
  */

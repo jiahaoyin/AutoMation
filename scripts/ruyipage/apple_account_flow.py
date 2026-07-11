@@ -58,9 +58,28 @@ CODE_FIELD_SELECTORS = (
     ("css:input[inputmode='numeric'][maxlength='1']", False),
     ("css:input[maxlength='1']", False),
 )
+OTP_SEMANTIC_RE = re.compile(
+    r"one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證",
+    re.IGNORECASE,
+)
+OTP_REJECTION_JS_PATTERN = (
+    r"(?:(?:(?:this|the|your)\s+)?"
+    r"(?:verification code|security code|one-time code)"
+    r"(?:\s+(?:you\s+)?entered)?\s+"
+    r"(?:(?:is|was|has)\s+)?(?:incorrect|invalid|expired)"
+    r"|(?:incorrect|invalid|expired)\s+"
+    r"(?:verification code|security code|one-time code)"
+    r"|(?:您(?:输入|輸入)的)?(?:验证码|驗證碼)\s*"
+    r"(?:不正确|不正確|无效|無效|(?:已)?过期|(?:已)?過期)"
+    r"|(?:不正确|不正確|无效|無效|(?:已)?过期|(?:已)?過期)"
+    r"\s*(?:的)?\s*(?:验证码|驗證碼))"
+)
 TRUST_BUTTON_RE = re.compile(r"^(trust(?: this browser)?|continue|信任(?:此浏览器)?|继续)$", re.IGNORECASE)
 REJECT_TRUST_RE = re.compile(r"don't trust|do not trust|not now|cancel|不信任|取消|暂不", re.IGNORECASE)
 TWO_FACTOR_SUBMIT_RE = re.compile(r"^(verify|continue|submit|next|验证|继续|提交|下一步)$", re.IGNORECASE)
+EDITABLE_TEXT_INPUT_TYPES = frozenset(
+    {"text", "search", "tel", "url", "email", "password", "number"}
+)
 APPLE_AUTH_HOSTS = frozenset(
     {
         "account.apple.com",
@@ -68,6 +87,9 @@ APPLE_AUTH_HOSTS = frozenset(
         "idmsa.apple.com",
     }
 )
+SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
+QUIT_FAILURE_REASON = "ruyipage_quit_failed"
+TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 
 
 def emit(event: dict[str, Any]) -> None:
@@ -88,13 +110,53 @@ def request_two_factor_preparation() -> None:
         raise RuntimeError("2FA preparation acknowledgement was not received")
 
 
+def validate_otp_generation(generation: Any) -> int:
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise RuntimeError("2FA generation must be 1 or 2")
+    if generation not in (1, 2):
+        raise RuntimeError("2FA generation must be 1 or 2")
+    return generation
+
+
+def validate_two_factor_code_command(command: Any, expected_generation: int) -> str:
+    expected_generation = validate_otp_generation(expected_generation)
+    if not isinstance(command, dict) or command.get("type") != "2fa_code":
+        raise RuntimeError("2FA code command was not received")
+    generation = validate_otp_generation(command.get("generation"))
+    if generation != expected_generation:
+        raise RuntimeError("2FA code generation did not match the request")
+    code = command.get("code")
+    if not isinstance(code, str) or re.fullmatch(r"[0-9]{6}", code) is None:
+        raise RuntimeError("2FA code must contain exactly six digits")
+    return code
+
+
 def human_pause(min_ms: int = 250, max_ms: int = 900) -> None:
     time.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
 
-def safe_elements(page: Any, selector: str) -> list[Any]:
+def classify_strong_two_factor(
+    *,
+    has_strong_text: bool,
+    semantic_target_count: int,
+    digit_cell_count: int,
+) -> bool:
+    return bool(
+        has_strong_text
+        or semantic_target_count > 0
+        or digit_cell_count == 6
+    )
+
+
+def safe_elements(
+    page: Any,
+    selector: str,
+    timeout_s: float | None = None,
+) -> list[Any]:
     try:
-        return list(page.eles(selector) or [])
+        if timeout_s is None:
+            return list(page.eles(selector) or [])
+        return list(page.eles(selector, timeout=timeout_s) or [])
     except Exception:
         return []
 
@@ -115,12 +177,40 @@ def iter_page_scopes(page: Any):
             pass
 
 
+def current_element_search_roots(page: Any) -> list[tuple[Any, Any]]:
+    scopes = list(iter_page_scopes(page))
+    roots = [(scope, scope) for scope in scopes]
+    seen_roots = {id(scope) for scope in scopes}
+    for scope in scopes:
+        try:
+            shadow_roots = scope.shadow_roots(mode="all", include_frames=False)
+        except Exception:
+            continue
+        for root in list(shadow_roots or []):
+            identity = id(root)
+            if identity in seen_roots:
+                continue
+            seen_roots.add(identity)
+            roots.append((scope, root))
+    return roots
+
+
 def element_is_interactable(element: Any) -> bool:
     try:
+        if str(element.attr("aria-disabled") or "").strip().lower() == "true":
+            return False
         states = element.states
         return bool(states.is_displayed and states.is_enabled)
     except Exception:
-        return True
+        return False
+
+
+def element_is_editable_text_control(element: Any) -> bool:
+    try:
+        input_type = str(element.attr("type") or "text").strip().lower()
+    except Exception:
+        return False
+    return input_type in EDITABLE_TEXT_INPUT_TYPES
 
 
 def find_elements(page: Any, selector: str) -> list[Any]:
@@ -173,6 +263,14 @@ def normalized_apple_frame_url(url: str) -> str | None:
     port = parsed.port
     netloc = host if port in (None, 443) else f"{host}:{port}"
     return parsed._replace(netloc=netloc, fragment="").geturl()
+
+
+def sanitized_apple_url(url: str) -> str | None:
+    parsed = parse_valid_apple_url(url)
+    if parsed is None:
+        return None
+    host = (parsed.hostname or "").lower()
+    return parsed._replace(netloc=host, query="", fragment="").geturl()
 
 
 def find_hosting_frame_element(frame_scope: Any) -> tuple[Any, Any]:
@@ -254,6 +352,88 @@ def root_viewport_center(root_page: Any, scope: Any, field: Any) -> dict[str, in
     return {"x": round(x), "y": round(y)}
 
 
+def scroll_element_into_view(element: Any) -> None:
+    try:
+        element.scroll.to_see()
+    except Exception as exc:
+        raise RuntimeError("unable to scroll ruyiPage input target into view") from exc
+
+
+def prepare_frame_input_target(root_page: Any, scope: Any, field: Any) -> dict[str, int]:
+    scroll_element_into_view(field)
+    current = scope
+    seen: set[int] = set()
+    while current is not root_page:
+        identity = id(current)
+        if identity in seen:
+            raise RuntimeError("cycle detected in ruyiPage frame hierarchy")
+        seen.add(identity)
+        parent, iframe = find_hosting_frame_element(current)
+        scroll_element_into_view(iframe)
+        current = parent
+    return root_viewport_center(root_page, scope, field)
+
+
+def element_focus_is_confirmed(element: Any) -> bool:
+    try:
+        focused = element.run_js(
+            """
+            function() {
+              return Boolean(
+                this === document.activeElement ||
+                this === this.getRootNode()?.activeElement
+              );
+            }
+            """
+        )
+    except Exception:
+        return False
+    return focused is True
+
+
+def require_keyboard_target_ready(element: Any) -> None:
+    if not element_is_interactable(element):
+        raise RuntimeError("ruyiPage input target is not interactable")
+    if not element_focus_is_confirmed(element):
+        raise RuntimeError("ruyiPage input target focus was not confirmed")
+
+
+def element_uses_rendered_text(element: Any) -> bool:
+    try:
+        if str(element.attr("contenteditable") or "").strip().lower() == "true":
+            return True
+        if str(element.attr("role") or "").strip().lower() != "textbox":
+            return False
+        return element.run_js(
+            """
+            function() {
+              return !['INPUT', 'TEXTAREA'].includes(
+                String(this.tagName || '').toUpperCase()
+              );
+            }
+            """
+        ) is True
+    except Exception:
+        return True
+
+
+def read_element_input_value(element: Any) -> tuple[bool, Any]:
+    try:
+        if element_uses_rendered_text(element):
+            value = element.run_js(
+                """
+                function() {
+                  return this.innerText ?? this.textContent ?? null;
+                }
+                """
+            )
+        else:
+            value = element.value
+    except Exception:
+        return False, None
+    return value is not None, value
+
+
 def human_click(
     scope: Any,
     element: Any,
@@ -281,43 +461,44 @@ def input_and_verify(
         # Firefox routes iframe keyboard input only after a top-context pointer focus.
         validate_apple_scope(root_page)
         action_scope = root_page
-        click_target = root_viewport_center(root_page, scope, field)
+        click_target = prepare_frame_input_target(root_page, scope, field)
 
     human_click(action_scope, click_target, pause=pause)
     pause(180, 480)
+    require_keyboard_target_ready(field)
     action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
     pause(120, 320)
+    require_keyboard_target_ready(field)
     action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
     pause(280, 680)
-    try:
-        actual = field.value
-    except Exception:
-        return action_scope
-    if actual is None or str(actual) == value:
+    readable, actual = read_element_input_value(field)
+    if readable and str(actual) == value:
         return action_scope
 
     if action_scope is scope:
         pause(180, 420)
-        field.input(value, clear=True)
+        require_keyboard_target_ready(field)
+        field.input("", clear=True)
+        pause(120, 320)
+        require_keyboard_target_ready(field)
+        field.input(value, clear=False)
         pause(280, 680)
-        try:
-            actual = field.value
-        except Exception:
-            return action_scope
-    if actual is not None and str(actual) != value:
-        detail = f"length {len(str(actual))}" if label == "password" else repr(str(actual))
-        raise RuntimeError(f"{label} input verification failed: {detail}")
+        readable, actual = read_element_input_value(field)
+    if not readable or str(actual) != value:
+        raise RuntimeError(f"{label} input verification failed")
     return action_scope
 
 
 def submit_with_enter(
     scope: Any,
+    element: Any,
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
     min_ms: int = 350,
     max_ms: int = 800,
 ) -> None:
     pause(min_ms, max_ms)
+    require_keyboard_target_ready(element)
     scope.actions.press(keys.ENTER).perform()
 
 
@@ -337,10 +518,18 @@ def submit_element_with_enter(
     else:
         validate_apple_scope(root_page)
         action_scope = root_page
-        click_target = root_viewport_center(root_page, scope, element)
+        click_target = prepare_frame_input_target(root_page, scope, element)
 
     human_click(action_scope, click_target, pause=pause)
-    submit_with_enter(action_scope, keys, pause=pause, min_ms=min_ms, max_ms=max_ms)
+    require_keyboard_target_ready(element)
+    submit_with_enter(
+        action_scope,
+        element,
+        keys,
+        pause=pause,
+        min_ms=min_ms,
+        max_ms=max_ms,
+    )
 
 
 def ensure_remember_checked(
@@ -381,7 +570,7 @@ def ensure_remember_checked(
                 action_target = click_target
             else:
                 action_scope = page
-                action_target = root_viewport_center(page, scope, click_target)
+                action_target = prepare_frame_input_target(page, scope, click_target)
             human_click(action_scope, action_target, pause=pause)
             pause(180, 420)
             try:
@@ -396,19 +585,266 @@ def ensure_remember_checked(
     raise RuntimeError("remember-account checkbox not found")
 
 
+def detect_shadow_root_state(root: Any) -> dict[str, bool]:
+    try:
+        raw = root.run_js(
+            r"""
+            function() {
+              const shadowRoot = this;
+              if (!shadowRoot?.querySelectorAll) {
+                return JSON.stringify({
+                  hasStrongText: false,
+                  semanticTargetCount: 0,
+                  digitCellCount: 0,
+                  trustPrompt: false,
+                  otpRejected: false,
+                  blocked: false,
+                  error: false
+                });
+              }
+              const visible = (el) => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = el.ownerDocument?.defaultView?.getComputedStyle(el);
+                return rect.width > 2 && rect.height > 2 &&
+                  style?.display !== 'none' && style?.visibility !== 'hidden';
+              };
+              const isEditableTextInput = (el) => {
+                if (el.tagName !== 'INPUT') return true;
+                return ['text', 'search', 'tel', 'url', 'email', 'password', 'number']
+                  .includes(String(el.type || 'text').toLowerCase());
+              };
+              const visibleTextElements = [...shadowRoot.querySelectorAll('*')]
+                .filter(visible)
+                .filter((el) => !['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT'].includes(el.tagName));
+              const strongTwoFactorText = visibleTextElements.some((el) => {
+                const text = typeof el.innerText === 'string'
+                  ? el.innerText
+                  : (el.children.length === 0 ? (el.textContent || '') : '');
+                return /two-factor|verification code|security code|one-time code|双重认证|雙重認證|验证码|驗證碼/i.test(text);
+              });
+              const targets = [...shadowRoot.querySelectorAll('input, [role="textbox"], [contenteditable="true"]')]
+                .filter(visible)
+                .filter(isEditableTextInput);
+              const semantics = (el) => /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
+                el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+                el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
+                el.getAttribute('autocomplete'), el.getAttribute('placeholder')
+              ].filter(Boolean).join(' '));
+              const semanticTargets = targets.filter(semantics);
+              const digitCells = targets.filter((el) =>
+                (el.maxLength === 1 || el.getAttribute('maxlength') === '1') &&
+                (el.tagName === 'INPUT' || semantics(el))
+              );
+              const body = visibleTextElements.map((el) => {
+                if (typeof el.innerText === 'string') return el.innerText;
+                return el.children.length === 0 ? (el.textContent || '') : '';
+              }).join('\n');
+              const normalizedBody = body.replace(/\s+/g, ' ');
+              const otpRejected = /__OTP_REJECTION_PATTERN__/i.test(normalizedBody);
+              const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
+              return JSON.stringify({
+                hasStrongText: strongTwoFactorText,
+                semanticTargetCount: semanticTargets.length,
+                digitCellCount: digitCells.length,
+                trustPrompt: /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body),
+                otpRejected,
+                blocked,
+                error: otpRejected || blocked ||
+                  /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|无法登录|無法登入|错误|錯誤|不正确|不正確|无效|無效/i.test(body)
+              });
+            }
+            """.replace("__OTP_REJECTION_PATTERN__", OTP_REJECTION_JS_PATTERN)
+        )
+    except Exception:
+        return {}
+    try:
+        evidence = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(evidence, dict):
+            return {}
+        return {
+            "twofa": classify_strong_two_factor(
+                has_strong_text=evidence.get("hasStrongText") is True,
+                semantic_target_count=int(evidence.get("semanticTargetCount") or 0),
+                digit_cell_count=int(evidence.get("digitCellCount") or 0),
+            ),
+            "trustPrompt": evidence.get("trustPrompt") is True,
+            "otpRejected": evidence.get("otpRejected") is True,
+            "blocked": evidence.get("blocked") is True,
+            "error": evidence.get("error") is True,
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def shadow_root_has_two_factor_marker(root: Any) -> bool:
+    return bool(detect_shadow_root_state(root).get("twofa"))
+
+
+def unique_elements(elements: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    seen: set[Any] = set()
+    for element in elements:
+        if element in seen:
+            continue
+        seen.add(element)
+        result.append(element)
+    return result
+
+
+def unique_scoped_elements(
+    elements: list[tuple[Any, Any]],
+) -> list[tuple[Any, Any]]:
+    result: list[tuple[Any, Any]] = []
+    seen: set[Any] = set()
+    for scope, element in elements:
+        if element in seen:
+            continue
+        seen.add(element)
+        result.append((scope, element))
+    return result
+
+
+def element_has_per_digit_semantics(element: Any) -> bool:
+    if element_has_otp_semantics(element):
+        return True
+    try:
+        return str(element.attr("maxlength") or "").strip() == "1"
+    except Exception:
+        return False
+
+
 def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
-    for selector, allow_single in CODE_FIELD_SELECTORS:
-        for scope in iter_page_scopes(page):
-            fields = [
-                element
-                for element in safe_elements(scope, selector)
-                if element_is_interactable(element)
+    all_candidates: list[tuple[Any, Any]] = []
+    grouped: list[tuple[Any, list[Any]]] = []
+    group_indexes: dict[int, int] = {}
+    for scope, root in current_element_search_roots(page):
+        identity = id(scope)
+        if identity not in group_indexes:
+            group_indexes[identity] = len(grouped)
+            grouped.append((scope, []))
+        grouped[group_indexes[identity]][1].append(root)
+
+    for scope, roots in grouped:
+        try:
+            state = detect_scope_login_state(scope)
+        except Exception:
+            continue
+        if not isinstance(state, dict) or not is_apple_url(str(state.get("href") or "")):
+            continue
+
+        shadow_twofa = any(
+            root is not scope and shadow_root_has_two_factor_marker(root)
+            for root in roots
+        )
+        two_factor_scope = bool(state.get("twofa") or shadow_twofa)
+        candidates: list[Any] = []
+        digit_inputs: list[Any] = []
+        role_textboxes: list[Any] = []
+
+        for root in roots:
+            for selector in (
+                "css:input[autocomplete='one-time-code']",
+                "css:.security-code-input input",
+            ):
+                candidates.extend(editable_text_elements(root, selector))
+            candidates.extend(semantic_otp_elements(root, "css:input"))
+            digit_inputs.extend(
+                editable_text_elements(
+                    root,
+                    "css:input[inputmode='numeric'][maxlength='1']",
+                )
+            )
+            digit_inputs.extend(
+                editable_text_elements(root, "css:input[maxlength='1']")
+            )
+            if two_factor_scope:
+                role_textboxes.extend(
+                    editable_text_elements(root, "css:[role='textbox']")
+                )
+                candidates.extend(
+                    semantic_otp_elements(root, "css:[contenteditable='true']")
+                )
+
+        digit_inputs = unique_elements(digit_inputs)
+        if len(digit_inputs) == 6:
+            candidates.extend(digit_inputs)
+
+        if two_factor_scope:
+            role_textboxes = unique_elements(role_textboxes)
+            candidates.extend(
+                field for field in role_textboxes if element_has_otp_semantics(field)
+            )
+            per_digit_textboxes = [
+                field for field in role_textboxes if element_has_per_digit_semantics(field)
             ]
-            if len(fields) >= 6:
-                return [(scope, field) for field in fields[:6]]
-            if allow_single and len(fields) == 1:
-                return [(scope, fields[0])]
-    return []
+            if len(role_textboxes) == 6 and len(per_digit_textboxes) == 6:
+                candidates.extend(per_digit_textboxes)
+
+        candidates = unique_elements(candidates)
+        all_candidates.extend((scope, field) for field in candidates)
+
+    all_candidates = unique_scoped_elements(all_candidates)
+    return all_candidates if len(all_candidates) in (1, 6) else []
+
+
+def interactable_elements(root: Any, selector: str) -> list[Any]:
+    return [
+        element
+        for element in safe_elements(root, selector, timeout_s=0)
+        if element_is_interactable(element)
+    ]
+
+
+def editable_text_elements(root: Any, selector: str) -> list[Any]:
+    return [
+        element
+        for element in interactable_elements(root, selector)
+        if element_is_editable_text_control(element)
+    ]
+
+
+def element_has_otp_semantics(element: Any) -> bool:
+    values: list[str] = []
+    for name in (
+        "aria-label",
+        "aria-describedby",
+        "name",
+        "id",
+        "class",
+        "autocomplete",
+        "inputmode",
+        "maxlength",
+        "placeholder",
+    ):
+        try:
+            value = element.attr(name)
+        except Exception:
+            continue
+        if value is not None:
+            values.append(str(value))
+    return bool(OTP_SEMANTIC_RE.search(" ".join(values)))
+
+
+def semantic_otp_elements(root: Any, selector: str) -> list[Any]:
+    return [
+        element
+        for element in editable_text_elements(root, selector)
+        if element_has_otp_semantics(element)
+    ]
+
+
+def wait_for_otp_target(
+    page: Any,
+    timeout_s: float = 30,
+) -> list[tuple[Any, Any]]:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        fields = security_code_fields(page)
+        if fields:
+            return fields
+        human_pause(300, 650)
+    raise RuntimeError("2FA is visible but an interactable OTP target did not appear")
 
 
 def fill_security_code(
@@ -416,14 +852,17 @@ def fill_security_code(
     code: str,
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
+    fields: list[tuple[Any, Any]] | None = None,
 ) -> None:
     digits = "".join(ch for ch in str(code) if ch.isdigit())
     if len(digits) != 6:
         raise RuntimeError("2FA code must contain exactly six digits")
 
-    fields = security_code_fields(page)
+    fields = fields if fields is not None else security_code_fields(page)
     if not fields:
         raise RuntimeError("2FA code input was not detected; refusing unfocused typing")
+    if len(fields) not in (1, 6):
+        raise RuntimeError("2FA code input must resolve to exactly one or six targets")
 
     if len(fields) == 1:
         scope, field = fields[0]
@@ -451,19 +890,72 @@ def fill_security_code(
         pause(80, 220)
 
 
+def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
+    if prompt_kind not in ("trust", "twofa"):
+        return False
+    script = r"""
+    function() {
+      const expectedPrompt = '__PROMPT_KIND__';
+      const container = this.closest([
+        'form', '[role="dialog"]', '[aria-modal="true"]', 'fieldset',
+        '.si-container', '.signin-container', '.auth-content',
+        '.security-code-input'
+      ].join(', '));
+      if (!container) return false;
+      const visible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = el.ownerDocument?.defaultView?.getComputedStyle(el);
+        return rect.width > 2 && rect.height > 2 &&
+          style?.display !== 'none' && style?.visibility !== 'hidden';
+      };
+      const isEditableTextInput = (el) => {
+        if (el.tagName !== 'INPUT') return true;
+        return ['text', 'search', 'tel', 'url', 'email', 'password', 'number']
+          .includes(String(el.type || 'text').toLowerCase());
+      };
+      if (!visible(container)) return false;
+      const text = container.innerText || '';
+      if (expectedPrompt === 'trust') {
+        return /trust this browser|信任此浏览器|信任此瀏覽器/i.test(text);
+      }
+      const otpSemantics = (el) =>
+        /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
+          el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+          el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
+          el.getAttribute('autocomplete'), el.getAttribute('placeholder')
+        ].filter(Boolean).join(' '));
+      const targets = [...container.querySelectorAll(
+        'input, [role="textbox"], [contenteditable="true"]'
+      )].filter(visible).filter(isEditableTextInput);
+      const semanticTargets = targets.filter(otpSemantics);
+      const digitCells = targets.filter((el) =>
+        (el.maxLength === 1 || el.getAttribute('maxlength') === '1') &&
+        (el.tagName === 'INPUT' || otpSemantics(el))
+      );
+      return Boolean(
+        /two-factor|verification code|security code|one-time code|双重认证|雙重認證|验证码|驗證碼/i.test(text) ||
+        semanticTargets.length > 0 || digitCells.length === 6
+      );
+    }
+    """.replace("__PROMPT_KIND__", prompt_kind)
+    try:
+        return button.run_js(script) is True
+    except Exception:
+        return False
+
+
 def click_trust_browser(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
-    for scope in iter_page_scopes(page):
+    for scope, root in current_element_search_roots(page):
         try:
             state = detect_scope_login_state(scope)
-            if not state.get("trustPrompt"):
-                continue
             validate_apple_url(str(state.get("href") or ""))
         except Exception:
             continue
-        for button in safe_elements(scope, "css:button"):
+        for button in safe_elements(root, "css:button", timeout_s=0):
             if not element_is_interactable(button):
                 continue
             try:
@@ -471,6 +963,8 @@ def click_trust_browser(
             except Exception:
                 continue
             if REJECT_TRUST_RE.search(text) or not TRUST_BUTTON_RE.fullmatch(text):
+                continue
+            if not button_has_prompt_semantics(button, "trust"):
                 continue
             pause(320, 760)
             human_click(scope, button, pause=pause)
@@ -482,18 +976,16 @@ def click_two_factor_submit(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
-    for scope in iter_page_scopes(page):
+    for scope, root in current_element_search_roots(page):
         try:
             state = detect_scope_login_state(scope)
         except Exception:
-            continue
-        if not (state.get("twofa") or int(state.get("codeInputCount") or 0) > 0):
             continue
         try:
             validate_apple_url(str(state.get("href") or ""))
         except Exception:
             continue
-        for button in safe_elements(scope, "css:button"):
+        for button in safe_elements(root, "css:button"):
             if not element_is_interactable(button):
                 continue
             try:
@@ -501,6 +993,8 @@ def click_two_factor_submit(
             except Exception:
                 continue
             if REJECT_TRUST_RE.search(text) or not TWO_FACTOR_SUBMIT_RE.fullmatch(text):
+                continue
+            if not button_has_prompt_semantics(button, "twofa"):
                 continue
             pause(280, 680)
             human_click(scope, button, pause=pause)
@@ -517,45 +1011,82 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             if (!el) return false;
             const r = el.getBoundingClientRect();
             const s = window.getComputedStyle(el);
-            return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
+            return r.width > 2 && r.height > 2 && s.display !== 'none' &&
+              s.visibility !== 'hidden' && !el.disabled &&
+              el.getAttribute('aria-disabled') !== 'true';
+          };
+          const isEditableTextInput = (el) => {
+            if (el.tagName !== 'INPUT') return true;
+            return ['text', 'search', 'tel', 'url', 'email', 'password', 'number']
+              .includes(String(el.type || 'text').toLowerCase());
           };
           const inputs = [...document.querySelectorAll('input')].filter(visible);
-          const codeInputs = inputs.filter((el) =>
-            el.maxLength === 1 ||
-            el.getAttribute('maxlength') === '1' ||
-            /code|security|otp/i.test((el.name || '') + (el.id || '') + (el.className || '') + (el.autocomplete || '')) ||
-            el.getAttribute('inputmode') === 'numeric'
+          const otpInputs = inputs.filter(isEditableTextInput);
+          const textTargets = [...document.querySelectorAll('[role="textbox"], [contenteditable="true"]')]
+            .filter(visible)
+            .filter(isEditableTextInput);
+          const otpSemantics = (el) =>
+            /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
+              el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+              el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
+              el.getAttribute('autocomplete'), el.getAttribute('placeholder')
+            ].filter(Boolean).join(' '));
+          const semanticTargets = [...otpInputs, ...textTargets].filter(otpSemantics);
+          const digitCells = [...otpInputs, ...textTargets].filter((el) =>
+            (el.maxLength === 1 || el.getAttribute('maxlength') === '1') &&
+            (el.tagName === 'INPUT' || otpSemantics(el))
           );
           const href = location.href;
           const password = inputs.some((el) => el.type === 'password');
           const email = inputs.some((el) => el.type === 'email' || /accountName|username/i.test(el.name || el.autocomplete || ''));
-          const error = /incorrect|invalid|wrong password|try again|captcha|locked|无法登录|错误|不正确|无效|被锁定/i.test(body);
-          const twofa = /two-factor|verification code|security code|双重认证|验证码/i.test(body) || codeInputs.length >= 1;
-          const trustPrompt = /trust this browser|信任此浏览器/i.test(body);
+          const normalizedBody = body.replace(/\s+/g, ' ');
+          const otpRejected = /__OTP_REJECTION_PATTERN__/i.test(normalizedBody);
+          const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
+          const error = otpRejected || blocked ||
+            /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|无法登录|無法登入|错误|錯誤|不正确|不正確|无效|無效/i.test(body);
+          const strongTwoFactorText = /two-factor|verification code|security code|one-time code|双重认证|雙重認證|验证码|驗證碼/i.test(body);
+          const trustPrompt = /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body);
           const accountMarker =
-            /personal information|个人信息|sign out|退出|account security|账户安全/i.test(body);
-          const trusted =
-            /account\.apple\.com\/account\/manage/i.test(href) &&
-            accountMarker &&
-            !password &&
-            !email &&
-            !twofa;
+            /personal information|个人信息|個人資料|sign out|退出|account security|账户安全|帳戶安全/i.test(body);
           return {
             href,
-            twofa,
+            hasStrongTwoFactorText: strongTwoFactorText,
+            semanticTargetCount: semanticTargets.length,
+            digitCellCount: digitCells.length,
             trustPrompt,
             error,
-            trusted,
+            otpRejected,
+            blocked,
+            accountManage: /account\.apple\.com\/account\/manage/i.test(href),
             accountMarker,
             password,
             email,
-            codeInputCount: codeInputs.length,
-            snippet: body.slice(0, 500)
+            codeInputCount: new Set([
+              ...semanticTargets,
+              ...(digitCells.length === 6 ? digitCells : [])
+            ]).size
           };
         })())
-        """
+        """.replace("__OTP_REJECTION_PATTERN__", OTP_REJECTION_JS_PATTERN)
     )
-    return json.loads(raw) if isinstance(raw, str) else raw
+    state = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(state, dict):
+        raise RuntimeError("ruyiPage returned an invalid login-state result")
+
+    state["twofa"] = classify_strong_two_factor(
+        has_strong_text=state.get("hasStrongTwoFactorText") is True,
+        semantic_target_count=int(state.get("semanticTargetCount") or 0),
+        digit_cell_count=int(state.get("digitCellCount") or 0),
+    )
+    if "accountManage" in state:
+        state["trusted"] = bool(
+            state.get("accountManage")
+            and state.get("accountMarker")
+            and not state.get("password")
+            and not state.get("email")
+            and not state["twofa"]
+        )
+    return state
 
 
 def parse_valid_apple_url(url: str):
@@ -595,6 +1126,25 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         except Exception:
             continue
         if isinstance(state, dict):
+            if is_apple_url(str(state.get("href") or "")):
+                try:
+                    shadow_roots = scope.shadow_roots(
+                        mode="all",
+                        include_frames=False,
+                    )
+                except Exception:
+                    shadow_roots = []
+                for root in list(shadow_roots or []):
+                    shadow_state = detect_shadow_root_state(root)
+                    for key in (
+                        "twofa",
+                        "trustPrompt",
+                        "otpRejected",
+                        "blocked",
+                        "error",
+                    ):
+                        if shadow_state.get(key):
+                            state = {**state, key: True}
             states.append(state)
 
     if not states:
@@ -603,83 +1153,159 @@ def detect_login_state(page: Any) -> dict[str, Any]:
     root_state = states[0]
     root_href = str(root_state.get("href") or "")
     root_is_account_manage = is_account_manage_url(root_href)
+    apple_states = [
+        state
+        for state in states
+        if is_apple_url(str(state.get("href") or ""))
+    ]
     has_apple_account_marker = any(
         is_apple_url(str(state.get("href") or ""))
         and bool(state.get("trusted") or state.get("accountMarker"))
         for state in states
     )
-    snippets = [
-        str(state.get("snippet", "")).strip()
-        for state in states
-        if str(state.get("snippet", "")).strip()
-    ]
     has_auth_ui = any(
         bool(state.get(key))
-        for state in states
+        for state in apple_states
         for key in ("email", "password", "twofa", "trustPrompt")
+    )
+    twofa_visible = any(bool(state.get("twofa")) for state in apple_states)
+    code_input_count = max(
+        (int(state.get("codeInputCount") or 0) for state in apple_states),
+        default=0,
     )
     return {
         "href": root_href or next(
             (state.get("href") for state in states if state.get("href")),
             "",
         ),
-        "twofa": any(bool(state.get("twofa")) for state in states),
-        "trustPrompt": any(bool(state.get("trustPrompt")) for state in states),
-        "error": any(bool(state.get("error")) for state in states),
+        "twofa": twofa_visible,
+        "twofaVisible": twofa_visible,
+        "inputReady": False,
+        "trustPrompt": any(bool(state.get("trustPrompt")) for state in apple_states),
+        "error": any(bool(state.get("error")) for state in apple_states),
+        "otpRejected": any(bool(state.get("otpRejected")) for state in apple_states),
+        "blocked": any(bool(state.get("blocked")) for state in apple_states),
         "trusted": (
             not has_auth_ui
             and root_is_account_manage
             and has_apple_account_marker
         ),
-        "password": any(bool(state.get("password")) for state in states),
-        "email": any(bool(state.get("email")) for state in states),
-        "codeInputCount": max(
-            (int(state.get("codeInputCount") or 0) for state in states),
-            default=0,
-        ),
-        "snippet": " | ".join(snippets)[:500],
+        "password": any(bool(state.get("password")) for state in apple_states),
+        "email": any(bool(state.get("email")) for state in apple_states),
+        "codeInputCount": code_input_count,
     }
 
 
+def settle_trust_state(
+    page: Any,
+    state: dict[str, Any],
+    *,
+    deadline: float,
+    pause: Callable[[int, int], None] | None = None,
+    hydration_timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    if pause is None:
+        pause = human_pause
+    hydration_deadline = min(deadline, time.monotonic() + hydration_timeout_s)
+    scanned_current_state = False
+    while True:
+        if state.get("error"):
+            return state
+        if scanned_current_state and time.monotonic() >= hydration_deadline:
+            if state.get("trustPrompt"):
+                raise RuntimeError(
+                    "trust-browser prompt detected but no matching button was found"
+                )
+            raise RuntimeError("trust-browser state did not settle before deadline")
+        if click_trust_browser(page, pause=pause):
+            pause(700, 1400)
+            state = detect_login_state(page)
+            scanned_current_state = True
+            continue
+        scanned_current_state = True
+        if not state.get("trustPrompt"):
+            return state
+        if time.monotonic() >= hydration_deadline:
+            raise RuntimeError(
+                "trust-browser prompt detected but no matching button was found"
+            )
+        pause(120, 260)
+        state = detect_login_state(page)
+
+
+def otp_retry_allowed(state: dict[str, Any], generation: int | None) -> bool:
+    return bool(
+        generation == 1
+        and is_apple_url(str(state.get("href") or ""))
+        and state.get("twofa")
+        and state.get("otpRejected")
+        and not state.get("blocked")
+    )
+
+
 def wait_for_2fa_or_session(page: Any, timeout_s: int = 75) -> dict[str, Any]:
-    deadline = time.time() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
     last_state: dict[str, Any] = {}
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         last_state = detect_login_state(page)
+        last_state = settle_trust_state(page, last_state, deadline=deadline)
         if last_state.get("error"):
-            raise RuntimeError(f"login stopped before 2FA: {last_state.get('snippet', '')[:180]}")
+            raise RuntimeError("login stopped before 2FA")
+        elapsed_ms = min(
+            max(0, int((time.monotonic() - started) * 1000)),
+            max(0, int(timeout_s * 1000)),
+        )
         if last_state.get("trusted"):
+            last_state["elapsedMs"] = elapsed_ms
+            return last_state
+        if last_state.get("twofa"):
+            fields = security_code_fields(page)
+            last_state["twofaVisible"] = True
+            last_state["inputReady"] = bool(fields)
+            last_state["elapsedMs"] = elapsed_ms
+            if fields:
+                last_state["codeInputCount"] = len(fields)
             return last_state
         fields = security_code_fields(page)
         if fields:
+            last_state["twofa"] = True
+            last_state["twofaVisible"] = True
+            last_state["inputReady"] = True
             last_state["codeInputCount"] = len(fields)
+            last_state["elapsedMs"] = elapsed_ms
             return last_state
         human_pause(500, 1000)
-    raise RuntimeError(f"2FA code page did not appear: {last_state.get('snippet', '')[:180]}")
+    raise RuntimeError("2FA code page did not appear")
 
 
 def wait_for_signed_in(
     page: Any,
     timeout_s: int = 90,
     submitted: bool = False,
+    otp_generation: int | None = None,
 ) -> dict[str, Any]:
-    deadline = time.time() + timeout_s
+    if otp_generation is not None:
+        validate_otp_generation(otp_generation)
+    deadline = time.monotonic() + timeout_s
     last_state: dict[str, Any] = {}
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         last_state = detect_login_state(page)
+        last_state = settle_trust_state(page, last_state, deadline=deadline)
+        if otp_generation is not None and not is_apple_url(
+            str(last_state.get("href") or "")
+        ):
+            raise RuntimeError("2FA state left the verified Apple HTTPS origin")
         if last_state.get("error"):
-            raise RuntimeError(f"2FA/login failed: {last_state.get('snippet', '')[:180]}")
+            if otp_retry_allowed(last_state, otp_generation):
+                return {**last_state, "retry2FA": True}
+            raise RuntimeError("2FA/login failed")
         if last_state.get("trusted"):
             return last_state
-        if last_state.get("trustPrompt"):
-            if not click_trust_browser(page):
-                raise RuntimeError("trust-browser prompt detected but no matching button was found")
-            human_pause(700, 1400)
-            continue
         if last_state.get("twofa") and not submitted:
             submitted = click_two_factor_submit(page)
         human_pause(600, 1100)
-    raise RuntimeError(f"account session was not confirmed after 2FA: {last_state.get('snippet', '')[:180]}")
+    raise RuntimeError("account session was not confirmed after 2FA")
 
 
 def collect_scope_personal_info(scope: Any) -> dict[str, Any]:
@@ -730,7 +1356,7 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
             (info.get("birthday") for info in collected if info.get("birthday")),
             None,
         ),
-        "href": root_info.get("href"),
+        "href": sanitized_apple_url(str(root_info.get("href") or "")),
         "title": root_info.get("title"),
     }
 
@@ -750,8 +1376,8 @@ def take_screenshot(page: Any, path: Path) -> str | None:
         path.parent.mkdir(parents=True, exist_ok=True)
         page.screenshot(str(path), full_page=True)
         return str(path)
-    except Exception as exc:
-        emit({"event": "warning", "message": f"screenshot failed: {exc}"})
+    except Exception:
+        emit({"event": "warning", "message": SCREENSHOT_FAILURE_REASON})
         return None
 
 
@@ -764,9 +1390,8 @@ def protocol_self_test() -> int:
 def node_self_test() -> int:
     emit({"event": "ready", "mode": "node-self-test"})
     request_two_factor_preparation()
-    emit({"event": "need_2fa"})
-    command = read_command()
-    code = "".join(ch for ch in str(command.get("code", "")) if ch.isdigit())[:6]
+    emit({"event": "need_2fa", "generation": 1})
+    code = validate_two_factor_code_command(read_command(), 1)
     argv_text = "\0".join(sys.argv[1:])
     sensitive_values = (os.environ.get("APPLE_ID", ""), os.environ.get("APPLE_PASSWORD", ""))
     credentials_in_argv = "--apple-id" in sys.argv or any(
@@ -855,6 +1480,11 @@ def browser_flow(args: argparse.Namespace) -> int:
 
     report_dir = Path(args.report_dir)
     screenshots_dir = report_dir / "screenshots"
+    success_screenshot_paths = (
+        screenshots_dir / "02-ruyipage-after-login.png",
+        screenshots_dir / "03-account-manage.png",
+    )
+    generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     page = FirefoxPage(opts)
     try:
@@ -864,81 +1494,133 @@ def browser_flow(args: argparse.Namespace) -> int:
         human_pause(900, 1800)
 
         initial_state = detect_login_state(page)
+        initial_state = settle_trust_state(
+            page,
+            initial_state,
+            deadline=time.monotonic() + 5.0,
+        )
+        if initial_state.get("error"):
+            raise RuntimeError("login page reported an authentication error")
         skipped_login = bool(initial_state.get("trusted"))
         skipped_2fa = skipped_login
         remember_checked: bool | None = None
 
         if not skipped_login:
-            email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
-            email_action_scope = input_and_verify(
-                email_scope,
-                email,
-                apple_id,
-                "email",
-                Keys,
-                root_page=page,
-            )
-            submit_with_enter(email_action_scope, Keys)
+            if initial_state.get("twofa"):
+                request_two_factor_preparation()
+            else:
+                email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
+                input_and_verify(
+                    email_scope,
+                    email,
+                    apple_id,
+                    "email",
+                    Keys,
+                    root_page=page,
+                )
+                submit_element_with_enter(
+                    page,
+                    email_scope,
+                    email,
+                    Keys,
+                )
 
-            password_scope, password_field = wait_for_element(
-                page,
-                PASSWORD_SELECTORS,
-                timeout_s=45,
-            )
-            input_and_verify(
-                password_scope,
-                password_field,
-                password,
-                "password",
-                Keys,
-                root_page=page,
-            )
-            remember_checked = ensure_remember_checked(page)
-            request_two_factor_preparation()
-            submit_element_with_enter(
-                page,
-                password_scope,
-                password_field,
-                Keys,
-                min_ms=420,
-                max_ms=900,
-            )
+                password_scope, password_field = wait_for_element(
+                    page,
+                    PASSWORD_SELECTORS,
+                    timeout_s=45,
+                )
+                input_and_verify(
+                    password_scope,
+                    password_field,
+                    password,
+                    "password",
+                    Keys,
+                    root_page=page,
+                )
+                remember_checked = ensure_remember_checked(page)
+                request_two_factor_preparation()
+                submit_element_with_enter(
+                    page,
+                    password_scope,
+                    password_field,
+                    Keys,
+                    min_ms=420,
+                    max_ms=900,
+                )
 
             login_state = wait_for_2fa_or_session(page)
             if login_state.get("trusted"):
                 skipped_2fa = True
             else:
-                emit(
-                    {
-                        "event": "need_2fa",
-                        "state": {
-                            "href": login_state.get("href"),
-                            "codeInputCount": login_state.get("codeInputCount"),
-                        },
-                    }
-                )
-                command = read_command()
-                code = "".join(ch for ch in str(command.get("code", "")) if ch.isdigit())
-                fill_security_code(page, code, Keys)
-                submitted = click_two_factor_submit(page)
-                human_pause(900, 1600)
-                wait_for_signed_in(page, submitted=submitted)
+                for generation in (1, 2):
+                    emit(
+                        {
+                            "event": "need_2fa",
+                            "generation": generation,
+                            "state": {
+                                "href": sanitized_apple_url(
+                                    str(login_state.get("href") or "")
+                                ),
+                                "twofaVisible": bool(
+                                    login_state.get("twofaVisible")
+                                    or login_state.get("twofa")
+                                ),
+                                "inputReady": bool(login_state.get("inputReady")),
+                                "codeInputCount": login_state.get("codeInputCount"),
+                                "elapsedMs": max(
+                                    0,
+                                    int(login_state.get("elapsedMs") or 0),
+                                ),
+                            },
+                        }
+                    )
+                    code = validate_two_factor_code_command(
+                        read_command(),
+                        generation,
+                    )
+                    fields = wait_for_otp_target(page)
+                    fill_security_code(page, code, Keys, fields=fields)
+                    submitted = click_two_factor_submit(page)
+                    human_pause(900, 1600)
+                    signed_in_state = wait_for_signed_in(
+                        page,
+                        submitted=submitted,
+                        otp_generation=generation,
+                    )
+                    if signed_in_state.get("retry2FA"):
+                        if generation != 1:
+                            raise RuntimeError("2FA/login failed")
+                        login_state = signed_in_state
+                        continue
+                    break
 
         screenshots["afterLogin"] = take_screenshot(
-            page, screenshots_dir / "02-ruyipage-after-login.png"
+            page, success_screenshot_paths[0]
         )
+        if screenshots["afterLogin"] is not None:
+            generated_screenshot_paths.append(success_screenshot_paths[0])
 
         page.get(ACCOUNT_INFORMATION_URL)
         page.wait.doc_loaded(timeout=20)
         human_pause(1200, 2400)
         final_state = detect_login_state(page)
+        final_state = settle_trust_state(
+            page,
+            final_state,
+            deadline=time.monotonic() + 5.0,
+        )
+        if final_state.get("error"):
+            raise RuntimeError("personal information page reported an authentication error")
         if not final_state.get("trusted"):
             raise RuntimeError("personal information page did not confirm an authenticated Apple session")
         personal_info = collect_personal_info(page)
         validate_personal_info_result(final_state, personal_info)
         screenshots["manage"] = take_screenshot(
-            page, screenshots_dir / "03-account-manage.png"
+            page, success_screenshot_paths[1]
         )
+        if screenshots["manage"] is not None:
+            generated_screenshot_paths.append(success_screenshot_paths[1])
 
         emit(
             {
@@ -956,19 +1638,20 @@ def browser_flow(args: argparse.Namespace) -> int:
             }
         )
         return 0
-    except Exception:
-        screenshots["failure"] = take_screenshot(
-            page, screenshots_dir / "99-ruyipage-failure.png"
-        )
-        raise
     finally:
         had_error = sys.exc_info()[0] is not None
         try:
             page.quit()
-        except Exception as exc:
+        except Exception:
+            for screenshot_path in generated_screenshot_paths:
+                screenshot_path.unlink(missing_ok=True)
             if not had_error:
                 raise
-            emit({"event": "warning", "message": f"ruyiPage quit failed after flow error: {exc}"})
+            emit({"event": "warning", "message": QUIT_FAILURE_REASON})
+        else:
+            if had_error:
+                for screenshot_path in generated_screenshot_paths:
+                    screenshot_path.unlink(missing_ok=True)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1000,10 +1683,20 @@ def main(argv: list[str]) -> int:
     return browser_flow(args)
 
 
-if __name__ == "__main__":
+def run_cli(argv: list[str]) -> int:
     try:
-        raise SystemExit(main(sys.argv[1:]))
-    except Exception as exc:
-        emit({"event": "result", "success": False, "error": str(exc)})
-        print(str(exc), file=sys.stderr, flush=True)
-        raise SystemExit(1)
+        return main(argv)
+    except Exception:
+        emit(
+            {
+                "event": "result",
+                "success": False,
+                "error": TOP_LEVEL_FAILURE_REASON,
+            }
+        )
+        print(TOP_LEVEL_FAILURE_REASON, file=sys.stderr, flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli(sys.argv[1:]))

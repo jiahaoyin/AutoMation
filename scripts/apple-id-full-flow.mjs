@@ -13,7 +13,7 @@
  */
 
 import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
-import { confirmOrPromptAppleCredentials } from "./lib/credentials.js";
+import { confirmOrPromptAppleCredentials, maskAppleId } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
 import { createReportDir, writeReport } from "./lib/report.js";
 import { ensureEnvironment } from "./lib/env-setup.js";
@@ -32,6 +32,7 @@ async function main() {
       quiet: false,
       skipFirefox: skipBrowser,
       skipRuyiPage: skipBrowser,
+      skipAutomation: skipMac,
     });
     console.log("");
   }
@@ -40,7 +41,7 @@ async function main() {
   const reportDir = createReportDir("apple-id-flow");
   const report = {
     runAt: new Date().toISOString(),
-    appleId: creds.appleId.replace(/(.{2}).+(@.+)/, "$1***$2"),
+    appleId: maskAppleId(creds.appleId),
     phases: {},
   };
   let reportFile = null;
@@ -52,7 +53,7 @@ async function main() {
       } catch (e) {
         report.phases.macSettings = {
           success: false,
-          error: e instanceof Error ? e.message : String(e),
+          error: "Mac Settings phase failed",
         };
         throw e;
       }
@@ -70,7 +71,7 @@ async function main() {
       } catch (e) {
         report.phases.accountBrowser = {
           success: false,
-          error: e instanceof Error ? e.message : String(e),
+          error: "Account browser phase failed",
         };
         throw e;
       }
@@ -81,7 +82,7 @@ async function main() {
 
     reportFile = writeReport(reportDir, report);
   } catch (e) {
-    report.error = e instanceof Error ? e.message : String(e);
+    report.error = "Apple ID flow failed";
     reportFile = writeReport(reportDir, report);
     console.error(`\n[报告] 失败报告已保存: ${reportFile}`);
     throw e;
@@ -94,7 +95,7 @@ async function main() {
   console.log("═══════════════════════════════════════════\n");
 }
 
-main().catch((e) => {
-  console.error("\n[失败]", e.message || e);
-  process.exit(1);
+main().catch(() => {
+  console.error("\n[failed] Apple ID flow failed");
+  process.exitCode = 1;
 });

@@ -168,8 +168,20 @@ export function requireAppleCredentials() {
   return { appleId, password };
 }
 
-function maskAppleId(appleId) {
-  return appleId.replace(/(.{2}).+(@.+)/, "$1***$2");
+export function maskAppleId(appleId) {
+  const value = String(appleId ?? "").trim();
+  if (!value) return "***";
+
+  const atIndex = value.indexOf("@");
+  if (atIndex >= 0) {
+    const local = value.slice(0, atIndex);
+    const domain = value.slice(atIndex);
+    const visible = local.length > 2 ? local.slice(0, 2) : "";
+    return `${visible}***${domain}`;
+  }
+
+  const visible = value.length > 2 ? value.slice(0, 2) : "";
+  return `${visible}***`;
 }
 
 /**

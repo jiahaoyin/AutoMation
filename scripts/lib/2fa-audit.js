@@ -1,6 +1,4 @@
-/**
- * 2FA 审计日志：截图路径 + 原文对齐
- */
+/** 2FA 审计日志。 */
 
 import fs from "node:fs";
 import path from "node:path";
@@ -18,14 +16,4 @@ export function append2FAAudit(reportDir, entry) {
   });
   fs.mkdirSync(path.dirname(auditPath), { recursive: true });
   fs.appendFileSync(auditPath, `${line}\n`, "utf-8");
-}
-
-/**
- * @param {string} reportDir
- * @param {string} filename
- * @returns {string|undefined}
- */
-export function screenshotPathFor(reportDir, filename) {
-  if (!reportDir) return undefined;
-  return path.join(reportDir, "screenshots", filename);
 }

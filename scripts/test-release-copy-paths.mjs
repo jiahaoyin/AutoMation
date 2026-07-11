@@ -1,5 +1,7 @@
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   collectRuntimeImports,
@@ -7,6 +9,94 @@ import {
   renderInstallSh,
   renderRunSh,
 } from "./build-release.mjs";
+
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
+const legacy2FAHelpers = [
+  ["apple-2fa", "wait.scpt"].join("-"),
+  ["apple-2fa", "phase.applescript"].join("-"),
+  ["2fa", "automation", "check.applescript"].join("-"),
+  ["accessibility", "check.applescript"].join("-"),
+];
+const ignoredRepositoryDirectories = new Set([
+  ".git",
+  ".runtime",
+  "data",
+  "dist",
+  "node_modules",
+]);
+const ignoredRepositorySubtrees = new Set(["docs/superpowers"]);
+const repositoryTextExtensions = new Set([
+  ".applescript",
+  ".cjs",
+  ".json",
+  ".js",
+  ".md",
+  ".mjs",
+  ".py",
+  ".scpt",
+  ".sh",
+  ".swift",
+  ".txt",
+  ".yaml",
+  ".yml",
+]);
+
+function collectRepositoryTextFiles(directory) {
+  const files = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    const relativeEntryPath = path
+      .relative(repositoryRoot, entryPath)
+      .split(path.sep)
+      .join("/");
+    if (entry.isDirectory()) {
+      if (
+        !ignoredRepositoryDirectories.has(entry.name) &&
+        !ignoredRepositorySubtrees.has(relativeEntryPath)
+      ) {
+        files.push(...collectRepositoryTextFiles(entryPath));
+      }
+      continue;
+    }
+    if (entry.isFile() && repositoryTextExtensions.has(path.extname(entry.name))) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+const legacyViolations = [];
+const environmentSetupSource = fs.readFileSync(
+  path.join(repositoryRoot, "scripts", "lib", "env-setup.js"),
+  "utf8"
+);
+for (const helper of legacy2FAHelpers) {
+  const relativePath = `scripts/${helper}`;
+  if (COPY_PATHS.includes(relativePath)) {
+    legacyViolations.push(`${relativePath} remains in COPY_PATHS`);
+  }
+  if (environmentSetupSource.includes(relativePath)) {
+    legacyViolations.push(`${relativePath} remains in the executable-layout list`);
+  }
+  if (fs.existsSync(path.join(repositoryRoot, relativePath))) {
+    legacyViolations.push(`${relativePath} still exists`);
+  }
+}
+for (const filePath of collectRepositoryTextFiles(repositoryRoot)) {
+  const source = fs.readFileSync(filePath, "utf8");
+  for (const helper of legacy2FAHelpers) {
+    if (source.includes(helper)) {
+      legacyViolations.push(
+        `${path.relative(repositoryRoot, filePath)} still references ${helper}`
+      );
+    }
+  }
+}
+assert.deepEqual(
+  legacyViolations,
+  [],
+  `legacy 2FA helper cleanup is incomplete:\n${legacyViolations.join("\n")}`
+);
 
 for (const rel of [
   "scripts/lib/browser-backend.js",
@@ -18,11 +108,11 @@ for (const rel of [
   "scripts/lib/mac-2fa-allow.js",
   "scripts/lib/mac-2fa-ocr.js",
   "scripts/lib/mac-2fa-popup.js",
-  "scripts/apple-2fa-phase.applescript",
   "scripts/swift/mac-2fa-click-allow.swift",
   "scripts/swift/mac-2fa-popup-read.swift",
   "scripts/swift/mac-2fa-popup-ocr.swift",
-  "scripts/2fa-automation-check.applescript",
+  "scripts/lib/manual-2fa-prompt.js",
+  "scripts/test-2fa-settings-code.mjs",
   "scripts/preflight-2fa-permissions.mjs",
   "scripts/bootstrap-macos.sh",
 ]) {
@@ -43,6 +133,7 @@ for (const rel of [
 
 for (const rel of COPY_PATHS) {
   assert.equal(fs.existsSync(new URL(`../${rel}`, import.meta.url)), true, `${rel} does not exist`);
+  assert.equal(rel.startsWith("scripts/bin/"), false, `${rel} must be built on the target Mac`);
 }
 
 const imports = collectRuntimeImports(["scripts/lib/account-browser-flow.js"]);
@@ -66,6 +157,7 @@ assert.equal(pkg.scripts["browser:test-session"], undefined);
 assert.match(pkg.scripts["test:ruyipage-flow"], /test-ruyipage-flow\.mjs/);
 assert.match(pkg.scripts["test:2fa-sidecar"], /test-two-fa-sidecar\.mjs/);
 assert.match(pkg.scripts["test:2fa-settings-unit"], /test-mac-settings-2fa\.mjs/);
+assert.match(pkg.scripts["test:2fa-settings"], /test-2fa-settings-code\.mjs/);
 assert.match(pkg.scripts["test:account-browser-flow"], /test-account-browser-flow\.mjs/);
 
 const releaseImports = collectRuntimeImports([
@@ -77,26 +169,135 @@ for (const rel of releaseImports) {
   assert.ok(COPY_PATHS.includes(rel), `${rel} is imported at runtime but missing from COPY_PATHS`);
 }
 
+const rootInstallSh = fs.readFileSync(new URL("../install.sh", import.meta.url), "utf8");
 const generatedInstallSh = renderInstallSh("test-version");
-for (const helper of [
-  "mac-settings-ax-fill",
+const twoFaAuditSource = fs.readFileSync(
+  new URL("./lib/2fa-audit.js", import.meta.url),
+  "utf8"
+);
+assert.doesNotMatch(
+  twoFaAuditSource,
+  /screenshotPathFor/,
+  "the 2FA audit module must not retain the unused screenshot-path API"
+);
+const requiredSwiftHelpers = [
   "mac-settings-2fa-code",
   "mac-2fa-popup-read",
   "mac-2fa-popup-ocr",
   "mac-2fa-click-allow",
+];
+const compiledSwiftHelpers = [
+  "mac-settings-ax-fill",
+  ...requiredSwiftHelpers,
+];
+const installContractViolations = [];
+if (generatedInstallSh !== rootInstallSh) {
+  installContractViolations.push("generated install.sh differs from repository install.sh");
+}
+for (const [label, installSource] of [
+  ["repository", rootInstallSh],
+  ["generated", generatedInstallSh],
 ]) {
+  const requirePattern = (pattern, reason) => {
+    if (!pattern.test(installSource)) installContractViolations.push(`${label}: ${reason}`);
+  };
+  requirePattern(/swiftc_usable\(\)/, "missing usable swiftc probe");
+  requirePattern(/\/usr\/bin\/xcrun --find swiftc/, "swiftc is not resolved through xcrun");
+  requirePattern(/"\$swiftc_path" --version/, "resolved swiftc is not executed");
+  if (/command -v swiftc/.test(installSource)) {
+    installContractViolations.push(`${label}: accepts a swiftc shim without executing it`);
+  }
+  requirePattern(/ensure_swiftc\(\)/, "missing swiftc dependency function");
+  requirePattern(
+    /\/usr\/bin\/xcode-select --install/,
+    "missing official Xcode Command Line Tools request"
+  );
+  requirePattern(
+    /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/,
+    "missing fixed positive CLT polling bound"
+  );
+  requirePattern(
+    /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/,
+    "missing fixed positive CLT polling interval"
+  );
+  requirePattern(
+    /for \(\( attempt = 1; attempt <= SWIFTC_INSTALL_MAX_ATTEMPTS; attempt\+\+ \)\)/,
+    "CLT polling is not bounded by SWIFTC_INSTALL_MAX_ATTEMPTS"
+  );
+  requirePattern(
+    /错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 \.\/install\.sh。/,
+    "missing fixed rerun error when swiftc remains unavailable"
+  );
+  requirePattern(
+    /validate_required_swift_sources\(\)[\s\S]*\[\[ -f "scripts\/swift\/\$\{helper\}\.swift" \]\]/,
+    "required Swift sources are not validated"
+  );
+  requirePattern(
+    /validate_required_swift_artifacts\(\)[\s\S]*\[\[ -f "scripts\/bin\/\$\{helper\}" && -x "scripts\/bin\/\$\{helper\}" \]\]/,
+    "required Swift artifacts are not validated as executable files"
+  );
+  requirePattern(
+    /mktemp -d "scripts\/bin\/\.swift-helpers\.[A-Za-z0-9_-]*X{6}"/,
+    "Swift helpers are not compiled in a unique scripts/bin temporary directory"
+  );
+  requirePattern(
+    /swift_product_is_executable\(\)[\s\S]*\[\[ -f "\$1" && -x "\$1" \]\]/,
+    "untouched Swift products are not validated as regular executable files"
+  );
+  requirePattern(
+    /compile_swift_helper\(\)[\s\S]*-o "\$output_path"/,
+    "Swift compiler output is not isolated to an uncreated temporary path"
+  );
+  requirePattern(
+    /\/bin\/mv -f -- "\$temp_dir\/\$\{helper\}" "scripts\/bin\/\$\{helper\}"/,
+    "validated Swift products are not atomically replaced on one filesystem"
+  );
+  requirePattern(
+    /cleanup_swift_helper_temp_dir\(\)[\s\S]*\/bin\/rm -f -- "\$temp_dir\/\$\{helper\}"[\s\S]*\/bin\/rmdir "\$temp_dir"/,
+    "Swift temporary products are not removed one file at a time"
+  );
+  if (/\bchmod\b/.test(installSource)) {
+    installContractViolations.push(`${label}: repairs compiler output modes with chmod`);
+  }
+  requirePattern(
+    /ensure_swiftc\s+validate_required_swift_sources\s+compile_swift_helpers\s+validate_required_swift_artifacts/,
+    "Swift dependency, source, compile, and artifact gates are not ordered"
+  );
+  if (/AppleScript.{0,40}回退|回退.{0,40}AppleScript/s.test(installSource)) {
+    installContractViolations.push(`${label}: advertises an AppleScript fallback`);
+  }
+  if (/xcodebuild[^\n]*license|softwareupdate[^\n]*--install|curl[^\n]*(?:swift|xcode)|brew[^\n]*install/i.test(installSource)) {
+    installContractViolations.push(`${label}: contains an unapproved Swift toolchain install path`);
+  }
+  for (const helper of requiredSwiftHelpers) {
+    requirePattern(new RegExp(`"${helper}"`), `${helper} is not a required Swift helper`);
+  }
+}
+assert.deepEqual(
+  installContractViolations,
+  [],
+  `install contract is incomplete:\n${installContractViolations.join("\n")}`
+);
+
+for (const helper of compiledSwiftHelpers) {
   assert.match(
     generatedInstallSh,
-    new RegExp(`swiftc[\\s\\S]*scripts/bin/${helper}[\\s\\S]*scripts/swift/${helper}\\.swift`),
+    new RegExp(`compile_swift_helper "\\$temp_dir" "${helper}"`),
     `${helper} must be compiled by the release install script`
   );
 }
-assert.match(generatedInstallSh, /command -v cliclick/);
+assert.doesNotMatch(generatedInstallSh, /cliclick/);
 assert.match(generatedInstallSh, /setup-environment\.mjs --install-ruyipage/);
 assert.match(generatedInstallSh, /bootstrap_macos_install_runtime/);
 const generatedRunSh = renderRunSh();
 assert.match(generatedRunSh, /--skip-browser/);
+assert.match(generatedRunSh, /--skip-mac/);
 assert.match(generatedRunSh, /--skip-firefox --skip-ruyipage/);
+assert.match(
+  generatedRunSh,
+  /if \[\[ "\$\{skip_mac\}" == "1" \]\]; then[\s\S]*setup_args\+=\(--skip-automation\)[\s\S]*fi/,
+  "release run.sh must skip Mac-login Automation checks for --skip-mac"
+);
 assert.match(generatedRunSh, /preflight-2fa-permissions\.mjs --quiet/);
 assert.match(generatedRunSh, /bootstrap_macos_runtime/);
 assert.doesNotMatch(generatedRunSh, /bootstrap_macos_install_runtime/);
@@ -107,8 +308,19 @@ assert.match(
 );
 
 const rootRunSh = fs.readFileSync(new URL("../run.sh", import.meta.url), "utf-8");
+assert.equal(
+  rootRunSh.replaceAll("\r\n", "\n"),
+  generatedRunSh.replaceAll("\r\n", "\n"),
+  "repository and release run.sh routing must stay identical"
+);
 assert.match(rootRunSh, /--skip-browser/);
+assert.match(rootRunSh, /--skip-mac/);
 assert.match(rootRunSh, /--skip-firefox --skip-ruyipage/);
+assert.match(
+  rootRunSh,
+  /if \[\[ "\$\{skip_mac\}" == "1" \]\]; then[\s\S]*setup_args\+=\(--skip-automation\)[\s\S]*fi/,
+  "repository run.sh must skip Mac-login Automation checks for --skip-mac"
+);
 assert.match(rootRunSh, /bootstrap_macos_runtime/);
 assert.doesNotMatch(rootRunSh, /bootstrap_macos_install_runtime/);
 assert.match(
@@ -129,16 +341,49 @@ assert.match(bootstrapMacOS, /resolve_trusted_python_signer/);
 assert.doesNotMatch(bootstrapMacOS, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -k/);
 assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)/);
+assert.match(setupEnvironment, /process\.argv\.includes\("--skip-automation"\)/);
+assert.match(
+  setupEnvironment,
+  /checkEnvironment\(\{[\s\S]*skipAutomation,[\s\S]*\}\)/,
+  "environment summary must honor the Mac-login Automation skip"
+);
 const envExample = fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8");
 assert.match(envExample, /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
+assert.match(envExample, /BROWSER_2FA_MANUAL_FALLBACK=1/);
 assert.match(envExample, /BROWSER_2FA_POLL_MS=800/);
 assert.doesNotMatch(envExample, /BROWSER_2FA_POPUP_WAIT_MS/);
 
 const releaseBuilder = fs.readFileSync(new URL("./build-release.mjs", import.meta.url), "utf-8");
 assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
 assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
+assert.match(releaseBuilder, /BROWSER_2FA_MANUAL_FALLBACK=1/);
+assert.match(
+  releaseBuilder,
+  /BROWSER_2FA_MANUAL_FALLBACK[^\n]*默认[^\n]*1/,
+  "release README must document the enabled-by-default manual fallback"
+);
+assert.match(
+  releaseBuilder,
+  /--skip-mac[^\n]*不要求[^\n]*自动化/,
+  "release README must preserve the browser-only permission boundary"
+);
+assert.doesNotMatch(
+  releaseBuilder,
+  /2FA 超时[^\n]*辅助功能\/自动化权限/,
+  "release README must not require Automation for browser 2FA"
+);
+assert.doesNotMatch(
+  releaseBuilder,
+  /Screen Recording[^\n]*(?:必须|硬失败)|(?:必须|硬失败)[^\n]*Screen Recording/i,
+  "release README must not make Screen Recording an installation hard failure"
+);
+assert.match(
+  releaseBuilder,
+  /"test:2fa-settings":\s*"node scripts\/test-2fa-settings-code\.mjs"/,
+  "release package must expose the safe Settings smoke command"
+);
 assert.match(releaseBuilder, /BROWSER_2FA_POLL_MS=800/);
 assert.doesNotMatch(releaseBuilder, /BROWSER_2FA_POPUP_WAIT_MS/);
 assert.match(
@@ -149,19 +394,37 @@ assert.match(
   fs.readFileSync(new URL("../docs\/PROJECT.md", import.meta.url), "utf-8"),
   /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/
 );
-assert.match(
-  setupEnvironment,
-  /checkEnvironment\(\{[\s\S]*skipFirefox,[\s\S]*skipRuyiPage,[\s\S]*skip2FAAutomation:/,
-  "setup environment must suppress browser-only checks when the browser phase is skipped"
-);
-
 const environmentSetup = fs.readFileSync(
   new URL("./lib/env-setup.js", import.meta.url),
   "utf-8"
 );
 assert.match(environmentSetup, /if \(!options\.skipFirefox && !firefoxInstalled\(\)\)/);
 assert.match(environmentSetup, /if \(!options\.skipRuyiPage\)/);
-assert.match(environmentSetup, /if \(!options\.skip2FAAutomation && !twoFaAutomation\.granted\)/);
+assert.match(environmentSetup, /if \(!options\.skipAutomation\)/);
+assert.doesNotMatch(environmentSetup, /check2FAAutomationGranted|ensure2FAAutomation/);
+
+const accessibilitySource = fs.readFileSync(
+  new URL("./lib/accessibility.js", import.meta.url),
+  "utf-8"
+);
+assert.doesNotMatch(accessibilitySource, /check2FAAutomationGranted|ensure2FAAutomation/);
+assert.match(
+  accessibilitySource,
+  /run2FAPermissionPreflight[\s\S]*ensureAccessibility/
+);
+assert.doesNotMatch(
+  accessibilitySource,
+  /run2FAPermissionPreflight[\s\S]*ensureAutomation/
+);
+
+const fullFlowSource = fs.readFileSync(
+  new URL("./apple-id-full-flow.mjs", import.meta.url),
+  "utf-8"
+);
+assert.match(
+  fullFlowSource,
+  /ensureEnvironment\(\{[\s\S]*skipAutomation:\s*skipMac/
+);
 
 const browserOrchestrator = fs.readFileSync(
   new URL("./lib/account-browser-flow.js", import.meta.url),

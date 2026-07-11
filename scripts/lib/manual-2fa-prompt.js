@@ -1,0 +1,122 @@
+const FIXED_PROMPT = "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
+
+/**
+ * Read one six-digit ASCII verification code without echoing terminal input.
+ * Returns null when the prompt is unavailable, cancelled, or timed out.
+ *
+ * @param {{
+ *   signal?: AbortSignal,
+ *   timeoutMs: number,
+ *   input?: NodeJS.ReadStream,
+ *   output?: NodeJS.WriteStream,
+ *   setTimeout?: typeof globalThis.setTimeout,
+ *   clearTimeout?: typeof globalThis.clearTimeout,
+ * }} options
+ * @returns {Promise<string|null>}
+ */
+export function promptForHidden2FACode(options) {
+  const {
+    signal,
+    timeoutMs,
+    input = process.stdin,
+    output = process.stdout,
+    setTimeout: schedule = globalThis.setTimeout,
+    clearTimeout: cancel = globalThis.clearTimeout,
+  } = options ?? {};
+
+  if (
+    signal?.aborted ||
+    input?.isTTY !== true ||
+    output?.isTTY !== true ||
+    typeof input.setRawMode !== "function" ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs <= 0
+  ) {
+    return Promise.resolve(null);
+  }
+
+  return new Promise((resolve) => {
+    const wasRaw = Boolean(input.isRaw);
+    const wasPaused = typeof input.isPaused === "function" ? input.isPaused() : false;
+    let entry = "";
+    let settled = false;
+    let timeoutToken = null;
+
+    const restoreInput = () => {
+      input.removeListener("data", onData);
+      input.removeListener("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+      if (timeoutToken != null) cancel(timeoutToken);
+      try {
+        input.setRawMode(wasRaw);
+      } catch {
+        /* terminal may already be detached */
+      }
+      if (wasPaused && typeof input.pause === "function") input.pause();
+      try {
+        output.write("\n");
+      } catch {
+        /* output closure must not block terminal restoration */
+      }
+    };
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      restoreInput();
+      resolve(value);
+    };
+
+    function onAbort() {
+      finish(null);
+    }
+
+    function onError() {
+      finish(null);
+    }
+
+    function onData(chunk) {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk ?? "");
+      for (const character of text) {
+        if (character === "\u0003" || character === "\u001b") {
+          finish(null);
+          return;
+        }
+        if (character === "\u0015") {
+          entry = "";
+          continue;
+        }
+        if (character === "\u007f" || character === "\b") {
+          entry = entry.slice(0, -1);
+          continue;
+        }
+        if (character === "\r" || character === "\n") {
+          if (/^[0-9]{6}$/.test(entry)) {
+            finish(entry);
+            return;
+          }
+          entry = "";
+          continue;
+        }
+        if (character >= "0" && character <= "9") {
+          entry += character;
+        } else if (character >= " ") {
+          entry += "\u0000";
+        }
+      }
+    }
+
+    try {
+      input.setRawMode(true);
+      input.on("data", onData);
+      input.once("error", onError);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      input.resume();
+      output.write(FIXED_PROMPT);
+      timeoutToken = schedule(() => finish(null), timeoutMs);
+      if (typeof timeoutToken?.unref === "function") timeoutToken.unref();
+    } catch {
+      finish(null);
+    }
+  });
+}

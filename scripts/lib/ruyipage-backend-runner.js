@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -11,12 +12,13 @@ import { resolvePythonCommand } from "./ruyipage-runtime.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "../..");
 const DEFAULT_SCRIPT = path.join(ROOT, "scripts", "ruyipage", "apple_account_flow.py");
+const MAX_KILL_GRACE_MS = 5_000;
 
 function parseJsonLine(line) {
   try {
     return JSON.parse(line);
-  } catch (err) {
-    throw new Error(`Invalid JSONL from ruyipage backend: ${line}`);
+  } catch {
+    throw new Error("Invalid JSONL from ruyipage backend");
   }
 }
 
@@ -27,7 +29,14 @@ export function resolveBackendTimeouts(env = process.env) {
   };
   return {
     timeoutMs: positiveNumber(env.RUYIPAGE_BACKEND_TIMEOUT_MS, 720_000),
-    killGraceMs: positiveNumber(env.RUYIPAGE_KILL_GRACE_MS, 5_000),
+    killGraceMs: Math.min(
+      positiveNumber(env.RUYIPAGE_KILL_GRACE_MS, MAX_KILL_GRACE_MS),
+      MAX_KILL_GRACE_MS
+    ),
+    eventHandlerTimeoutMs: positiveNumber(
+      env.RUYIPAGE_EVENT_HANDLER_TIMEOUT_MS,
+      30_000
+    ),
   };
 }
 
@@ -38,7 +47,9 @@ export function resolveBackendTimeouts(env = process.env) {
  *   cwd?: string,
  *   args?: string[],
  *   timeoutMs?: number,
- *   killGraceMs?: number
+ *   killGraceMs?: number,
+ *   eventHandlerTimeoutMs?: number,
+ *   childStopperOptions?: object
  * }} [options]
  */
 export function createRuyiPageBackendRunner(options = {}) {
@@ -51,7 +62,16 @@ export function createRuyiPageBackendRunner(options = {}) {
   const extraArgs = options.args || [];
   const configuredTimeouts = resolveBackendTimeouts();
   const timeoutMs = options.timeoutMs ?? configuredTimeouts.timeoutMs;
-  const killGraceMs = options.killGraceMs ?? configuredTimeouts.killGraceMs;
+  const requestedKillGraceMs = options.killGraceMs ?? configuredTimeouts.killGraceMs;
+  const killGraceMs =
+    Number.isFinite(requestedKillGraceMs) && requestedKillGraceMs > 0
+      ? Math.min(requestedKillGraceMs, MAX_KILL_GRACE_MS)
+      : configuredTimeouts.killGraceMs;
+  const eventHandlerTimeoutMs =
+    Number.isFinite(options.eventHandlerTimeoutMs) && options.eventHandlerTimeoutMs > 0
+      ? options.eventHandlerTimeoutMs
+      : configuredTimeouts.eventHandlerTimeoutMs;
+  const childStopperOptions = options.childStopperOptions ?? {};
 
   return {
     /**
@@ -60,7 +80,7 @@ export function createRuyiPageBackendRunner(options = {}) {
      * @param {string} params.reportDir
      * @param {(event: object) => void|Promise<void>} [params.onEvent]
      * @param {() => Promise<void>} params.prepare2FA
-     * @param {() => Promise<string>} params.get2FACode
+ * @param {(request: {generation: 1|2, rejectPrevious: boolean}) => Promise<string>} params.get2FACode
      */
     run(params) {
       return runRuyiPageBackend({
@@ -70,6 +90,8 @@ export function createRuyiPageBackendRunner(options = {}) {
         args: extraArgs,
         timeoutMs,
         killGraceMs,
+        eventHandlerTimeoutMs,
+        childStopperOptions,
         ...params,
       });
     },
@@ -82,7 +104,34 @@ export function createChildStopper(child, options = {}) {
   const signalProcessGroup = options.signalProcessGroup ?? process.kill;
   const schedule = options.schedule ?? setTimeout;
   const cancel = options.cancel ?? clearTimeout;
+  const now = options.now ?? Date.now;
+  const forceCleanupTimeoutMs =
+    Number.isFinite(options.forceCleanupTimeoutMs) && options.forceCleanupTimeoutMs > 0
+      ? options.forceCleanupTimeoutMs
+      : 2_000;
+  const cleanupPollIntervalMs =
+    Number.isFinite(options.cleanupPollIntervalMs) && options.cleanupPollIntervalMs > 0
+      ? options.cleanupPollIntervalMs
+      : 25;
   let forceTimer = null;
+  let cleanupPollTimer = null;
+  let forceCleanupDeadline = null;
+  let stopRequested = false;
+  let cleanupPending = false;
+  let resolveCleanup = () => {};
+  let rejectCleanup = () => {};
+  let cleanup = Promise.resolve();
+
+  const settleCleanup = (error = null) => {
+    if (!cleanupPending) return;
+    cleanupPending = false;
+    if (forceTimer != null) cancel(forceTimer);
+    if (cleanupPollTimer != null) cancel(cleanupPollTimer);
+    forceTimer = null;
+    cleanupPollTimer = null;
+    if (error) rejectCleanup(error);
+    else resolveCleanup();
+  };
 
   const signal = (signalName) => {
     if (platform !== "win32" && child.pid) {
@@ -100,25 +149,85 @@ export function createChildStopper(child, options = {}) {
     }
   };
 
+  const processGroupIsAlive = () => {
+    if (platform === "win32" || !child.pid) return false;
+    try {
+      signalProcessGroup(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code !== "ESRCH";
+    }
+  };
+
+  const pollProcessGroupAfterForce = () => {
+    if (!cleanupPending) return;
+    if (!processGroupIsAlive()) {
+      settleCleanup();
+      return;
+    }
+    const remainingMs = forceCleanupDeadline - now();
+    if (remainingMs <= 0) {
+      settleCleanup(new Error("ruyipage backend cleanup failed"));
+      return;
+    }
+    try {
+      cleanupPollTimer = schedule(() => {
+        cleanupPollTimer = null;
+        pollProcessGroupAfterForce();
+      }, Math.min(cleanupPollIntervalMs, remainingMs));
+    } catch {
+      settleCleanup(new Error("ruyipage backend cleanup failed"));
+    }
+  };
+
   return {
     stop() {
+      if (stopRequested) return;
+      stopRequested = true;
       try {
         child.stdin.end();
       } catch {
         /* ignore */
       }
       signal(platform === "win32" ? "SIGTERM" : "SIGINT");
-      if (forceTimer == null) {
+      cleanupPending = true;
+      cleanup = new Promise((resolve, reject) => {
+        resolveCleanup = resolve;
+        rejectCleanup = reject;
+      });
+      void cleanup.catch(() => {});
+      try {
         forceTimer = schedule(() => {
+          forceTimer = null;
           signal("SIGKILL");
+          if (platform === "win32" || !child.pid) {
+            settleCleanup();
+            return;
+          }
+          forceCleanupDeadline = now() + forceCleanupTimeoutMs;
+          pollProcessGroupAfterForce();
         }, graceMs);
+      } catch {
+        settleCleanup(new Error("ruyipage backend cleanup failed"));
       }
     },
     cancelForce() {
-      if (forceTimer != null) {
-        cancel(forceTimer);
-        forceTimer = null;
+      if (cleanupPending && !processGroupIsAlive()) {
+        settleCleanup();
       }
+    },
+    stopIfProcessGroupAlive() {
+      if (processGroupIsAlive()) {
+        this.stop();
+        return true;
+      }
+      return false;
+    },
+    waitForCleanup() {
+      if (cleanupPending && !processGroupIsAlive()) {
+        settleCleanup();
+      }
+      return cleanup;
     },
   };
 }
@@ -130,6 +239,8 @@ async function runRuyiPageBackend({
   args,
   timeoutMs,
   killGraceMs,
+  eventHandlerTimeoutMs,
+  childStopperOptions,
   creds,
   reportDir,
   onEvent,
@@ -160,90 +271,272 @@ async function runRuyiPageBackend({
     }
   );
 
-  let stderr = "";
+  const stdoutDecoder = new StringDecoder("utf8");
   let stdoutBuffer = "";
+  let stdoutDecoderEnded = false;
+  const finishStdoutDecoding = () => {
+    if (stdoutDecoderEnded) return;
+    stdoutDecoderEnded = true;
+    stdoutBuffer += stdoutDecoder.end();
+  };
   let finalResult = null;
   let exitCode = null;
   let processingError = null;
   let timedOut = false;
+  let acceptingStdout = true;
   let twoFaPrepared = false;
+  let twoFaGeneration = 0;
+  let childEnded = false;
+  let childError = null;
   /** @type {Promise<void>} */
   let processing = Promise.resolve();
-  const stopper = createChildStopper(child, { graceMs: killGraceMs });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    stopper.stop();
-  }, timeoutMs);
-
-  child.stderr.on("data", (buf) => {
-    stderr += buf.toString();
+  const stopper = createChildStopper(child, {
+    ...childStopperOptions,
+    graceMs: killGraceMs,
   });
+  const stdinWriteRejectors = new Set();
+  let stdinFailure = null;
+  const failStdin = () => {
+    if (stdinFailure) return stdinFailure;
+    stdinFailure = new Error("ruyipage backend stdin failed");
+    processingError ??= stdinFailure;
+    for (const rejectWrite of stdinWriteRejectors) rejectWrite(stdinFailure);
+    stdinWriteRejectors.clear();
+    if (!childEnded) stopper.stop();
+    return stdinFailure;
+  };
+  child.stdin?.on("error", failStdin);
+  let resolveBackendTimeout;
+  const backendTimeoutOutcome = new Promise((resolve) => {
+    resolveBackendTimeout = resolve;
+  });
+  const childOutcome = new Promise((resolve) => {
+    child.once("error", (error) => {
+      childEnded = true;
+      childError = error;
+      resolve({ error, exitCode: null });
+    });
+    child.once("exit", (code) => {
+      childEnded = true;
+      exitCode = code;
+      resolve({ error: null, exitCode: code });
+    });
+  });
+  const childCloseOutcome = new Promise((resolve) => {
+    child.once("close", (code) => {
+      finishStdoutDecoding();
+      exitCode = code;
+      resolve({ error: childError, exitCode: code });
+    });
+  });
+  const terminalError = (outcome) => {
+    if (timedOut) {
+      return new Error(`ruyipage backend timed out after ${timeoutMs}ms`);
+    }
+    if (outcome?.error) return outcome.error;
+    return new Error(`ruyipage backend exited ${outcome?.exitCode ?? "unknown"}`);
+  };
+  const whileChildAlive = async (operation) => {
+    if (childEnded) throw terminalError(await childOutcome);
+    return Promise.race([
+      Promise.resolve().then(operation),
+      childOutcome.then((outcome) => {
+        throw terminalError(outcome);
+      }),
+      backendTimeoutOutcome.then(() => {
+        throw terminalError();
+      }),
+    ]);
+  };
+  const callExternal = (operation, failureMessage) =>
+    Promise.resolve()
+      .then(operation)
+      .catch(() => {
+        throw new Error(failureMessage);
+      });
+  const callOnEvent = async (event) => {
+    if (typeof onEvent !== "function") return;
 
-  child.stdout.on("data", (buf) => {
-    stdoutBuffer += buf.toString();
-    const lines = stdoutBuffer.split(/\r?\n/);
-    stdoutBuffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      processing = processing
-        .then(async () => {
-          const event = parseJsonLine(line);
-          if (onEvent) await onEvent(event);
-          if (event.event === "prepare_2fa") {
-            if (twoFaPrepared) {
-              throw new Error("ruyipage backend requested duplicate 2FA preparation");
-            }
-            if (typeof prepare2FA !== "function") {
-              throw new Error("ruyipage backend requested 2FA preparation without a handler");
-            }
-            await prepare2FA();
-            twoFaPrepared = true;
-            child.stdin.write(JSON.stringify({ type: "2fa_prepared" }) + "\n");
-          } else if (event.event === "need_2fa") {
-            if (!twoFaPrepared) {
-              throw new Error("ruyipage backend requested a 2FA code before preparation");
-            }
-            const code = await get2FACode();
-            child.stdin.write(JSON.stringify({ type: "2fa_code", code }) + "\n");
+    const safeEventNames = new Set(["ready", "prepare_2fa", "need_2fa", "warning", "result"]);
+    const eventName = safeEventNames.has(event?.event) ? event.event : "unknown";
+    let handlerTimer;
+    const handlerOutcome = callExternal(
+      () => onEvent(event),
+      "ruyipage event handler failed"
+    );
+    const handlerTimeout = new Promise((_, reject) => {
+      handlerTimer = setTimeout(() => {
+        reject(
+          new Error(
+            `ruyipage onEvent handler timed out for ${eventName} after ${eventHandlerTimeoutMs}ms`
+          )
+        );
+      }, eventHandlerTimeoutMs);
+    });
+    const candidates = [
+      handlerOutcome,
+      handlerTimeout,
+      backendTimeoutOutcome.then(() => {
+        throw terminalError();
+      }),
+    ];
+    if (event.event !== "result") {
+      candidates.push(
+        childOutcome.then((outcome) => {
+          throw terminalError(outcome);
+        })
+      );
+    }
+
+    try {
+      await Promise.race(candidates);
+    } finally {
+      clearTimeout(handlerTimer);
+    }
+  };
+  const writeCommand = (command) =>
+    whileChildAlive(
+      () =>
+        new Promise((resolve, reject) => {
+          const stdin = child.stdin;
+          let settled = false;
+          const settleWrite = (error = null) => {
+            if (settled) return;
+            settled = true;
+            stdinWriteRejectors.delete(settleWrite);
+            if (error) reject(error);
+            else resolve();
+          };
+          if (stdinFailure) {
+            settleWrite(stdinFailure);
+            return;
           }
-          if (event.event === "result") {
-            finalResult = event;
+          if (!stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+            settleWrite(failStdin());
+            return;
+          }
+          stdinWriteRejectors.add(settleWrite);
+          try {
+            stdin.write(`${JSON.stringify(command)}\n`, (error) => {
+              if (error) failStdin();
+              else settleWrite();
+            });
+          } catch {
+            failStdin();
           }
         })
-        .catch((err) => {
-          processingError = err;
-          stopper.stop();
-        });
-    }
-  });
+    );
+  const timer = setTimeout(() => {
+    timedOut = true;
+    acceptingStdout = false;
+    stopper.stop();
+    resolveBackendTimeout();
+  }, timeoutMs);
 
-  exitCode = await new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("exit", resolve);
-  }).finally(() => {
-    clearTimeout(timer);
-    stopper.cancelForce();
+  child.stderr.resume();
+
+  const processLine = async (line) => {
+    const event = parseJsonLine(line);
+    await callOnEvent(event);
+    if (event?.event === "prepare_2fa") {
+      if (twoFaPrepared) {
+        throw new Error("ruyipage backend requested duplicate 2FA preparation");
+      }
+      if (typeof prepare2FA !== "function") {
+        throw new Error("ruyipage backend requested 2FA preparation without a handler");
+      }
+      await whileChildAlive(() =>
+        callExternal(prepare2FA, "ruyipage 2FA preparation failed")
+      );
+      twoFaPrepared = true;
+      await writeCommand({ type: "2fa_prepared" });
+    } else if (event?.event === "need_2fa") {
+      if (!twoFaPrepared) {
+        throw new Error("ruyipage backend requested a 2FA code before preparation");
+      }
+      const generation = event.generation;
+      if (
+        !Number.isInteger(generation) ||
+        generation < 1 ||
+        generation > 2 ||
+        generation !== twoFaGeneration + 1
+      ) {
+        throw new Error("ruyipage backend sent invalid 2FA generation");
+      }
+      twoFaGeneration = generation;
+      const code = await whileChildAlive(() =>
+        callExternal(
+          () =>
+            get2FACode({
+              generation,
+              rejectPrevious: generation === 2,
+            }),
+          "ruyipage 2FA code provider failed"
+        )
+      );
+      await writeCommand({ type: "2fa_code", generation, code });
+    }
+    if (event?.event === "result") finalResult = event;
+  };
+  const enqueueLine = (line) => {
+    if (!line.trim()) return;
+    processing = processing
+      .then(() => processLine(line))
+      .catch((error) => {
+        processingError ??= error;
+        if (!childEnded) stopper.stop();
+      });
+  };
+
+  child.stdout.on("data", (buf) => {
+    if (!acceptingStdout) return;
+    stdoutBuffer += stdoutDecoder.write(buf);
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) enqueueLine(line);
   });
-  await processing;
-  if (processingError) throw processingError;
+  child.stdout.once("end", finishStdoutDecoding);
+  child.stdout.once("close", finishStdoutDecoding);
+
+  let outcome;
+  try {
+    const completion = await Promise.race([
+      childCloseOutcome.then((value) => ({ type: "close", value })),
+      backendTimeoutOutcome.then(() => ({ type: "timeout" })),
+    ]);
+    if (completion.type === "timeout") {
+      await processing;
+    } else {
+      outcome = completion.value;
+      enqueueLine(stdoutBuffer);
+      stdoutBuffer = "";
+      await processing;
+    }
+  } finally {
+    clearTimeout(timer);
+    try {
+      if (!timedOut) stopper.stopIfProcessGroupAlive();
+      await stopper.waitForCleanup();
+    } finally {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+    }
+  }
   if (timedOut) {
     throw new Error(`ruyipage backend timed out after ${timeoutMs}ms`);
   }
-
-  if (stdoutBuffer.trim()) {
-    const event = parseJsonLine(stdoutBuffer.trim());
-    if (onEvent) await onEvent(event);
-    if (event.event === "result") finalResult = event;
-  }
+  if (processingError) throw processingError;
+  if (outcome.error) throw outcome.error;
 
   if (exitCode !== 0) {
-    throw new Error(`ruyipage backend exited ${exitCode}: ${stderr.trim()}`);
+    throw new Error(`ruyipage backend exited ${exitCode}`);
   }
   if (!finalResult) {
-    throw new Error(`ruyipage backend exited without result: ${stderr.trim()}`);
+    throw new Error("ruyipage backend exited without result");
   }
-  if (finalResult.success === false) {
-    throw new Error(finalResult.error || "ruyipage backend failed");
+  if (finalResult.success !== true) {
+    throw new Error("ruyipage backend failed");
   }
   return finalResult;
 }
