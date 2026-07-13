@@ -26,11 +26,14 @@ The default synchronized run takes an exclusive repository lock. Parallel read-o
 use `--no-sync` only after the Mac HEAD is already the exact pushed Windows SHA; those runs share
 a reader lock and cannot overlap a synchronizing writer.
 
-Mac Codex keeps the repository hard read-only. The only additional writable path exposed to
-sandboxed test commands is the current round's `$REMOTE_ROUND_DIR/tmp`, granted with `--add-dir`
-and exported as `TMPDIR`. Do not broaden that grant to the round root, repository, `$HOME`, or a
-shared system temp directory. The per-round temp directory follows the protected evidence
-lifecycle for that round and is not included in the fixed artifact download list.
+Mac Codex keeps the repository hard read-only. The orchestrator selects a custom permission
+profile that extends `:read-only`; its only write entry is the current round's
+`$REMOTE_ROUND_DIR/tmp`, also exported as `TMPDIR`. Do not replace this with legacy `--add-dir`,
+which does not add writes to the built-in read-only profile. Do not broaden the custom write entry
+to the round root, repository, `$HOME`, or a shared system temp directory. The per-round temp
+directory follows the protected evidence lifecycle and is not in the fixed artifact download list.
+Before model execution, the orchestrator must validate that exact profile with `codex sandbox -P`
+and `--include-managed-config`; a managed-policy conflict must fail closed instead of falling back.
 
 When Mac Codex typechecks Swift inside its sandbox, pass a writable cache explicitly:
 `/usr/bin/xcrun swiftc -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" -typecheck <file>`.

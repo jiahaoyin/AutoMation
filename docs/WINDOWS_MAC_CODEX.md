@@ -162,6 +162,10 @@ web_search = "disabled"
 include_only = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TMPDIR"]
 ```
 
+这里的 `sandbox_mode = "read-only"` 是无人值守 profile 的保守基线。调度器启动每轮任务
+时会通过 session `-c` 显式选择本轮自定义 `default_permissions`；Codex 0.144.3 会按
+permissions profile 语法解析该会话，而不是把仓库切成 legacy workspace-write。
+
 设置权限：
 
 ```bash
@@ -241,13 +245,16 @@ Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 re
 2. 通过 SSH 要求 Mac 仓库 clean。
 3. Codex 启动前由调度器在 Mac 执行受控的 `fetch`、`switch`、`merge --ff-only` 并核对
    相同 SHA；若工作区 dirty、分支分叉或无法 fast-forward，则立即停止。
-4. 以 `/Users/admin/.local/bin/codex exec -p automation -s read-only` 启动 Mac Codex，仓库路径
-   保持硬只读。
-5. 仅通过 `--add-dir` 授予本轮
-   `/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp` 可写权限，并将 `TMPDIR`
-   指向它；不得扩大到 round 根目录、仓库、`$HOME` 或共享系统临时目录。
-6. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
-7. 下载固定八项证据文件到 Windows 并输出一行 JSON 摘要。
+4. 使用 `codex sandbox -P mac_verification --include-managed-config` 做零模型权限预检；
+   若 managed requirements 不允许该 profile，立即失败，不接受静默回退。
+5. 以 `/Users/admin/.local/bin/codex exec -p automation` 启动 Mac Codex，并选择一个继承
+   `:read-only` 的本轮自定义权限 profile，使仓库路径保持硬只读。
+6. 自定义 profile 的唯一 write 条目是
+   `/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp`，同时将 `TMPDIR` 指向它；
+   不使用在内置 read-only 下无写权限效果的 legacy `--add-dir`，也不得扩大到 round
+   根目录、仓库、`$HOME` 或共享系统临时目录。
+7. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
+8. 下载固定八项证据文件到 Windows 并输出一行 JSON 摘要。
 
 ## 8. 阅读测试结果
 
@@ -261,7 +268,7 @@ Windows 产物目录：
 
 | 文件 | 用途 |
 |---|---|
-| `summary.json` | Windows 汇总状态、错误、事件统计、Git 前后状态和全部产物路径 |
+| `summary.json` | Windows 汇总状态、错误、事件统计、Git 前后状态和固定证据路径 |
 | `final.json` | Mac 模型的任务理解、环境观察、命令、测试、发现和 Windows 建议 |
 | `events.jsonl` | Codex 原始 JSONL 执行事件 |
 | `stderr.log` | Codex/工具标准错误 |

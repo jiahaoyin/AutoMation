@@ -160,23 +160,47 @@ assert.match(
   remoteScript,
   /export PATH="\$REMOTE_REPO\/\.runtime\/node\/bin:\$HOME\/\.local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/
 );
-assert.match(remoteScript, /"\$CODEX_BIN" exec -p automation -s read-only/);
+assert.ok(
+  remoteScript.includes(
+    'PERMISSION_PROFILE="{ extends = \\":read-only\\", filesystem = { \\"$RUN_TMP_DIR\\" = \\"write\\" } }"'
+  )
+);
 assert.match(remoteScript, /RUN_TMP_DIR="\$REMOTE_ROUND_DIR\/tmp"/);
 assert.match(remoteScript, /export TMPDIR="\$RUN_TMP_DIR"/);
-assert.match(remoteScript, /--add-dir "\$RUN_TMP_DIR"/);
-assert.equal((remoteScript.match(/--add-dir/g) ?? []).length, 1);
+assert.equal((remoteScript.match(/PERMISSION_PROFILE=/g) ?? []).length, 1);
+assert.equal((remoteScript.match(/permissions\.mac_verification=/g) ?? []).length, 2);
+assert.equal((remoteScript.match(/default_permissions=/g) ?? []).length, 1);
+assert.equal((remoteScript.match(/\n  -c /g) ?? []).length, 3);
+const forbiddenSandboxOverride =
+  /--add-dir|--sandbox(?:=|\s)|--dangerously-bypass-approvals-and-sandbox|(?:^|\s)-s(?:=|\s|read-only|workspace-write|danger-full-access)/;
+for (const unsafeArgument of [
+  "-s read-only",
+  "-s=read-only",
+  "-sread-only",
+]) {
+  assert.match(unsafeArgument, forbiddenSandboxOverride);
+}
+assert.doesNotMatch(remoteScript, forbiddenSandboxOverride);
 assert.match(
   remoteScript,
-  /"\$CODEX_BIN" exec -p automation -s read-only \\\n  --add-dir "\$RUN_TMP_DIR" \\\n  --json/
+  /"\$CODEX_BIN" sandbox -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -P mac_verification \\\n  --include-managed-config \\\n  -C "\$REMOTE_REPO" \\\n  \/usr\/bin\/true/
 );
-assert.doesNotMatch(remoteScript, /--add-dir "\$(?:REMOTE_ROUND_DIR|REMOTE_REPO|HOME)"/);
+assert.match(
+  remoteScript,
+  /"\$CODEX_BIN" exec -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -c 'default_permissions="mac_verification"' \\\n  --json/
+);
+assert.ok(
+  remoteScript.indexOf('"$CODEX_BIN" sandbox -p automation') <
+    remoteScript.indexOf('"$CODEX_BIN" exec -p automation'),
+  "managed permission preflight must pass before Codex exec starts"
+);
 for (const command of [
   '/bin/mkdir -p "$REMOTE_ROUND_DIR"',
   '/bin/chmod 700 "$REMOTE_ROUND_DIR"',
   '/bin/mkdir "$RUN_TMP_DIR"',
   '/bin/chmod 700 "$RUN_TMP_DIR"',
   'export TMPDIR="$RUN_TMP_DIR"',
-  '"$CODEX_BIN" exec -p automation -s read-only',
+  '"$CODEX_BIN" exec -p automation',
 ]) {
   assert.ok(remoteScript.includes(command), `remote script must include: ${command}`);
 }
@@ -190,7 +214,7 @@ assert.ok(
     remoteScript.indexOf('/bin/chmod 700 "$RUN_TMP_DIR"') <
       remoteScript.indexOf('export TMPDIR="$RUN_TMP_DIR"') &&
     remoteScript.indexOf('export TMPDIR="$RUN_TMP_DIR"') <
-      remoteScript.indexOf('"$CODEX_BIN" exec -p automation -s read-only'),
+      remoteScript.indexOf('"$CODEX_BIN" exec -p automation'),
   "private per-round TMPDIR must exist before Codex starts"
 );
 assert.match(remoteScript, /--json/);
