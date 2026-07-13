@@ -11,6 +11,7 @@ import {
   parseArgs,
   runProcess,
   summarizeRun,
+  validateFinalReport,
 } from "./mac-codex-orchestrator.mjs";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000;
@@ -33,6 +34,7 @@ for (const contract of [projectInstructions, operationsGuide]) {
 }
 assert.match(projectInstructions, /Windows is the development host/);
 assert.match(projectInstructions, /Mac is the macOS verification host/);
+assert.match(projectInstructions, /fast-forward/);
 assert.match(projectInstructions, /-module-cache-path/);
 assert.match(operationsGuide, /codex-exit\.txt/);
 assert.match(operationsGuide, /git-before\.txt/);
@@ -40,6 +42,9 @@ assert.match(operationsGuide, /git-after\.txt/);
 assert.match(operationsGuide, /test:2fa-allow/);
 assert.match(operationsGuide, /真实 Apple ID/);
 assert.match(operationsGuide, /-module-cache-path/);
+assert.match(operationsGuide, /sandbox_mode = "read-only"/);
+assert.match(operationsGuide, /umask 077/);
+assert.match(operationsGuide, /30 天/);
 
 function removeTreeOneFileAtATime(directory) {
   if (!fs.existsSync(directory)) return;
@@ -109,6 +114,10 @@ for (const timeout of ["0", "999", "1.5", "abc", "86400001"]) {
   );
 }
 assert.throws(() => parseArgs(["--task", "x", "--unknown"]), /unknown|未知/i);
+assert.throws(
+  () => parseArgs(["--task", "x", "--ssh-alias", "-F"]),
+  /SSH alias/i
+);
 
 const prompt = buildAgentPrompt({ task: "检查中文任务与登录流程" });
 for (const requiredText of [
@@ -151,7 +160,7 @@ assert.match(
   remoteScript,
   /export PATH="\$REMOTE_REPO\/\.runtime\/node\/bin:\$HOME\/\.local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/
 );
-assert.match(remoteScript, /"\$CODEX_BIN" exec -p automation/);
+assert.match(remoteScript, /"\$CODEX_BIN" exec -p automation -s read-only/);
 assert.match(remoteScript, /--json/);
 assert.match(remoteScript, /--output-schema/);
 assert.match(remoteScript, /-o "\$REMOTE_ROUND_DIR\/final\.json"/);
@@ -160,19 +169,46 @@ assert.match(
   /< \/dev\/null[\s\S]*> "\$REMOTE_ROUND_DIR\/events\.jsonl"/,
   "Codex must not consume the remaining SSH script as additional prompt input"
 );
-assert.match(remoteScript, /git fetch origin/);
-assert.match(remoteScript, /git switch -- "\$BRANCH"/);
-assert.match(remoteScript, /git merge --ff-only -- "origin\/\$BRANCH"/);
-assert.match(remoteScript, /git rev-parse HEAD/);
+assert.match(remoteScript, /\/usr\/bin\/git fetch origin/);
+assert.match(remoteScript, /\/usr\/bin\/git switch -- "\$BRANCH"/);
+assert.match(remoteScript, /\/usr\/bin\/git merge --ff-only -- "origin\/\$BRANCH"/);
+assert.match(remoteScript, /\/usr\/bin\/git rev-parse HEAD/);
+assert.doesNotMatch(remoteScript, /(^|\n)git\s/m);
 assert.doesNotMatch(remoteScript, /git\s+(?:reset|clean)\b|rm\s+-[A-Za-z]*r[A-Za-z]*f/i);
+assert.ok(
+  remoteScript.indexOf('/usr/bin/git status') < remoteScript.indexOf('export PATH='),
+  "control-plane Git checks must run before the project runtime enters PATH"
+);
+assert.ok(
+  remoteScript.indexOf("umask 077") < remoteScript.indexOf('/bin/mkdir -p'),
+  "run artifacts must be private from creation"
+);
+assert.match(remoteScript, /LOCK_MODE='writer'/);
+assert.match(remoteScript, /acquire_gate\(\)/);
+assert.match(remoteScript, /cleanup_lock\(\)/);
+assert.match(remoteScript, /trap cleanup_lock EXIT INT TERM/);
+assert.match(remoteScript, /READERS_DIR/);
+assert.match(remoteScript, /WRITER_LOCK/);
+
+const multilineTask = "第一行\r\n第二行 '$(touch nope)' & 结束";
+const multilineScript = buildRemoteScript({ ...remoteOptions, task: multilineTask });
+const multilineBase64 = multilineScript.match(/PROMPT_B64='([A-Za-z0-9+/=]+)'/)?.[1];
+assert.ok(multilineBase64);
+assert.equal(
+  Buffer.from(multilineBase64, "base64").toString("utf8"),
+  buildAgentPrompt({ task: multilineTask })
+);
 
 const noSyncScript = buildRemoteScript({ ...remoteOptions, sync: false });
 assert.doesNotMatch(noSyncScript, /git fetch origin|git switch|git merge/);
 assert.match(noSyncScript, /git rev-parse HEAD/);
+assert.match(noSyncScript, /LOCK_MODE='reader'/);
 
 assert.deepEqual(buildSshArgs({ sshAlias: "mac-codex" }), [
   "-o",
   "BatchMode=yes",
+  "-o",
+  "StrictHostKeyChecking=yes",
   "mac-codex",
   "/bin/zsh",
   "-s",
@@ -184,6 +220,10 @@ assert.deepEqual(
     roundDir: "C:\\runs\\round-02",
   }),
   [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
     "-r",
     `mac-codex:${remoteOptions.remoteRoundDir}/.`,
     "C:\\runs\\round-02",
@@ -239,11 +279,28 @@ function validReport(status = "passed") {
   };
 }
 
+assert.deepEqual(validateFinalReport(validReport()), []);
+const criticalPassedReport = validReport();
+criticalPassedReport.findings.push({
+  severity: "critical",
+  title: "critical review finding",
+  details: "must fail the report",
+});
+assert.ok(
+  validateFinalReport(criticalPassedReport).some((error) => /critical|important/i.test(error))
+);
+const failedTestPassedReport = validReport();
+failedTestPassedReport.tests[0].status = "failed";
+failedTestPassedReport.tests[0].exitCode = 1;
+assert.ok(
+  validateFinalReport(failedTestPassedReport).some((error) => /failed test/i.test(error))
+);
+
 function writeArtifacts(roundDir, overrides = {}) {
   fs.mkdirSync(roundDir, { recursive: true });
   const artifacts = {
     "events.jsonl":
-      '{"type":"thread.started"}\n{"type":"item.completed"}\n',
+      '{"type":"thread.started"}\n{"type":"item.completed"}\n{"type":"turn.completed"}\n',
     "stderr.log": "",
     "final.json": `${JSON.stringify(validReport())}\n`,
     "git-before.txt": "",
@@ -270,10 +327,10 @@ try {
   assert.equal(passed.status, "passed");
   assert.deepEqual(passed.errors, []);
   assert.deepEqual(passed.events, {
-    total: 2,
-    valid: 2,
+    total: 3,
+    valid: 3,
     invalid: 0,
-    byType: { "thread.started": 1, "item.completed": 1 },
+    byType: { "thread.started": 1, "item.completed": 1, "turn.completed": 1 },
   });
   assert.equal(passed.git.changed, false);
   assert.equal(passed.codex.exitCode, 0);
@@ -316,6 +373,18 @@ try {
   assert.ok(
     invalidReport.errors.some((error) => error.code === "invalid_final_report")
   );
+
+  const emptyEventsDir = path.join(artifactRoot, "empty-events");
+  writeArtifacts(emptyEventsDir, { "events.jsonl": "" });
+  const emptyEvents = summarizeRun(emptyEventsDir, processResults);
+  assert.equal(emptyEvents.status, "failed");
+  assert.ok(emptyEvents.errors.some((error) => error.code === "missing_events"));
+
+  const primitiveEventsDir = path.join(artifactRoot, "primitive-events");
+  writeArtifacts(primitiveEventsDir, { "events.jsonl": "42\n" });
+  const primitiveEvents = summarizeRun(primitiveEventsDir, processResults);
+  assert.equal(primitiveEvents.status, "failed");
+  assert.ok(primitiveEvents.errors.some((error) => error.code === "invalid_events"));
 
   const processFailedDir = path.join(artifactRoot, "process-failed");
   writeArtifacts(processFailedDir);

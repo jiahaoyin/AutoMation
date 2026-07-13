@@ -155,11 +155,8 @@ Mac 的常规配置放在 `~/.codex/config.toml`。无人值守测试配置放�
 
 ```toml
 approval_policy = "never"
-sandbox_mode = "workspace-write"
+sandbox_mode = "read-only"
 web_search = "disabled"
-
-[sandbox_workspace_write]
-network_access = false
 
 [shell_environment_policy]
 include_only = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TMPDIR"]
@@ -234,12 +231,17 @@ npm.cmd run -s mac:codex -- --task "识别当前 macOS 环境，运行与本次�
 npm.cmd run -s mac:codex -- --task-file .\mac-test-task.txt --round 1
 ```
 
+默认同步任务持有独占仓库锁。需要并发只读审查时，先用一次默认任务把 Mac 同步到精确
+Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 reader lock，不能与
+后续同步 writer 并发。出现 `Mac repository is busy` 时等待当前任务结束后重试。
+
 调度器会：
 
 1. 检查 Windows 仓库 clean、读取当前分支和 HEAD。
 2. 通过 SSH 要求 Mac 仓库 clean。
-3. 在 Mac 执行 `fetch`、`switch`、`merge --ff-only` 并核对相同 SHA。
-4. 以 `/Users/admin/.local/bin/codex exec -p automation` 启动 Mac Codex。
+3. Codex 启动前由调度器在 Mac 执行受控的 `fetch`、`switch`、`merge --ff-only` 并核对
+   相同 SHA；若工作区 dirty、分支分叉或无法 fast-forward，则立即停止。
+4. 以 `/Users/admin/.local/bin/codex exec -p automation -s read-only` 启动 Mac Codex。
 5. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
 6. 下载全部产物到 Windows 并输出一行 JSON 摘要。
 
@@ -265,6 +267,10 @@ Windows 产物目录：
 
 只有以下条件同时满足，顶层 `status` 才是 `passed`：SSH 和 scp 成功、Codex 退出 0、
 JSONL 与 `final.json` 有效、报告状态通过、Mac Git 状态和 HEAD 未变化。
+
+远端调度器使用 `umask 077`，run 目录为 0700，产物文件为 0600。运行证据默认保留
+30 天；本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐文件、逐目录
+清理。调度器不会自动递归删除历史证据。
 
 ## 9. Windows 修复 -> Mac 重测循环
 

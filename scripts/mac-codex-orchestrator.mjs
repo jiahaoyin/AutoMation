@@ -96,7 +96,7 @@ export function parseArgs(argv) {
 
   const task = (taskFile === undefined ? taskText : fs.readFileSync(taskFile, "utf8")).trim();
   if (!task) throw new Error("Task must not be empty");
-  if (!/^[A-Za-z0-9._-]+$/.test(sshAlias)) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(sshAlias)) {
     throw new Error(`Invalid SSH alias: ${sshAlias}`);
   }
   if (!remoteRepo.startsWith("/") || /[\r\n]/.test(remoteRepo)) {
@@ -140,6 +140,10 @@ function validateRemoteValue(value, label) {
   if (!value || /[\r\n\0]/.test(value)) throw new Error(`Invalid ${label}`);
 }
 
+function validateTask(value) {
+  if (!value || value.includes("\0")) throw new Error("Invalid task");
+}
+
 export function buildRemoteScript(options) {
   const {
     task,
@@ -149,8 +153,8 @@ export function buildRemoteScript(options) {
     branch,
     expectedHead,
   } = options;
+  validateTask(task);
   for (const [value, label] of [
-    [task, "task"],
     [remoteRepo, "remote repository"],
     [remoteRoundDir, "remote round directory"],
     [branch, "branch"],
@@ -160,42 +164,112 @@ export function buildRemoteScript(options) {
   }
 
   const promptBase64 = Buffer.from(buildAgentPrompt(options), "utf8").toString("base64");
+  const runToken = crypto
+    .createHash("sha256")
+    .update(remoteRoundDir)
+    .digest("hex")
+    .slice(0, 24);
+  const lockMode = sync ? "writer" : "reader";
   const syncCommands = sync
     ? [
-        "git fetch origin",
-        'git switch -- "$BRANCH"',
-        'git merge --ff-only -- "origin/$BRANCH"',
+        "/usr/bin/git fetch origin",
+        '/usr/bin/git switch -- "$BRANCH"',
+        '/usr/bin/git merge --ff-only -- "origin/$BRANCH"',
       ]
     : [];
 
   return [
     "#!/bin/zsh",
     "set -euo pipefail",
+    "umask 077",
     `REMOTE_REPO=${shellQuote(remoteRepo)}`,
     `REMOTE_ROUND_DIR=${shellQuote(remoteRoundDir)}`,
     `BRANCH=${shellQuote(branch)}`,
     `EXPECTED_HEAD=${shellQuote(expectedHead)}`,
     `CODEX_BIN=${shellQuote(CODEX_BIN)}`,
     `PROMPT_B64=${shellQuote(promptBase64)}`,
+    `RUN_TOKEN=${shellQuote(runToken)}`,
+    `LOCK_MODE=${shellQuote(lockMode)}`,
     'SCHEMA_PATH="$REMOTE_REPO/scripts/mac-codex-report.schema.json"',
+    'LOCK_ROOT="$HOME/.codex-orchestrator/locks/apple-automation"',
+    'GATE_LOCK="$LOCK_ROOT/gate"',
+    'WRITER_LOCK="$LOCK_ROOT/writer"',
+    'READERS_DIR="$LOCK_ROOT/readers"',
+    'RUN_READER="$READERS_DIR/$RUN_TOKEN"',
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=0",
+    "acquire_gate() {",
+    "  local attempt=0",
+    '  while ! /bin/mkdir "$GATE_LOCK" 2>/dev/null; do',
+    "    attempt=$((attempt + 1))",
+    '    if (( attempt >= 300 )); then print -u2 -- "Timed out acquiring repository gate"; return 1; fi',
+    "    /bin/sleep 0.1",
+    "  done",
+    "}",
+    "release_gate() {",
+    '  /bin/rmdir "$GATE_LOCK" 2>/dev/null || true',
+    "}",
+    "cleanup_lock() {",
+    '  local mode="$LOCK_MODE"',
+    "  if (( GATE_HELD == 1 )); then release_gate; GATE_HELD=0; fi",
+    "  (( LOCK_ACQUIRED == 1 )) || return 0",
+    "  LOCK_MODE=''",
+    "  acquire_gate || return 0",
+    "  GATE_HELD=1",
+    '  if [[ "$mode" == "writer" ]]; then',
+    '    /bin/rmdir "$WRITER_LOCK" 2>/dev/null || true',
+    "  else",
+    '    /bin/rm -f "$RUN_READER"',
+    "  fi",
+    "  LOCK_ACQUIRED=0",
+    "  release_gate",
+    "  GATE_HELD=0",
+    "}",
+    '/bin/mkdir -p "$READERS_DIR"',
+    '/bin/chmod 700 "$LOCK_ROOT" "$READERS_DIR"',
+    "acquire_gate || exit 22",
+    "GATE_HELD=1",
+    'if [[ "$LOCK_MODE" == "writer" ]]; then',
+    '  reader_files=("$READERS_DIR"/*(N))',
+    '  if [[ -d "$WRITER_LOCK" ]] || (( ${#reader_files[@]} > 0 )); then',
+    '    print -u2 -- "Mac repository is busy with another Codex run"',
+    "    release_gate",
+    "    GATE_HELD=0",
+    "    exit 22",
+    "  fi",
+    '  /bin/mkdir "$WRITER_LOCK"',
+    "else",
+    '  if [[ -d "$WRITER_LOCK" ]]; then',
+    '    print -u2 -- "Mac repository is busy with a synchronizing Codex run"',
+    "    release_gate",
+    "    GATE_HELD=0",
+    "    exit 22",
+    "  fi",
+    '  /usr/bin/touch "$RUN_READER"',
+    "fi",
+    "LOCK_ACQUIRED=1",
+    "trap cleanup_lock EXIT INT TERM",
+    "release_gate",
+    "GATE_HELD=0",
     '/bin/mkdir -p "$REMOTE_ROUND_DIR"',
     'cd "$REMOTE_REPO"',
-    'export PATH="$REMOTE_REPO/.runtime/node/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
-    'if [[ -n "$(git status --porcelain)" ]]; then',
+    'if [[ -n "$(/usr/bin/git status --porcelain)" ]]; then',
     '  print -u2 -- "Mac repository is not clean"',
     "  exit 20",
     "fi",
     ...syncCommands,
-    'CURRENT_HEAD="$(git rev-parse HEAD)"',
+    'CURRENT_HEAD="$(/usr/bin/git rev-parse HEAD)"',
     'if [[ "$CURRENT_HEAD" != "$EXPECTED_HEAD" ]]; then',
     '  print -u2 -- "Mac HEAD does not match the Windows HEAD"',
     "  exit 21",
     "fi",
-    'git status --porcelain=v1 > "$REMOTE_ROUND_DIR/git-before.txt"',
-    'git rev-parse HEAD > "$REMOTE_ROUND_DIR/head-before.txt"',
+    '/bin/chmod 700 "$REMOTE_ROUND_DIR"',
+    '/usr/bin/git status --porcelain=v1 > "$REMOTE_ROUND_DIR/git-before.txt"',
+    '/usr/bin/git rev-parse HEAD > "$REMOTE_ROUND_DIR/head-before.txt"',
+    'export PATH="$REMOTE_REPO/.runtime/node/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
     'PROMPT="$(printf \'%s\' "$PROMPT_B64" | /usr/bin/base64 -D)"',
     "set +e",
-    '"$CODEX_BIN" exec -p automation \\',
+    '"$CODEX_BIN" exec -p automation -s read-only \\',
     "  --json \\",
     '  --output-schema "$SCHEMA_PATH" \\',
     '  -o "$REMOTE_ROUND_DIR/final.json" \\',
@@ -207,19 +281,35 @@ export function buildRemoteScript(options) {
     "CODEX_EXIT=$?",
     "set -e",
     'printf \'%s\\n\' "$CODEX_EXIT" > "$REMOTE_ROUND_DIR/codex-exit.txt"',
-    'git status --porcelain=v1 > "$REMOTE_ROUND_DIR/git-after.txt"',
-    'git rev-parse HEAD > "$REMOTE_ROUND_DIR/head-after.txt"',
+    '/usr/bin/git status --porcelain=v1 > "$REMOTE_ROUND_DIR/git-after.txt"',
+    '/usr/bin/git rev-parse HEAD > "$REMOTE_ROUND_DIR/head-after.txt"',
     "exit 0",
     "",
   ].join("\n");
 }
 
 export function buildSshArgs({ sshAlias }) {
-  return ["-o", "BatchMode=yes", sshAlias, "/bin/zsh", "-s"];
+  return [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    sshAlias,
+    "/bin/zsh",
+    "-s",
+  ];
 }
 
 export function buildScpArgs({ sshAlias, remoteRoundDir, roundDir }) {
-  return ["-r", `${sshAlias}:${remoteRoundDir}/.`, roundDir];
+  return [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-r",
+    `${sshAlias}:${remoteRoundDir}/.`,
+    roundDir,
+  ];
 }
 
 export function runProcess(command, args, options = {}) {
@@ -390,6 +480,20 @@ export function validateFinalReport(report) {
     errors
   );
   if (!["passed", "failed"].includes(report.status)) errors.push("report.status is invalid");
+  if (
+    report.status === "passed" &&
+    Array.isArray(report.findings) &&
+    report.findings.some((finding) => ["critical", "important"].includes(finding.severity))
+  ) {
+    errors.push("report.status cannot be passed with critical or important findings");
+  }
+  if (
+    report.status === "passed" &&
+    Array.isArray(report.tests) &&
+    report.tests.some((test) => test.status === "failed")
+  ) {
+    errors.push("report.status cannot be passed with a failed test");
+  }
   return errors;
 }
 
@@ -420,6 +524,7 @@ function countEvents(source) {
     summary.total += 1;
     try {
       const event = JSON.parse(line);
+      if (!isPlainObject(event)) throw new Error("event must be an object");
       summary.valid += 1;
       const type =
         (typeof event?.type === "string" && event.type) ||
@@ -467,6 +572,12 @@ export function summarizeRun(roundDir, processResults = {}) {
     events = countEvents(readArtifact(artifacts.events));
     if (events.invalid > 0) {
       errors.push({ code: "invalid_events", message: "events.jsonl contains invalid JSON" });
+    }
+    if (events.valid === 0 || (events.byType["turn.completed"] ?? 0) === 0) {
+      errors.push({
+        code: "missing_events",
+        message: "events.jsonl has no valid completed Codex turn",
+      });
     }
   }
 

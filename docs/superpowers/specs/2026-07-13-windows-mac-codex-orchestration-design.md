@@ -76,7 +76,7 @@ npm.cmd run -s mac:codex -- --task "检查当前改动并运行相关 macOS 测�
 ## 配置与安全边界
 
 - SSH 继续使用固定 ED25519 主机指纹、专用密钥和来源限制。
-- Codex 使用 `approval_policy = "never"`、`sandbox_mode = "workspace-write"`、
+- Codex 使用 `approval_policy = "never"`、`sandbox_mode = "read-only"`、
   `web_search = "disabled"`，模型 shell 网络关闭。
 - Git 同步由调度器在 Codex 外完成；Codex 本身不得访问网络。
 - 自动化调用使用绝对 Codex 路径，不能依赖非登录 SSH 的 PATH。
