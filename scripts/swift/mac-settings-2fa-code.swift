@@ -131,7 +131,9 @@ func treeContainsExactText(_ root: AXUIElement, names: [String], maxNodes: Int =
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
         visited += 1
-        if hasExactName(node, names: names) { return true }
+        if axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil,
+           hasExactName(node, names: names) { return true }
         queue.append(contentsOf: axChildren(node))
     }
     return false
@@ -176,6 +178,7 @@ func findExactButton(
         visited += 1
         if axRole(node) == kAXButtonRole as String,
            elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
            axBool(node, kAXEnabledAttribute as String) == true,
            supportsPressAction(node),
            hasExactName(node, names: names),
@@ -193,22 +196,32 @@ func findExactButton(
 }
 
 func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
+    guard let focusedWindow: AXUIElement = axCopy(
+        appElement,
+        kAXFocusedWindowAttribute as String
+    ) else { return [] }
     var dialogs: [AXUIElement] = []
-    let windows = collectWindows(appElement: appElement)
-    for window in windows {
-        var queue = axChildren(window)
-        var visited = 0
-        while !queue.isEmpty && visited < 1_200 {
-            let node = queue.removeFirst()
-            visited += 1
-            let role = axRole(node)
-            if role == kAXSheetRole as String || role == "AXDialog" || role == kAXPopoverRole as String {
-                dialogs.append(node)
-            }
-            queue.append(contentsOf: axChildren(node))
-        }
+    if isDedicatedDialogWindow(focusedWindow),
+       axBool(focusedWindow, kAXHiddenAttribute as String) != true,
+       axFrame(focusedWindow) != nil {
+        dialogs.append(focusedWindow)
     }
-    return Array(dialogs.reversed()) + windows
+    var queue = axChildren(focusedWindow)
+    var visited = 0
+    while !queue.isEmpty && visited < 1_200 {
+        let node = queue.removeFirst()
+        visited += 1
+        let role = axRole(node)
+        let isDialog = role == "AXDialog" ||
+            (role == kAXWindowRole as String && isDedicatedDialogWindow(node))
+        if (role == kAXSheetRole as String || isDialog || role == kAXPopoverRole as String),
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil {
+            dialogs.append(node)
+        }
+        queue.append(contentsOf: axChildren(node))
+    }
+    return Array(dialogs.reversed())
 }
 
 func findVerificationCodeAlertRoot(
@@ -288,6 +301,8 @@ func findGetCodeButton(
     twoFactorNames: [String],
     buttonNames: [String]
 ) -> AXUIElement? {
+    guard let focusedWindow = focusedWindowForProcess(expectedPid) else { return nil }
+    var matches: [AXUIElement] = []
     for root in collectSheetRoots(appElement) {
         guard elementBelongsToProcess(root, pid: expectedPid),
               treeContainsExactText(root, names: twoFactorNames) else { continue }
@@ -295,11 +310,13 @@ func findGetCodeButton(
             in: root,
             names: buttonNames,
             expectedPid: expectedPid
-        ) {
-            return button
+        ), axWindowForElement(button) == focusedWindow {
+            if !matches.contains(where: { $0 == button }) {
+                matches.append(button)
+            }
         }
     }
-    return nil
+    return matches.count == 1 ? matches[0] : nil
 }
 
 func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
@@ -501,7 +518,13 @@ func clickElementAtVerifiedFrame(
     return true
 }
 
-func clickNamed(in root: AXUIElement, names: [String], maxNodes: Int = 700) -> Bool {
+func clickNamed(
+    in root: AXUIElement,
+    names: [String],
+    expectedPid: pid_t,
+    maxNodes: Int = 700
+) -> Bool {
+    guard let focusedWindow = focusedWindowForProcess(expectedPid) else { return false }
     var queue: [AXUIElement] = [root]
     var visited = 0
     while !queue.isEmpty && visited < maxNodes {
@@ -510,12 +533,15 @@ func clickNamed(in root: AXUIElement, names: [String], maxNodes: Int = 700) -> B
         let role = axRole(node)
         let blob = axDescription(node)
         let matched = names.contains { blob == $0 || blob.contains($0) }
-        if matched {
-            if role == kAXButtonRole as String || role == "AXLink" || role == kAXMenuItemRole as String {
-                if pressElement(node) { return true }
-            } else if pressElement(node) {
-                return true
-            }
+        if matched,
+           elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axBool(node, kAXEnabledAttribute as String) == true,
+           supportsPressAction(node),
+           axFrame(node) != nil,
+           axWindowForElement(node) == focusedWindow,
+           pressElement(node) {
+            return true
         }
         if isContainerRole(role) || visited <= 3 {
             queue.append(contentsOf: axChildren(node))
@@ -739,18 +765,42 @@ let twoFactor = ["双重认证", "雙重認證", "Two-Factor Authentication", "�
 let getCodeBtn = ["获取验证码", "取得驗證碼", "Get Verification Code", "Get a Verification Code"]
 
 stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
-logStep(3, "click Sign-In & Security")
-guard clickNamed(in: appElement, names: signInSecurity) else {
-    emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found"))
-}
-cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
+if findGetCodeButton(
+    appElement: appElement,
+    expectedPid: settingsPid,
+    twoFactorNames: twoFactor,
+    buttonNames: getCodeBtn
+) != nil {
+    logStep(3, "Sign-In & Security already open")
+    logStep(4, "Two-Factor Authentication already open")
+} else {
+    logStep(3, "click Sign-In & Security")
+    if clickNamed(in: appElement, names: signInSecurity, expectedPid: settingsPid) {
+        cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
+    }
 
-stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
-logStep(4, "click Two-Factor Authentication")
-guard clickNamed(in: appElement, names: twoFactor) else {
-    emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
+    stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
+    if findGetCodeButton(
+        appElement: appElement,
+        expectedPid: settingsPid,
+        twoFactorNames: twoFactor,
+        buttonNames: getCodeBtn
+    ) != nil {
+        logStep(4, "Two-Factor Authentication already open")
+    } else {
+        logStep(4, "click Two-Factor Authentication")
+        if !clickNamed(in: appElement, names: twoFactor, expectedPid: settingsPid),
+           findGetCodeButton(
+               appElement: appElement,
+               expectedPid: settingsPid,
+               twoFactorNames: twoFactor,
+               buttonNames: getCodeBtn
+           ) == nil {
+            emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
+        }
+        cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
+    }
 }
-cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
 
 stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 logStep(5, "click Get Verification Code")

@@ -678,6 +678,23 @@ function runStrictVerificationCodeSourceContractTest() {
     /clickNamed|blob\.contains|AXLink|kAXMenuItemRole/,
     "Get Verification Code must use the strict button path"
   );
+  assert.match(getCodeFinder, /focusedWindowForProcess\(expectedPid\)/);
+  assert.match(getCodeFinder, /axWindowForElement\(button\)\s*==\s*focusedWindow/);
+  const sheetRoots = functionBody("collectSheetRoots");
+  assert.match(sheetRoots, /kAXFocusedWindowAttribute/);
+  assert.match(sheetRoots, /kAXHiddenAttribute/);
+  assert.match(sheetRoots, /isDedicatedDialogWindow\(focusedWindow\)/);
+  assert.match(sheetRoots, /kAXWindowRole[\s\S]*isDedicatedDialogWindow\(node\)/);
+  assert.doesNotMatch(sheetRoots, /collectWindows\(/);
+
+  const navigationClick = functionBody("clickNamed");
+  assert.match(navigationClick, /expectedPid/);
+  assert.match(navigationClick, /focusedWindowForProcess\(expectedPid\)/);
+  assert.match(navigationClick, /kAXHiddenAttribute/);
+  assert.match(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}==\s*true/);
+  assert.doesNotMatch(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}!=\s*false/);
+  assert.match(navigationClick, /supportsPressAction\(node\)/);
+  assert.match(navigationClick, /axWindowForElement\(node\)\s*==\s*focusedWindow/);
 
   const request = functionBody("requestVerificationCodeAlert");
   const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
@@ -993,6 +1010,19 @@ function runTraditionalChineseStateContractTest() {
   assert.match(source, /let signInSecurity\s*=\s*\[[^\]]*"登入與安全性"/);
   assert.match(source, /let twoFactor\s*=\s*\[[^\]]*"雙重認證"/);
   assert.match(source, /let getCodeBtn\s*=\s*\[[^\]]*"取得驗證碼"/);
+
+  const resumeProbe = source.indexOf("if findGetCodeButton(", source.indexOf("let getCodeBtn"));
+  const signInClick = source.indexOf("clickNamed(in: appElement, names: signInSecurity,");
+  assert.ok(
+    resumeProbe >= 0 && resumeProbe < signInClick,
+    "Settings navigation must resume an already-open Two-Factor Authentication sheet"
+  );
+  assert.match(source.slice(resumeProbe, signInClick), /Two-Factor Authentication already open/);
+  assert.doesNotMatch(
+    source.slice(signInClick, source.lastIndexOf("requestVerificationCodeAlert(")),
+    /treeContainsExactText\(appElement/,
+    "resumed navigation must not trust hidden application-tree text"
+  );
 
   const getCodeRequest = source.lastIndexOf("requestVerificationCodeAlert(");
   const scan = source.indexOf("scanCodeFromAlertOnly(", getCodeRequest);
