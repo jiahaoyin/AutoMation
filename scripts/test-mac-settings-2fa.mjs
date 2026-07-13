@@ -731,7 +731,13 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /focusedWindowForProcess\(expectedPid\)[\s\S]{0,180}kAXHiddenAttribute[\s\S]{0,120}axFrame\(focusedWindow\)/);
   assert.doesNotMatch(activation, /AXUIElementPerformAction\(window,\s*kAXRaiseAction/);
   assert.match(activation, /pid=/);
-  assert.match(activation, /role=/);
+  assert.match(activation, /roleWindow=/);
+  assert.match(activation, /roleEmpty=/);
+  assert.match(activation, /roleSheet=/);
+  assert.match(activation, /roleGroup=/);
+  assert.match(activation, /roleOther=/);
+  assert.match(activation, /hidden=/);
+  assert.match(activation, /frameMissing=/);
   assert.match(activation, /unhidden=/);
   assert.match(activation, /framed=/);
   assert.match(activation, /minimized=/);

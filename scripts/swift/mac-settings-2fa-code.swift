@@ -702,6 +702,12 @@ func activateSystemSettings(
     var lastUnhiddenCount = 0
     var lastFramedCount = 0
     var lastMinimizedCount = 0
+    var lastRoleEmptyCount = 0
+    var lastRoleSheetCount = 0
+    var lastRoleGroupCount = 0
+    var lastRoleOtherCount = 0
+    var lastHiddenCount = 0
+    var lastFrameMissingCount = 0
     repeat {
         if let focusedWindow = focusedWindowForProcess(expectedPid),
            axBool(focusedWindow, kAXHiddenAttribute as String) != true,
@@ -750,6 +756,22 @@ func activateSystemSettings(
         lastMinimizedCount = roleWindows.filter {
             axBool($0, kAXMinimizedAttribute as String) == true
         }.count
+        lastRoleEmptyCount = pidWindows.filter { axRole($0).isEmpty }.count
+        lastRoleSheetCount = pidWindows.filter {
+            axRole($0) == kAXSheetRole as String
+        }.count
+        lastRoleGroupCount = pidWindows.filter {
+            axRole($0) == kAXGroupRole as String
+        }.count
+        lastRoleOtherCount = max(
+            0,
+            pidWindows.count - lastRoleEmptyCount - lastRoleCount -
+                lastRoleSheetCount - lastRoleGroupCount
+        )
+        lastHiddenCount = pidWindows.filter {
+            axBool($0, kAXHiddenAttribute as String) == true
+        }.count
+        lastFrameMissingCount = pidWindows.filter { axFrame($0) == nil }.count
         let target = dialogs.count == 1
             ? dialogs[0]
             : mainWindows.count == 1
@@ -777,7 +799,7 @@ func activateSystemSettings(
 
     logStep(
         1,
-        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) pid=\(lastPidCount) role=\(lastRoleCount) unhidden=\(lastUnhiddenCount) framed=\(lastFramedCount) minimized=\(lastMinimizedCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
+        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) pid=\(lastPidCount) roleWindow=\(lastRoleCount) roleEmpty=\(lastRoleEmptyCount) roleSheet=\(lastRoleSheetCount) roleGroup=\(lastRoleGroupCount) roleOther=\(lastRoleOtherCount) hidden=\(lastHiddenCount) frameMissing=\(lastFrameMissingCount) unhidden=\(lastUnhiddenCount) framed=\(lastFramedCount) minimized=\(lastMinimizedCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
     )
     return false
 }
