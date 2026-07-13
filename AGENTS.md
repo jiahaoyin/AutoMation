@@ -21,6 +21,8 @@ npm.cmd run -s mac:codex -- --task "Describe the macOS checks and tests to run"
 For long UTF-8 instructions, use `--task-file <path>`. Use `--round 2`, `--round 3`, and so on
 for repair/retest iterations. Read the returned JSON and the `summary.json`, `final.json`,
 `events.jsonl`, and `stderr.log` paths before deciding the next Windows change.
+Treat unchanged evidence as insufficient: both Mac Git status files must be empty and both HEAD
+files must equal the exact Windows SHA for the round.
 
 The default synchronized run takes an exclusive repository lock. Parallel read-only reviews may
 use `--no-sync` only after the Mac HEAD is already the exact pushed Windows SHA; those runs share

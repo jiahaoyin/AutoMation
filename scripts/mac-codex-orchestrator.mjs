@@ -268,6 +268,10 @@ export function buildRemoteScript(options) {
     '  print -u2 -- "Mac HEAD does not match the Windows HEAD"',
     "  exit 21",
     "fi",
+    'if [[ -n "$(/usr/bin/git status --porcelain)" ]]; then',
+    '  print -u2 -- "Mac repository is not clean after synchronization"',
+    "  exit 20",
+    "fi",
     '/usr/bin/git status --porcelain=v1 > "$REMOTE_ROUND_DIR/git-before.txt"',
     '/usr/bin/git rev-parse HEAD > "$REMOTE_ROUND_DIR/head-before.txt"',
     'export PATH="$REMOTE_REPO/.runtime/node/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"',
@@ -552,7 +556,7 @@ function countEvents(source) {
   return summary;
 }
 
-export function summarizeRun(roundDir, processResults = {}) {
+export function summarizeRun(roundDir, processResults = {}, expectedHead) {
   const artifacts = {
     events: path.join(roundDir, "events.jsonl"),
     stderr: path.join(roundDir, "stderr.log"),
@@ -565,6 +569,14 @@ export function summarizeRun(roundDir, processResults = {}) {
     summary: path.join(roundDir, "summary.json"),
   };
   const errors = [];
+  const expectedHeadIsValid =
+    typeof expectedHead === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead);
+  if (!expectedHeadIsValid) {
+    errors.push({
+      code: "invalid_expected_head",
+      message: "Expected Windows HEAD is missing or invalid",
+    });
+  }
   const missing = REQUIRED_ARTIFACTS.filter(
     (name) => !fs.existsSync(path.join(roundDir, name))
   );
@@ -631,6 +643,20 @@ export function summarizeRun(roundDir, processResults = {}) {
     (gitBefore !== gitAfter || headBefore !== headAfter);
   if (gitChanged) {
     errors.push({ code: "git_changed", message: "Mac Git state changed during Codex execution" });
+  }
+  if ((gitBefore !== null && gitBefore !== "") || (gitAfter !== null && gitAfter !== "")) {
+    errors.push({ code: "git_dirty", message: "Mac repository was not clean during verification" });
+  }
+  if (
+    expectedHeadIsValid &&
+    headBefore !== null &&
+    headAfter !== null &&
+    (headBefore !== expectedHead || headAfter !== expectedHead)
+  ) {
+    errors.push({
+      code: "head_mismatch",
+      message: "Mac HEAD evidence does not match the expected Windows HEAD",
+    });
   }
 
   let codexExitCode = null;
@@ -723,7 +749,7 @@ export async function runCli(argv = process.argv.slice(2)) {
   );
   if (scp.stderr.trim()) console.error(scp.stderr.trim());
 
-  const summary = summarizeRun(roundDir, { ssh, scp });
+  const summary = summarizeRun(roundDir, { ssh, scp }, expectedHead);
   fs.writeFileSync(summary.artifacts.summary, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   process.stdout.write(`${JSON.stringify(summary)}\n`);
   if (summary.status !== "passed") process.exitCode = 1;

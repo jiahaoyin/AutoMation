@@ -16,6 +16,7 @@ import {
 
 const DEFAULT_TIMEOUT_MS = 1_800_000;
 const DEFAULT_REMOTE_REPO = "/Users/admin/Desktop/Apple-AutoMation";
+const EXPECTED_HEAD = "0123456789abcdef0123456789abcdef01234567";
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
   "utf8"
@@ -145,7 +146,7 @@ const remoteOptions = {
   remoteRepo: DEFAULT_REMOTE_REPO,
   remoteRoundDir: "/Users/admin/.codex-orchestrator/runs/run-test/mac/round-02",
   branch: "codex/ruyipage-risk-reduction",
-  expectedHead: "0123456789abcdef",
+  expectedHead: EXPECTED_HEAD,
 };
 const remoteScript = buildRemoteScript(remoteOptions);
 const promptBase64 = remoteScript.match(/PROMPT_B64='([A-Za-z0-9+/=]+)'/)?.[1];
@@ -229,6 +230,16 @@ assert.match(remoteScript, /\/usr\/bin\/git fetch origin/);
 assert.match(remoteScript, /\/usr\/bin\/git switch -- "\$BRANCH"/);
 assert.match(remoteScript, /\/usr\/bin\/git merge --ff-only -- "origin\/\$BRANCH"/);
 assert.match(remoteScript, /\/usr\/bin\/git rev-parse HEAD/);
+const postSyncCleanCheck = 'Mac repository is not clean after synchronization';
+assert.ok(
+  remoteScript.indexOf(postSyncCleanCheck) >
+    remoteScript.indexOf('Mac HEAD does not match the Windows HEAD') &&
+    remoteScript.indexOf(postSyncCleanCheck) >
+      remoteScript.indexOf('/usr/bin/git merge --ff-only -- "origin/$BRANCH"') &&
+    remoteScript.indexOf(postSyncCleanCheck) <
+      remoteScript.indexOf('"$CODEX_BIN" exec -p automation'),
+  "Mac repository cleanliness must be rechecked after synchronization and HEAD verification, before Codex exec"
+);
 assert.doesNotMatch(remoteScript, /(^|\n)git\s/m);
 assert.doesNotMatch(remoteScript, /git\s+(?:reset|clean)\b|rm\s+-[A-Za-z]*r[A-Za-z]*f/i);
 assert.ok(
@@ -374,8 +385,8 @@ function writeArtifacts(roundDir, overrides = {}) {
     "final.json": `${JSON.stringify(validReport())}\n`,
     "git-before.txt": "",
     "git-after.txt": "",
-    "head-before.txt": "0123456789abcdef\n",
-    "head-after.txt": "0123456789abcdef\n",
+    "head-before.txt": `${EXPECTED_HEAD}\n`,
+    "head-after.txt": `${EXPECTED_HEAD}\n`,
     "codex-exit.txt": "0\n",
     ...overrides,
   };
@@ -392,7 +403,7 @@ const artifactRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mac-codex-summary-")
 try {
   const passedDir = path.join(artifactRoot, "passed");
   writeArtifacts(passedDir);
-  const passed = summarizeRun(passedDir, processResults);
+  const passed = summarizeRun(passedDir, processResults, EXPECTED_HEAD);
   assert.equal(passed.status, "passed");
   assert.deepEqual(passed.errors, []);
   assert.deepEqual(passed.events, {
@@ -408,20 +419,53 @@ try {
 
   const changedDir = path.join(artifactRoot, "changed");
   writeArtifacts(changedDir, { "git-after.txt": " M scripts/file.mjs\n" });
-  const changed = summarizeRun(changedDir, processResults);
+  const changed = summarizeRun(changedDir, processResults, EXPECTED_HEAD);
   assert.equal(changed.status, "failed");
   assert.equal(changed.git.changed, true);
   assert.ok(changed.errors.some((error) => error.code === "git_changed"));
 
+  const dirtyBothDir = path.join(artifactRoot, "dirty-both");
+  writeArtifacts(dirtyBothDir, {
+    "git-before.txt": " M scripts/file.mjs\n",
+    "git-after.txt": " M scripts/file.mjs\n",
+  });
+  const dirtyBoth = summarizeRun(dirtyBothDir, processResults, EXPECTED_HEAD);
+  assert.equal(dirtyBoth.status, "failed");
+  assert.equal(dirtyBoth.git.changed, false);
+  assert.ok(dirtyBoth.errors.some((error) => error.code === "git_dirty"));
+
+  const wrongHeadDir = path.join(artifactRoot, "wrong-head");
+  const wrongHead = "fedcba9876543210fedcba9876543210fedcba98";
+  writeArtifacts(wrongHeadDir, {
+    "head-before.txt": `${wrongHead}\n`,
+    "head-after.txt": `${wrongHead}\n`,
+  });
+  const wrongHeadSummary = summarizeRun(wrongHeadDir, processResults, EXPECTED_HEAD);
+  assert.equal(wrongHeadSummary.status, "failed");
+  assert.equal(wrongHeadSummary.git.changed, false);
+  assert.ok(wrongHeadSummary.errors.some((error) => error.code === "head_mismatch"));
+
+  const missingExpectedHead = summarizeRun(passedDir, processResults);
+  assert.equal(missingExpectedHead.status, "failed");
+  assert.ok(
+    missingExpectedHead.errors.some((error) => error.code === "invalid_expected_head")
+  );
+
+  const invalidExpectedHead = summarizeRun(passedDir, processResults, "not-a-git-head");
+  assert.equal(invalidExpectedHead.status, "failed");
+  assert.ok(
+    invalidExpectedHead.errors.some((error) => error.code === "invalid_expected_head")
+  );
+
   const codexFailedDir = path.join(artifactRoot, "codex-failed");
   writeArtifacts(codexFailedDir, { "codex-exit.txt": "17\n" });
-  const codexFailed = summarizeRun(codexFailedDir, processResults);
+  const codexFailed = summarizeRun(codexFailedDir, processResults, EXPECTED_HEAD);
   assert.equal(codexFailed.status, "failed");
   assert.ok(codexFailed.errors.some((error) => error.code === "codex_failed"));
 
   const missingDir = path.join(artifactRoot, "missing");
   writeArtifacts(missingDir, { "final.json": null });
-  const missing = summarizeRun(missingDir, processResults);
+  const missing = summarizeRun(missingDir, processResults, EXPECTED_HEAD);
   assert.equal(missing.status, "failed");
   assert.ok(missing.errors.some((error) => error.code === "missing_artifact"));
 
@@ -429,7 +473,7 @@ try {
   writeArtifacts(failedReportDir, {
     "final.json": `${JSON.stringify(validReport("failed"))}\n`,
   });
-  const failedReport = summarizeRun(failedReportDir, processResults);
+  const failedReport = summarizeRun(failedReportDir, processResults, EXPECTED_HEAD);
   assert.equal(failedReport.status, "failed");
   assert.ok(failedReport.errors.some((error) => error.code === "report_failed"));
 
@@ -437,7 +481,7 @@ try {
   writeArtifacts(invalidReportDir, {
     "final.json": '{"status":"passed"}\n',
   });
-  const invalidReport = summarizeRun(invalidReportDir, processResults);
+  const invalidReport = summarizeRun(invalidReportDir, processResults, EXPECTED_HEAD);
   assert.equal(invalidReport.status, "failed");
   assert.ok(
     invalidReport.errors.some((error) => error.code === "invalid_final_report")
@@ -445,22 +489,26 @@ try {
 
   const emptyEventsDir = path.join(artifactRoot, "empty-events");
   writeArtifacts(emptyEventsDir, { "events.jsonl": "" });
-  const emptyEvents = summarizeRun(emptyEventsDir, processResults);
+  const emptyEvents = summarizeRun(emptyEventsDir, processResults, EXPECTED_HEAD);
   assert.equal(emptyEvents.status, "failed");
   assert.ok(emptyEvents.errors.some((error) => error.code === "missing_events"));
 
   const primitiveEventsDir = path.join(artifactRoot, "primitive-events");
   writeArtifacts(primitiveEventsDir, { "events.jsonl": "42\n" });
-  const primitiveEvents = summarizeRun(primitiveEventsDir, processResults);
+  const primitiveEvents = summarizeRun(primitiveEventsDir, processResults, EXPECTED_HEAD);
   assert.equal(primitiveEvents.status, "failed");
   assert.ok(primitiveEvents.errors.some((error) => error.code === "invalid_events"));
 
   const processFailedDir = path.join(artifactRoot, "process-failed");
   writeArtifacts(processFailedDir);
-  const processFailed = summarizeRun(processFailedDir, {
-    ssh: { exitCode: 255, timedOut: false },
-    scp: { exitCode: 1, timedOut: true },
-  });
+  const processFailed = summarizeRun(
+    processFailedDir,
+    {
+      ssh: { exitCode: 255, timedOut: false },
+      scp: { exitCode: 1, timedOut: true },
+    },
+    EXPECTED_HEAD
+  );
   assert.equal(processFailed.status, "failed");
   assert.ok(processFailed.errors.some((error) => error.code === "ssh_failed"));
   assert.ok(processFailed.errors.some((error) => error.code === "scp_failed"));

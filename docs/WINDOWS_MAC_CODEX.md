@@ -278,7 +278,9 @@ Windows 产物目录：
 | Mac 端 `tmp/` | 每轮独立的沙箱临时目录；唯一额外可写路径，不在固定证据回传清单中 |
 
 只有以下条件同时满足，顶层 `status` 才是 `passed`：SSH 和 scp 成功、Codex 退出 0、
-JSONL 与 `final.json` 有效、报告状态通过、Mac Git 状态和 HEAD 未变化。
+JSONL 与 `final.json` 有效、报告状态通过、Mac 前后 Git 状态都为空，并且前后 HEAD 都
+严格等于本轮 Windows 推送的 expected SHA。仅仅“前后同样脏”或“前后同样是错误
+HEAD”也必须失败。
 
 远端调度器使用 `umask 077`；round 与 `tmp` 目录为 0700，普通新建文件默认为 0600。
 `tmp/` 只保留在 Mac，不会被固定八项证据文件的 scp 清单下载到 Windows；它采用同一

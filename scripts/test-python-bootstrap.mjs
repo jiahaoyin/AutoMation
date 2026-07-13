@@ -72,10 +72,26 @@ const signerFunction = bootstrap.match(
   /resolve_trusted_python_signer\(\)\s*\{([\s\S]*?)\n\}/
 )?.[1];
 assert.ok(signerFunction, "trusted Python signer resolver is required");
+const forbiddenSignerTempConstruct =
+  /<<<|<<-?|[<>]\s*\(|\bmktemp\b|\/(?:var\/)?tmp(?:\/|\b)|\$\{?TMPDIR\}?/;
+for (const unsafeConstruct of [
+  '<<< "${signature}"',
+  "<<EOF",
+  "<<-EOF",
+  "< <(printf '%s' value)",
+  "> >(cat)",
+  "mktemp signer.XXXXXX",
+  "/tmp/signer",
+  "/var/tmp/signer",
+  "$TMPDIR/signer",
+  "${TMPDIR}/signer",
+]) {
+  assert.match(unsafeConstruct, forbiddenSignerTempConstruct);
+}
 assert.doesNotMatch(
   signerFunction,
-  /<<<\s*"\$signature"/,
-  "signer parsing must not ask Bash to create a here-string temp file"
+  forbiddenSignerTempConstruct,
+  "signer parsing must not use shell constructs or paths that create temporary files"
 );
 assert.doesNotMatch(bootstrap, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/pkgutil --check-signature/);
@@ -350,32 +366,65 @@ try {
    Certificate Chain:
     1. ${identity}
     2. Developer ID Certification Authority`;
-  for (const teamId of ["BMM5U3QVKW", "DJ3H93M7VJ"]) {
-    const signatureResult = spawnSync(
+  const runSigner = (signature) =>
+    spawnSync(
       bash,
       [
         "-lc",
-        `${source}; resolve_trusted_python_signer ` +
-          `${bashQuote(signatureFor(`Developer ID Installer: Python Software Foundation (${teamId})`))}`,
+        `${source}; resolve_trusted_python_signer ${bashQuote(signature)}`,
       ],
       { encoding: "utf-8" }
+    );
+  for (const teamId of ["BMM5U3QVKW", "DJ3H93M7VJ"]) {
+    const signatureResult = runSigner(
+      signatureFor(`Developer ID Installer: Python Software Foundation (${teamId})`)
     );
     assert.equal(signatureResult.status, 0, signatureResult.stderr);
     assert.match(signatureResult.stdout, new RegExp(`\\(${teamId}\\)`));
   }
-  for (const identity of [
-    "Developer ID Installer: Other Publisher (BMM5U3QVKW)",
-    "Developer ID Installer: Python Software Foundation (SHORT1234)",
+  const trustedIdentity =
+    "Developer ID Installer: Python Software Foundation (BMM5U3QVKW)";
+  for (const [name, signature] of [
+    ["single line", `1. ${trustedIdentity}`],
+    ["LF multiline without trailing newline", signatureFor(trustedIdentity)],
+    ["LF multiline with trailing newline", `${signatureFor(trustedIdentity)}\n`],
+    [
+      "consecutive empty lines",
+      `\n\n${signatureFor(trustedIdentity).replaceAll("\n", "\n\n")}\n\n`,
+    ],
+    [
+      "CRLF multiline",
+      `${signatureFor(trustedIdentity).replaceAll("\n", "\r\n")}\r\n`,
+    ],
   ]) {
-    const signatureResult = spawnSync(
-      bash,
-      [
-        "-lc",
-        `${source}; resolve_trusted_python_signer ${bashQuote(signatureFor(identity))}`,
-      ],
-      { encoding: "utf-8" }
-    );
-    assert.notEqual(signatureResult.status, 0, `unexpectedly trusted: ${identity}`);
+    const signatureResult = runSigner(signature);
+    assert.equal(signatureResult.status, 0, `${name}: ${signatureResult.stderr}`);
+    assert.equal(signatureResult.stdout.trim(), trustedIdentity, name);
+  }
+  for (const [name, signature] of [
+    ["empty input", ""],
+    [
+      "other publisher",
+      signatureFor("Developer ID Installer: Other Publisher (BMM5U3QVKW)"),
+    ],
+    [
+      "short team ID",
+      signatureFor(
+        "Developer ID Installer: Python Software Foundation (SHORT1234)"
+      ),
+    ],
+    [
+      "lowercase team ID",
+      signatureFor(
+        "Developer ID Installer: Python Software Foundation (bmm5u3qvkw)"
+      ),
+    ],
+    ["same-line prefix", `prefix 1. ${trustedIdentity}`],
+    ["same-line suffix", `1. ${trustedIdentity} suffix`],
+    ["wrong chain position", `2. ${trustedIdentity}`],
+  ]) {
+    const signatureResult = runSigner(signature);
+    assert.notEqual(signatureResult.status, 0, `unexpectedly trusted ${name}`);
   }
   const oldResult = spawnSync(
     bash,
