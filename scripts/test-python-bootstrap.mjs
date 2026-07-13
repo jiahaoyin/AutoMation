@@ -25,6 +25,10 @@ for (const source of [rootInstall, generatedInstall]) {
   assert.match(source, /\/usr\/bin\/xcrun --find swiftc/);
   assert.match(source, /"\$swiftc_path" --version/);
   assert.doesNotMatch(source, /command -v swiftc/);
+  assert.match(
+    source,
+    /mac-2fa-popup-ocr[\s\S]*?-framework ScreenCaptureKit[\s\S]*?mac-2fa-click-allow/
+  );
   assert.match(source, /\/usr\/bin\/xcode-select --install/);
   assert.match(source, /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/);
   assert.match(source, /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/);
@@ -314,12 +318,20 @@ for (const helper of swiftHelpers) {
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "python-bootstrap-test-"));
 const oldPython = path.join(tempDir, "python-old");
 const supportedPython = path.join(tempDir, "python-supported");
+const untrustedPython = path.join(tempDir, "python-untrusted");
+const untrustedMarker = path.join(tempDir, "python-untrusted-executed");
 const frameworkBin = path.join(tempDir, "framework-bin");
 const frameworkPython = path.join(frameworkBin, "python3");
 try {
   fs.mkdirSync(frameworkBin);
   fs.writeFileSync(oldPython, "#!/bin/bash\necho 'Python 3.9.18'\n", { mode: 0o755 });
   fs.writeFileSync(supportedPython, "#!/bin/bash\necho 'Python 3.12.10'\n", { mode: 0o755 });
+  fs.writeFileSync(
+    untrustedPython,
+    `#!/bin/bash\nprintf 'executed\\n' > ${bashQuote(toBashPath(untrustedMarker))}\n` +
+      "echo 'Python 3.12.10'\n",
+    { mode: 0o755 }
+  );
   fs.writeFileSync(frameworkPython, "#!/bin/bash\necho 'Python 3.12.10'\n", { mode: 0o755 });
   const bootstrapPath = fileURLToPath(new URL("./bootstrap-macos.sh", import.meta.url));
   const source = `source ${bashQuote(toBashPath(bootstrapPath))}`;
@@ -389,14 +401,17 @@ try {
     [
       "-lc",
       `${source}; python_path_is_admin_trusted() { return 1; }; ` +
-        `PYTHON_BOOTSTRAP_EXECUTABLE=${bashQuote(toBashPath(supportedPython))}; ` +
+        `PYTHON_BOOTSTRAP_EXECUTABLE=${bashQuote(toBashPath(untrustedPython))}; ` +
+        `PYTHON_FRAMEWORK_BIN=${bashQuote(toBashPath(frameworkBin))}; ` +
         "resolve_supported_python",
     ],
     { encoding: "utf-8" }
   );
-  assert.notEqual(
-    untrustedResult.status,
-    0,
+  assert.equal(untrustedResult.status, 0, untrustedResult.stderr);
+  assert.equal(untrustedResult.stdout.trim(), toBashPath(frameworkPython));
+  assert.equal(
+    fs.existsSync(untrustedMarker),
+    false,
     "an untrusted interpreter must not execute while sudo authorization is active"
   );
 
@@ -428,6 +443,8 @@ try {
 } finally {
   if (fs.existsSync(oldPython)) fs.unlinkSync(oldPython);
   if (fs.existsSync(supportedPython)) fs.unlinkSync(supportedPython);
+  if (fs.existsSync(untrustedPython)) fs.unlinkSync(untrustedPython);
+  if (fs.existsSync(untrustedMarker)) fs.unlinkSync(untrustedMarker);
   if (fs.existsSync(frameworkPython)) fs.unlinkSync(frameworkPython);
   if (fs.existsSync(frameworkBin)) fs.rmdirSync(frameworkBin);
   fs.rmdirSync(tempDir);

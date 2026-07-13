@@ -1194,7 +1194,7 @@ test("Swift center-crop OCR resets on empty or changed captures", () => {
   assert.match(observe, /states\[windowID\] = CenterCandidateState[\s\S]*return false/);
   assert.match(
     mainLoop,
-    /guard let cg = captureDialog\(target\) else \{[\s\S]*reset\(windowID: wid\)[\s\S]*continue/
+    /guard let cg = await captureDialog\(target\) else \{[\s\S]*reset\(windowID: wid\)[\s\S]*continue/
   );
   assert.match(
     mainLoop,
@@ -1264,7 +1264,7 @@ test("popup production modules use only the constrained Swift helper", () => {
   }
 });
 
-test("OCR capture is window-id-only and stays in CoreGraphics memory", () => {
+test("OCR capture is window-id-only and stays in ScreenCaptureKit memory", () => {
   const capture = sourceFunctionBody(
     popupOcrSwiftSource,
     "func captureWindowByID"
@@ -1272,11 +1272,16 @@ test("OCR capture is window-id-only and stays in CoreGraphics memory", () => {
   const dispatch = sourceFunctionBody(popupOcrSwiftSource, "func captureDialog");
 
   assert.doesNotMatch(popupOcrSwiftSource, /captureRectScreencapture|paddedFrame/);
+  assert.match(popupOcrSwiftSource, /import ScreenCaptureKit/);
+  assert.match(ocrSource, /"ScreenCaptureKit"/);
+  assert.doesNotMatch(popupOcrSwiftSource, /CGWindowListCreateImage/);
   assert.match(dispatch, /guard let wid = target\.windowID/);
-  assert.match(dispatch, /captureWindowByID\(wid\)/);
-  assert.match(capture, /CGWindowListCreateImage/);
-  assert.match(capture, /optionIncludingWindow/);
-  assert.match(capture, /\bwid\b/);
+  assert.match(dispatch, /await captureWindowByID\(wid\)/);
+  assert.match(capture, /SCShareableContent\.excludingDesktopWindows/);
+  assert.match(capture, /\$0\.windowID == wid/);
+  assert.match(capture, /SCContentFilter\(desktopIndependentWindow: window\)/);
+  assert.match(capture, /SCScreenshotManager\.captureImage/);
+  assert.match(capture, /configuration\.showsCursor = false/);
   assert.doesNotMatch(
     popupOcrSwiftSource,
     /\bProcess\s*\(|screencapture|waitUntilExit|NSTemporaryDirectory|FileManager\.default|\.png/

@@ -33,11 +33,13 @@ for (const contract of [projectInstructions, operationsGuide]) {
 }
 assert.match(projectInstructions, /Windows is the development host/);
 assert.match(projectInstructions, /Mac is the macOS verification host/);
+assert.match(projectInstructions, /-module-cache-path/);
 assert.match(operationsGuide, /codex-exit\.txt/);
 assert.match(operationsGuide, /git-before\.txt/);
 assert.match(operationsGuide, /git-after\.txt/);
 assert.match(operationsGuide, /test:2fa-allow/);
 assert.match(operationsGuide, /真实 Apple ID/);
+assert.match(operationsGuide, /-module-cache-path/);
 
 function removeTreeOneFileAtATime(directory) {
   if (!fs.existsSync(directory)) return;
@@ -145,10 +147,19 @@ assert.equal(
 );
 assert.doesNotMatch(remoteScript, /检查中文任务与登录流程/);
 assert.match(remoteScript, /CODEX_BIN='\/Users\/admin\/\.local\/bin\/codex'/);
+assert.match(
+  remoteScript,
+  /export PATH="\$REMOTE_REPO\/\.runtime\/node\/bin:\$HOME\/\.local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/
+);
 assert.match(remoteScript, /"\$CODEX_BIN" exec -p automation/);
 assert.match(remoteScript, /--json/);
 assert.match(remoteScript, /--output-schema/);
 assert.match(remoteScript, /-o "\$REMOTE_ROUND_DIR\/final\.json"/);
+assert.match(
+  remoteScript,
+  /< \/dev\/null[\s\S]*> "\$REMOTE_ROUND_DIR\/events\.jsonl"/,
+  "Codex must not consume the remaining SSH script as additional prompt input"
+);
 assert.match(remoteScript, /git fetch origin/);
 assert.match(remoteScript, /git switch -- "\$BRANCH"/);
 assert.match(remoteScript, /git merge --ff-only -- "origin\/\$BRANCH"/);

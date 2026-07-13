@@ -6,6 +6,7 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import ScreenCaptureKit
 import Vision
 
 struct Output: Codable {
@@ -263,18 +264,33 @@ func findCodeDialogs() -> [DialogTarget] {
     return out
 }
 
-func captureWindowByID(_ wid: CGWindowID) -> CGImage? {
-    CGWindowListCreateImage(
-        .null,
-        [.optionIncludingWindow],
-        wid,
-        [.boundsIgnoreFraming, .bestResolution]
-    )
+func captureWindowByID(_ wid: CGWindowID) async -> CGImage? {
+    do {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        )
+        guard let window = content.windows.first(where: { $0.windowID == wid }) else {
+            return nil
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let configuration = SCStreamConfiguration()
+        let scale = CGFloat(filter.pointPixelScale)
+        configuration.width = max(1, Int(filter.contentRect.width * scale))
+        configuration.height = max(1, Int(filter.contentRect.height * scale))
+        configuration.showsCursor = false
+        return try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+    } catch {
+        return nil
+    }
 }
 
-func captureDialog(_ target: DialogTarget) -> CGImage? {
+func captureDialog(_ target: DialogTarget) async -> CGImage? {
     guard let wid = target.windowID else { return nil }
-    return captureWindowByID(wid)
+    return await captureWindowByID(wid)
 }
 
 func ocrLines(from cgImage: CGImage, level: VNRequestTextRecognitionLevel) -> [String] {
@@ -412,7 +428,7 @@ while Date() < deadline {
         guard let wid = target.windowID else { continue }
         guard capturedWindowIDs.insert(wid).inserted else { continue }
         logStep("code dialog found")
-        guard let cg = captureDialog(target) else {
+        guard let cg = await captureDialog(target) else {
             centerCandidateTracker.reset(windowID: wid)
             logStep("window capture failed")
             continue

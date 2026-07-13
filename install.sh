@@ -108,7 +108,8 @@ compile_swift_helpers() {
     ! compile_swift_helper "$temp_dir" "mac-2fa-popup-read" \
       -framework ApplicationServices -framework AppKit ||
     ! compile_swift_helper "$temp_dir" "mac-2fa-popup-ocr" \
-      -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics ||
+      -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
+      -framework ScreenCaptureKit ||
     ! compile_swift_helper "$temp_dir" "mac-2fa-click-allow" \
       -framework ApplicationServices -framework AppKit; then
     cleanup_swift_helper_temp_dir "$temp_dir"

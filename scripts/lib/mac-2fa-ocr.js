@@ -62,6 +62,8 @@ function compileOcrHelper(sourcePath, binaryPath, options = {}) {
         "Vision",
         "-framework",
         "CoreGraphics",
+        "-framework",
+        "ScreenCaptureKit",
       ],
       { encoding: "utf-8" }
     );

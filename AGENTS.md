@@ -21,6 +21,9 @@ For long UTF-8 instructions, use `--task-file <path>`. Use `--round 2`, `--round
 for repair/retest iterations. Read the returned JSON and the `summary.json`, `final.json`,
 `events.jsonl`, and `stderr.log` paths before deciding the next Windows change.
 
+When Mac Codex typechecks Swift inside its sandbox, pass a writable cache explicitly:
+`/usr/bin/xcrun swiftc -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" -typecheck <file>`.
+
 Do not run manual 2FA, a real Apple account flow, `test:2fa-allow` manual mode, or tests that need
 unattended GUI confirmation. Those require an explicitly supervised Mac session.
 

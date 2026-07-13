@@ -294,6 +294,14 @@ npm.cmd run -s mac:codex -- --task-file .\mac-test-task.txt --round 2
 - ruyiPage/协议/sidecar/辅助功能 helper 的纯单元测试
 - Swift helper 的 `xcrun swiftc -typecheck`
 
+Mac Codex 沙箱内的 Swift typecheck 应显式增加可写模块缓存：
+
+```bash
+/usr/bin/xcrun swiftc \
+  -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" \
+  -typecheck scripts/swift/<helper>.swift
+```
+
 默认禁止：
 
 - `npm run test:2fa-allow` 的人工模式
