@@ -68,82 +68,236 @@ func isContainerRole(_ role: String) -> Bool {
         .contains(role)
 }
 
-func extractSixDigit(_ text: String) -> String? {
-    let digits = text.filter(\.isNumber)
-    guard digits.count >= 6 else { return nil }
-    return String(digits.prefix(6))
+let exactTextAttributes = [
+    kAXTitleAttribute as String,
+    kAXDescriptionAttribute as String,
+    kAXValueAttribute as String,
+]
+
+let verificationAlertTitles = [
+    "Apple 账户验证码",
+    "Apple 帳戶驗證碼",
+    "Apple 帳號驗證碼",
+    "Apple Account Verification Code",
+    "Apple ID Verification Code",
+]
+
+let verificationAlertCloseButtons = ["好", "OK"]
+
+func normalizedAXText(_ text: String) -> String {
+    text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
 }
 
-func looksLikeFormattedCode(_ text: String) -> Bool {
-    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    return t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil
+func axExactTexts(_ element: AXUIElement) -> [String] {
+    exactTextAttributes
+        .compactMap { axString(element, $0) }
+        .map(normalizedAXText)
+        .filter { !$0.isEmpty }
 }
 
-func hasSettingsCodeAlert(_ blob: String) -> Bool {
-    if blob.contains("Apple 账户验证码") { return true }
-    if blob.contains("账户验证码") && (blob.contains("好") || blob.contains("OK")) { return true }
-    if blob.contains("Apple 帳戶驗證碼") || blob.contains("Apple 帳號驗證碼") { return true }
-    if (blob.contains("帳戶驗證碼") || blob.contains("帳號驗證碼")) && (blob.contains("好") || blob.contains("OK")) { return true }
-    if blob.lowercased().contains("verification code") && (blob.contains("OK") || blob.contains("好")) { return true }
-    if blob.contains("验证码") && blob.contains("好") { return true }
-    if blob.contains("驗證碼") && blob.contains("好") { return true }
+func hasExactName(_ element: AXUIElement, names: [String]) -> Bool {
+    let expected = Set(names.map(normalizedAXText))
+    return axExactTexts(element).contains(where: expected.contains)
+}
+
+func sixDigitCodeCandidates(_ text: String) -> Set<String> {
+    let candidate = normalizedAXText(text)
+    let pattern = #"(?<![0-9])(?:[0-9]{3} [0-9]{3}|[0-9]{6})(?![0-9])"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    let fullRange = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+    var codes = Set<String>()
+    for match in regex.matches(in: candidate, range: fullRange) {
+        guard let range = Range(match.range, in: candidate) else { continue }
+        codes.insert(String(candidate[range]).replacingOccurrences(of: " ", with: ""))
+    }
+    return codes
+}
+
+func axParent(_ element: AXUIElement) -> AXUIElement? {
+    axCopy(element, kAXParentAttribute as String)
+}
+
+func isDedicatedDialogWindow(_ element: AXUIElement) -> Bool {
+    guard axRole(element) == kAXWindowRole as String else { return false }
+    let subrole = axString(element, kAXSubroleAttribute as String) ?? ""
+    return subrole == "AXDialog" ||
+        subrole == "AXSystemDialog" ||
+        axBool(element, kAXModalAttribute as String) == true
+}
+
+func treeContainsExactText(_ root: AXUIElement, names: [String], maxNodes: Int = 900) -> Bool {
+    var queue: [AXUIElement] = [root]
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        visited += 1
+        if hasExactName(node, names: names) { return true }
+        queue.append(contentsOf: axChildren(node))
+    }
     return false
 }
 
-func blobDeep(_ root: AXUIElement, maxNodes: Int = 800) -> String {
+func elementBelongsToProcess(_ element: AXUIElement, pid: pid_t) -> Bool {
+    var elementPid: pid_t = 0
+    return AXUIElementGetPid(element, &elementPid) == .success && elementPid == pid
+}
+
+func supportsPressAction(_ element: AXUIElement) -> Bool {
+    var actions: CFArray?
+    guard AXUIElementCopyActionNames(element, &actions) == .success,
+          let names = actions as? [String] else { return false }
+    return names.contains(kAXPressAction as String)
+}
+
+func axFrame(_ element: AXUIElement) -> CGRect? {
+    guard let position = axPoint(element, attribute: kAXPositionAttribute as String),
+          let size = axSize(element, attribute: kAXSizeAttribute as String),
+          position.x.isFinite,
+          position.y.isFinite,
+          size.width.isFinite,
+          size.height.isFinite,
+          size.width >= 8,
+          size.height >= 8 else { return nil }
+    return CGRect(origin: position, size: size)
+}
+
+func findExactButton(
+    in root: AXUIElement,
+    names: [String],
+    expectedPid: pid_t,
+    maxNodes: Int = 900
+) -> AXUIElement? {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
     var queue: [AXUIElement] = [root]
     var visited = 0
-    var blob = ""
+    var matches: [AXUIElement] = []
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
         visited += 1
-        blob += " " + axDescription(node)
-        if isContainerRole(axRole(node)) || visited <= 3 {
+        if axRole(node) == kAXButtonRole as String,
+           elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXEnabledAttribute as String) == true,
+           supportsPressAction(node),
+           hasExactName(node, names: names),
+           let frame = axFrame(node),
+           frame.width <= 1_000,
+           frame.height <= 200,
+           pointIsOnActiveDisplay(CGPoint(x: frame.midX, y: frame.midY)) {
+            if !matches.contains(where: { $0 == node }) {
+                matches.append(node)
+            }
+        }
+        queue.append(contentsOf: axChildren(node))
+    }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
+    var dialogs: [AXUIElement] = []
+    let windows = collectWindows(appElement: appElement)
+    for window in windows {
+        var queue = axChildren(window)
+        var visited = 0
+        while !queue.isEmpty && visited < 1_200 {
+            let node = queue.removeFirst()
+            visited += 1
+            let role = axRole(node)
+            if role == kAXSheetRole as String || role == "AXDialog" || role == kAXPopoverRole as String {
+                dialogs.append(node)
+            }
             queue.append(contentsOf: axChildren(node))
         }
     }
-    return blob
+    return Array(dialogs.reversed()) + windows
 }
 
-func findFormattedCodeInTree(_ root: AXUIElement, maxNodes: Int = 600) -> String? {
-    var queue: [AXUIElement] = [root]
-    var visited = 0
-    while !queue.isEmpty && visited < maxNodes {
-        let node = queue.removeFirst()
-        visited += 1
-        let blob = axDescription(node)
-        if axRole(node) == kAXStaticTextRole as String || axRole(node) == kAXGroupRole as String {
-            if looksLikeFormattedCode(blob), let code = extractSixDigit(blob) {
-                return code
+func findVerificationCodeAlertRoot(
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> AXUIElement? {
+    for window in collectWindows(appElement: appElement) {
+        var queue: [AXUIElement] = [window]
+        var visited = 0
+        while !queue.isEmpty && visited < 1_500 {
+            let node = queue.removeFirst()
+            visited += 1
+            if hasExactName(node, names: verificationAlertTitles) {
+                var candidate: AXUIElement? = node
+                for _ in 0..<10 {
+                    guard let current = candidate,
+                          elementBelongsToProcess(current, pid: expectedPid) else { break }
+                    let role = axRole(current)
+                    if role == kAXApplicationRole as String {
+                        break
+                    }
+                    if role == kAXWindowRole as String && !isDedicatedDialogWindow(current) {
+                        break
+                    }
+                    if findExactButton(
+                        in: current,
+                        names: verificationAlertCloseButtons,
+                        expectedPid: expectedPid,
+                        maxNodes: 300
+                    ) != nil {
+                        return current
+                    }
+                    if role == kAXWindowRole as String { break }
+                    candidate = axParent(current)
+                }
             }
-        }
-        if isContainerRole(axRole(node)) || visited <= 2 {
             queue.append(contentsOf: axChildren(node))
         }
     }
     return nil
 }
 
-func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
-    var sheets: [AXUIElement] = []
-    var windows: [AXUIElement] = []
-    for w in collectWindows(appElement: appElement) {
-        windows.append(w)
-        for child in axChildren(w) {
-            let role = axRole(child)
-            if role == kAXSheetRole as String || role == "AXDialog" {
-                sheets.append(child)
+func findSixDigitCodeInAlert(_ root: AXUIElement, maxNodes: Int = 600) -> String? {
+    var queue: [AXUIElement] = [root]
+    var visited = 0
+    var candidates = Set<String>()
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        visited += 1
+        let role = axRole(node)
+        if role == kAXStaticTextRole as String || role == kAXGroupRole as String {
+            for text in axExactTexts(node) {
+                candidates.formUnion(sixDigitCodeCandidates(text))
             }
         }
+        queue.append(contentsOf: axChildren(node))
     }
-    return sheets + windows
+    guard candidates.count == 1 else { return nil }
+    return candidates.first
 }
 
-func scanCodeFromAlertOnly(appElement: AXUIElement) -> String? {
+func scanCodeFromAlertOnly(appElement: AXUIElement, expectedPid: pid_t) -> String? {
+    guard let alert = findVerificationCodeAlertRoot(
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return nil }
+    return findSixDigitCodeInAlert(alert)
+}
+
+func hasVerificationCodeAlert(appElement: AXUIElement, expectedPid: pid_t) -> Bool {
+    findVerificationCodeAlertRoot(appElement: appElement, expectedPid: expectedPid) != nil
+}
+
+func findGetCodeButton(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    twoFactorNames: [String],
+    buttonNames: [String]
+) -> AXUIElement? {
     for root in collectSheetRoots(appElement) {
-        let blob = blobDeep(root)
-        guard hasSettingsCodeAlert(blob) else { continue }
-        if let code = findFormattedCodeInTree(root) { return code }
+        guard elementBelongsToProcess(root, pid: expectedPid),
+              treeContainsExactText(root, names: twoFactorNames) else { continue }
+        if let button = findExactButton(
+            in: root,
+            names: buttonNames,
+            expectedPid: expectedPid
+        ) {
+            return button
+        }
     }
     return nil
 }
@@ -161,6 +315,11 @@ func isTrustedSystemSettings(_ app: NSRunningApplication) -> Bool {
           let executableURL = app.executableURL,
           isAppleSystemExecutable(executableURL) else { return false }
     return settingsExecutableNames.contains(executableURL.lastPathComponent)
+}
+
+func isTrustedSystemSettingsProcess(_ pid: pid_t) -> Bool {
+    guard let app = NSRunningApplication(processIdentifier: pid) else { return false }
+    return isTrustedSystemSettings(app)
 }
 
 func findSettingsApp() -> NSRunningApplication? {
@@ -193,6 +352,153 @@ func pressElement(_ element: AXUIElement) -> Bool {
     AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     usleep(80_000)
     return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+}
+
+func pressExactButton(
+    _ element: AXUIElement,
+    expectedPid: pid_t,
+    names: [String]
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          axRole(element) == kAXButtonRole as String,
+          elementBelongsToProcess(element, pid: expectedPid),
+          axBool(element, kAXEnabledAttribute as String) == true,
+          supportsPressAction(element),
+          hasExactName(element, names: names) else { return false }
+    return pressElement(element)
+}
+
+func axPoint(_ element: AXUIElement, attribute: String) -> CGPoint? {
+    guard let value: CFTypeRef = axCopy(element, attribute),
+          CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var point = CGPoint.zero
+    guard AXValueGetValue(value as! AXValue, .cgPoint, &point) else { return nil }
+    return point
+}
+
+func axSize(_ element: AXUIElement, attribute: String) -> CGSize? {
+    guard let value: CFTypeRef = axCopy(element, attribute),
+          CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var size = CGSize.zero
+    guard AXValueGetValue(value as! AXValue, .cgSize, &size) else { return nil }
+    return size
+}
+
+func pointIsOnActiveDisplay(_ point: CGPoint) -> Bool {
+    var displayCount: UInt32 = 0
+    guard CGGetActiveDisplayList(0, nil, &displayCount) == .success,
+          displayCount > 0 else { return false }
+    let capacity = displayCount
+    var displayIds = Array(repeating: CGDirectDisplayID(), count: Int(displayCount))
+    let status = displayIds.withUnsafeMutableBufferPointer { buffer in
+        CGGetActiveDisplayList(capacity, buffer.baseAddress, &displayCount)
+    }
+    guard status == .success else {
+        return false
+    }
+    return displayIds.prefix(Int(displayCount)).contains {
+        CGDisplayBounds($0).contains(point)
+    }
+}
+
+func axWindowForElement(_ element: AXUIElement) -> AXUIElement? {
+    if let window: AXUIElement = axCopy(element, kAXWindowAttribute as String) {
+        return window
+    }
+    var current = element
+    for _ in 0..<12 {
+        guard let parent = axParent(current) else { return nil }
+        if axRole(parent) == kAXWindowRole as String { return parent }
+        current = parent
+    }
+    return nil
+}
+
+func focusedWindowForProcess(_ pid: pid_t) -> AXUIElement? {
+    let appElement = AXUIElementCreateApplication(pid)
+    guard let window: AXUIElement = axCopy(appElement, kAXFocusedWindowAttribute as String),
+          axRole(window) == kAXWindowRole as String,
+          elementBelongsToProcess(window, pid: pid) else { return nil }
+    return window
+}
+
+func hitTestMatchesButton(
+    _ button: AXUIElement,
+    at point: CGPoint,
+    expectedPid: pid_t
+) -> Bool {
+    let systemWide = AXUIElementCreateSystemWide()
+    var hit: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(
+        systemWide,
+        Float(point.x),
+        Float(point.y),
+        &hit
+    ) == .success,
+          let hit,
+          elementBelongsToProcess(hit, pid: expectedPid) else { return false }
+
+    var current: AXUIElement? = hit
+    for _ in 0..<8 {
+        guard let node = current else { break }
+        if node == button { return true }
+        current = axParent(node)
+    }
+    return false
+}
+
+func clickElementAtVerifiedFrame(
+    _ element: AXUIElement,
+    expectedPid: pid_t,
+    names: [String]
+) -> Bool {
+    guard let settingsApp = NSRunningApplication(processIdentifier: expectedPid),
+          isTrustedSystemSettings(settingsApp),
+          settingsApp.activate(options: [.activateIgnoringOtherApps]) else { return false }
+    usleep(120_000)
+    guard settingsApp.isActive,
+          let buttonFrame = axFrame(element),
+          buttonFrame.width >= 24,
+          buttonFrame.width <= 500,
+          buttonFrame.height >= 16,
+          buttonFrame.height <= 120,
+          let buttonWindow = axWindowForElement(element),
+          let focusedWindow = focusedWindowForProcess(expectedPid),
+          buttonWindow == focusedWindow,
+          let focusedFrame = axFrame(focusedWindow),
+          focusedFrame.contains(buttonFrame) else { return false }
+    guard axRole(element) == kAXButtonRole as String,
+          elementBelongsToProcess(element, pid: expectedPid),
+          axBool(element, kAXEnabledAttribute as String) == true,
+          supportsPressAction(element),
+          hasExactName(element, names: names),
+          pointIsOnActiveDisplay(CGPoint(x: buttonFrame.midX, y: buttonFrame.midY)),
+          hitTestMatchesButton(
+              element,
+              at: CGPoint(x: buttonFrame.midX, y: buttonFrame.midY),
+              expectedPid: expectedPid
+          ) else { return false }
+
+    let target = CGPoint(x: buttonFrame.midX, y: buttonFrame.midY)
+    guard pointIsOnActiveDisplay(target),
+          let source = CGEventSource(stateID: .hidSystemState),
+          let mouseDown = CGEvent(
+              mouseEventSource: source,
+              mouseType: .leftMouseDown,
+              mouseCursorPosition: target,
+              mouseButton: .left
+          ),
+          let mouseUp = CGEvent(
+              mouseEventSource: source,
+              mouseType: .leftMouseUp,
+              mouseCursorPosition: target,
+              mouseButton: .left
+          ) else { return false }
+
+    defer { mouseUp.post(tap: .cghidEventTap) }
+    mouseDown.post(tap: .cghidEventTap)
+    usleep(80_000)
+    return true
 }
 
 func clickNamed(in root: AXUIElement, names: [String], maxNodes: Int = 700) -> Bool {
@@ -236,41 +542,164 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
-func closeVerificationCodeAlert(appElement: AXUIElement, waitForAlertMs: Int = 0) {
+@discardableResult
+func closeVerificationCodeAlert(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    waitForAlertMs: Int = 0
+) -> Bool {
     let deadline = Date().addingTimeInterval(TimeInterval(max(0, waitForAlertMs)) / 1000.0)
+    var pressAttempts = 0
+    var coordinateFallbackUsed = false
     repeat {
-        for root in collectSheetRoots(appElement) {
-            guard hasSettingsCodeAlert(blobDeep(root)) else { continue }
-            if clickNamed(in: root, names: ["好", "OK", "Done", "完成"]) {
-                return
+        guard let alert = findVerificationCodeAlertRoot(
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else {
+            if Date() >= deadline { return true }
+            usleep(100_000)
+            continue
+        }
+        if let closeButton = findExactButton(
+            in: alert,
+            names: verificationAlertCloseButtons,
+            expectedPid: expectedPid
+        ) {
+            if pressAttempts < 2 {
+                _ = pressExactButton(
+                    closeButton,
+                    expectedPid: expectedPid,
+                    names: verificationAlertCloseButtons
+                )
+                pressAttempts += 1
+            } else if !coordinateFallbackUsed {
+                _ = clickElementAtVerifiedFrame(
+                    closeButton,
+                    expectedPid: expectedPid,
+                    names: verificationAlertCloseButtons
+                )
+                coordinateFallbackUsed = true
             }
         }
-        if Date() >= deadline { return }
+        if Date() >= deadline {
+            return findVerificationCodeAlertRoot(
+                appElement: appElement,
+                expectedPid: expectedPid
+            ) == nil
+        }
         usleep(100_000)
     } while true
 }
 
-func stopIfCancelled(appElement: AXUIElement? = nil) {
+func stopIfCancelled(appElement: AXUIElement? = nil, expectedPid: pid_t? = nil) {
     guard let path = cancelFilePath,
           FileManager.default.fileExists(atPath: path) else { return }
-    if let appElement {
+    if let appElement, let expectedPid {
         closeVerificationCodeAlert(
             appElement: appElement,
+            expectedPid: expectedPid,
             waitForAlertMs: verificationCodeRequested ? 3_000 : 0
         )
     }
     emit(Output(ok: false, code: nil, message: "cancelled"))
 }
 
-func cancellablePause(_ microseconds: UInt32, appElement: AXUIElement? = nil) {
+func cancellablePause(
+    _ microseconds: UInt32,
+    appElement: AXUIElement? = nil,
+    expectedPid: pid_t? = nil
+) {
     var remaining = microseconds
     while remaining > 0 {
-        stopIfCancelled(appElement: appElement)
+        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
         let step = min(remaining, 100_000)
         usleep(step)
         remaining -= step
     }
-    stopIfCancelled(appElement: appElement)
+    stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+}
+
+func waitForVerificationCodeAlert(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    timeoutMs: Int
+) -> Bool {
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    repeat {
+        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+        if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
+            return true
+        }
+        if Date() >= deadline { return false }
+        usleep(100_000)
+    } while true
+}
+
+func requestVerificationCodeAlert(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    twoFactorNames: [String],
+    buttonNames: [String]
+) -> Bool {
+    if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
+        guard closeVerificationCodeAlert(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            waitForAlertMs: 1_000
+        ), !hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) else {
+            return false
+        }
+    }
+
+    for attempt in 1...3 {
+        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+        if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
+            return true
+        }
+        guard let button = findGetCodeButton(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            twoFactorNames: twoFactorNames,
+            buttonNames: buttonNames
+        ) else {
+            if waitForVerificationCodeAlert(
+                appElement: appElement,
+                expectedPid: expectedPid,
+                timeoutMs: 250
+            ) {
+                return true
+            }
+            continue
+        }
+
+        verificationCodeRequested = true
+        if attempt < 3 {
+            _ = pressExactButton(
+                button,
+                expectedPid: expectedPid,
+                names: buttonNames
+            )
+        } else {
+            _ = clickElementAtVerifiedFrame(
+                button,
+                expectedPid: expectedPid,
+                names: buttonNames
+            )
+        }
+
+        if waitForVerificationCodeAlert(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            timeoutMs: 2_000
+        ) {
+            return true
+        }
+    }
+    return waitForVerificationCodeAlert(
+        appElement: appElement,
+        expectedPid: expectedPid,
+        timeoutMs: 500
+    )
 }
 
 var timeoutSec = 90
@@ -301,43 +730,55 @@ guard let app = findSettingsApp() else {
 
 app.activate(options: [.activateIgnoringOtherApps])
 let appElement = AXUIElementCreateApplication(app.processIdentifier)
-cancellablePause(900_000, appElement: appElement)
+let settingsPid = app.processIdentifier
+cancellablePause(900_000, appElement: appElement, expectedPid: settingsPid)
 logStep(2, "System Settings ready")
 
 let signInSecurity = ["登录与安全性", "登入與安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性"]
 let twoFactor = ["双重认证", "雙重認證", "Two-Factor Authentication", "双因素认证"]
 let getCodeBtn = ["获取验证码", "取得驗證碼", "Get Verification Code", "Get a Verification Code"]
 
-stopIfCancelled(appElement: appElement)
+stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 logStep(3, "click Sign-In & Security")
 guard clickNamed(in: appElement, names: signInSecurity) else {
     emit(Output(ok: false, code: nil, message: "Sign-In & Security row not found"))
 }
-cancellablePause(1_200_000, appElement: appElement)
+cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
 
-stopIfCancelled(appElement: appElement)
+stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 logStep(4, "click Two-Factor Authentication")
 guard clickNamed(in: appElement, names: twoFactor) else {
     emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
 }
-cancellablePause(1_200_000, appElement: appElement)
+cancellablePause(1_200_000, appElement: appElement, expectedPid: settingsPid)
 
-stopIfCancelled(appElement: appElement)
+stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 logStep(5, "click Get Verification Code")
-guard clickNamed(in: appElement, names: getCodeBtn) else {
-    emit(Output(ok: false, code: nil, message: "Get Verification Code button not found"))
+guard requestVerificationCodeAlert(
+    appElement: appElement,
+    expectedPid: settingsPid,
+    twoFactorNames: twoFactor,
+    buttonNames: getCodeBtn
+) else {
+    closeVerificationCodeAlert(
+        appElement: appElement,
+        expectedPid: settingsPid,
+        waitForAlertMs: 1_000
+    )
+    emit(Output(ok: false, code: nil, message: "verification code alert was not opened"))
 }
-verificationCodeRequested = true
 
 logStep(6, "waiting for verification code alert…")
-cancellablePause(2_500_000, appElement: appElement)
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 var code: String?
 var stableHits = 0
 while Date() < deadline {
-    cancellablePause(500_000, appElement: appElement)
-    if let detectedCode = scanCodeFromAlertOnly(appElement: appElement) {
+    cancellablePause(250_000, appElement: appElement, expectedPid: settingsPid)
+    if let detectedCode = scanCodeFromAlertOnly(
+        appElement: appElement,
+        expectedPid: settingsPid
+    ) {
         if code == detectedCode {
             stableHits += 1
         } else {
@@ -351,14 +792,24 @@ while Date() < deadline {
     }
 }
 
-guard let finalCode = code else {
-    closeVerificationCodeAlert(appElement: appElement, waitForAlertMs: 1_000)
+guard stableHits >= 2, let finalCode = code else {
+    closeVerificationCodeAlert(
+        appElement: appElement,
+        expectedPid: settingsPid,
+        waitForAlertMs: 1_000
+    )
     emit(Output(ok: false, code: nil, message: "verification code alert not found"))
 }
 
 logStep(7, "verification code detected")
 
-stopIfCancelled(appElement: appElement)
-closeVerificationCodeAlert(appElement: appElement, waitForAlertMs: 2_000)
-stopIfCancelled(appElement: appElement)
+stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
+guard closeVerificationCodeAlert(
+    appElement: appElement,
+    expectedPid: settingsPid,
+    waitForAlertMs: 2_000
+) else {
+    emit(Output(ok: false, code: nil, message: "verification code alert cleanup failed"))
+}
+stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 emit(Output(ok: true, code: finalCode, message: "ok"))

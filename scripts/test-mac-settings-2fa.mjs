@@ -566,10 +566,14 @@ function runSwiftCancellationContractTest() {
   assert.match(source, /func closeVerificationCodeAlert/);
   assert.match(source, /verificationCodeRequested/);
   assert.match(source, /waitForAlertMs/);
-  assert.match(source, /clickNamed\(in: root, names:/);
+  assert.match(source, /func findExactButton\(/);
   assert.match(
     source,
-    /closeVerificationCodeAlert\(appElement: appElement, waitForAlertMs: 2_000\)/
+    /let verificationAlertCloseButtons\s*=\s*\[\s*"好"\s*,\s*"OK"\s*\]/
+  );
+  assert.match(
+    source,
+    /closeVerificationCodeAlert\(\s*appElement: appElement,\s*expectedPid: settingsPid,\s*waitForAlertMs: 2_000\s*\)/
   );
   assert.ok(
     source.match(/stopIfCancelled\(/g)?.length >= 6,
@@ -584,7 +588,7 @@ function runSwiftCancellationContractTest() {
   assert.doesNotMatch(source, /\bscreenshot\s*:/);
 
   const timeoutFailure = source.slice(
-    source.indexOf("guard let finalCode = code else"),
+    source.indexOf("guard stableHits >= 2, let finalCode = code else"),
     source.indexOf('logStep(7, "verification code detected")')
   );
   const timeoutClose = timeoutFailure.indexOf("closeVerificationCodeAlert");
@@ -621,6 +625,342 @@ function runSwiftCancellationContractTest() {
   }
 }
 
+function runStrictVerificationCodeSourceContractTest() {
+  const source = fs.readFileSync(
+    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
+    "utf8"
+  );
+  const functionBody = (name) => {
+    const start = source.indexOf("func " + name);
+    assert.notEqual(start, -1, "missing Swift function " + name);
+    const next = source.indexOf("\nfunc ", start + 5);
+    return source.slice(start, next === -1 ? source.length : next);
+  };
+  const assertOrdered = (body, fragments, message) => {
+    let previous = -1;
+    for (const fragment of fragments) {
+      const current = body.indexOf(fragment);
+      assert.ok(current > previous, message + ": missing or out-of-order " + fragment);
+      previous = current;
+    }
+  };
+
+  const exactButton = functionBody("findExactButton");
+  assert.match(exactButton, /axRole\(node\)\s*==\s*kAXButtonRole\s+as\s+String/);
+  assert.match(exactButton, /elementBelongsToProcess\(node,\s*pid:\s*expectedPid\)/);
+  assert.match(exactButton, /hasExactName\(node,\s*names:\s*names\)/);
+  assert.match(exactButton, /supportsPressAction\(node\)/);
+  assert.doesNotMatch(
+    exactButton,
+    /blob\.contains|AXLink|kAXMenuItemRole|kAXStaticTextRole|kAXGroupRole/,
+    "Get Verification Code matching must not accept prose, links, menu items, text, or containers"
+  );
+
+  const exactName = functionBody("hasExactName");
+  assert.match(exactName, /axExactTexts\(element\)/);
+  assert.match(exactName, /expected\.contains/);
+  assert.doesNotMatch(exactName, /blob\.contains|\.contains\(\$0\)/);
+
+  const getCodeFinder = functionBody("findGetCodeButton");
+  assert.match(getCodeFinder, /twoFactorNames/);
+  assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*expectedPid\)/);
+  assert.match(
+    getCodeFinder,
+    /(?:guard|if)[\s\S]{0,300}twoFactorNames/,
+    "Get Verification Code must verify the Two-Factor Authentication scope before finding its button"
+  );
+  assert.ok(
+    getCodeFinder.indexOf("twoFactorNames") < getCodeFinder.indexOf("findExactButton("),
+    "Two-Factor Authentication scope verification must precede strict button lookup"
+  );
+  assert.doesNotMatch(
+    getCodeFinder,
+    /clickNamed|blob\.contains|AXLink|kAXMenuItemRole/,
+    "Get Verification Code must use the strict button path"
+  );
+
+  const request = functionBody("requestVerificationCodeAlert");
+  const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
+  assert.ok(retryMatch, "verification-code request must have a bounded retry loop");
+  assert.ok(
+    Number(retryMatch[1].replaceAll("_", "")) <= 5,
+    "verification-code request retries must remain bounded"
+  );
+  const loopStart = request.indexOf("for ");
+  const loopEnd = request.indexOf(
+    "\n    }\n    return waitForVerificationCodeAlert(",
+    loopStart
+  );
+  const retryBody = request.slice(loopStart, loopEnd);
+  assert.match(retryBody, /findGetCodeButton\(/);
+  const postActionBody = retryBody.slice(retryBody.indexOf("if attempt < 3"));
+  assertOrdered(
+    postActionBody,
+    ["pressExactButton(", "clickElementAtVerifiedFrame(", "waitForVerificationCodeAlert(", "return true"],
+    "each click attempt must be followed by bounded alert confirmation"
+  );
+  assert.doesNotMatch(
+    postActionBody.slice(0, postActionBody.indexOf("waitForVerificationCodeAlert(")),
+    /return\s+true/,
+    "button action success must not be treated as request success"
+  );
+  const waitTimeout = request.match(
+    /waitForVerificationCodeAlert\([\s\S]*?timeoutMs:\s*([0-9_]+)/
+  );
+  assert.ok(waitTimeout, "verification-code request must use an explicit bounded alert wait");
+  assert.ok(
+    Number(waitTimeout[1].replaceAll("_", "")) <= 5_000,
+    "post-click alert confirmation must not consume the provider timeout"
+  );
+
+  const frameClick = functionBody("clickElementAtVerifiedFrame");
+  assert.match(frameClick, /axRole\(element\)\s*==\s*kAXButtonRole\s+as\s+String/);
+  assert.match(frameClick, /elementBelongsToProcess\(element,\s*pid:\s*expectedPid\)/);
+  assert.match(frameClick, /supportsPressAction\(element\)/);
+  assert.match(frameClick, /axFrame\(element\)/);
+  assertOrdered(
+    frameClick,
+    ["let mouseDown = CGEvent(", "let mouseUp = CGEvent("],
+    "coordinate fallback must construct both mouse events before posting"
+  );
+  assert.match(frameClick, /mouseDown\.post/);
+  assert.match(frameClick, /defer[\s\S]*mouseUp\.post/);
+  assert.doesNotMatch(frameClick, /screenshot|ocr|screencapture|CGWindowList/i);
+  assert.match(request, /clickElementAtVerifiedFrame\(\s*button,\s*expectedPid:/);
+
+  const alertRoot = functionBody("findVerificationCodeAlertRoot");
+  assert.match(alertRoot, /hasExactName\(node,\s*names:\s*verificationAlertTitles\)/);
+  assert.match(alertRoot, /for\s+_\s+in\s+0\.\.<10/);
+  assert.match(alertRoot, /elementBelongsToProcess\(\w+,\s*pid:\s*expectedPid\)/);
+  assert.match(alertRoot, /findExactButton\([\s\S]*?names:\s*verificationAlertCloseButtons[\s\S]*?expectedPid:\s*expectedPid/);
+  assert.match(alertRoot, /axParent\(\w+\)/);
+  assert.match(alertRoot, /kAXWindowRole/);
+  assert.match(alertRoot, /kAXApplicationRole/);
+  assertOrdered(
+    alertRoot,
+    ["hasExactName(node, names: verificationAlertTitles)", "findExactButton(", "return current"],
+    "the exact title node and exact close button must resolve to one verified alert container"
+  );
+  assert.match(alertRoot, /isDedicatedDialogWindow\(current\)/);
+  assert.ok(
+    alertRoot.indexOf("kAXApplicationRole") < alertRoot.indexOf("return current"),
+    "verification-code alert lookup must reject an AXApplication before returning a container"
+  );
+
+  const codeCandidate = functionBody("sixDigitCodeCandidates");
+  assert.match(codeCandidate, /NSRegularExpression/);
+  assert.match(codeCandidate, /\.matches\s*\(/);
+  assert.match(codeCandidate, /range/);
+  assert.match(codeCandidate, /\[0-9\]\{6\}/);
+  assert.match(codeCandidate, /\[0-9\]\{3\}\s+\[0-9\]\{3\}/);
+  assert.ok(
+    /(?:\(\?<\!|\(\?!|\\b)/.test(codeCandidate),
+    "verification-code extraction must use digit boundaries inside alert prose"
+  );
+
+  const codeScan = functionBody("findSixDigitCodeInAlert");
+  assert.match(codeScan, /kAXStaticTextRole/);
+  assert.match(codeScan, /kAXGroupRole/);
+  assert.match(codeScan, /sixDigitCodeCandidates\(/);
+  assert.match(codeScan, /Set<String>\(\)/);
+  assert.match(codeScan, /candidates\.(?:insert|formUnion)/);
+  assert.match(codeScan, /candidates\.count\s*==\s*1/);
+  assert.doesNotMatch(codeScan, /blobDeep|axDescription\(node\)|extractSixDigit/);
+
+  const scan = functionBody("scanCodeFromAlertOnly");
+  assertOrdered(
+    scan,
+    ["findVerificationCodeAlertRoot(", "findSixDigitCodeInAlert("],
+    "code text may only be read after the alert root is verified"
+  );
+
+  const closeAlert = functionBody("closeVerificationCodeAlert");
+  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /findExactButton\(/);
+  assert.match(closeAlert, /verificationAlertCloseButtons/);
+  assert.doesNotMatch(closeAlert, /clickNamed/);
+
+  assert.match(source, /let settingsPid\s*=\s*app\.processIdentifier/);
+  const requestCall = source.slice(source.indexOf("guard requestVerificationCodeAlert("));
+  assert.match(requestCall, /expectedPid:\s*settingsPid/);
+  assert.doesNotMatch(source, /blobDeep|findFormattedCodeInTree|extractSixDigit|looksLikeFormattedCode/);
+  assert.doesNotMatch(source, /screencapture|captureWindowScreenshot|captureSheetScreenshot|OCR/i);
+}
+
+function runVerificationCodeHardeningSourceContractTest() {
+  const source = fs.readFileSync(
+    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
+    "utf8"
+  );
+  const functionBody = (name) => {
+    const start = source.indexOf("func " + name);
+    assert.notEqual(start, -1, "missing Swift function " + name);
+    const next = source.indexOf("\nfunc ", start + 5);
+    return source.slice(start, next === -1 ? source.length : next);
+  };
+
+  for (const name of [
+    "findExactButton",
+    "pressExactButton",
+    "clickElementAtVerifiedFrame",
+  ]) {
+    const body = functionBody(name);
+    assert.match(
+      body,
+      /axBool\(\s*\w+\s*,\s*kAXEnabledAttribute\s+as\s+String\s*\)\s*==\s*true/,
+      name + " must require AXEnabled == true rather than treating nil as enabled"
+    );
+    assert.doesNotMatch(
+      body,
+      /axBool\([\s\S]*kAXEnabledAttribute[\s\S]*\)\s*!=\s*false/,
+      name + " must not accept an unknown enabled state"
+    );
+  }
+
+  const codeCandidates = functionBody("sixDigitCodeCandidates");
+  assert.match(codeCandidates, /NSRegularExpression/);
+  assert.match(codeCandidates, /\.matches\s*\(/);
+  assert.match(
+    codeCandidates,
+    /(?:for\s+\w+\s+in\s+(?:regex\.)?matches|matches\.(?:map|compactMap))/
+  );
+  assert.match(codeCandidates, /range/);
+  assert.match(codeCandidates, /\[0-9\]\{6\}/);
+  assert.match(codeCandidates, /\[0-9\]\{3\}\s+\[0-9\]\{3\}/);
+  assert.ok(
+    /(?:\(\?<\!|\(\?!|\\b)/.test(codeCandidates),
+    "verification-code matching must use digit boundaries inside AX text"
+  );
+
+  const codeScan = functionBody("findSixDigitCodeInAlert");
+  assert.match(codeScan, /kAXStaticTextRole/);
+  assert.match(codeScan, /kAXGroupRole/);
+  assert.match(codeScan, /sixDigitCodeCandidates\(/);
+  assert.match(codeScan, /Set<String>\(\)/);
+  assert.match(codeScan, /candidates\.(?:insert|formUnion)/);
+  assert.match(codeScan, /candidates\.count\s*==\s*1/);
+
+  const request = functionBody("requestVerificationCodeAlert");
+  const loopStart = request.search(/for\s+\w+\s+in\s+1\.\.\./);
+  assert.ok(loopStart >= 0, "verification-code request must retain a bounded retry loop");
+  const buttonIndex = request.indexOf("findGetCodeButton(", loopStart);
+  assert.ok(buttonIndex > loopStart, "each retry must freshly resolve the Get Verification Code button");
+
+  const closeBeforeLoop = request.indexOf("closeVerificationCodeAlert(");
+  assert.ok(
+    closeBeforeLoop >= 0 && closeBeforeLoop < loopStart,
+    "requestVerificationCodeAlert must close a pre-existing alert before starting retries"
+  );
+  const preLoop = request.slice(0, loopStart);
+  assert.doesNotMatch(
+    preLoop,
+    /if\s+hasVerificationCodeAlert\([\s\S]{0,240}return\s+true/,
+    "a dialog visible before the request must not be accepted as the new request result"
+  );
+
+  const alertChecks = [...request.matchAll(/hasVerificationCodeAlert\(/g)].map(
+    (match) => match.index
+  );
+  assert.ok(
+    alertChecks.length >= 3,
+    "each retry needs pre-button, post-missing-button, and final late-alert checks"
+  );
+  assert.ok(alertChecks[0] < buttonIndex, "new-alert check must precede button lookup");
+
+  const missingButtonEnd = request.indexOf("continue", buttonIndex);
+  assert.ok(missingButtonEnd > buttonIndex, "missing-button path must remain bounded");
+  const missingButtonPath = request.slice(request.indexOf("else", buttonIndex), missingButtonEnd);
+  assert.match(
+    missingButtonPath,
+    /(?:hasVerificationCodeAlert|waitForVerificationCodeAlert)\(/,
+    "missing-button path must check for a late verification alert before continuing"
+  );
+  assert.match(
+    request,
+    /\n    \}\n    return\s+waitForVerificationCodeAlert\(/,
+    "retry loop must perform a final bounded late-alert check before failing"
+  );
+
+  const closeAlert = functionBody("closeVerificationCodeAlert");
+  assert.match(
+    source,
+    /func closeVerificationCodeAlert\([\s\S]*?\)\s*->\s*Bool\s*\{/,
+    "alert close helper must report whether cleanup was confirmed"
+  );
+  assert.match(closeAlert, /waitForAlertMs/);
+  assert.match(closeAlert, /deadline/);
+  assert.match(closeAlert, /Date\(\)\s*>=\s*deadline/);
+  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /return\s+true/);
+  assert.match(
+    closeAlert,
+    /return\s+findVerificationCodeAlertRoot\([\s\S]{0,240}==\s*nil/,
+    "alert close timeout must return the verified disappearance result"
+  );
+  assert.doesNotMatch(
+    closeAlert,
+    /guard\s+let\s+\w+\s*=\s*findVerificationCodeAlertRoot\([\s\S]*?else\s*\{\s*return\s*\}/,
+    "an initially absent alert must be watched until the bounded deadline"
+  );
+  assert.ok(
+    /findVerificationCodeAlertRoot\([\s\S]{0,200}==\s*nil/.test(
+      closeAlert
+    ),
+    "observed verification alerts must be confirmed gone before close returns true"
+  );
+
+  const successStart = source.lastIndexOf('logStep(7, "verification code detected")');
+  const successEnd = source.lastIndexOf("emit(Output(ok: true");
+  const successPath = source.slice(successStart, successEnd);
+  assert.match(
+    successPath,
+    /(?:guard|if)[\s\S]{0,500}closeVerificationCodeAlert/,
+    "the success path must require a true alert-close result"
+  );
+
+  const stabilityPath = source.slice(source.indexOf("var stableHits"), successStart);
+  assert.match(
+    stabilityPath,
+    /guard\s+stableHits\s*>=\s*2/,
+    "a single candidate at the deadline must not become the returned code"
+  );
+
+  const alertRoot = functionBody("findVerificationCodeAlertRoot");
+  const dialogWindow = functionBody("isDedicatedDialogWindow");
+  assert.match(source, /kAXSubroleAttribute/);
+  assert.match(source, /(?:["']AXDialog["']|kAXDialogSubrole)/);
+  assert.match(source, /(?:["']AXSystemDialog["']|kAXSystemDialogSubrole)/);
+  assert.match(alertRoot, /kAXWindowRole/);
+  assert.match(alertRoot, /kAXApplicationRole/);
+  assert.match(alertRoot, /isDedicatedDialogWindow\(current\)/);
+  assert.match(
+    dialogWindow,
+    /(?:kAXSubroleAttribute|subrole)[\s\S]{0,500}(?:AXDialog|AXSystemDialog)/,
+    "an AXWindow may be accepted only for an exact dialog subrole"
+  );
+
+  const frameClick = functionBody("clickElementAtVerifiedFrame");
+  assert.match(
+    frameClick,
+    /(?:kAXFocusedWindowAttribute|focusedWindow|focused.*window)/i,
+    "coordinate fallback must use the focused System Settings window"
+  );
+  assert.match(frameClick, /axFrame\(element\)/);
+  assert.match(
+    frameClick,
+    /focusedFrame\.contains\(buttonFrame\)/,
+    "button center must be contained by the focused window frame"
+  );
+  assert.match(source, /func hitTestMatchesButton[\s\S]*AXUIElementCopyElementAtPosition/);
+  assert.match(frameClick, /defer[\s\S]*mouseUp\.post/);
+
+  assert.doesNotMatch(
+    source,
+    /OCR|screencapture|captureWindowScreenshot|captureSheetScreenshot|--screenshot/i
+  );
+  assert.doesNotMatch(source, /\braw\s*:/);
+}
+
 function runTraditionalChineseStateContractTest() {
   const source = fs.readFileSync(
     new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
@@ -633,28 +973,34 @@ function runTraditionalChineseStateContractTest() {
     return source.slice(start, next === -1 ? source.length : next);
   };
 
-  const alertPredicate = functionBody("hasSettingsCodeAlert");
-  assert.match(alertPredicate, /帳戶驗證碼/);
+  assert.match(
+    source,
+    /let verificationAlertTitles\s*=\s*\[[\s\S]*"Apple 帳戶驗證碼"[\s\S]*\]/
+  );
 
   const scanAlert = functionBody("scanCodeFromAlertOnly");
   assert.match(
     scanAlert,
-    /guard hasSettingsCodeAlert\(blob\)[\s\S]*findFormattedCodeInTree\(root\)/
+    /findVerificationCodeAlertRoot\([\s\S]*findSixDigitCodeInAlert\(alert\)/
   );
 
   const closeAlert = functionBody("closeVerificationCodeAlert");
-  assert.match(closeAlert, /hasSettingsCodeAlert\(blobDeep\(root\)\)/);
-  assert.match(closeAlert, /"好"/);
+  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /findExactButton\(/);
+  assert.match(closeAlert, /verificationAlertCloseButtons/);
+  assert.match(source, /let verificationAlertCloseButtons\s*=\s*\[[^\]]*"好"/);
 
   assert.match(source, /let signInSecurity\s*=\s*\[[^\]]*"登入與安全性"/);
   assert.match(source, /let twoFactor\s*=\s*\[[^\]]*"雙重認證"/);
   assert.match(source, /let getCodeBtn\s*=\s*\[[^\]]*"取得驗證碼"/);
 
-  const getCodeClick = source.indexOf("clickNamed(in: appElement, names: getCodeBtn)");
-  const requested = source.indexOf("verificationCodeRequested = true", getCodeClick);
-  const scan = source.indexOf("scanCodeFromAlertOnly(appElement: appElement)", requested);
+  const getCodeRequest = source.lastIndexOf("requestVerificationCodeAlert(");
+  const scan = source.indexOf("scanCodeFromAlertOnly(", getCodeRequest);
+  const requestCall = source.slice(getCodeRequest, scan);
   assert.ok(
-    getCodeClick >= 0 && requested > getCodeClick && scan > requested,
+    getCodeRequest >= 0 &&
+      scan > getCodeRequest &&
+      /buttonNames:\s*getCodeBtn/.test(requestCall),
     "zh-Hant navigation must still transition through request, alert scan, and code return"
   );
 }
@@ -695,6 +1041,8 @@ await runInvalidCodeTest();
 await runSixtySecondBudgetIncludesCleanupGraceTest();
 await runTimeoutKeepsMarkerUntilChildClosesTest();
 runSwiftCancellationContractTest();
+runVerificationCodeHardeningSourceContractTest();
+runStrictVerificationCodeSourceContractTest();
 runTraditionalChineseStateContractTest();
 runManualSettingsPrivacyContractTest();
 
