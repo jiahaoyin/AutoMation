@@ -686,10 +686,15 @@ func activateSystemSettings(
     _ = app.activate(options: [.activateAllWindows])
 
     let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    var lastWindowCount = 0
+    var lastVisibleCount = 0
+    var lastDialogCount = 0
+    var lastMainCount = 0
     repeat {
         if focusedWindowForProcess(expectedPid) != nil { return true }
 
-        let visibleWindows = collectWindows(appElement: appElement).filter {
+        let windows = collectWindows(appElement: appElement)
+        let visibleWindows = windows.filter {
             elementBelongsToProcess($0, pid: expectedPid) &&
                 axRole($0) == kAXWindowRole as String &&
                 axBool($0, kAXHiddenAttribute as String) != true &&
@@ -699,6 +704,10 @@ func activateSystemSettings(
         let mainWindows = visibleWindows.filter {
             axBool($0, kAXMainAttribute as String) == true
         }
+        lastWindowCount = windows.count
+        lastVisibleCount = visibleWindows.count
+        lastDialogCount = dialogs.count
+        lastMainCount = mainWindows.count
         let target = dialogs.count == 1
             ? dialogs[0]
             : mainWindows.count == 1
@@ -713,9 +722,15 @@ func activateSystemSettings(
            ) {
             return true
         }
-        if Date() >= deadline { return false }
+        if Date() >= deadline { break }
         usleep(100_000)
     } while true
+
+    logStep(
+        1,
+        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
+    )
+    return false
 }
 
 func emit(_ output: Output) -> Never {

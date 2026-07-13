@@ -719,6 +719,12 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /mainWindows\.count\s*==\s*1/);
   assert.match(activation, /visibleWindows\.count\s*==\s*1/);
   assert.match(activation, /focusTrustedSettingsWindow\(/);
+  assert.match(activation, /activation state trusted=/);
+  assert.match(activation, /AXIsProcessTrusted\(\)/);
+  assert.match(activation, /windows=/);
+  assert.match(activation, /visible=/);
+  assert.match(activation, /dialogs=/);
+  assert.match(activation, /main=/);
   assert.doesNotMatch(activation, /activateIgnoringOtherApps/);
 
   const focusWindow = functionBody("focusTrustedSettingsWindow");
