@@ -543,15 +543,18 @@ func clickElementAtVerifiedFrame(
 ) -> Bool {
     guard let settingsApp = NSRunningApplication(processIdentifier: expectedPid),
           isTrustedSystemSettings(settingsApp),
-          settingsApp.activate(options: [.activateIgnoringOtherApps]) else { return false }
-    usleep(120_000)
-    guard settingsApp.isActive,
+          let buttonWindow = axWindowForElement(element),
+          focusTrustedSettingsWindow(
+              buttonWindow,
+              app: settingsApp,
+              expectedPid: expectedPid,
+              timeoutMs: 1_500
+          ),
           let buttonFrame = axFrame(element),
           buttonFrame.width >= 24,
           buttonFrame.width <= 500,
           buttonFrame.height >= 16,
           buttonFrame.height <= 120,
-          let buttonWindow = axWindowForElement(element),
           let focusedWindow = focusedWindowForProcess(expectedPid),
           buttonWindow == focusedWindow,
           let focusedFrame = axFrame(focusedWindow),
@@ -628,6 +631,91 @@ func collectWindows(appElement: AXUIElement) -> [AXUIElement] {
         if !wins.contains(where: { $0 == focused }) { wins.append(focused) }
     }
     return wins
+}
+
+func focusTrustedSettingsWindow(
+    _ window: AXUIElement,
+    app: NSRunningApplication,
+    expectedPid: pid_t,
+    timeoutMs: Int
+) -> Bool {
+    guard isTrustedSystemSettings(app),
+          elementBelongsToProcess(window, pid: expectedPid),
+          axRole(window) == kAXWindowRole as String,
+          axBool(window, kAXHiddenAttribute as String) != true,
+          axFrame(window) != nil else { return false }
+
+    _ = app.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(
+        window,
+        kAXMainAttribute as CFString,
+        kCFBooleanTrue
+    )
+    _ = AXUIElementSetAttributeValue(
+        window,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    )
+    _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    repeat {
+        if focusedWindowForProcess(expectedPid) == window { return true }
+        if Date() >= deadline { return false }
+        usleep(100_000)
+    } while true
+}
+
+func activateSystemSettings(
+    _ app: NSRunningApplication,
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    timeoutMs: Int = 4_000
+) -> Bool {
+    guard isTrustedSystemSettings(app), app.processIdentifier == expectedPid else { return false }
+
+    if let bundleURL = app.bundleURL {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(
+            at: bundleURL,
+            configuration: configuration
+        ) { _, _ in }
+    }
+    _ = app.activate(options: [.activateAllWindows])
+
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    repeat {
+        if focusedWindowForProcess(expectedPid) != nil { return true }
+
+        let visibleWindows = collectWindows(appElement: appElement).filter {
+            elementBelongsToProcess($0, pid: expectedPid) &&
+                axRole($0) == kAXWindowRole as String &&
+                axBool($0, kAXHiddenAttribute as String) != true &&
+                axFrame($0) != nil
+        }
+        let dialogs = visibleWindows.filter(isDedicatedDialogWindow)
+        let mainWindows = visibleWindows.filter {
+            axBool($0, kAXMainAttribute as String) == true
+        }
+        let target = dialogs.count == 1
+            ? dialogs[0]
+            : mainWindows.count == 1
+                ? mainWindows[0]
+                : visibleWindows.count == 1 ? visibleWindows[0] : nil
+        if let target,
+           focusTrustedSettingsWindow(
+               target,
+               app: app,
+               expectedPid: expectedPid,
+               timeoutMs: 500
+           ) {
+            return true
+        }
+        if Date() >= deadline { return false }
+        usleep(100_000)
+    } while true
 }
 
 func emit(_ output: Output) -> Never {
@@ -826,10 +914,16 @@ guard let app = findSettingsApp() else {
     emit(Output(ok: false, code: nil, message: "System Settings not found"))
 }
 
-app.activate(options: [.activateIgnoringOtherApps])
 let appElement = AXUIElementCreateApplication(app.processIdentifier)
 let settingsPid = app.processIdentifier
-cancellablePause(900_000, appElement: appElement, expectedPid: settingsPid)
+guard activateSystemSettings(
+    app,
+    appElement: appElement,
+    expectedPid: settingsPid
+) else {
+    emit(Output(ok: false, code: nil, message: "System Settings focus unavailable"))
+}
+cancellablePause(300_000, appElement: appElement, expectedPid: settingsPid)
 logStep(2, "System Settings ready")
 
 let signInSecurity = ["登录与安全性", "登入與安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性"]

@@ -710,6 +710,26 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(navigationDiagnostics, /getCode=/);
   assert.doesNotMatch(navigationDiagnostics, /axDescription|axExactTexts|codeRaw|print\(/);
 
+  const activation = functionBody("activateSystemSettings");
+  assert.match(activation, /NSWorkspace\.OpenConfiguration\(\)/);
+  assert.match(activation, /configuration\.activates\s*=\s*true/);
+  assert.match(activation, /activate\(options:\s*\[\.activateAllWindows\]\)/);
+  assert.match(activation, /visibleWindows\.filter/);
+  assert.match(activation, /dialogs\.count\s*==\s*1/);
+  assert.match(activation, /mainWindows\.count\s*==\s*1/);
+  assert.match(activation, /visibleWindows\.count\s*==\s*1/);
+  assert.match(activation, /focusTrustedSettingsWindow\(/);
+  assert.doesNotMatch(activation, /activateIgnoringOtherApps/);
+
+  const focusWindow = functionBody("focusTrustedSettingsWindow");
+  assert.match(focusWindow, /isTrustedSystemSettings\(app\)/);
+  assert.match(focusWindow, /elementBelongsToProcess\(window,\s*pid:\s*expectedPid\)/);
+  assert.match(focusWindow, /kAXRaiseAction/);
+  assert.match(focusWindow, /kAXMainAttribute/);
+  assert.match(focusWindow, /kAXFocusedAttribute/);
+  assert.match(focusWindow, /focusedWindowForProcess\(expectedPid\)\s*==\s*window/);
+  assert.doesNotMatch(source, /activateIgnoringOtherApps/);
+
   const request = functionBody("requestVerificationCodeAlert");
   const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
   assert.ok(retryMatch, "verification-code request must have a bounded retry loop");
