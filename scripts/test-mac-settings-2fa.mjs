@@ -53,6 +53,101 @@ async function captureConsole(callback) {
   }
 }
 
+function swiftFunctionBodyFromSource(source, name) {
+  const start = source.indexOf(`func ${name}`);
+  assert.notEqual(start, -1, `missing Swift function ${name}`);
+  const next = source.indexOf("\nfunc ", start + 5);
+  return source.slice(start, next === -1 ? source.length : next);
+}
+
+function assertSettingsOwnerSafetyContract(source) {
+  const openSettings = swiftFunctionBodyFromSource(source, "openAppleAccountSettings");
+  assert.match(
+    openSettings,
+    /guard\s+let url\s*=\s*URL\(string:\s*s\),\s*NSWorkspace\.shared\.open\(url\)\s+else\s*\{\s*continue\s*\}/,
+    "each account URL must use the NSWorkspace.open result as its fallback gate"
+  );
+
+  const pageWait = swiftFunctionBodyFromSource(source, "waitForAppleAccountSettingsPage");
+  assert.doesNotMatch(pageWait, /(?:true\s*\|\||\|\|\s*true)/);
+  assert.match(
+    pageWait,
+    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,300}\)\s*\{\s*return true\s*\}/,
+    "a running extension is success only after visible target-page AX evidence"
+  );
+
+  const frameClick = swiftFunctionBodyFromSource(source, "clickElementAtVerifiedFrame");
+  const mouseUpCreated = frameClick.indexOf("let mouseUp = CGEvent(");
+  const finalOwnerCheck = frameClick.lastIndexOf(
+    "guard isTrustedSystemSettingsProcess(expectedPid)"
+  );
+  const mouseDownPosted = frameClick.indexOf("mouseDown.post");
+  assert.ok(
+    mouseUpCreated >= 0 &&
+      finalOwnerCheck > mouseUpCreated &&
+      mouseDownPosted > finalOwnerCheck,
+    "the current unique UI owner must be revalidated immediately before CGEvent posting"
+  );
+
+  const press = swiftFunctionBodyFromSource(source, "pressElement");
+  assert.ok(
+    press.indexOf("isTrustedSystemSettingsProcess(expectedPid)") >= 0 &&
+      press.indexOf("isTrustedSystemSettingsProcess(expectedPid)") <
+        press.indexOf("AXUIElementPerformAction"),
+    "the current unique UI owner must be revalidated before the first AX press"
+  );
+}
+
+function runSettingsOwnerMutationResistanceTest() {
+  const source = fs
+    .readFileSync(new URL("./swift/mac-settings-2fa-code.swift", import.meta.url), "utf8")
+    .replace(/\r\n/g, "\n");
+  assertSettingsOwnerSafetyContract(source);
+
+  const ignoredOpenResult = source.replace(
+    "guard let url = URL(string: s), NSWorkspace.shared.open(url) else { continue }",
+    "guard let url = URL(string: s) else { continue }\n        _ = NSWorkspace.shared.open(url)"
+  );
+  assert.notEqual(ignoredOpenResult, source, "open-result mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(ignoredOpenResult),
+    /fallback gate/
+  );
+
+  const unconditionalPageEvidence = source.replace(
+    "if treeContainsExactText(\n                appElement,",
+    "if true || treeContainsExactText(\n                appElement,"
+  );
+  assert.notEqual(
+    unconditionalPageEvidence,
+    source,
+    "page-evidence mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(unconditionalPageEvidence),
+    assert.AssertionError
+  );
+
+  const finalClickGuard = [
+    "    guard isTrustedSystemSettingsProcess(expectedPid),",
+    "          elementBelongsToProcess(element, pid: expectedPid) else { return false }",
+    "    defer { mouseUp.post(tap: .cghidEventTap) }",
+  ].join("\n");
+  const missingFinalClickGuard = source.replace(
+    finalClickGuard,
+    "    defer { mouseUp.post(tap: .cghidEventTap) }"
+  );
+  assert.notEqual(
+    missingFinalClickGuard,
+    source,
+    "final-action mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingFinalClickGuard),
+    /immediately before CGEvent/
+  );
+}
+
 function createChild() {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
@@ -600,13 +695,143 @@ function runSwiftCancellationContractTest() {
     source.indexOf("func findSettingsApp"),
     source.indexOf("func openAppleAccountSettings")
   );
-  const findCall = source.indexOf("guard let app = findSettingsApp()");
-  const axCreate = source.indexOf("AXUIElementCreateApplication(app.processIdentifier)");
+  const ownerLoop = source.indexOf("for uiOwnerAttempt in 1...2");
+  const findCall = source.indexOf("guard let app = findSettingsApp(),", ownerLoop);
+  const uiOwnerCall = source.indexOf(
+    "let settingsUIApp = waitForSettingsUIOwner(fallbackApp: app)",
+    findCall
+  );
+  const axCreate = source.indexOf(
+    "AXUIElementCreateApplication(settingsUIApp.processIdentifier)"
+  );
   assert.match(source, /func isAppleSystemExecutable/);
   assert.match(source, /executableURL\.lastPathComponent/);
   assert.match(finder, /guard isTrustedSystemSettings\(app\) else/);
   assert.doesNotMatch(finder, /localizedName/);
-  assert.ok(findCall >= 0 && axCreate > findCall, "trusted app lookup must precede AX enumeration");
+  assert.ok(
+    ownerLoop >= 0 && findCall > ownerLoop && uiOwnerCall > findCall && axCreate > uiOwnerCall,
+    "each bounded owner attempt must resolve the trusted UI before AX enumeration"
+  );
+  const ownerLoopEnd = source.indexOf(
+    'emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable"))',
+    ownerLoop
+  );
+  const ownerRecovery = source.slice(ownerLoop, ownerLoopEnd);
+  assert.match(ownerRecovery, /guard isTrustedSystemSettingsProcess\(settingsPid\) else \{ continue \}/);
+  assert.match(ownerRecovery, /case \.ownerLost:\s*continue/);
+  assert.match(ownerRecovery, /if ownerLost \{ continue \}/);
+  assert.ok(
+    ownerRecovery.indexOf("waitForSettingsUIOwner(fallbackApp: app)") <
+      ownerRecovery.indexOf("AXUIElementCreateApplication(settingsUIApp.processIdentifier)"),
+    "a restarted ExtensionKit owner must be rebound before any new AX traversal"
+  );
+
+  assert.match(
+    source,
+    /appleIDSettingsExecutablePaths[\s\S]*\/System\/Library\/ExtensionKit\/Extensions\/AppleIDSettings\.appex\/Contents\/MacOS\/AppleIDSettings/
+  );
+  const extensionTrustStart = source.indexOf("func isTrustedAppleIDSettingsExtension(");
+  const extensionTrust = source.slice(
+    extensionTrustStart,
+    source.indexOf("\nfunc ", extensionTrustStart + 5)
+  );
+  assert.match(extensionTrust, /standardizedFileURL\.path/);
+  assert.match(extensionTrust, /appleIDSettingsExecutablePaths\.contains\(path\)/);
+  assert.doesNotMatch(extensionTrust, /hasPrefix|localizedName/);
+  const uiOwnerStart = source.indexOf("func waitForSettingsUIOwner(");
+  const uiOwner = source.slice(
+    uiOwnerStart,
+    source.indexOf("\nfunc ", uiOwnerStart + 5)
+  );
+  assert.match(uiOwner, /isTrustedAppleIDSettingsExtension/);
+  assert.match(uiOwner, /matches\.count\s*==\s*1/);
+  assert.match(uiOwner, /matches\.count\s*>\s*1[\s\S]{0,80}return nil/);
+  assert.match(uiOwner, /isTrustedSystemSettingsProcess\(fallbackApp\.processIdentifier\)/);
+
+  const processTrustStart = source.indexOf("func isTrustedSystemSettingsProcess(");
+  const processTrust = source.slice(
+    processTrustStart,
+    source.indexOf("\nfunc ", processTrustStart + 5)
+  );
+  assert.match(processTrust, /extensions\.count\s*==\s*1/);
+  assert.match(processTrust, /extensions\[0\]\.processIdentifier\s*==\s*pid/);
+  assert.match(processTrust, /extensions\.isEmpty/);
+  assert.match(processTrust, /majorVersion\s*<\s*13/);
+  assert.match(processTrust, /settingsApps\.count\s*==\s*1/);
+  assert.ok(
+    processTrust.indexOf("extensions.count == 1") <
+      processTrust.indexOf("NSRunningApplication(processIdentifier: pid)"),
+    "the unique extension owner must take precedence over the host fallback"
+  );
+
+  const accountUrlBlock = source.slice(
+    source.indexOf("let modernAccountUrls"),
+    source.indexOf("func logStep")
+  );
+  assert.ok(
+    accountUrlBlock.indexOf("com.apple.AccountSettings.AccountsSettingsExtension") <
+      accountUrlBlock.indexOf("com.apple.systempreferences.AppleIDSettings"),
+    "macOS 15 Apple Account extension URL must be tried first"
+  );
+  assert.match(accountUrlBlock, /majorVersion\s*>=\s*13/);
+
+  const openSettingsStart = source.indexOf("func openAppleAccountSettings(");
+  const openSettings = source.slice(
+    openSettingsStart,
+    source.indexOf("\nfunc ", openSettingsStart + 5)
+  );
+  assert.match(openSettings, /for s in orderedAccountUrls\(\)/);
+  assert.match(openSettings, /NSWorkspace\.shared\.open\(url\)/);
+  assert.match(openSettings, /else\s*\{\s*continue\s*\}/);
+  assert.match(openSettings, /waitForAppleAccountSettingsPage/);
+  assert.ok(
+    openSettings.indexOf("continue") < openSettings.indexOf("return true"),
+    "a rejected URL must fall through to the next account-settings route"
+  );
+
+  const pageWaitStart = source.indexOf("func waitForAppleAccountSettingsPage(");
+  const pageWait = source.slice(
+    pageWaitStart,
+    source.indexOf("\nfunc ", pageWaitStart + 5)
+  );
+  assert.match(pageWait, /matches\.count\s*>\s*1[\s\S]{0,80}return false/);
+  assert.match(pageWait, /AXUIElementCreateApplication\(pid\)/);
+  assert.match(pageWait, /treeContainsExactText\(/);
+  assert.match(pageWait, /names:\s*appleAccountPageEvidence/);
+  assert.match(pageWait, /expectedPid:\s*pid/);
+  assert.ok(
+    pageWait.indexOf("treeContainsExactText(") < pageWait.indexOf("return true"),
+    "a pre-existing extension is not success until the target Apple Account page is visible"
+  );
+
+  const guardedFunctions = [
+    "findExactButton",
+    "visibleExactMatchCounts",
+    "findVerificationCodeAlertRoot",
+    "findSixDigitCodeInAlert",
+    "findGetCodeButton",
+    "clickNamed",
+    "focusTrustedSettingsWindow",
+    "requestVerificationCodeAlert",
+  ];
+  for (const name of guardedFunctions) {
+    const start = source.indexOf(`func ${name}`);
+    const body = source.slice(start, source.indexOf("\nfunc ", start + 5));
+    assert.match(
+      body,
+      /isTrustedSystemSettingsProcess\(expectedPid\)/,
+      `${name} must revalidate the current unique Settings UI owner`
+    );
+  }
+
+  const pressStart = source.indexOf("func pressElement(");
+  const pressBody = source.slice(pressStart, source.indexOf("\nfunc ", pressStart + 5));
+  assert.match(pressBody, /expectedPid:\s*pid_t/);
+  assert.ok(
+    pressBody.indexOf("isTrustedSystemSettingsProcess(expectedPid)") <
+      pressBody.indexOf("AXUIElementPerformAction"),
+    "AX press must revalidate the UI owner immediately before acting"
+  );
 
   const systemPath = source.slice(
     source.indexOf("func isAppleSystemExecutable"),
@@ -679,7 +904,10 @@ function runStrictVerificationCodeSourceContractTest() {
     "Get Verification Code must use the strict button path"
   );
   assert.match(getCodeFinder, /focusedWindowForProcess\(expectedPid\)/);
-  assert.match(getCodeFinder, /axWindowForElement\(button\)\s*==\s*focusedWindow/);
+  assert.match(
+    getCodeFinder,
+    /axWindowForElement\(button,\s*expectedPid:\s*expectedPid\)\s*==\s*focusedWindow/
+  );
   const sheetRoots = functionBody("collectSheetRoots");
   assert.match(source, /let axSheetsAttribute\s*=\s*"AXSheets"/);
   assert.match(functionBody("axSheets"), /axCopy\(element,\s*axSheetsAttribute\)/);
@@ -699,7 +927,10 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}==\s*true/);
   assert.doesNotMatch(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}!=\s*false/);
   assert.match(navigationClick, /supportsPressAction\(node\)/);
-  assert.match(navigationClick, /axWindowForElement\(node\)\s*==\s*focusedWindow/);
+  assert.match(
+    navigationClick,
+    /axWindowForElement\(node,\s*expectedPid:\s*expectedPid\)\s*==\s*focusedWindow/
+  );
 
   const navigationDiagnostics = functionBody("logNavigationState");
   assert.match(navigationDiagnostics, /visibleExactMatchCounts\(/);
@@ -854,7 +1085,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(closeAlert, /verificationAlertCloseButtons/);
   assert.doesNotMatch(closeAlert, /clickNamed/);
 
-  assert.match(source, /let settingsPid\s*=\s*app\.processIdentifier/);
+  assert.match(source, /let settingsPid\s*=\s*settingsUIApp\.processIdentifier/);
   const requestCall = source.slice(source.indexOf("guard requestVerificationCodeAlert("));
   assert.match(requestCall, /expectedPid:\s*settingsPid/);
   assert.doesNotMatch(source, /blobDeep|findFormattedCodeInTree|extractSixDigit|looksLikeFormattedCode/);
@@ -964,13 +1195,15 @@ function runVerificationCodeHardeningSourceContractTest() {
   assert.match(closeAlert, /waitForAlertMs/);
   assert.match(closeAlert, /deadline/);
   assert.match(closeAlert, /Date\(\)\s*>=\s*deadline/);
+  assert.match(closeAlert, /guard isTrustedSystemSettingsProcess\(expectedPid\) else \{ return false \}/);
   assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
-  assert.match(closeAlert, /return\s+true/);
   assert.match(
     closeAlert,
-    /return\s+findVerificationCodeAlertRoot\([\s\S]{0,240}==\s*nil/,
-    "alert close timeout must return the verified disappearance result"
+    /return\s+isTrustedSystemSettingsProcess\(expectedPid\)/,
+    "an absent alert is success only while the same trusted UI owner is still current"
   );
+  assert.match(closeAlert, /let alertGone\s*=\s*findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /return alertGone/);
   assert.doesNotMatch(
     closeAlert,
     /guard\s+let\s+\w+\s*=\s*findVerificationCodeAlertRoot\([\s\S]*?else\s*\{\s*return\s*\}/,
@@ -990,6 +1223,21 @@ function runVerificationCodeHardeningSourceContractTest() {
     successPath,
     /(?:guard|if)[\s\S]{0,500}closeVerificationCodeAlert/,
     "the success path must require a true alert-close result"
+  );
+
+  const ownerRecoveryStart = source.indexOf("for uiOwnerAttempt in 1...2");
+  const ownerRecoveryEnd = source.lastIndexOf(
+    'emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable"))'
+  );
+  const ownerRecovery = source.slice(ownerRecoveryStart, ownerRecoveryEnd);
+  assert.ok(
+    (ownerRecovery.match(/guard\s+isTrustedSystemSettingsProcess\(settingsPid\)\s+else\s*\{\s*continue\s*\}/g) ?? []).length >= 4,
+    "every cleanup result must revalidate the ExtensionKit owner before it is consumed"
+  );
+  assert.match(
+    closeAlert,
+    /let alertGone\s*=\s*findVerificationCodeAlertRoot\([\s\S]{0,240}guard isTrustedSystemSettingsProcess\(expectedPid\) else \{ return false \}[\s\S]{0,100}return alertGone/,
+    "alert disappearance must be followed by a final owner revalidation"
   );
 
   const stabilityPath = source.slice(source.indexOf("var stableHits"), successStart);
@@ -1055,7 +1303,7 @@ function runTraditionalChineseStateContractTest() {
   const scanAlert = functionBody("scanCodeFromAlertOnly");
   assert.match(
     scanAlert,
-    /findVerificationCodeAlertRoot\([\s\S]*findSixDigitCodeInAlert\(alert\)/
+    /findVerificationCodeAlertRoot\([\s\S]*findSixDigitCodeInAlert\(alert,\s*expectedPid:\s*expectedPid\)/
   );
 
   const closeAlert = functionBody("closeVerificationCodeAlert");
@@ -1127,6 +1375,7 @@ await runForceStopAllowsLatePopupCleanupTest();
 await runInvalidCodeTest();
 await runSixtySecondBudgetIncludesCleanupGraceTest();
 await runTimeoutKeepsMarkerUntilChildClosesTest();
+runSettingsOwnerMutationResistanceTest();
 runSwiftCancellationContractTest();
 runVerificationCodeHardeningSourceContractTest();
 runStrictVerificationCodeSourceContractTest();
