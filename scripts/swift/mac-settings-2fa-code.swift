@@ -66,8 +66,9 @@ func axOptionalElementStrict(
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attr as CFString, &value)
     if error == .success {
-        guard let candidate = value as? AXUIElement else { return (false, nil) }
-        return (true, candidate)
+        guard let rawValue = value,
+              CFGetTypeID(rawValue) == AXUIElementGetTypeID() else { return (false, nil) }
+        return (true, rawValue as! AXUIElement)
     }
     if error == .noValue || error == .attributeUnsupported {
         return (true, nil)

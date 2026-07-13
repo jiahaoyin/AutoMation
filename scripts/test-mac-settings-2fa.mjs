@@ -129,6 +129,9 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
   assert.match(windowlessOwner, /axElementArrayStrict\(/);
   assert.match(windowlessOwner, /guard focused\.known,\s*main\.known else/);
+  const optionalElement = swiftFunctionBodyFromSource(source, "axOptionalElementStrict");
+  assert.match(optionalElement, /CFGetTypeID\(rawValue\)\s*==\s*AXUIElementGetTypeID\(\)/);
+  assert.match(optionalElement, /rawValue as! AXUIElement/);
   assert.match(
     windowlessOwner,
     /return\s+!hasStandardWindow\s*&&\s*isTrustedSystemSettingsProcess\(expectedPid\)/,
@@ -1068,6 +1071,8 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(windowlessOwner, /kAXMainWindowAttribute/);
   assert.match(windowlessOwner, /axElementArrayStrict\(/);
   assert.match(windowlessOwner, /guard focused\.known,\s*main\.known else/);
+  const optionalElement = functionBody("axOptionalElementStrict");
+  assert.match(optionalElement, /CFGetTypeID\(rawValue\)\s*==\s*AXUIElementGetTypeID\(\)/);
   assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
   assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
   assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
