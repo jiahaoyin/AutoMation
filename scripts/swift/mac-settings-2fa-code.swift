@@ -52,6 +52,29 @@ func axCopy<T>(_ element: AXUIElement, _ attr: String) -> T? {
     return value as? T
 }
 
+func axElementArrayStrict(_ element: AXUIElement, _ attr: String) -> [AXUIElement]? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success,
+          let elements = value as? [AXUIElement] else { return nil }
+    return elements
+}
+
+func axOptionalElementStrict(
+    _ element: AXUIElement,
+    _ attr: String
+) -> (known: Bool, value: AXUIElement?) {
+    var value: CFTypeRef?
+    let error = AXUIElementCopyAttributeValue(element, attr as CFString, &value)
+    if error == .success {
+        guard let candidate = value as? AXUIElement else { return (false, nil) }
+        return (true, candidate)
+    }
+    if error == .noValue || error == .attributeUnsupported {
+        return (true, nil)
+    }
+    return (false, nil)
+}
+
 func axString(_ element: AXUIElement, _ attr: String) -> String? {
     guard let v: CFTypeRef = axCopy(element, attr) else { return nil }
     if let s = v as? String { return s }
@@ -157,15 +180,19 @@ func treeContainsExactText(
     guard isTrustedSystemSettingsProcess(expectedPid),
           elementBelongsToProcess(root, pid: expectedPid) else { return false }
     var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
     var visited = 0
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
         visited += 1
         if axBool(node, kAXHiddenAttribute as String) != true,
            axFrame(node) != nil,
            hasExactName(node, names: names) {
             return isTrustedSystemSettingsProcess(expectedPid)
         }
+        queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
     }
     return false
@@ -203,10 +230,13 @@ func findExactButton(
 ) -> AXUIElement? {
     guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
     var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
     var visited = 0
     var matches: [AXUIElement] = []
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
         visited += 1
         if axRole(node) == kAXButtonRole as String,
            elementBelongsToProcess(node, pid: expectedPid),
@@ -222,6 +252,7 @@ func findExactButton(
                 matches.append(node)
             }
         }
+        queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
     }
     guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
@@ -229,18 +260,27 @@ func findExactButton(
 }
 
 func collectSheetRoots(_ appElement: AXUIElement, expectedPid: pid_t) -> [AXUIElement] {
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return [] }
-    guard let focusedWindow: AXUIElement = axCopy(
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(appElement, pid: expectedPid) else { return [] }
+    let focusedWindow: AXUIElement? = axCopy(
         appElement,
         kAXFocusedWindowAttribute as String
-    ) else { return [] }
-    var dialogs: [AXUIElement] = []
-    if isDedicatedDialogWindow(focusedWindow),
-       axBool(focusedWindow, kAXHiddenAttribute as String) != true,
-       axFrame(focusedWindow) != nil {
-        dialogs.append(focusedWindow)
+    )
+    let traversalRoot: AXUIElement
+    if let focusedWindow,
+       elementBelongsToProcess(focusedWindow, pid: expectedPid),
+       axRole(focusedWindow) == kAXWindowRole as String {
+        traversalRoot = focusedWindow
+    } else {
+        traversalRoot = appElement
     }
-    var queue = axSheets(focusedWindow) + axChildren(focusedWindow)
+    var dialogs: [AXUIElement] = []
+    if isDedicatedDialogWindow(traversalRoot),
+       axBool(traversalRoot, kAXHiddenAttribute as String) != true,
+       axFrame(traversalRoot) != nil {
+        dialogs.append(traversalRoot)
+    }
+    var queue = axSheets(traversalRoot) + axChildren(traversalRoot)
     var seen: [AXUIElement] = []
     var visited = 0
     while !queue.isEmpty && visited < 1_200 {
@@ -333,7 +373,9 @@ func findVerificationCodeAlertRoot(
     expectedPid: pid_t
 ) -> AXUIElement? {
     guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
-    for window in collectWindows(appElement: appElement, expectedPid: expectedPid) {
+    var roots = collectWindows(appElement: appElement, expectedPid: expectedPid)
+    if !roots.contains(where: { $0 == appElement }) { roots.append(appElement) }
+    for window in roots {
         guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
         var queue: [AXUIElement] = [window]
         var visited = 0
@@ -365,6 +407,7 @@ func findVerificationCodeAlertRoot(
                     candidate = axParent(current)
                 }
             }
+            queue.append(contentsOf: axSheets(node))
             queue.append(contentsOf: axChildren(node))
         }
     }
@@ -415,29 +458,34 @@ func findGetCodeButton(
     twoFactorNames: [String],
     buttonNames: [String]
 ) -> AXUIElement? {
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          let focusedWindow = focusedWindowForProcess(expectedPid) else { return nil }
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
+    var roots = collectSheetRoots(appElement, expectedPid: expectedPid)
+    if roots.isEmpty { roots = [appElement] }
     var matches: [AXUIElement] = []
-    for root in collectSheetRoots(appElement, expectedPid: expectedPid) {
-        guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
+    for root in roots {
         guard elementBelongsToProcess(root, pid: expectedPid),
               treeContainsExactText(
                   root,
                   names: twoFactorNames,
-                  expectedPid: expectedPid
+                  expectedPid: expectedPid,
+                  maxNodes: 2_000
+              ),
+              let button = findExactButton(
+                  in: root,
+                  names: buttonNames,
+                  expectedPid: expectedPid,
+                  maxNodes: 2_000
               ) else { continue }
-        if let button = findExactButton(
-            in: root,
-            names: buttonNames,
+        guard settingsActionScopeAllowsElement(
+            button,
+            appElement: appElement,
             expectedPid: expectedPid
-        ), axWindowForElement(button, expectedPid: expectedPid) == focusedWindow {
-            if !matches.contains(where: { $0 == button }) {
-                matches.append(button)
-            }
-        }
+        ) else { continue }
+        if !matches.contains(where: { $0 == button }) { matches.append(button) }
     }
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
-    return matches.count == 1 ? matches[0] : nil
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          matches.count == 1 else { return nil }
+    return matches[0]
 }
 
 func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
@@ -551,32 +599,59 @@ func openAppleAccountSettings() -> Bool {
     )
 }
 
-func pressElement(_ element: AXUIElement, expectedPid: pid_t) -> Bool {
+func pressElement(
+    _ element: AXUIElement,
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> Bool {
     guard isTrustedSystemSettingsProcess(expectedPid),
+          settingsActionScopeAllowsElement(
+              element,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           elementBelongsToProcess(element, pid: expectedPid),
           axBool(element, kAXEnabledAttribute as String) == true else { return false }
     let err = AXUIElementPerformAction(element, kAXPressAction as CFString)
     if err == .success { return true }
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    guard settingsActionScopeAllowsElement(
+        element,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return false }
     _ = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     usleep(80_000)
-    guard isTrustedSystemSettingsProcess(expectedPid),
+    guard settingsActionScopeAllowsElement(
+              element,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           elementBelongsToProcess(element, pid: expectedPid) else { return false }
     return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
 }
 
 func pressExactButton(
     _ element: AXUIElement,
+    appElement: AXUIElement,
     expectedPid: pid_t,
     names: [String]
 ) -> Bool {
     guard isTrustedSystemSettingsProcess(expectedPid),
+          settingsActionScopeAllowsElement(
+              element,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           axRole(element) == kAXButtonRole as String,
           elementBelongsToProcess(element, pid: expectedPid),
           axBool(element, kAXEnabledAttribute as String) == true,
           supportsPressAction(element),
           hasExactName(element, names: names) else { return false }
-    return pressElement(element, expectedPid: expectedPid)
+    return pressElement(
+        element,
+        appElement: appElement,
+        expectedPid: expectedPid
+    )
 }
 
 func axPoint(_ element: AXUIElement, attribute: String) -> CGPoint? {
@@ -638,6 +713,63 @@ func focusedWindowForProcess(_ pid: pid_t) -> AXUIElement? {
           axRole(window) == kAXWindowRole as String,
           elementBelongsToProcess(window, pid: pid) else { return nil }
     return window
+}
+
+func isWindowlessAppleIDSettingsOwner(
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(appElement, pid: expectedPid),
+          let owner = NSRunningApplication(processIdentifier: expectedPid),
+          isTrustedAppleIDSettingsExtension(owner) else { return false }
+    guard var candidates = axElementArrayStrict(
+        appElement,
+        kAXWindowsAttribute as String
+    ) else { return false }
+    let focused = axOptionalElementStrict(
+        appElement,
+        kAXFocusedWindowAttribute as String
+    )
+    let main = axOptionalElementStrict(
+        appElement,
+        kAXMainWindowAttribute as String
+    )
+    guard focused.known, main.known else { return false }
+    if let focused = focused.value {
+        candidates.append(focused)
+    }
+    if let main = main.value {
+        candidates.append(main)
+    }
+    var hasStandardWindow = false
+    for candidate in candidates {
+        guard elementBelongsToProcess(candidate, pid: expectedPid),
+              let role = axString(candidate, kAXRoleAttribute as String),
+              !role.isEmpty else { return false }
+        if role == kAXWindowRole as String { hasStandardWindow = true }
+    }
+    return !hasStandardWindow && isTrustedSystemSettingsProcess(expectedPid)
+}
+
+func settingsActionScopeAllowsElement(
+    _ element: AXUIElement,
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(element, pid: expectedPid) else { return false }
+    if let focusedWindow = focusedWindowForProcess(expectedPid) {
+        guard axWindowForElement(
+            element,
+            expectedPid: expectedPid
+        ) == focusedWindow else { return false }
+        return isTrustedSystemSettingsProcess(expectedPid)
+    }
+    return isWindowlessAppleIDSettingsOwner(
+        appElement: appElement,
+        expectedPid: expectedPid
+    )
 }
 
 func hitTestMatchesButton(
@@ -729,33 +861,47 @@ func clickNamed(
     in root: AXUIElement,
     names: [String],
     expectedPid: pid_t,
-    maxNodes: Int = 700
+    maxNodes: Int = 2_000
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          let focusedWindow = focusedWindowForProcess(expectedPid) else { return false }
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
     var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var matches: [AXUIElement] = []
     var visited = 0
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
         visited += 1
-        let role = axRole(node)
-        let blob = axDescription(node)
-        let matched = names.contains { blob == $0 || blob.contains($0) }
-        if matched,
+        if hasExactName(node, names: names),
            elementBelongsToProcess(node, pid: expectedPid),
            axBool(node, kAXHiddenAttribute as String) != true,
            axBool(node, kAXEnabledAttribute as String) == true,
            supportsPressAction(node),
            axFrame(node) != nil,
-           axWindowForElement(node, expectedPid: expectedPid) == focusedWindow,
-           pressElement(node, expectedPid: expectedPid) {
-            return true
+           settingsActionScopeAllowsElement(
+               node,
+               appElement: root,
+               expectedPid: expectedPid
+           ),
+           !matches.contains(where: { $0 == node }) {
+            matches.append(node)
         }
-        if isContainerRole(role) || visited <= 3 {
-            queue.append(contentsOf: axChildren(node))
-        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
     }
-    return false
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          matches.count == 1 else { return false }
+    guard settingsActionScopeAllowsElement(
+        matches[0],
+        appElement: root,
+        expectedPid: expectedPid
+    ) else { return false }
+    return pressElement(
+        matches[0],
+        appElement: root,
+        expectedPid: expectedPid
+    )
 }
 
 func collectWindows(appElement: AXUIElement, expectedPid: pid_t) -> [AXUIElement] {
@@ -851,6 +997,17 @@ func activateSystemSettings(
         if let focusedWindow = focusedWindowForProcess(expectedPid),
            axBool(focusedWindow, kAXHiddenAttribute as String) != true,
            axFrame(focusedWindow) != nil {
+            return true
+        }
+        if isWindowlessAppleIDSettingsOwner(
+            appElement: appElement,
+            expectedPid: expectedPid
+        ), treeContainsExactText(
+                appElement,
+                names: appleAccountPageEvidence,
+                expectedPid: expectedPid,
+                maxNodes: 2_000
+            ) {
             return true
         }
 
@@ -983,6 +1140,7 @@ func closeVerificationCodeAlert(
             if pressAttempts < 2 {
                 _ = pressExactButton(
                     closeButton,
+                    appElement: appElement,
                     expectedPid: expectedPid,
                     names: verificationAlertCloseButtons
                 )
@@ -1097,6 +1255,7 @@ func requestVerificationCodeAlert(
         if attempt < 3 {
             _ = pressExactButton(
                 button,
+                appElement: appElement,
                 expectedPid: expectedPid,
                 names: buttonNames
             )

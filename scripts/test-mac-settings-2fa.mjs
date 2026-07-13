@@ -28,6 +28,16 @@ function assertSafeError(error) {
   assertNoSecrets(JSON.stringify(Object.fromEntries(Object.entries(error ?? {}))));
 }
 
+function readNormalizedText(url) {
+  return fs.readFileSync(url, "utf8").replace(/\r\n?/g, "\n");
+}
+
+function readSettingsSwiftSource() {
+  return readNormalizedText(
+    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url)
+  );
+}
+
 async function rejectionOf(promise) {
   try {
     await promise;
@@ -90,18 +100,65 @@ function assertSettingsOwnerSafetyContract(source) {
   );
 
   const press = swiftFunctionBodyFromSource(source, "pressElement");
+  const scopeChecks = [...press.matchAll(/settingsActionScopeAllowsElement\(/g)].map(
+    (match) => match.index
+  );
+  const pressActions = [...press.matchAll(/AXUIElementPerformAction/g)].map(
+    (match) => match.index
+  );
   assert.ok(
-    press.indexOf("isTrustedSystemSettingsProcess(expectedPid)") >= 0 &&
-      press.indexOf("isTrustedSystemSettingsProcess(expectedPid)") <
-        press.indexOf("AXUIElementPerformAction"),
-    "the current unique UI owner must be revalidated before the first AX press"
+    scopeChecks.length >= 3 &&
+      pressActions.length >= 2 &&
+      scopeChecks[0] < pressActions[0] &&
+      scopeChecks.at(-1) > pressActions[0] &&
+      scopeChecks.at(-1) < pressActions.at(-1),
+    "the complete action scope must be revalidated before every AX press"
+  );
+
+  const windowlessOwner = swiftFunctionBodyFromSource(
+    source,
+    "isWindowlessAppleIDSettingsOwner"
+  );
+  assert.match(
+    windowlessOwner,
+    /isTrustedAppleIDSettingsExtension\(owner\)/,
+    "windowless actions require the exact AppleIDSettings ExtensionKit owner"
+  );
+  assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
+  assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
+  assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
+  assert.match(windowlessOwner, /axElementArrayStrict\(/);
+  assert.match(windowlessOwner, /guard focused\.known,\s*main\.known else/);
+  assert.match(
+    windowlessOwner,
+    /return\s+!hasStandardWindow\s*&&\s*isTrustedSystemSettingsProcess\(expectedPid\)/,
+    "windowless actions must prove the same PID exposes no standard AXWindow"
+  );
+
+  const actionScope = swiftFunctionBodyFromSource(
+    source,
+    "settingsActionScopeAllowsElement"
+  );
+  assert.match(actionScope, /if let focusedWindow = focusedWindowForProcess\(expectedPid\)/);
+  assert.match(actionScope, /return isWindowlessAppleIDSettingsOwner\(/);
+  assert.doesNotMatch(actionScope, /focusedWindow\s*==\s*nil/);
+
+  const exactButton = swiftFunctionBodyFromSource(source, "findExactButton");
+  assert.match(
+    exactButton,
+    /let frame\s*=\s*axFrame\(node\)/,
+    "strict button discovery must use the node's real AX frame"
+  );
+  assert.match(exactButton, /pointIsOnActiveDisplay\(/);
+  assert.match(
+    exactButton,
+    /return matches\.count\s*==\s*1\s*\?\s*matches\[0\]\s*:\s*nil/,
+    "strict button discovery must fail closed unless one button exists"
   );
 }
 
 function runSettingsOwnerMutationResistanceTest() {
-  const source = fs
-    .readFileSync(new URL("./swift/mac-settings-2fa-code.swift", import.meta.url), "utf8")
-    .replace(/\r\n/g, "\n");
+  const source = readSettingsSwiftSource();
   assertSettingsOwnerSafetyContract(source);
 
   const ignoredOpenResult = source.replace(
@@ -145,6 +202,76 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingFinalClickGuard),
     /immediately before CGEvent/
+  );
+
+  const genericWindowlessOwner = source.replace(
+    "isTrustedAppleIDSettingsExtension(owner) else { return false }",
+    "isTrustedSystemSettings(owner) else { return false }"
+  );
+  assert.notEqual(
+    genericWindowlessOwner,
+    source,
+    "windowless-owner identity mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(genericWindowlessOwner),
+    /exact AppleIDSettings ExtensionKit owner/
+  );
+
+  const uncheckedStandardWindow = source.replace(
+    "return !hasStandardWindow && isTrustedSystemSettingsProcess(expectedPid)",
+    "return isTrustedSystemSettingsProcess(expectedPid)"
+  );
+  assert.notEqual(
+    uncheckedStandardWindow,
+    source,
+    "standard-window mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(uncheckedStandardWindow),
+    /no standard AXWindow/
+  );
+
+  const nonUniqueButton = source.replace(
+    "return matches.count == 1 ? matches[0] : nil",
+    "return matches.first"
+  );
+  assert.notEqual(nonUniqueButton, source, "button-uniqueness mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(nonUniqueButton),
+    /unless one button exists/
+  );
+
+  const fabricatedButtonFrame = source.replace(
+    "let frame = axFrame(node),",
+    "let frame = CGRect(x: 0, y: 0, width: 100, height: 40),"
+  );
+  assert.notEqual(
+    fabricatedButtonFrame,
+    source,
+    "button-frame mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(fabricatedButtonFrame),
+    /real AX frame/
+  );
+
+  const pressBody = swiftFunctionBodyFromSource(source, "pressElement");
+  const finalScopeIndex = pressBody.lastIndexOf("settingsActionScopeAllowsElement(");
+  assert.ok(finalScopeIndex >= 0, "second-press mutation fixture must find final scope check");
+  const weakenedPressBody =
+    pressBody.slice(0, finalScopeIndex) +
+    "isTrustedSystemSettingsProcess(" +
+    pressBody.slice(finalScopeIndex + "settingsActionScopeAllowsElement(".length);
+  const missingSecondPressScope = source.replace(pressBody, weakenedPressBody);
+  assert.notEqual(
+    missingSecondPressScope,
+    source,
+    "second-press scope mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingSecondPressScope),
+    /before every AX press/
   );
 }
 
@@ -626,10 +753,7 @@ function runSwiftCancellationContractTest() {
     new URL("./lib/mac-settings-2fa.js", import.meta.url),
     "utf8"
   );
-  const source = fs.readFileSync(
-    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
-    "utf8"
-  );
+  const source = readSettingsSwiftSource();
   assert.doesNotMatch(nodeSource, /screenshotPath|--screenshot/);
   assert.match(nodeSource, /let forceKillTimer/);
   const finishBody = nodeSource.slice(
@@ -851,10 +975,7 @@ function runSwiftCancellationContractTest() {
 }
 
 function runStrictVerificationCodeSourceContractTest() {
-  const source = fs.readFileSync(
-    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
-    "utf8"
-  );
+  const source = readSettingsSwiftSource();
   const functionBody = (name) => {
     const start = source.indexOf("func " + name);
     assert.notEqual(start, -1, "missing Swift function " + name);
@@ -888,7 +1009,12 @@ function runStrictVerificationCodeSourceContractTest() {
 
   const getCodeFinder = functionBody("findGetCodeButton");
   assert.match(getCodeFinder, /twoFactorNames/);
+  assert.match(getCodeFinder, /collectSheetRoots\(appElement,\s*expectedPid:\s*expectedPid\)/);
+  assert.match(getCodeFinder, /if roots\.isEmpty \{ roots = \[appElement\] \}/);
   assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*expectedPid\)/);
+  assert.match(getCodeFinder, /treeContainsExactText\(\s*root,/);
+  assert.match(getCodeFinder, /let button = findExactButton\(\s*in:\s*root,/);
+  assert.match(getCodeFinder, /matches\.count\s*==\s*1/);
   assert.match(
     getCodeFinder,
     /(?:guard|if)[\s\S]{0,300}twoFactorNames/,
@@ -903,34 +1029,57 @@ function runStrictVerificationCodeSourceContractTest() {
     /clickNamed|blob\.contains|AXLink|kAXMenuItemRole/,
     "Get Verification Code must use the strict button path"
   );
-  assert.match(getCodeFinder, /focusedWindowForProcess\(expectedPid\)/);
   assert.match(
     getCodeFinder,
-    /axWindowForElement\(button,\s*expectedPid:\s*expectedPid\)\s*==\s*focusedWindow/
+    /settingsActionScopeAllowsElement\(\s*button,\s*appElement:\s*appElement,/
   );
   const sheetRoots = functionBody("collectSheetRoots");
   assert.match(source, /let axSheetsAttribute\s*=\s*"AXSheets"/);
   assert.match(functionBody("axSheets"), /axCopy\(element,\s*axSheetsAttribute\)/);
   assert.match(sheetRoots, /kAXFocusedWindowAttribute/);
-  assert.match(sheetRoots, /axSheets\(focusedWindow\)\s*\+\s*axChildren\(focusedWindow\)/);
+  assert.match(sheetRoots, /traversalRoot\s*=\s*focusedWindow/);
+  assert.match(sheetRoots, /traversalRoot\s*=\s*appElement/);
+  assert.match(sheetRoots, /axSheets\(traversalRoot\)\s*\+\s*axChildren\(traversalRoot\)/);
   assert.match(sheetRoots, /queue\.append\(contentsOf:\s*axSheets\(node\)\)/);
   assert.match(sheetRoots, /seen\.contains/);
   assert.match(sheetRoots, /kAXHiddenAttribute/);
-  assert.match(sheetRoots, /isDedicatedDialogWindow\(focusedWindow\)/);
+  assert.match(sheetRoots, /isDedicatedDialogWindow\(traversalRoot\)/);
   assert.match(sheetRoots, /kAXWindowRole[\s\S]*isDedicatedDialogWindow\(node\)/);
   assert.doesNotMatch(sheetRoots, /collectWindows\(/);
 
   const navigationClick = functionBody("clickNamed");
   assert.match(navigationClick, /expectedPid/);
-  assert.match(navigationClick, /focusedWindowForProcess\(expectedPid\)/);
+  assert.match(navigationClick, /hasExactName\(node,\s*names:\s*names\)/);
   assert.match(navigationClick, /kAXHiddenAttribute/);
   assert.match(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}==\s*true/);
   assert.doesNotMatch(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}!=\s*false/);
   assert.match(navigationClick, /supportsPressAction\(node\)/);
-  assert.match(
-    navigationClick,
-    /axWindowForElement\(node,\s*expectedPid:\s*expectedPid\)\s*==\s*focusedWindow/
+  assert.ok(
+    (navigationClick.match(/settingsActionScopeAllowsElement\(/g) ?? []).length >= 2,
+    "window scope must be revalidated during discovery and immediately before navigation press"
   );
+  assert.match(navigationClick, /matches\.count\s*==\s*1/);
+  assert.doesNotMatch(navigationClick, /blob\.contains|blob\s*=|names\.contains/);
+
+  const windowlessOwner = functionBody("isWindowlessAppleIDSettingsOwner");
+  assert.match(windowlessOwner, /isTrustedAppleIDSettingsExtension\(owner\)/);
+  assert.match(windowlessOwner, /kAXWindowsAttribute/);
+  assert.match(windowlessOwner, /kAXFocusedWindowAttribute/);
+  assert.match(windowlessOwner, /kAXMainWindowAttribute/);
+  assert.match(windowlessOwner, /axElementArrayStrict\(/);
+  assert.match(windowlessOwner, /guard focused\.known,\s*main\.known else/);
+  assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
+  assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
+  assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
+  assert.match(windowlessOwner, /!hasStandardWindow/);
+
+  const actionScope = functionBody("settingsActionScopeAllowsElement");
+  assert.match(actionScope, /if let focusedWindow = focusedWindowForProcess\(expectedPid\)/);
+  assert.match(
+    actionScope,
+    /axWindowForElement\([\s\S]{0,160}expectedPid:\s*expectedPid[\s\S]{0,80}==\s*focusedWindow/
+  );
+  assert.match(actionScope, /return isWindowlessAppleIDSettingsOwner\(/);
 
   const navigationDiagnostics = functionBody("logNavigationState");
   assert.match(navigationDiagnostics, /visibleExactMatchCounts\(/);
@@ -960,6 +1109,14 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /kAXHiddenAttribute[\s\S]*kCFBooleanFalse/);
   assert.match(activation, /kAXMinimizedAttribute[\s\S]*kCFBooleanFalse/);
   assert.match(activation, /focusedWindowForProcess\(expectedPid\)[\s\S]{0,180}kAXHiddenAttribute[\s\S]{0,120}axFrame\(focusedWindow\)/);
+  assert.match(
+    activation,
+    /isWindowlessAppleIDSettingsOwner\([\s\S]{0,220}treeContainsExactText\([\s\S]{0,260}names:\s*appleAccountPageEvidence[\s\S]{0,220}return true/
+  );
+  assert.ok(
+    activation.indexOf("treeContainsExactText(") < activation.indexOf("let windows = collectWindows("),
+    "windowless target-page evidence must be checked before window diagnostics"
+  );
   assert.doesNotMatch(activation, /AXUIElementPerformAction\(window,\s*kAXRaiseAction/);
   assert.match(activation, /pid=/);
   assert.match(activation, /roleWindow=/);
@@ -1034,6 +1191,8 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(request, /clickElementAtVerifiedFrame\(\s*button,\s*expectedPid:/);
 
   const alertRoot = functionBody("findVerificationCodeAlertRoot");
+  assert.match(alertRoot, /roots\.append\(appElement\)/);
+  assert.match(alertRoot, /queue\.append\(contentsOf:\s*axSheets\(node\)\)/);
   assert.match(alertRoot, /hasExactName\(node,\s*names:\s*verificationAlertTitles\)/);
   assert.match(alertRoot, /for\s+_\s+in\s+0\.\.<10/);
   assert.match(alertRoot, /elementBelongsToProcess\(\w+,\s*pid:\s*expectedPid\)/);
@@ -1093,10 +1252,7 @@ function runStrictVerificationCodeSourceContractTest() {
 }
 
 function runVerificationCodeHardeningSourceContractTest() {
-  const source = fs.readFileSync(
-    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
-    "utf8"
-  );
+  const source = readSettingsSwiftSource();
   const functionBody = (name) => {
     const start = source.indexOf("func " + name);
     assert.notEqual(start, -1, "missing Swift function " + name);
@@ -1284,10 +1440,7 @@ function runVerificationCodeHardeningSourceContractTest() {
 }
 
 function runTraditionalChineseStateContractTest() {
-  const source = fs.readFileSync(
-    new URL("./swift/mac-settings-2fa-code.swift", import.meta.url),
-    "utf8"
-  );
+  const source = readSettingsSwiftSource();
   const functionBody = (name) => {
     const start = source.indexOf(`func ${name}`);
     assert.notEqual(start, -1, `missing Swift function ${name}`);
