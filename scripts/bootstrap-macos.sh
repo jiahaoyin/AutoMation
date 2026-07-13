@@ -262,7 +262,7 @@ install_node_official_binary() {
   arch="$(uname -m)"
   case "$arch" in
     arm64) arch="arm64" ;;
-    x86_64) arch="x86_64" ;;
+    x86_64) arch="x64" ;;
     *) echo "错误: 不支持的 CPU 架构: $arch"; return 1 ;;
   esac
 

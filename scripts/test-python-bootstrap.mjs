@@ -74,6 +74,8 @@ assert.match(bootstrap, /\/usr\/bin\/shasum/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/bin\/true/);
 assert.match(bootstrap, /SUDO_KEEPALIVE_PID/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -k/);
+assert.match(bootstrap, /x86_64\) arch="x64" ;;/);
+assert.doesNotMatch(bootstrap, /x86_64\) arch="x86_64" ;;/);
 assert.match(bootstrap, /major > 3 \|\| \(major == 3 && minor >= 10\)/);
 assert.match(bootstrap, /export PYTHON_BOOTSTRAP_EXECUTABLE="\$python_path"/);
 assert.match(bootstrap, /python_path_is_admin_trusted/);
