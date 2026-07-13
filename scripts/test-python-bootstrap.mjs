@@ -68,6 +68,15 @@ assert.match(
   /8373e58da4ea146b3eb1c1f9834f19a319440b6b679b06050b1f9ee3237aa8e4/
 );
 assert.match(bootstrap, /resolve_trusted_python_signer/);
+const signerFunction = bootstrap.match(
+  /resolve_trusted_python_signer\(\)\s*\{([\s\S]*?)\n\}/
+)?.[1];
+assert.ok(signerFunction, "trusted Python signer resolver is required");
+assert.doesNotMatch(
+  signerFunction,
+  /<<<\s*"\$signature"/,
+  "signer parsing must not ask Bash to create a here-string temp file"
+);
 assert.doesNotMatch(bootstrap, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/pkgutil --check-signature/);
 assert.match(bootstrap, /\/usr\/bin\/sudo -n \/usr\/sbin\/installer -pkg/);

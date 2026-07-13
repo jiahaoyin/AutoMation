@@ -147,12 +147,20 @@ verify_python_pkg_hash() {
 resolve_trusted_python_signer() {
   local signature="$1"
   local line
-  while IFS= read -r line; do
+  while :; do
+    if [[ "$signature" == *$'\n'* ]]; then
+      line="${signature%%$'\n'*}"
+      signature="${signature#*$'\n'}"
+    else
+      line="$signature"
+      signature=""
+    fi
     if [[ "$line" =~ ^[[:space:]]*1\.[[:space:]]+Developer[[:space:]]ID[[:space:]]Installer:[[:space:]]Python[[:space:]]Software[[:space:]]Foundation[[:space:]]\(([A-Z0-9]{10})\)[[:space:]]*$ ]]; then
       printf 'Developer ID Installer: Python Software Foundation (%s)\n' "${BASH_REMATCH[1]}"
       return 0
     fi
-  done <<< "$signature"
+    [[ -n "$signature" ]] || break
+  done
   return 1
 }
 
