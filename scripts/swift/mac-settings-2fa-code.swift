@@ -51,6 +51,10 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
     axCopy(element, kAXChildrenAttribute as String) ?? []
 }
 
+func axSheets(_ element: AXUIElement) -> [AXUIElement] {
+    axCopy(element, kAXSheetsAttribute as String) ?? []
+}
+
 func axRole(_ element: AXUIElement) -> String {
     axString(element, kAXRoleAttribute as String) ?? ""
 }
@@ -206,10 +210,13 @@ func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
        axFrame(focusedWindow) != nil {
         dialogs.append(focusedWindow)
     }
-    var queue = axChildren(focusedWindow)
+    var queue = axSheets(focusedWindow) + axChildren(focusedWindow)
+    var seen: [AXUIElement] = []
     var visited = 0
     while !queue.isEmpty && visited < 1_200 {
         let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
         visited += 1
         let role = axRole(node)
         let isDialog = role == "AXDialog" ||
@@ -219,6 +226,7 @@ func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
            axFrame(node) != nil {
             dialogs.append(node)
         }
+        queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
     }
     return Array(dialogs.reversed())

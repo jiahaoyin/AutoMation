@@ -682,6 +682,9 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(getCodeFinder, /axWindowForElement\(button\)\s*==\s*focusedWindow/);
   const sheetRoots = functionBody("collectSheetRoots");
   assert.match(sheetRoots, /kAXFocusedWindowAttribute/);
+  assert.match(sheetRoots, /axSheets\(focusedWindow\)\s*\+\s*axChildren\(focusedWindow\)/);
+  assert.match(sheetRoots, /queue\.append\(contentsOf:\s*axSheets\(node\)\)/);
+  assert.match(sheetRoots, /seen\.contains/);
   assert.match(sheetRoots, /kAXHiddenAttribute/);
   assert.match(sheetRoots, /isDedicatedDialogWindow\(focusedWindow\)/);
   assert.match(sheetRoots, /kAXWindowRole[\s\S]*isDedicatedDialogWindow\(node\)/);
