@@ -14,6 +14,7 @@ struct Output: Codable {
 
 let settingsBundleIds: Set<String> = ["com.apple.systempreferences", "com.apple.SystemSettings"]
 let settingsExecutableNames: Set<String> = ["System Settings", "System Preferences"]
+let axSheetsAttribute = "AXSheets"
 var cancelFilePath: String?
 var verificationCodeRequested = false
 
@@ -52,7 +53,7 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
 }
 
 func axSheets(_ element: AXUIElement) -> [AXUIElement] {
-    axCopy(element, kAXSheetsAttribute as String) ?? []
+    axCopy(element, axSheetsAttribute) ?? []
 }
 
 func axRole(_ element: AXUIElement) -> String {

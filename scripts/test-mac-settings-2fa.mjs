@@ -681,6 +681,8 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(getCodeFinder, /focusedWindowForProcess\(expectedPid\)/);
   assert.match(getCodeFinder, /axWindowForElement\(button\)\s*==\s*focusedWindow/);
   const sheetRoots = functionBody("collectSheetRoots");
+  assert.match(source, /let axSheetsAttribute\s*=\s*"AXSheets"/);
+  assert.match(functionBody("axSheets"), /axCopy\(element,\s*axSheetsAttribute\)/);
   assert.match(sheetRoots, /kAXFocusedWindowAttribute/);
   assert.match(sheetRoots, /axSheets\(focusedWindow\)\s*\+\s*axChildren\(focusedWindow\)/);
   assert.match(sheetRoots, /queue\.append\(contentsOf:\s*axSheets\(node\)\)/);
