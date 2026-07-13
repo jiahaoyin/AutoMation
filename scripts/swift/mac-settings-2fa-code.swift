@@ -686,16 +686,49 @@ func activateSystemSettings(
         ) { _, _ in }
     }
     _ = app.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(
+        appElement,
+        kAXHiddenAttribute as CFString,
+        kCFBooleanFalse
+    )
 
     let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
     var lastWindowCount = 0
     var lastVisibleCount = 0
     var lastDialogCount = 0
     var lastMainCount = 0
+    var lastPidCount = 0
+    var lastRoleCount = 0
+    var lastUnhiddenCount = 0
+    var lastFramedCount = 0
+    var lastMinimizedCount = 0
     repeat {
-        if focusedWindowForProcess(expectedPid) != nil { return true }
+        if let focusedWindow = focusedWindowForProcess(expectedPid),
+           axBool(focusedWindow, kAXHiddenAttribute as String) != true,
+           axFrame(focusedWindow) != nil {
+            return true
+        }
 
         let windows = collectWindows(appElement: appElement)
+        let pidWindows = windows.filter {
+            elementBelongsToProcess($0, pid: expectedPid)
+        }
+        let roleWindows = pidWindows.filter {
+            axRole($0) == kAXWindowRole as String
+        }
+        for window in roleWindows {
+            if axBool(window, kAXMinimizedAttribute as String) == true {
+                _ = AXUIElementSetAttributeValue(
+                    window,
+                    kAXMinimizedAttribute as CFString,
+                    kCFBooleanFalse
+                )
+            }
+        }
+        let unhiddenWindows = roleWindows.filter {
+            axBool($0, kAXHiddenAttribute as String) != true
+        }
+        let framedWindows = unhiddenWindows.filter { axFrame($0) != nil }
         let visibleWindows = windows.filter {
             elementBelongsToProcess($0, pid: expectedPid) &&
                 axRole($0) == kAXWindowRole as String &&
@@ -710,6 +743,13 @@ func activateSystemSettings(
         lastVisibleCount = visibleWindows.count
         lastDialogCount = dialogs.count
         lastMainCount = mainWindows.count
+        lastPidCount = pidWindows.count
+        lastRoleCount = roleWindows.count
+        lastUnhiddenCount = unhiddenWindows.count
+        lastFramedCount = framedWindows.count
+        lastMinimizedCount = roleWindows.filter {
+            axBool($0, kAXMinimizedAttribute as String) == true
+        }.count
         let target = dialogs.count == 1
             ? dialogs[0]
             : mainWindows.count == 1
@@ -726,13 +766,18 @@ func activateSystemSettings(
         }
         _ = app.unhide()
         _ = app.activate(options: [.activateAllWindows])
+        _ = AXUIElementSetAttributeValue(
+            appElement,
+            kAXHiddenAttribute as CFString,
+            kCFBooleanFalse
+        )
         if Date() >= deadline { break }
         usleep(100_000)
     } while true
 
     logStep(
         1,
-        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
+        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) pid=\(lastPidCount) role=\(lastRoleCount) unhidden=\(lastUnhiddenCount) framed=\(lastFramedCount) minimized=\(lastMinimizedCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
     )
     return false
 }

@@ -726,6 +726,15 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /visible=/);
   assert.match(activation, /dialogs=/);
   assert.match(activation, /main=/);
+  assert.match(activation, /kAXHiddenAttribute[\s\S]*kCFBooleanFalse/);
+  assert.match(activation, /kAXMinimizedAttribute[\s\S]*kCFBooleanFalse/);
+  assert.match(activation, /focusedWindowForProcess\(expectedPid\)[\s\S]{0,180}kAXHiddenAttribute[\s\S]{0,120}axFrame\(focusedWindow\)/);
+  assert.doesNotMatch(activation, /AXUIElementPerformAction\(window,\s*kAXRaiseAction/);
+  assert.match(activation, /pid=/);
+  assert.match(activation, /role=/);
+  assert.match(activation, /unhidden=/);
+  assert.match(activation, /framed=/);
+  assert.match(activation, /minimized=/);
   assert.doesNotMatch(activation, /activateIgnoringOtherApps/);
 
   const focusWindow = functionBody("focusTrustedSettingsWindow");
