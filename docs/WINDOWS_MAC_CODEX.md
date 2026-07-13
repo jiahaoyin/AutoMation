@@ -241,9 +241,13 @@ Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 re
 2. 通过 SSH 要求 Mac 仓库 clean。
 3. Codex 启动前由调度器在 Mac 执行受控的 `fetch`、`switch`、`merge --ff-only` 并核对
    相同 SHA；若工作区 dirty、分支分叉或无法 fast-forward，则立即停止。
-4. 以 `/Users/admin/.local/bin/codex exec -p automation -s read-only` 启动 Mac Codex。
-5. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
-6. 下载全部产物到 Windows 并输出一行 JSON 摘要。
+4. 以 `/Users/admin/.local/bin/codex exec -p automation -s read-only` 启动 Mac Codex，仓库路径
+   保持硬只读。
+5. 仅通过 `--add-dir` 授予本轮
+   `/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp` 可写权限，并将 `TMPDIR`
+   指向它；不得扩大到 round 根目录、仓库、`$HOME` 或共享系统临时目录。
+6. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
+7. 下载固定八项证据文件到 Windows 并输出一行 JSON 摘要。
 
 ## 8. 阅读测试结果
 
@@ -264,13 +268,16 @@ Windows 产物目录：
 | `codex-exit.txt` | Mac Codex 退出码 |
 | `git-before.txt`, `git-after.txt` | Mac 执行前后工作区状态 |
 | `head-before.txt`, `head-after.txt` | Mac 执行前后提交 SHA |
+| Mac 端 `tmp/` | 每轮独立的沙箱临时目录；唯一额外可写路径，不在固定证据回传清单中 |
 
 只有以下条件同时满足，顶层 `status` 才是 `passed`：SSH 和 scp 成功、Codex 退出 0、
 JSONL 与 `final.json` 有效、报告状态通过、Mac Git 状态和 HEAD 未变化。
 
-远端调度器使用 `umask 077`，run 目录为 0700，产物文件为 0600。运行证据默认保留
-30 天；本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐文件、逐目录
-清理。调度器不会自动递归删除历史证据。
+远端调度器使用 `umask 077`；round 与 `tmp` 目录为 0700，普通新建文件默认为 0600。
+`tmp/` 只保留在 Mac，不会被固定八项证据文件的 scp 清单下载到 Windows；它采用同一
+证据保留和逐项清理周期。运行证据的维护策略为保留 30 天；不得向 `tmp/` 写入秘密或
+无界增长的大文件。本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐
+文件、逐目录清理。调度器不会自动递归删除历史证据。
 
 ## 9. Windows 修复 -> Mac 重测循环
 

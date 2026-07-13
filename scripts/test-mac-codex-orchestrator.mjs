@@ -161,6 +161,38 @@ assert.match(
   /export PATH="\$REMOTE_REPO\/\.runtime\/node\/bin:\$HOME\/\.local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/
 );
 assert.match(remoteScript, /"\$CODEX_BIN" exec -p automation -s read-only/);
+assert.match(remoteScript, /RUN_TMP_DIR="\$REMOTE_ROUND_DIR\/tmp"/);
+assert.match(remoteScript, /export TMPDIR="\$RUN_TMP_DIR"/);
+assert.match(remoteScript, /--add-dir "\$RUN_TMP_DIR"/);
+assert.equal((remoteScript.match(/--add-dir/g) ?? []).length, 1);
+assert.match(
+  remoteScript,
+  /"\$CODEX_BIN" exec -p automation -s read-only \\\n  --add-dir "\$RUN_TMP_DIR" \\\n  --json/
+);
+assert.doesNotMatch(remoteScript, /--add-dir "\$(?:REMOTE_ROUND_DIR|REMOTE_REPO|HOME)"/);
+for (const command of [
+  '/bin/mkdir -p "$REMOTE_ROUND_DIR"',
+  '/bin/chmod 700 "$REMOTE_ROUND_DIR"',
+  '/bin/mkdir "$RUN_TMP_DIR"',
+  '/bin/chmod 700 "$RUN_TMP_DIR"',
+  'export TMPDIR="$RUN_TMP_DIR"',
+  '"$CODEX_BIN" exec -p automation -s read-only',
+]) {
+  assert.ok(remoteScript.includes(command), `remote script must include: ${command}`);
+}
+assert.ok(
+  remoteScript.indexOf('/bin/mkdir -p "$REMOTE_ROUND_DIR"') <
+    remoteScript.indexOf('/bin/chmod 700 "$REMOTE_ROUND_DIR"') &&
+    remoteScript.indexOf('/bin/chmod 700 "$REMOTE_ROUND_DIR"') <
+      remoteScript.indexOf('/bin/mkdir "$RUN_TMP_DIR"') &&
+    remoteScript.indexOf('/bin/mkdir "$RUN_TMP_DIR"') <
+      remoteScript.indexOf('/bin/chmod 700 "$RUN_TMP_DIR"') &&
+    remoteScript.indexOf('/bin/chmod 700 "$RUN_TMP_DIR"') <
+      remoteScript.indexOf('export TMPDIR="$RUN_TMP_DIR"') &&
+    remoteScript.indexOf('export TMPDIR="$RUN_TMP_DIR"') <
+      remoteScript.indexOf('"$CODEX_BIN" exec -p automation -s read-only'),
+  "private per-round TMPDIR must exist before Codex starts"
+);
 assert.match(remoteScript, /--json/);
 assert.match(remoteScript, /--output-schema/);
 assert.match(remoteScript, /-o "\$REMOTE_ROUND_DIR\/final\.json"/);
@@ -213,22 +245,35 @@ assert.deepEqual(buildSshArgs({ sshAlias: "mac-codex" }), [
   "/bin/zsh",
   "-s",
 ]);
+const scpArgs = buildScpArgs({
+  sshAlias: "mac-codex",
+  remoteRoundDir: remoteOptions.remoteRoundDir,
+  roundDir: "C:\\runs\\round-02",
+});
+const requiredArtifacts = [
+  "events.jsonl",
+  "stderr.log",
+  "final.json",
+  "git-before.txt",
+  "git-after.txt",
+  "head-before.txt",
+  "head-after.txt",
+  "codex-exit.txt",
+];
+assert.deepEqual(scpArgs.slice(0, 4), [
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "StrictHostKeyChecking=yes",
+]);
 assert.deepEqual(
-  buildScpArgs({
-    sshAlias: "mac-codex",
-    remoteRoundDir: remoteOptions.remoteRoundDir,
-    roundDir: "C:\\runs\\round-02",
-  }),
-  [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "StrictHostKeyChecking=yes",
-    "-r",
-    `mac-codex:${remoteOptions.remoteRoundDir}/.`,
-    "C:\\runs\\round-02",
-  ]
+  scpArgs.slice(4, -1),
+  requiredArtifacts.map(
+    (artifact) => `mac-codex:${remoteOptions.remoteRoundDir}/${artifact}`
+  )
 );
+assert.equal(scpArgs.at(-1), "C:\\runs\\round-02");
+assert.doesNotMatch(scpArgs.join("\n"), /(?:^|\n)-r(?:\n|$)|\/\.?(?:\n|$)|\/tmp(?:\/|\n|$)/);
 
 const schema = JSON.parse(
   fs.readFileSync(new URL("./mac-codex-report.schema.json", import.meta.url), "utf8")
