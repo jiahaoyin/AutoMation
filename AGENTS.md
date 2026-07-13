@@ -32,4 +32,3 @@ unattended GUI confirmation. Those require an explicitly supervised Mac session.
   stop and report the mismatch instead of forcing synchronization.
 
 See `docs/WINDOWS_MAC_CODEX.md` for setup, operation, artifacts, and troubleshooting.
-

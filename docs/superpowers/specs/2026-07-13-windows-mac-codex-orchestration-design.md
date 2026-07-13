@@ -91,4 +91,3 @@ npm.cmd run -s mac:codex -- --task "检查当前改动并运行相关 macOS 测�
 5. Mac Codex smoke 返回结构化任务理解、环境识别、命令和测试结果。
 6. Mac 运行相关非交互测试，Git 前后保持 clean。
 7. 至少三路只读审查通过；发现问题则修改、重测并重新审查。
-
