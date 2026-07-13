@@ -233,6 +233,69 @@ func collectSheetRoots(_ appElement: AXUIElement) -> [AXUIElement] {
     return Array(dialogs.reversed())
 }
 
+func visibleExactMatchCounts(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    names: [String],
+    maxNodes: Int = 2_000
+) -> (visible: Int, pressable: Int) {
+    var queue = axSheets(appElement) + axChildren(appElement)
+    var seen: [AXUIElement] = []
+    var visited = 0
+    var visible = 0
+    var pressable = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        if elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil,
+           hasExactName(node, names: names) {
+            visible += 1
+            if axBool(node, kAXEnabledAttribute as String) == true,
+               supportsPressAction(node) {
+                pressable += 1
+            }
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return (visible, pressable)
+}
+
+func logNavigationState(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    signInNames: [String],
+    twoFactorNames: [String],
+    buttonNames: [String]
+) {
+    let signIn = visibleExactMatchCounts(
+        appElement: appElement,
+        expectedPid: expectedPid,
+        names: signInNames
+    )
+    let twoFactor = visibleExactMatchCounts(
+        appElement: appElement,
+        expectedPid: expectedPid,
+        names: twoFactorNames
+    )
+    let focused = focusedWindowForProcess(expectedPid) == nil ? 0 : 1
+    let sheets = collectSheetRoots(appElement).count
+    let getCode = findGetCodeButton(
+        appElement: appElement,
+        expectedPid: expectedPid,
+        twoFactorNames: twoFactorNames,
+        buttonNames: buttonNames
+    ) == nil ? 0 : 1
+    logStep(
+        2,
+        "navigation state focused=\(focused) sheets=\(sheets) signInVisible=\(signIn.visible) signInPressable=\(signIn.pressable) twoFactorVisible=\(twoFactor.visible) twoFactorPressable=\(twoFactor.pressable) getCode=\(getCode)"
+    )
+}
+
 func findVerificationCodeAlertRoot(
     appElement: AXUIElement,
     expectedPid: pid_t
@@ -772,6 +835,14 @@ logStep(2, "System Settings ready")
 let signInSecurity = ["登录与安全性", "登入與安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性"]
 let twoFactor = ["双重认证", "雙重認證", "Two-Factor Authentication", "双因素认证"]
 let getCodeBtn = ["获取验证码", "取得驗證碼", "Get Verification Code", "Get a Verification Code"]
+
+logNavigationState(
+    appElement: appElement,
+    expectedPid: settingsPid,
+    signInNames: signInSecurity,
+    twoFactorNames: twoFactor,
+    buttonNames: getCodeBtn
+)
 
 stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
 if findGetCodeButton(

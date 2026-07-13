@@ -701,6 +701,15 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(navigationClick, /supportsPressAction\(node\)/);
   assert.match(navigationClick, /axWindowForElement\(node\)\s*==\s*focusedWindow/);
 
+  const navigationDiagnostics = functionBody("logNavigationState");
+  assert.match(navigationDiagnostics, /visibleExactMatchCounts\(/);
+  assert.match(navigationDiagnostics, /focused=/);
+  assert.match(navigationDiagnostics, /sheets=/);
+  assert.match(navigationDiagnostics, /signInVisible=/);
+  assert.match(navigationDiagnostics, /twoFactorVisible=/);
+  assert.match(navigationDiagnostics, /getCode=/);
+  assert.doesNotMatch(navigationDiagnostics, /axDescription|axExactTexts|codeRaw|print\(/);
+
   const request = functionBody("requestVerificationCodeAlert");
   const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
   assert.ok(retryMatch, "verification-code request must have a bounded retry loop");
