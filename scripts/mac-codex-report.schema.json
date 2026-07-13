@@ -11,6 +11,8 @@
     "tests",
     "findings",
     "recommendedWindowsActions",
+    "executionMode",
+    "supervisedGuiStatus",
     "status"
   ],
   "properties": {
@@ -83,6 +85,12 @@
         "type": "string",
         "minLength": 1
       }
+    },
+    "executionMode": {
+      "enum": ["noninteractive", "supervised_gui"]
+    },
+    "supervisedGuiStatus": {
+      "enum": ["not_requested", "passed", "failed", "skipped"]
     },
     "status": {
       "enum": ["passed", "failed"]

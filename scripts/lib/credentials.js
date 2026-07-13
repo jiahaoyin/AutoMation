@@ -14,6 +14,19 @@ export function resolveEnvPath() {
   return path.join(PACKAGE_ROOT, ".env");
 }
 
+export function parseEnvValue(source) {
+  const value = String(source ?? "").trim();
+  if (value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1);
+  }
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value
+      .slice(1, -1)
+      .replace(/\\([\\"])/g, "$1");
+  }
+  return value;
+}
+
 export function loadEnvFile() {
   const envPath = resolveEnvPath();
   if (!fs.existsSync(envPath)) return envPath;
@@ -25,14 +38,8 @@ export function loadEnvFile() {
     const eq = trimmed.indexOf("=");
     if (eq <= 0) continue;
     const key = trimmed.slice(0, eq).trim();
-    let val = trimmed.slice(eq + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
-    }
-    if (!process.env[key]) process.env[key] = val;
+    const val = parseEnvValue(trimmed.slice(eq + 1));
+    if (!Object.hasOwn(process.env, key)) process.env[key] = val;
   }
   return envPath;
 }

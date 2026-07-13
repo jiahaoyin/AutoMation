@@ -301,6 +301,8 @@ assert.match(
 assert.match(generatedRunSh, /preflight-2fa-permissions\.mjs --quiet/);
 assert.match(generatedRunSh, /bootstrap_macos_runtime/);
 assert.doesNotMatch(generatedRunSh, /bootstrap_macos_install_runtime/);
+assert.doesNotMatch(generatedRunSh, /source\s+(?:["']?)\.env|set\s+-a/);
+assert.match(generatedRunSh, /credentials\.js loads \.env as data/);
 assert.match(
   generatedRunSh,
   /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/,
@@ -323,6 +325,8 @@ assert.match(
 );
 assert.match(rootRunSh, /bootstrap_macos_runtime/);
 assert.doesNotMatch(rootRunSh, /bootstrap_macos_install_runtime/);
+assert.doesNotMatch(rootRunSh, /source\s+(?:["']?)\.env|set\s+-a/);
+assert.match(rootRunSh, /credentials\.js loads \.env as data/);
 assert.match(
   rootRunSh,
   /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/

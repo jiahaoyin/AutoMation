@@ -42,6 +42,13 @@ When Mac Codex typechecks Swift inside its sandbox, pass a writable cache explic
 
 Do not run manual 2FA, a real Apple account flow, `test:2fa-allow` manual mode, or tests that need
 unattended GUI confirmation. Those require an explicitly supervised Mac session.
+An explicitly supervised session must use a synchronized exclusive orchestrator run with
+`--allow-supervised-gui`; omitting that flag keeps the non-interactive prohibition in force.
+The flag does not relax the read-only repository profile, `$TMPDIR` write boundary, secret-redaction
+rules, or the requirement that every browser action use ruyiPage.
+For supervised runs the orchestrator must force reports, screenshots, 2FA audit/cancel files, and
+the Firefox profile under the per-round `$TMPDIR`. A passed result also requires both the completed
+`run.sh --skip-mac` command event and the fixed production acceptance artifact.
 
 ## Safety
 

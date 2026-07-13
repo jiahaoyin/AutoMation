@@ -1245,6 +1245,7 @@ class BrowserFlowTests(unittest.TestCase):
         )
         result = events[-1]
         self.assertTrue(result["success"])
+        self.assertTrue(result["browserLogin"]["accountHomeConfirmed"])
         self.assertFalse(result["browserLogin"]["skippedLogin"])
         self.assertFalse(result["browserLogin"]["skipped2FA"])
 

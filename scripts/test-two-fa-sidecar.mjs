@@ -1,7 +1,11 @@
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { createMac2FACollector } from "./lib/two-fa-sidecar.js";
+
+const HARNESS_REPORT_PREFIX = "apple-automation-two-fa-sidecar-";
 
 function deferred() {
   let resolve;
@@ -257,32 +261,158 @@ function createNativeHarness(
   };
 }
 
+function cleanupHarnessReportDir(reportDir) {
+  const resolvedReportDir = path.resolve(reportDir);
+  assert.equal(
+    path.dirname(resolvedReportDir),
+    path.resolve(os.tmpdir()),
+    "harness report directory must be a direct child of os.tmpdir()"
+  );
+  assert.equal(
+    path.basename(resolvedReportDir).startsWith(HARNESS_REPORT_PREFIX),
+    true,
+    "harness report directory must use the expected prefix"
+  );
+  const reportStats = fs.lstatSync(resolvedReportDir);
+  assert.equal(
+    reportStats.isSymbolicLink(),
+    false,
+    "harness report directory must not be a symlink"
+  );
+  assert.equal(reportStats.isDirectory(), true, "harness report path must be a directory");
+  const auditPath = path.join(resolvedReportDir, "2fa-audit.jsonl");
+  if (fs.existsSync(auditPath)) {
+    const auditStats = fs.lstatSync(auditPath);
+    assert.equal(auditStats.isSymbolicLink(), false, "harness audit path must not be a symlink");
+    assert.equal(auditStats.isFile(), true, "harness audit path must be a regular file");
+    fs.unlinkSync(auditPath);
+  }
+  assert.deepEqual(
+    fs.readdirSync(resolvedReportDir),
+    [],
+    "harness report directory contains an unexpected entry"
+  );
+  fs.rmdirSync(resolvedReportDir);
+}
+
 function createHarness(options = {}) {
   const clock = new ManualClock();
   const native = createNativeHarness(clock, options);
   const audits = [];
   const statuses = [];
-  const collector = createMac2FACollector({
-    reportDir: "data/reports/account-browser-flow-test",
-    timeoutMs: options.timeoutMs ?? 30_000,
-    settingsFallbackAfterMs: options.settingsFallbackAfterMs ?? 8_000,
-    settingsFallback: options.settingsFallback,
-    pollIntervalMs: options.pollIntervalMs ?? 10,
-    auditThrottleMs: options.auditThrottleMs ?? 30,
-    cleanupGraceMs: 50,
-    manualFallback: options.manualFallback,
-    manualCodeProvider: options.manualCodeProvider,
-    isTTY: options.isTTY ?? false,
-    onAudit(entry) {
-      audits.push(entry);
-    },
-    onStatus(status) {
-      statuses.push(status);
-      options.onStatus?.(status);
-    },
-    runtime: native.runtime,
-  });
-  return { clock, native, collector, audits, statuses };
+  const reportDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), HARNESS_REPORT_PREFIX)
+  );
+  let collector;
+  try {
+    collector = createMac2FACollector({
+      reportDir,
+      timeoutMs: options.timeoutMs ?? 30_000,
+      settingsFallbackAfterMs: options.settingsFallbackAfterMs ?? 8_000,
+      settingsFallback: options.settingsFallback,
+      pollIntervalMs: options.pollIntervalMs ?? 10,
+      auditThrottleMs: options.auditThrottleMs ?? 30,
+      cleanupGraceMs: 50,
+      manualFallback: options.manualFallback,
+      manualCodeProvider: options.manualCodeProvider,
+      isTTY: options.isTTY ?? false,
+      onAudit(entry) {
+        audits.push(entry);
+      },
+      onStatus(status) {
+        statuses.push(status);
+        options.onStatus?.(status);
+      },
+      runtime: native.runtime,
+    });
+  } catch (error) {
+    cleanupHarnessReportDir(reportDir);
+    throw error;
+  }
+
+  const disposeCollector = collector.dispose;
+  let disposePromise = null;
+  collector.dispose = () => {
+    disposePromise ??= Promise.resolve()
+      .then(() => disposeCollector())
+      .finally(() => cleanupHarnessReportDir(reportDir));
+    return disposePromise;
+  };
+
+  return { clock, native, collector, audits, statuses, reportDir };
+}
+
+function pathIsWithin(parentPath, candidatePath) {
+  const relative = path.relative(parentPath, candidatePath);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+async function readOnlyCwdDoesNotAffectHarnessReportsTest() {
+  const originalCwd = process.cwd();
+  const readOnlyCwd = fs.mkdtempSync(
+    path.join(os.tmpdir(), "apple-automation-two-fa-read-only-cwd-")
+  );
+  const originalMkdirSync = fs.mkdirSync;
+  const originalAppendFileSync = fs.appendFileSync;
+  const blockedWrites = [];
+  const harnesses = [];
+  let reportDirs = [];
+
+  const rejectCwdWrite = (targetPath) => {
+    const resolved = path.resolve(String(targetPath));
+    if (!pathIsWithin(readOnlyCwd, resolved)) return;
+    blockedWrites.push(resolved);
+    const error = new Error(`simulated read-only cwd write: ${resolved}`);
+    error.code = "EACCES";
+    throw error;
+  };
+
+  try {
+    process.chdir(readOnlyCwd);
+    fs.mkdirSync = (targetPath, ...args) => {
+      rejectCwdWrite(targetPath);
+      return originalMkdirSync(targetPath, ...args);
+    };
+    fs.appendFileSync = (targetPath, ...args) => {
+      rejectCwdWrite(targetPath);
+      return originalAppendFileSync(targetPath, ...args);
+    };
+
+    harnesses.push(createHarness({ settingsFallback: false, manualFallback: false }));
+    harnesses.push(createHarness({ settingsFallback: false, manualFallback: false }));
+    reportDirs = harnesses.map(({ reportDir }) => reportDir);
+    await Promise.all(harnesses.map(({ collector }) => collector.prepare()));
+
+    assert.deepEqual(blockedWrites, [], "harness reports must never write under cwd");
+    assert.equal(reportDirs.every((reportDir) => path.isAbsolute(reportDir)), true);
+    assert.equal(
+      reportDirs.every((reportDir) => pathIsWithin(os.tmpdir(), reportDir)),
+      true,
+      "every harness report directory must live under os.tmpdir()"
+    );
+    assert.notEqual(reportDirs[0], reportDirs[1], "each harness needs an isolated directory");
+    assert.equal(
+      reportDirs.every((reportDir) => fs.existsSync(path.join(reportDir, "2fa-audit.jsonl"))),
+      true,
+      "each harness must successfully write its audit outside cwd"
+    );
+  } finally {
+    try {
+      for (const { collector } of harnesses) await collector.dispose();
+    } finally {
+      fs.mkdirSync = originalMkdirSync;
+      fs.appendFileSync = originalAppendFileSync;
+      process.chdir(originalCwd);
+      fs.rmdirSync(readOnlyCwd);
+    }
+  }
+
+  for (const reportDir of reportDirs) {
+    assert.equal(fs.existsSync(reportDir), false, "dispose must remove each harness directory");
+  }
 }
 
 async function bufferEarlyPopupTest() {
@@ -1681,6 +1811,7 @@ async function disposalClosesVisiblePopupTest() {
 }
 
 const focusedTests = {
+  "report-dir": readOnlyCwdDoesNotAffectHarnessReportsTest,
   "allow-remains": allowAttemptRemainingVisibleIsNotConfirmedTest,
   "allow-transition": allowIsConfirmedOnlyAfterStableStateTransitionTest,
   "preexisting-allow": preexistingAllowIsNeverAutomaticallyClickedTest,
@@ -1727,6 +1858,7 @@ if (focusedTest) {
   await test();
   console.log(`two-fa collector focused test: ${focusedTest} ok`);
 } else {
+  await readOnlyCwdDoesNotAffectHarnessReportsTest();
   await bufferEarlyPopupTest();
   await collectorCarriesPreparationBoundaryIntoAllowFlowTest();
   await preexistingAllowIsNeverAutomaticallyClickedTest();

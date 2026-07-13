@@ -134,8 +134,16 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
     }
   }
 
+  if (
+    result?.browserLogin?.success !== true ||
+    result.browserLogin.backend !== "ruyipage" ||
+    result.browserLogin.accountHomeConfirmed !== true
+  ) {
+    throw new Error("ruyipage backend did not confirm the authenticated Apple account home");
+  }
+
   return {
-    browserLogin: result.browserLogin ?? { success: true, backend: "ruyipage" },
+    browserLogin: result.browserLogin,
     antiAutomation: { backend: "ruyipage", delegated: true },
     personalInfo: result.personalInfo ?? null,
     screenshots: result.screenshots ?? {},

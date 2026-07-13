@@ -1,8 +1,18 @@
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
-import { maskAppleId } from "./lib/credentials.js";
+import {
+  loadEnvFile,
+  maskAppleId,
+  parseEnvValue,
+} from "./lib/credentials.js";
+import {
+  resolveReportRoot,
+  writeAccountHomeAcceptanceMarker,
+} from "./lib/report.js";
 
 const SECRET_FIXTURE =
   "person@example.com 123456 https://example.test/path?token=SECRET TOP-SECRET";
@@ -67,7 +77,11 @@ const params = {
 function successfulResult() {
   return {
     success: true,
-    browserLogin: { success: true, backend: "ruyipage" },
+    browserLogin: {
+      success: true,
+      backend: "ruyipage",
+      accountHomeConfirmed: true,
+    },
     personalInfo: { fullName: "Test Person", birthday: null },
     screenshots: {},
   };
@@ -178,12 +192,28 @@ async function runFailureDisposalTest() {
   assert.equal(harness.collectorCount, 1);
 }
 
+async function runMissingAccountHomeConfirmationTest() {
+  const harness = createRuntime(async () => ({
+    success: true,
+    browserLogin: { success: true, backend: "ruyipage" },
+    personalInfo: { fullName: "Test Person", birthday: null },
+    screenshots: {},
+  }));
+
+  await assert.rejects(
+    runAccountBrowserPhase(params, harness.runtime),
+    /authenticated Apple account home/
+  );
+  assert.deepEqual(harness.calls, ["dispose"]);
+}
+
 async function runTrustedSessionDisposalTest() {
   const harness = createRuntime(async () => ({
     ...successfulResult(),
     browserLogin: {
       success: true,
       backend: "ruyipage",
+      accountHomeConfirmed: true,
       skippedLogin: true,
       skipped2FA: true,
     },
@@ -280,6 +310,42 @@ function runAppleIdMaskingTest() {
   }
 }
 
+function runEnvDataParsingTest() {
+  assert.equal(parseEnvValue(String.raw`"a\\b\"c"`), 'a\\b"c');
+  assert.equal(parseEnvValue(String.raw`'a\\b"c'`), String.raw`a\\b"c`);
+  assert.equal(parseEnvValue('" leading # $ value "'), " leading # $ value ");
+  assert.equal(parseEnvValue("plain#value$HOME"), "plain#value$HOME");
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-env-data-"));
+  const envPath = path.join(tempDir, ".env");
+  const originalCwd = process.cwd();
+  const externalKey = "APPLE_AUTOMATION_TEST_EXTERNAL";
+  const loadedKey = "APPLE_AUTOMATION_TEST_LOADED";
+  const originalExternal = process.env[externalKey];
+  const originalLoaded = process.env[loadedKey];
+  try {
+    fs.writeFileSync(
+      envPath,
+      `${externalKey}=from-file\n${loadedKey}="a\\\\b\\\"c # $HOME"\n`,
+      "utf8"
+    );
+    process.env[externalKey] = "";
+    delete process.env[loadedKey];
+    process.chdir(tempDir);
+    assert.equal(loadEnvFile(), envPath);
+    assert.equal(process.env[externalKey], "");
+    assert.equal(process.env[loadedKey], 'a\\b"c # $HOME');
+  } finally {
+    process.chdir(originalCwd);
+    if (originalExternal === undefined) delete process.env[externalKey];
+    else process.env[externalKey] = originalExternal;
+    if (originalLoaded === undefined) delete process.env[loadedKey];
+    else process.env[loadedKey] = originalLoaded;
+    if (fs.existsSync(envPath)) fs.unlinkSync(envPath);
+    fs.rmdirSync(tempDir);
+  }
+}
+
 function runFullFlowSourceContractTest() {
   const source = fs.readFileSync(
     new URL("./apple-id-full-flow.mjs", import.meta.url),
@@ -295,6 +361,46 @@ function runFullFlowSourceContractTest() {
   assert.doesNotMatch(source, /e\.message|String\(e\)/);
   assert.match(source, /process\.exitCode\s*=\s*1/);
   assert.doesNotMatch(source, /process\.exit\(1\)/);
+  assert.match(
+    source,
+    /report\.phases\.accountBrowser\?\.browserLogin\?\.accountHomeConfirmed\s*===\s*true/
+  );
+  assert.match(source, /REAL_ACCOUNT_HOME_CONFIRMED/);
+}
+
+function runReportRootOverrideTest() {
+  const requested = "tmp/mac-supervised-reports";
+  assert.equal(
+    resolveReportRoot({ APPLE_AUTOMATION_REPORT_ROOT: requested }),
+    path.resolve(requested)
+  );
+  assert.match(resolveReportRoot({}), /[\\/]data[\\/]reports$/);
+}
+
+function runAcceptanceMarkerTest() {
+  const reportRoot = fs.mkdtempSync(path.join(os.tmpdir(), "apple-account-marker-"));
+  const markerPath = path.join(reportRoot, ".account-home-confirmed");
+  try {
+    assert.equal(
+      writeAccountHomeAcceptanceMarker({
+        APPLE_AUTOMATION_REPORT_ROOT: reportRoot,
+        APPLE_AUTOMATION_ACCEPTANCE_MARKER: markerPath,
+      }),
+      markerPath
+    );
+    assert.equal(fs.readFileSync(markerPath, "utf8"), "REAL_ACCOUNT_HOME_CONFIRMED\n");
+    assert.throws(
+      () =>
+        writeAccountHomeAcceptanceMarker({
+          APPLE_AUTOMATION_REPORT_ROOT: reportRoot,
+          APPLE_AUTOMATION_ACCEPTANCE_MARKER: path.join(reportRoot, "nested", "marker"),
+        }),
+      /direct child/
+    );
+  } finally {
+    if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+    fs.rmdirSync(reportRoot);
+  }
 }
 
 function runTwoFASidecarSettingsScreenshotSourceContractTest() {
@@ -309,7 +415,10 @@ function runTwoFASidecarSettingsScreenshotSourceContractTest() {
 const focusedTests = {
   "mask-apple-id": () => {
     runAppleIdMaskingTest();
+    runEnvDataParsingTest();
     runFullFlowSourceContractTest();
+    runReportRootOverrideTest();
+    runAcceptanceMarkerTest();
   },
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
@@ -330,13 +439,17 @@ await runTwoFactorLifecycleTest();
 await runTwoGenerationForwardingTest();
 await runFixedTwoFactorStatusPromptsTest();
 await runFailureDisposalTest();
+await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
 await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
 await runReadyModeSanitizationTest();
 await runCleanupErrorSanitizationTest();
 runAppleIdMaskingTest();
+runEnvDataParsingTest();
 runFullFlowSourceContractTest();
+runReportRootOverrideTest();
+runAcceptanceMarkerTest();
 runTwoFASidecarSettingsScreenshotSourceContractTest();
 
 console.log("account browser flow lifecycle: ok");

@@ -1629,6 +1629,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                 "browserLogin": {
                     "success": True,
                     "backend": "ruyipage",
+                    "accountHomeConfirmed": True,
                     "skippedLogin": skipped_login,
                     "skipped2FA": skipped_2fa,
                     "rememberAccount": remember_checked,

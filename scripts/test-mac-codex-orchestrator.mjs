@@ -8,6 +8,7 @@ import {
   buildRemoteScript,
   buildScpArgs,
   buildSshArgs,
+  hasSupervisedAcceptanceEvent,
   parseArgs,
   runProcess,
   summarizeRun,
@@ -73,6 +74,7 @@ assert.deepEqual(defaults, {
   round: 1,
   roundName: "round-01",
   timeoutMs: DEFAULT_TIMEOUT_MS,
+  supervisedGui: false,
 });
 
 const taskFileDir = fs.mkdtempSync(path.join(os.tmpdir(), "mac-codex-task-"));
@@ -100,6 +102,7 @@ try {
     round: 7,
     roundName: "round-07",
     timeoutMs: 45_000,
+    supervisedGui: false,
   });
 } finally {
   removeTreeOneFileAtATime(taskFileDir);
@@ -119,6 +122,13 @@ assert.throws(
   () => parseArgs(["--task", "x", "--ssh-alias", "-F"]),
   /SSH alias/i
 );
+assert.throws(
+  () => parseArgs(["--task", "x", "--allow-supervised-gui", "--no-sync"]),
+  /synchronized exclusive run/i
+);
+
+const supervisedArgs = parseArgs(["--task", "执行受监督 GUI 验收", "--allow-supervised-gui"]);
+assert.equal(supervisedArgs.supervisedGui, true);
 
 const prompt = buildAgentPrompt({ task: "检查中文任务与登录流程" });
 for (const requiredText of [
@@ -136,9 +146,34 @@ for (const requiredText of [
   "2FA",
   "退出码",
   "JSON Schema",
+  "noninteractive",
 ]) {
   assert.match(prompt, new RegExp(requiredText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 }
+assert.match(prompt, /不执行人工 2FA/);
+assert.doesNotMatch(prompt, /用户明确监督并授权 GUI 验收/);
+
+const supervisedPrompt = buildAgentPrompt({
+  task: "执行真实 Apple Account 登录验收",
+  supervisedGui: true,
+});
+for (const requiredText of [
+  "用户明确监督并授权 GUI 验收",
+  "真实 Apple 账号流程",
+  "ruyiPage",
+  "生产脚本在进程内部加载凭据",
+  "完整 Apple ID",
+  "raw AX/OCR",
+  "固定成功标记",
+  "supervised_gui",
+  "REAL_ACCOUNT_HOME_CONFIRMED",
+]) {
+  assert.match(
+    supervisedPrompt,
+    new RegExp(requiredText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  );
+}
+assert.doesNotMatch(supervisedPrompt, /不执行人工 2FA/);
 
 const remoteOptions = {
   task: "检查中文任务与登录流程",
@@ -168,10 +203,28 @@ assert.ok(
 );
 assert.match(remoteScript, /RUN_TMP_DIR="\$REMOTE_ROUND_DIR\/tmp"/);
 assert.match(remoteScript, /export TMPDIR="\$RUN_TMP_DIR"/);
+assert.match(
+  remoteScript,
+  /export APPLE_AUTOMATION_REPORT_ROOT="\$RUN_TMP_DIR\/reports"/
+);
+assert.match(
+  remoteScript,
+  /export APPLE_AUTOMATION_ACCEPTANCE_MARKER="\$ACCEPTANCE_MARKER"/
+);
+assert.match(remoteScript, /export FIREFOX_PROFILE_DIR="\$RUN_TMP_DIR\/firefox-profile"/);
+assert.match(remoteScript, /export BROWSER_PROFILE_MODE="persistent"/);
+for (const variable of [
+  "APPLE_AUTOMATION_REPORT_ROOT",
+  "APPLE_AUTOMATION_ACCEPTANCE_MARKER",
+  "FIREFOX_PROFILE_DIR",
+  "BROWSER_PROFILE_MODE",
+]) {
+  assert.match(remoteScript, new RegExp(`SHELL_ENV_INCLUDE_ONLY=.*${variable}`));
+}
 assert.equal((remoteScript.match(/PERMISSION_PROFILE=/g) ?? []).length, 1);
 assert.equal((remoteScript.match(/permissions\.mac_verification=/g) ?? []).length, 2);
 assert.equal((remoteScript.match(/default_permissions=/g) ?? []).length, 1);
-assert.equal((remoteScript.match(/\n  -c /g) ?? []).length, 3);
+assert.equal((remoteScript.match(/\n  -c /g) ?? []).length, 5);
 const forbiddenSandboxOverride =
   /--add-dir|--sandbox(?:=|\s)|--dangerously-bypass-approvals-and-sandbox|(?:^|\s)-s(?:=|\s|read-only|workspace-write|danger-full-access)/;
 for (const unsafeArgument of [
@@ -184,11 +237,11 @@ for (const unsafeArgument of [
 assert.doesNotMatch(remoteScript, forbiddenSandboxOverride);
 assert.match(
   remoteScript,
-  /"\$CODEX_BIN" sandbox -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -P mac_verification \\\n  --include-managed-config \\\n  -C "\$REMOTE_REPO" \\\n  \/usr\/bin\/true/
+  /"\$CODEX_BIN" sandbox -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -c "shell_environment_policy\.include_only=\$SHELL_ENV_INCLUDE_ONLY" \\\n  -P mac_verification \\\n  --include-managed-config \\\n  -C "\$REMOTE_REPO" \\\n  \/usr\/bin\/true/
 );
 assert.match(
   remoteScript,
-  /"\$CODEX_BIN" exec -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -c 'default_permissions="mac_verification"' \\\n  --json/
+  /"\$CODEX_BIN" exec -p automation \\\n  -c "permissions\.mac_verification=\$PERMISSION_PROFILE" \\\n  -c "shell_environment_policy\.include_only=\$SHELL_ENV_INCLUDE_ONLY" \\\n  -c 'default_permissions="mac_verification"' \\\n  --json/
 );
 assert.ok(
   remoteScript.indexOf('"$CODEX_BIN" sandbox -p automation') <
@@ -201,6 +254,8 @@ for (const command of [
   '/bin/mkdir "$RUN_TMP_DIR"',
   '/bin/chmod 700 "$RUN_TMP_DIR"',
   'export TMPDIR="$RUN_TMP_DIR"',
+  'export APPLE_AUTOMATION_REPORT_ROOT="$RUN_TMP_DIR/reports"',
+  'export FIREFOX_PROFILE_DIR="$RUN_TMP_DIR/firefox-profile"',
   '"$CODEX_BIN" exec -p automation',
 ]) {
   assert.ok(remoteScript.includes(command), `remote script must include: ${command}`);
@@ -270,6 +325,15 @@ const noSyncScript = buildRemoteScript({ ...remoteOptions, sync: false });
 assert.doesNotMatch(noSyncScript, /git fetch origin|git switch|git merge/);
 assert.match(noSyncScript, /git rev-parse HEAD/);
 assert.match(noSyncScript, /LOCK_MODE='reader'/);
+assert.throws(
+  () =>
+    buildRemoteScript({
+      ...remoteOptions,
+      sync: false,
+      supervisedGui: true,
+    }),
+  /synchronized exclusive run/i
+);
 
 assert.deepEqual(buildSshArgs({ sshAlias: "mac-codex" }), [
   "-o",
@@ -294,6 +358,7 @@ const requiredArtifacts = [
   "head-before.txt",
   "head-after.txt",
   "codex-exit.txt",
+  "supervised-acceptance.txt",
 ];
 assert.deepEqual(scpArgs.slice(0, 4), [
   "-o",
@@ -324,6 +389,8 @@ assert.deepEqual(
     "tests",
     "findings",
     "recommendedWindowsActions",
+    "executionMode",
+    "supervisedGuiStatus",
     "status",
   ])
 );
@@ -331,8 +398,16 @@ for (const property of ["commands", "tests", "findings"]) {
   assert.equal(schema.properties[property].items.additionalProperties, false);
 }
 assert.deepEqual(schema.properties.status.enum, ["passed", "failed"]);
+assert.deepEqual(schema.properties.executionMode.enum, ["noninteractive", "supervised_gui"]);
+assert.deepEqual(schema.properties.supervisedGuiStatus.enum, [
+  "not_requested",
+  "passed",
+  "failed",
+  "skipped",
+]);
 
-function validReport(status = "passed") {
+function validReport(status = "passed", options = {}) {
+  const executionMode = options.executionMode ?? "noninteractive";
   return {
     taskUnderstanding: "检查相关 macOS 合同并运行非交互测试",
     environmentObservations: ["macOS Intel x86_64", "Node.js 22.14.0"],
@@ -355,11 +430,61 @@ function validReport(status = "passed") {
     ],
     findings: [],
     recommendedWindowsActions: [],
+    executionMode,
+    supervisedGuiStatus:
+      options.supervisedGuiStatus ??
+      (executionMode === "supervised_gui" ? "passed" : "not_requested"),
     status,
   };
 }
 
+const supervisedAcceptanceEvents = [
+  { type: "thread.started" },
+  {
+    type: "item.completed",
+    item: {
+      id: "item-acceptance",
+      type: "command_execution",
+      command:
+        `/bin/zsh -lc 'printf "\\n" | env APPLE_AUTOMATION_REPORT_ROOT="$TMPDIR/reports" ./run.sh --skip-mac'`,
+      aggregated_output: "[验收] REAL_ACCOUNT_HOME_CONFIRMED\n",
+      exit_code: 0,
+      status: "completed",
+    },
+  },
+  { type: "turn.completed" },
+]
+  .map((event) => JSON.stringify(event))
+  .join("\n") + "\n";
+
+assert.equal(hasSupervisedAcceptanceEvent(supervisedAcceptanceEvents), true);
+assert.equal(
+  hasSupervisedAcceptanceEvent(
+    supervisedAcceptanceEvents.replace("REAL_ACCOUNT_HOME_CONFIRMED", "ACCOUNT_FLOW_FAILED")
+  ),
+  false
+);
+assert.equal(
+  hasSupervisedAcceptanceEvent(
+    supervisedAcceptanceEvents.replace("./run.sh --skip-mac", "printf marker")
+  ),
+  false
+);
+
 assert.deepEqual(validateFinalReport(validReport()), []);
+assert.deepEqual(
+  validateFinalReport(validReport("passed", { executionMode: "supervised_gui" })),
+  []
+);
+const skippedSupervisedReport = validReport("passed", {
+  executionMode: "supervised_gui",
+  supervisedGuiStatus: "skipped",
+});
+assert.ok(
+  validateFinalReport(skippedSupervisedReport).some((error) =>
+    /without supervised GUI acceptance/i.test(error)
+  )
+);
 const criticalPassedReport = validReport();
 criticalPassedReport.findings.push({
   severity: "critical",
@@ -388,6 +513,7 @@ function writeArtifacts(roundDir, overrides = {}) {
     "head-before.txt": `${EXPECTED_HEAD}\n`,
     "head-after.txt": `${EXPECTED_HEAD}\n`,
     "codex-exit.txt": "0\n",
+    "supervised-acceptance.txt": "not_requested\n",
     ...overrides,
   };
   for (const [name, content] of Object.entries(artifacts)) {
@@ -414,8 +540,54 @@ try {
   });
   assert.equal(passed.git.changed, false);
   assert.equal(passed.codex.exitCode, 0);
+  assert.equal(passed.expectedExecutionMode, "noninteractive");
   assert.deepEqual(passed.report, validReport());
   assert.equal(passed.artifacts.finalReport, path.join(passedDir, "final.json"));
+
+  const supervisedDir = path.join(artifactRoot, "supervised-passed");
+  writeArtifacts(supervisedDir, {
+    "events.jsonl": supervisedAcceptanceEvents,
+    "supervised-acceptance.txt": "accepted\n",
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const supervised = summarizeRun(
+    supervisedDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui"
+  );
+  assert.equal(supervised.status, "passed");
+  assert.equal(supervised.expectedExecutionMode, "supervised_gui");
+  assert.equal(supervised.supervisedAcceptance, "accepted");
+
+  const missingAcceptanceDir = path.join(artifactRoot, "supervised-missing-acceptance");
+  writeArtifacts(missingAcceptanceDir, {
+    "supervised-acceptance.txt": "missing\n",
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const missingAcceptance = summarizeRun(
+    missingAcceptanceDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui"
+  );
+  assert.equal(missingAcceptance.status, "failed");
+  assert.ok(
+    missingAcceptance.errors.some((error) => error.code === "supervised_acceptance_missing")
+  );
+
+  const modeMismatch = summarizeRun(
+    supervisedDir,
+    processResults,
+    EXPECTED_HEAD,
+    "noninteractive"
+  );
+  assert.equal(modeMismatch.status, "failed");
+  assert.ok(modeMismatch.errors.some((error) => error.code === "execution_mode_mismatch"));
 
   const changedDir = path.join(artifactRoot, "changed");
   writeArtifacts(changedDir, { "git-after.txt": " M scripts/file.mjs\n" });

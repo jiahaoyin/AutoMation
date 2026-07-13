@@ -32,11 +32,6 @@ if [[ "${skip_browser}" != "1" ]]; then
   node scripts/preflight-2fa-permissions.mjs --quiet
 fi
 
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
+# credentials.js loads .env as data and preserves already-exported runtime overrides.
 
 exec node scripts/apple-id-full-flow.mjs --skip-setup "$@"

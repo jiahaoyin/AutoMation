@@ -159,7 +159,11 @@ sandbox_mode = "read-only"
 web_search = "disabled"
 
 [shell_environment_policy]
-include_only = ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TMPDIR"]
+include_only = [
+  "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TMPDIR",
+  "APPLE_AUTOMATION_REPORT_ROOT", "APPLE_AUTOMATION_ACCEPTANCE_MARKER",
+  "FIREFOX_PROFILE_DIR", "BROWSER_PROFILE_MODE"
+]
 ```
 
 这里的 `sandbox_mode = "read-only"` 是无人值守 profile 的保守基线。调度器启动每轮任务
@@ -229,6 +233,18 @@ git status --short
 npm.cmd run -s mac:codex -- --task "识别当前 macOS 环境，运行与本次修改相关的非交互测试，并给出结构化结论"
 ```
 
+真实账号、2FA 或需要图形界面确认的验收默认禁止。只有用户明确表示正在监督该 Mac 会话
+并授权本轮真实验收时，才能使用同步独占开关：
+
+```powershell
+npm.cmd run -s mac:codex -- --task-file .\mac-supervised-task.txt --round 2 --allow-supervised-gui
+```
+
+`--allow-supervised-gui` 不能与 `--no-sync` 同用，也不会放宽 Mac 仓库只读、唯一
+`$TMPDIR` 可写、秘密脱敏或浏览器只能由 ruyiPage 操作的限制。Mac Codex 不得直接打开
+或打印 `.env`；生产流程可以在进程内部加载凭据，但命令、日志、报告和文件名不得出现
+密码、完整 Apple ID、OTP、URL query、raw AX/OCR 或截图。
+
 长任务避免 PowerShell 多层引号，写入 UTF-8 文本后运行：
 
 ```powershell
@@ -252,9 +268,11 @@ Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 re
 6. 自定义 profile 的唯一 write 条目是
    `/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp`，同时将 `TMPDIR` 指向它；
    不使用在内置 read-only 下无写权限效果的 legacy `--add-dir`，也不得扩大到 round
-   根目录、仓库、`$HOME` 或共享系统临时目录。
-7. Mac Codex 说明任务理解和环境识别，运行相关非交互测试。
-8. 下载固定八项证据文件到 Windows 并输出一行 JSON 摘要。
+   根目录、仓库、`$HOME` 或共享系统临时目录。调度器还会强制把报告、截图、2FA audit、
+   cancel marker 和 Firefox profile 定向到该 `tmp`，不依赖任务文本自行设置。
+7. Mac Codex 说明任务理解和环境识别；默认运行相关非交互测试，只有显式受监督开关才
+   运行任务限定的真实 GUI/账号验收。
+8. 下载固定九项证据文件到 Windows 并输出一行 JSON 摘要。
 
 ## 8. 阅读测试结果
 
@@ -273,6 +291,7 @@ Windows 产物目录：
 | `events.jsonl` | Codex 原始 JSONL 执行事件 |
 | `stderr.log` | Codex/工具标准错误 |
 | `codex-exit.txt` | Mac Codex 退出码 |
+| `supervised-acceptance.txt` | 受监督流程的固定验收哨兵状态；只有生产流程确认账号首页后才为 `accepted` |
 | `git-before.txt`, `git-after.txt` | Mac 执行前后工作区状态 |
 | `head-before.txt`, `head-after.txt` | Mac 执行前后提交 SHA |
 | Mac 端 `tmp/` | 每轮独立的沙箱临时目录；唯一额外可写路径，不在固定证据回传清单中 |
@@ -283,7 +302,7 @@ JSONL 与 `final.json` 有效、报告状态通过、Mac 前后 Git 状态都为
 HEAD”也必须失败。
 
 远端调度器使用 `umask 077`；round 与 `tmp` 目录为 0700，普通新建文件默认为 0600。
-`tmp/` 只保留在 Mac，不会被固定八项证据文件的 scp 清单下载到 Windows；它采用同一
+`tmp/` 只保留在 Mac，不会被固定九项证据文件的 scp 清单下载到 Windows；它采用同一
 证据保留和逐项清理周期。运行证据的维护策略为保留 30 天；不得向 `tmp/` 写入秘密或
 无界增长的大文件。本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐
 文件、逐目录清理。调度器不会自动递归删除历史证据。

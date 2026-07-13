@@ -15,7 +15,11 @@
 import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
 import { confirmOrPromptAppleCredentials, maskAppleId } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
-import { createReportDir, writeReport } from "./lib/report.js";
+import {
+  createReportDir,
+  writeAccountHomeAcceptanceMarker,
+  writeReport,
+} from "./lib/report.js";
 import { ensureEnvironment } from "./lib/env-setup.js";
 
 const skipMac = process.argv.includes("--skip-mac");
@@ -81,6 +85,10 @@ async function main() {
     }
 
     reportFile = writeReport(reportDir, report);
+    if (report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true) {
+      writeAccountHomeAcceptanceMarker();
+      console.log("[验收] REAL_ACCOUNT_HOME_CONFIRMED");
+    }
   } catch (e) {
     report.error = "Apple ID flow failed";
     reportFile = writeReport(reportDir, report);
