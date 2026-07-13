@@ -712,6 +712,7 @@ function runStrictVerificationCodeSourceContractTest() {
 
   const activation = functionBody("activateSystemSettings");
   assert.match(activation, /NSWorkspace\.OpenConfiguration\(\)/);
+  assert.match(activation, /app\.unhide\(\)/);
   assert.match(activation, /configuration\.activates\s*=\s*true/);
   assert.match(activation, /activate\(options:\s*\[\.activateAllWindows\]\)/);
   assert.match(activation, /visibleWindows\.filter/);
@@ -729,6 +730,7 @@ function runStrictVerificationCodeSourceContractTest() {
 
   const focusWindow = functionBody("focusTrustedSettingsWindow");
   assert.match(focusWindow, /isTrustedSystemSettings\(app\)/);
+  assert.match(focusWindow, /app\.unhide\(\)/);
   assert.match(focusWindow, /elementBelongsToProcess\(window,\s*pid:\s*expectedPid\)/);
   assert.match(focusWindow, /kAXRaiseAction/);
   assert.match(focusWindow, /kAXMainAttribute/);

@@ -645,6 +645,7 @@ func focusTrustedSettingsWindow(
           axBool(window, kAXHiddenAttribute as String) != true,
           axFrame(window) != nil else { return false }
 
+    _ = app.unhide()
     _ = app.activate(options: [.activateAllWindows])
     _ = AXUIElementSetAttributeValue(
         window,
@@ -674,6 +675,7 @@ func activateSystemSettings(
 ) -> Bool {
     guard isTrustedSystemSettings(app), app.processIdentifier == expectedPid else { return false }
 
+    _ = app.unhide()
     if let bundleURL = app.bundleURL {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -722,6 +724,8 @@ func activateSystemSettings(
            ) {
             return true
         }
+        _ = app.unhide()
+        _ = app.activate(options: [.activateAllWindows])
         if Date() >= deadline { break }
         usleep(100_000)
     } while true
