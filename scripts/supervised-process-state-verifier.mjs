@@ -3,7 +3,10 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { RUYIPAGE_SUPERVISOR_COMMAND_ID } from "./lib/ruyipage-backend-runner.js";
+import {
+  RUYIPAGE_SUPERVISOR_COMMAND_ID,
+  validateRuyiPageLifecycleState,
+} from "./lib/ruyipage-backend-runner.js";
 import { readBoundedRegularFile } from "./supervised-terminal-bridge.mjs";
 
 const STATES = new Set(["starting", "active", "inactive", "cleanup_failed"]);
@@ -57,6 +60,13 @@ export function readVerifiedRuyiPageProcessState(filePath, expected = {}) {
   return validateRuyiPageProcessState(file.text, expected);
 }
 
+export function readVerifiedRuyiPageLifecycleState(filePath, expected = {}) {
+  if (!path.isAbsolute(filePath)) return null;
+  const file = readBoundedRegularFile(filePath, 256);
+  if (file.state !== "present") return null;
+  return validateRuyiPageLifecycleState(file.text, expected.nonce);
+}
+
 function isMainModule() {
   return (
     process.argv[1] &&
@@ -66,19 +76,26 @@ function isMainModule() {
 
 if (isMainModule()) {
   const [kind, filePath, expectedNonce, ...extra] = process.argv.slice(2);
-  const state =
-    kind === "ruyipage" &&
-    extra.length === 0 &&
-    /^[0-9a-f]{32}$/.test(String(expectedNonce ?? ""))
+  const validRequest =
+    extra.length === 0 && /^[0-9a-f]{32}$/.test(String(expectedNonce ?? ""));
+  const state = validRequest
+    ? kind === "ruyipage"
       ? readVerifiedRuyiPageProcessState(String(filePath ?? ""), {
           nonce: expectedNonce,
         })
-      : null;
+      : kind === "ruyipage-lifecycle"
+        ? readVerifiedRuyiPageLifecycleState(String(filePath ?? ""), {
+            nonce: expectedNonce,
+          })
+        : null
+    : null;
   if (!state) {
     process.exitCode = 1;
   } else {
     process.stdout.write(
-      `${state.pid}\n${state.pgid}\n${Buffer.from(state.startedAt, "utf8").toString("base64")}\n${state.state}\n${state.commandSha256}\n`
+      kind === "ruyipage-lifecycle"
+        ? `${state.state}\n`
+        : `${state.pid}\n${state.pgid}\n${Buffer.from(state.startedAt, "utf8").toString("base64")}\n${state.state}\n${state.commandSha256}\n`
     );
   }
 }

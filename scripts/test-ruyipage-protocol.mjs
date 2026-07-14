@@ -560,6 +560,32 @@ async function runChildStopperFallbackIdentityChangeSelfTest() {
   );
 }
 
+async function runChildStopperDirectChildSelfTest() {
+  const childSignals = [];
+  const child = {
+    pid: 8765,
+    exitCode: null,
+    signalCode: null,
+    stdin: { end() {} },
+    kill(signal) {
+      childSignals.push(signal);
+    },
+  };
+  const stopper = createChildStopper(child, {
+    platform: "darwin",
+    useProcessGroup: false,
+    graceMs: 100,
+    signalProcessGroup() {
+      throw new Error("direct child mode must not signal a process group");
+    },
+  });
+  stopper.stop();
+  assert.deepEqual(childSignals, ["SIGINT"]);
+  child.exitCode = 0;
+  stopper.cancelForce();
+  await stopper.waitForCleanup();
+}
+
 function processIsAlive(pid) {
   if (!pid) return false;
   try {
@@ -1932,6 +1958,7 @@ const focusedTests = {
   "cleanup-timeout": runChildStopperCleanupDeadlineSelfTest,
   "identity-change": runChildStopperIdentityChangeSelfTest,
   "fallback-identity-change": runChildStopperFallbackIdentityChangeSelfTest,
+  "direct-child": runChildStopperDirectChildSelfTest,
   "runner-cleanup": runNodeRunnerProcessGroupSettlementSelfTest,
   "runner-cleanup-failure": runNodeRunnerCleanupFailureWithoutChildExitSelfTest,
   "normal-close-descendant": runNodeRunnerNormalCloseDescendantCleanupSelfTest,
@@ -1964,6 +1991,7 @@ await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();
 await runChildStopperIdentityChangeSelfTest();
 await runChildStopperFallbackIdentityChangeSelfTest();
+await runChildStopperDirectChildSelfTest();
 await runNodeRunnerProcessGroupSettlementSelfTest();
 await runNodeRunnerCleanupFailureWithoutChildExitSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupSelfTest();

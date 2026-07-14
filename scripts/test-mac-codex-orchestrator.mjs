@@ -31,6 +31,7 @@ import {
 } from "./supervised-mac-acceptance.mjs";
 import { validateSupervisedRequestArtifacts } from "./supervised-request-verifier.mjs";
 import {
+  readVerifiedRuyiPageLifecycleState,
   readVerifiedRuyiPageProcessState,
   validateRuyiPageProcessState,
 } from "./supervised-process-state-verifier.mjs";
@@ -921,6 +922,25 @@ try {
     ),
     null
   );
+  const lifecyclePath = path.join(processStateDir, ".ruyipage-lifecycle.json");
+  const lifecycleState = {
+    version: 1,
+    nonce: SUPERVISED_TOKEN,
+    state: "inactive",
+  };
+  fs.writeFileSync(lifecyclePath, `${JSON.stringify(lifecycleState)}\n`, "utf8");
+  assert.deepEqual(
+    readVerifiedRuyiPageLifecycleState(lifecyclePath, {
+      nonce: SUPERVISED_TOKEN,
+    }),
+    lifecycleState
+  );
+  assert.equal(
+    readVerifiedRuyiPageLifecycleState(lifecyclePath, {
+      nonce: "f".repeat(32),
+    }),
+    null
+  );
 } finally {
   removeTreeOneFileAtATime(processStateDir);
 }
@@ -1521,7 +1541,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "cleanup_failed",
     markerConfirmed: false,
-    ruyiPageStateSeen: true,
+    ruyiPageCleanupEvidence: true,
   }),
   "recovered"
 );
@@ -1531,7 +1551,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "cleanup_failed",
     markerConfirmed: false,
-    ruyiPageStateSeen: true,
+    ruyiPageCleanupEvidence: true,
   }),
   "failed"
 );
@@ -1541,7 +1561,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "cleanup_failed",
     markerConfirmed: false,
-    ruyiPageStateSeen: false,
+    ruyiPageCleanupEvidence: true,
   }),
   "recovered"
 );
@@ -1551,7 +1571,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "valid",
     markerConfirmed: false,
-    ruyiPageStateSeen: false,
+    ruyiPageCleanupEvidence: false,
   }),
   "clean"
 );
@@ -1561,7 +1581,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "invalid",
     markerConfirmed: false,
-    ruyiPageStateSeen: false,
+    ruyiPageCleanupEvidence: false,
   }),
   "clean"
 );
@@ -1571,7 +1591,7 @@ assert.equal(
     ruyiPageGroupClean: true,
     supervisorStatusOutcome: "valid",
     markerConfirmed: true,
-    ruyiPageStateSeen: false,
+    ruyiPageCleanupEvidence: false,
   }),
   "failed"
 );
@@ -1721,6 +1741,10 @@ assert.match(
   supervisedRemoteScript,
   /supervised-process-state-verifier\.mjs" ruyipage/
 );
+assert.match(
+  supervisedRemoteScript,
+  /supervised-process-state-verifier\.mjs" ruyipage-lifecycle[\s\S]*ruyi_lifecycle_state" != "inactive"/
+);
 assert.doesNotMatch(supervisedRemoteScript, /-z "\$(?:\/bin\/)?ps .*command=/);
 assert.match(supervisedRemoteScript, /MODEL_TMP_OK=1/);
 assert.ok(
@@ -1799,6 +1823,26 @@ assert.match(
 assert.match(
   ruyiPageRunnerSource,
   /usesProcessStateSupervisor[\s\S]*buildRuyiPageProcessSupervisorScript\(\)/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /usesProcessStateSupervisor[\s\S]*APPLE_AUTOMATION_SUPERVISED_GUI !== "1"/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /usesOuterProcessSupervisor[\s\S]*APPLE_AUTOMATION_SUPERVISED_GUI === "1"/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /detached: process\.platform !== "win32" && !usesOuterProcessSupervisor/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /useProcessGroup: !usesOuterProcessSupervisor/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /if \(usesOuterProcessSupervisor\) \{[\s\S]*try \{[\s\S]*"active"[\s\S]*catch \{[\s\S]*stopper\.stop\(\)[\s\S]*await stopper\.waitForCleanup\(\)[\s\S]*"inactive"/
 );
 assert.match(ruyiPageRunnerSource, /"active"[\s\S]*"inactive"[\s\S]*"cleanup_failed"/);
 assert.match(

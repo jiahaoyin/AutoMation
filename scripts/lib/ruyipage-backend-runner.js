@@ -463,6 +463,7 @@ export function createRuyiPageBackendRunner(options = {}) {
 
 export function createChildStopper(child, options = {}) {
   const platform = options.platform ?? process.platform;
+  const useProcessGroup = options.useProcessGroup ?? platform !== "win32";
   const graceMs = options.graceMs ?? 5_000;
   const signalProcessGroup = options.signalProcessGroup ?? process.kill;
   const schedule = options.schedule ?? setTimeout;
@@ -508,7 +509,7 @@ export function createChildStopper(child, options = {}) {
   };
 
   const signal = (signalName) => {
-    if (platform !== "win32" && child.pid) {
+    if (useProcessGroup && platform !== "win32" && child.pid) {
       if (!processGroupIdentityMatches()) return;
       try {
         signalProcessGroup(-child.pid, signalName);
@@ -525,6 +526,9 @@ export function createChildStopper(child, options = {}) {
   };
 
   const processGroupIsAlive = () => {
+    if (!useProcessGroup) {
+      return child.exitCode == null && child.signalCode == null;
+    }
     if (platform === "win32" || !child.pid) return false;
     try {
       signalProcessGroup(-child.pid, 0);
@@ -645,11 +649,18 @@ async function runRuyiPageBackend({
     ...args,
   ];
   const usesProcessStateSupervisor =
-    process.platform !== "win32" && processStatePath !== null;
-  const processNonce = usesProcessStateSupervisor
+    process.platform !== "win32" &&
+    processStatePath !== null &&
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI !== "1";
+  const usesOuterProcessSupervisor =
+    process.platform !== "win32" &&
+    processStatePath !== null &&
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+  const usesLifecycleState = usesProcessStateSupervisor || usesOuterProcessSupervisor;
+  const processNonce = usesLifecycleState
     ? String(process.env.APPLE_AUTOMATION_SUPERVISED_TOKEN ?? "")
     : null;
-  if (usesProcessStateSupervisor && !/^[0-9a-f]{32}$/.test(processNonce)) {
+  if (usesLifecycleState && !/^[0-9a-f]{32}$/.test(processNonce)) {
     throw new Error("ruyipage process nonce is unavailable");
   }
   const supervisorScript = buildRuyiPageProcessSupervisorScript();
@@ -659,7 +670,7 @@ async function runRuyiPageBackend({
   if (usesProcessStateSupervisor && !parentProcessIdentity) {
     throw new Error("ruyipage parent process identity is unavailable");
   }
-  if (usesProcessStateSupervisor) {
+  if (usesLifecycleState) {
     writeRuyiPageLifecycleState(lifecycleStatePath, "preparing", processNonce);
   }
   const child = spawn(
@@ -684,7 +695,7 @@ async function runRuyiPageBackend({
     {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      detached: process.platform !== "win32",
+      detached: process.platform !== "win32" && !usesOuterProcessSupervisor,
       env: {
         ...process.env,
         APPLE_ID: creds.appleId,
@@ -716,6 +727,7 @@ async function runRuyiPageBackend({
   const stopper = createChildStopper(child, {
     ...childStopperOptions,
     graceMs: killGraceMs,
+    useProcessGroup: !usesOuterProcessSupervisor,
     verifyProcessGroupIdentity: usesProcessStateSupervisor
       ? () => {
           if (!processIdentity) return false;
@@ -783,6 +795,37 @@ async function runRuyiPageBackend({
       resolve({ error: childError, exitCode: code });
     });
   });
+  if (usesOuterProcessSupervisor) {
+    try {
+      writeRuyiPageLifecycleState(lifecycleStatePath, "active", processNonce);
+    } catch {
+      stopper.stop();
+      let cleanupFailed = false;
+      try {
+        await stopper.waitForCleanup();
+      } catch {
+        cleanupFailed = true;
+      } finally {
+        try {
+          writeRuyiPageLifecycleState(
+            lifecycleStatePath,
+            cleanupFailed ? "cleanup_failed" : "inactive",
+            processNonce
+          );
+        } catch {
+          cleanupFailed = true;
+        }
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        for (const [signal, handler] of signalHandlers) {
+          process.removeListener(signal, handler);
+        }
+      }
+      if (cleanupFailed) throw new Error("ruyipage backend cleanup failed");
+      throw new Error("ruyipage lifecycle initialization failed");
+    }
+  }
   if (usesProcessStateSupervisor) {
     try {
       processIdentity = await waitForProcessIdentity(
@@ -1050,7 +1093,7 @@ async function runRuyiPageBackend({
             processNonce
           );
         }
-        if (usesProcessStateSupervisor) {
+        if (usesLifecycleState) {
           writeRuyiPageLifecycleState(
             lifecycleStatePath,
             cleanupConfirmed ? "inactive" : "cleanup_failed",

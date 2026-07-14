@@ -597,20 +597,22 @@ async function cleanupRecordedRuyiPageProcess(
       : null;
   if (file.state === "missing") {
     if (lifecycleFile.state === "missing") {
-      return { ok: true, seen: false, lifecycleSeen: false };
+      return { ok: true, seen: false, cleanupEvidence: false };
     }
     return {
       ok: lifecycle?.state === "inactive",
       seen: false,
-      lifecycleSeen: lifecycle !== null,
+      cleanupEvidence: lifecycle?.state === "inactive",
     };
   }
-  if (file.state !== "present") return { ok: false, seen: true };
+  if (file.state !== "present") {
+    return { ok: false, seen: true, cleanupEvidence: false };
+  }
   let value;
   try {
     value = JSON.parse(file.text);
   } catch {
-    return { ok: false, seen: true };
+    return { ok: false, seen: true, cleanupEvidence: false };
   }
   if (
     value?.version !== 1 ||
@@ -630,9 +632,11 @@ async function cleanupRecordedRuyiPageProcess(
     Object.keys(value).sort().join(",") !==
       "commandId,commandSha256,nonce,pgid,pid,startedAt,state,version"
   ) {
-    return { ok: false, seen: true };
+    return { ok: false, seen: true, cleanupEvidence: false };
   }
-  if (!processGroupExists(value.pid)) return { ok: true, seen: true };
+  if (!processGroupExists(value.pid)) {
+    return { ok: true, seen: true, cleanupEvidence: true };
+  }
   const identity = fixedProcessIdentity(value.pid);
   const identityPredicate = (current) =>
     current.command.includes("ruyipage-supervisor") &&
@@ -646,11 +650,12 @@ async function cleanupRecordedRuyiPageProcess(
     identity.startedAt !== value.startedAt ||
     !identityPredicate(identity)
   ) {
-    return { ok: false, seen: true };
+    return { ok: false, seen: true, cleanupEvidence: false };
   }
   return {
     ok: await terminateRecordedProcessGroup(identity, identityPredicate),
     seen: true,
+    cleanupEvidence: true,
   };
 }
 
@@ -800,7 +805,7 @@ export function classifyProcessCleanup({
   ruyiPageGroupClean,
   supervisorStatusOutcome,
   markerConfirmed,
-  ruyiPageStateSeen,
+  ruyiPageCleanupEvidence,
 }) {
   if (
     productionGroupClean !== true ||
@@ -808,7 +813,7 @@ export function classifyProcessCleanup({
   ) {
     return "failed";
   }
-  if (markerConfirmed === true && ruyiPageStateSeen !== true) return "failed";
+  if (markerConfirmed === true && ruyiPageCleanupEvidence !== true) return "failed";
   return supervisorStatusOutcome === "cleanup_failed" ? "recovered" : "clean";
 }
 
@@ -1356,7 +1361,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       ruyiPageGroupClean: ruyiPageCleanup.ok,
       supervisorStatusOutcome,
       markerConfirmed,
-      ruyiPageStateSeen: ruyiPageCleanup.seen,
+      ruyiPageCleanupEvidence: ruyiPageCleanup.cleanupEvidence,
     });
     const productionStateFile = readBoundedRegularFile(productionStatePath, 512);
     let productionStateConfirmed = false;
