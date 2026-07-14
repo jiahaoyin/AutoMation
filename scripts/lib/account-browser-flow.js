@@ -117,7 +117,8 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
   }
 
   const collector = createCollector({
-    timeoutMs: 240_000,
+    timeoutMs:
+      process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1" ? 130_000 : 240_000,
     reportDir,
     onStatus: reportTwoFactorStatus,
   });

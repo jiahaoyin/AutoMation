@@ -67,6 +67,9 @@ function createRuntime(runBackend, options = {}) {
     get collectorCount() {
       return collectorCount;
     },
+    get collectorTimeoutMs() {
+      return collectorOptions?.timeoutMs ?? null;
+    },
   };
 }
 
@@ -126,6 +129,24 @@ async function runTwoGenerationForwardingTest() {
 
   await runAccountBrowserPhase(params, harness.runtime);
   assert.deepEqual(harness.codeRequests, requests);
+}
+
+async function runSupervisedCollectorTimeoutTest() {
+  const previous = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+  const supervised = createRuntime(async () => successfulResult());
+  try {
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
+    await runAccountBrowserPhase(params, supervised.runtime);
+    assert.equal(supervised.collectorTimeoutMs, 130_000);
+
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "0";
+    const regular = createRuntime(async () => successfulResult());
+    await runAccountBrowserPhase(params, regular.runtime);
+    assert.equal(regular.collectorTimeoutMs, 240_000);
+  } finally {
+    if (previous === undefined) delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+    else process.env.APPLE_AUTOMATION_SUPERVISED_GUI = previous;
+  }
 }
 
 async function runFixedTwoFactorStatusPromptsTest() {
@@ -467,6 +488,7 @@ if (focusedTest) {
 
 await runTwoFactorLifecycleTest();
 await runTwoGenerationForwardingTest();
+await runSupervisedCollectorTimeoutTest();
 await runFixedTwoFactorStatusPromptsTest();
 await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();

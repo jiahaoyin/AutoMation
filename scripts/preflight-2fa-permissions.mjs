@@ -6,6 +6,7 @@
  */
 
 import {
+  isAccessibilityGranted,
   isAccessibilityDeniedError,
   run2FAPermissionPreflight,
 } from "./lib/accessibility.js";
@@ -14,9 +15,15 @@ const quiet = process.argv.includes("--quiet");
 const supervised = process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
 
 async function main() {
-  if (supervised) console.log("[2FA] status:permission_preflight_start");
+  if (supervised) {
+    console.log("[2FA] status:permission_preflight_start");
+    const granted = await isAccessibilityGranted().catch(() => false);
+    console.log(
+      `[2FA] status:${granted ? "permission_preflight_ready" : "permission_preflight_missing"}`
+    );
+    return;
+  }
   await run2FAPermissionPreflight({ quiet, timeoutMs: 120_000 });
-  if (supervised) console.log("[2FA] status:permission_preflight_ready");
 }
 
 main().catch((e) => {
