@@ -21,6 +21,8 @@ const ALLOWED_READY_MODES = new Set([
 
 const FIXED_ENVIRONMENT_WARNING = "[Firefox] 环境提示: browser environment warning";
 const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
+  settings_accessibility:
+    "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
   manual_allow:
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
   manual_code: "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",

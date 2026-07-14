@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { start2FASettingsCodeRequest } from "./lib/mac-settings-2fa.js";
 import * as settingsModule from "./lib/mac-settings-2fa.js";
+import { isAccessibilityDeniedError } from "./lib/accessibility.js";
 
 const SECRETS = [
   "person@example.com",
@@ -869,6 +870,33 @@ async function runHelperFailureSanitizationTest() {
   }
 }
 
+async function runAccessibilityFailureClassificationTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({ ok: false, message: "Accessibility permission unavailable" }) +
+          "\n"
+      )
+    );
+    harness.child.emit("close", 1, null);
+
+    const error = await rejectionOf(request.promise);
+    assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_ACCESSIBILITY_DENIED");
+    assert.match(error.message, /requires Accessibility permission/);
+    assert.equal(isAccessibilityDeniedError(error), true);
+  } finally {
+    harness.cleanup();
+  }
+}
+
 async function runChildErrorSanitizationTest() {
   const harness = createHarness();
   try {
@@ -1093,6 +1121,19 @@ function runSwiftCancellationContractTest() {
 
   assert.match(source, /--cancel-file/);
   assert.match(source, /func stopIfCancelled/);
+  const normalStart = source.indexOf(
+    "stopIfCancelled()\nguard AXIsProcessTrusted() else"
+  );
+  const accessibilityGate = source.indexOf("guard AXIsProcessTrusted() else", normalStart);
+  const ownerAttempts = source.indexOf("for uiOwnerAttempt in 1...2", normalStart);
+  assert.ok(
+    normalStart >= 0 && accessibilityGate > normalStart && ownerAttempts > accessibilityGate,
+    "the Settings helper must fail with a fixed Accessibility classification before AX discovery"
+  );
+  assert.match(
+    source.slice(accessibilityGate, ownerAttempts),
+    /Accessibility permission unavailable/
+  );
   assert.match(source, /func closeVerificationCodeAlert/);
   assert.match(source, /verificationCodeRequested/);
   assert.match(source, /waitForAlertMs/);
@@ -1916,6 +1957,7 @@ function runManualSettingsPrivacyContractTest() {
 await runSuccessTest();
 await runSensitiveOutputSanitizationTest();
 await runHelperFailureSanitizationTest();
+await runAccessibilityFailureClassificationTest();
 await runChildErrorSanitizationTest();
 await runCancelTest();
 runMissingSourceRejectsOldBinaryTest();

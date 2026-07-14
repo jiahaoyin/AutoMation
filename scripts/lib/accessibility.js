@@ -92,12 +92,13 @@ export function isAutomationDeniedError(err) {
 /** 是否为 macOS 辅助功能未授权错误（-25211 等） */
 export function isAccessibilityDeniedError(err) {
   const parts = [
+    err?.code ?? "",
     err instanceof Error ? err.message : "",
     err?.stderr ?? "",
     err?.stdout ?? "",
     String(err),
   ];
-  return /-25211|assistive access|辅助访问|不允许辅助|not allowed assist/i.test(
+  return /-25211|ACCESSIBILITY_DENIED|requires Accessibility permission|assistive access|辅助访问|不允许辅助|not allowed assist/i.test(
     parts.join("\n")
   );
 }
@@ -117,7 +118,7 @@ function resolveAccessibilityRuntime(options = {}) {
 export async function isAccessibilityGranted(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return true;
-  const result = await runtime.checkCapability();
+  const result = await runtime.checkCapability({ signal: options.signal });
   return result.capability === "available";
 }
 
@@ -125,7 +126,7 @@ export async function isAccessibilityGranted(options = {}) {
 export async function triggerAccessibilityPrompt(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return { capability: "available" };
-  return runtime.promptPermission();
+  return runtime.promptPermission({ signal: options.signal });
 }
 
 /**
@@ -273,6 +274,13 @@ function log(msg, quiet) {
   if (!quiet) console.log(msg);
 }
 
+function throwIfAccessibilityCancelled(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error("Accessibility authorization was cancelled");
+  error.code = "2FA_ACCESSIBILITY_CANCELLED";
+  throw error;
+}
+
 /**
  * 检测辅助功能；未授权时触发系统原生提示并等待用户授权
  * @param {object} [options]
@@ -281,24 +289,28 @@ function log(msg, quiet) {
  * @param {number} [options.pollMs]
  */
 export async function ensureAccessibility(options = {}) {
-  const { quiet = false, timeoutMs = 180_000, pollMs = 2000 } = options;
+  const { quiet = false, timeoutMs = 180_000, pollMs = 2000, signal } = options;
   const runtime = resolveAccessibilityRuntime(options);
 
+  throwIfAccessibilityCancelled(signal);
   if (runtime.platform !== "darwin") {
     return { granted: true, skipped: true };
   }
 
   const host = getAccessibilityHostApp();
 
-  if (await isAccessibilityGranted({ runtime })) {
+  if (await isAccessibilityGranted({ runtime, signal })) {
+    throwIfAccessibilityCancelled(signal);
     log(`✓ 辅助功能已授权（${host.name}）`, quiet);
     return { granted: true, host: host.name };
   }
+  throwIfAccessibilityCancelled(signal);
 
   log(">>> 辅助功能未授权，正在引导开启…", quiet);
   log(`    需要允许「${host.name}」控制此电脑（原生 AX 操作依赖此项）`, quiet);
 
-  await triggerAccessibilityPrompt({ runtime });
+  await triggerAccessibilityPrompt({ runtime, signal });
+  throwIfAccessibilityCancelled(signal);
   log(`    请按 macOS 原生提示授权「${host.name}」（等待授权中…）`, quiet);
   console.log(
     `    若未出现提示，请立即打开：系统设置 → 隐私与安全性 → 辅助功能，并勾选「${host.name}」`,
@@ -307,7 +319,9 @@ export async function ensureAccessibility(options = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await runtime.sleep(pollMs);
-    if (await isAccessibilityGranted({ runtime })) {
+    throwIfAccessibilityCancelled(signal);
+    if (await isAccessibilityGranted({ runtime, signal })) {
+      throwIfAccessibilityCancelled(signal);
       log(`✓ 辅助功能已授权（${host.name}）`, quiet);
       return { granted: true, host: host.name };
     }

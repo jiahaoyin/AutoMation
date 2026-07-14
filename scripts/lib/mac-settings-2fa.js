@@ -257,6 +257,12 @@ export function start2FASettingsCodeRequest(opts = {}) {
       finish(cancelledError());
       return;
     }
+    if (parsedOutput && parsed?.message === "Accessibility permission unavailable") {
+      const error = new Error("2FA settings helper requires Accessibility permission");
+      error.code = "2FA_SETTINGS_ACCESSIBILITY_DENIED";
+      finish(error);
+      return;
+    }
     const suffix =
       typeof signal === "string" && /^SIG[A-Z0-9]+$/.test(signal)
         ? ` (signal ${signal})`

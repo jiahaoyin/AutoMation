@@ -1694,6 +1694,10 @@ while i < args.count {
 }
 
 stopIfCancelled()
+guard AXIsProcessTrusted() else {
+    logStep(0, "Accessibility permission unavailable")
+    emit(Output(ok: false, code: nil, message: "Accessibility permission unavailable"))
+}
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 
 for uiOwnerAttempt in 1...2 {

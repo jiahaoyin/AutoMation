@@ -7,6 +7,7 @@ import { strict as assert } from "node:assert";
 import fs from "node:fs";
 
 import {
+  ensureAccessibility,
   isAccessibilityGranted,
   getAccessibilityHostApp,
   run2FAPermissionPreflight,
@@ -63,11 +64,11 @@ assert.match(
 );
 assert.match(
   exportedFunctionSource(accessibilitySource, "isAccessibilityGranted"),
-  /runtime\.checkCapability\(\)/
+  /runtime\.checkCapability\(\{\s*signal:\s*options\.signal\s*\}\)/
 );
 assert.match(
   exportedFunctionSource(accessibilitySource, "triggerAccessibilityPrompt"),
-  /runtime\.promptPermission\(\)/
+  /runtime\.promptPermission\(\{\s*signal:\s*options\.signal\s*\}\)/
 );
 assert.doesNotMatch(
   accessibilitySource,
@@ -92,11 +93,15 @@ assert.doesNotMatch(
 );
 
 const nativeCalls = [];
+const nativeOptions = [];
+const nativeController = new AbortController();
 const available = await checkNativeAccessibilityCapability({
   platform: "darwin",
+  signal: nativeController.signal,
   ensureHelper: () => true,
-  async execFile(_binary, args) {
+  async execFile(_binary, args, options) {
     nativeCalls.push([...args]);
+    nativeOptions.push(options);
     return {
       stdout: JSON.stringify({ capability: "available", raw: "must-not-escape" }),
     };
@@ -104,6 +109,7 @@ const available = await checkNativeAccessibilityCapability({
 });
 assert.deepEqual(available, { capability: "available" });
 assert.deepEqual(nativeCalls.shift(), ["--preflight-accessibility"]);
+assert.equal(nativeOptions.shift().signal, nativeController.signal);
 
 const prompted = await promptNativeAccessibilityPermission({
   platform: "darwin",
@@ -185,6 +191,36 @@ try {
 }
 assert.equal(runtimePreflight.ok, true);
 assert.deepEqual(preflightCalls, ["check", "prompt", "sleep", "check"]);
+
+const cancellationController = new AbortController();
+const cancellationCalls = [];
+await assert.rejects(
+  ensureAccessibility({
+    quiet: true,
+    timeoutMs: 100,
+    pollMs: 1,
+    signal: cancellationController.signal,
+    runtime: {
+      platform: "darwin",
+      async checkCapability({ signal }) {
+        assert.equal(signal, cancellationController.signal);
+        cancellationCalls.push("check");
+        return { capability: "permission_missing" };
+      },
+      async promptPermission({ signal }) {
+        assert.equal(signal, cancellationController.signal);
+        cancellationCalls.push("prompt");
+        cancellationController.abort();
+        return { capability: "permission_missing" };
+      },
+      async sleep() {
+        cancellationCalls.push("sleep");
+      },
+    },
+  }),
+  (error) => error?.code === "2FA_ACCESSIBILITY_CANCELLED"
+);
+assert.deepEqual(cancellationCalls, ["check", "prompt"]);
 
 const preflightFlag = popupSwiftSource.indexOf('args.contains("--preflight-accessibility")');
 const promptFlag = popupSwiftSource.indexOf('args.contains("--prompt-accessibility")');

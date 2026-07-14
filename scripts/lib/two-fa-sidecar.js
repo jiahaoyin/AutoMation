@@ -7,6 +7,7 @@ import {
 } from "./mac-2fa-popup.js";
 import { start2FASettingsCodeRequest } from "./mac-settings-2fa.js";
 import { promptForHidden2FACode } from "./manual-2fa-prompt.js";
+import { ensureAccessibility, isAccessibilityDeniedError } from "./accessibility.js";
 
 const MAX_ALLOW_ATTEMPTS = 2;
 const MAX_SETTINGS_ATTEMPTS = 2;
@@ -17,6 +18,7 @@ const PREEXISTING_ALLOW_CLEAR_IDLE_HITS = 3;
 const STATUS_NAMES = new Set([
   "settings_start",
   "settings_retry",
+  "settings_accessibility",
   "manual_allow",
   "manual_code",
   "ocr_permission_missing",
@@ -64,6 +66,7 @@ function resolveRuntime(overrides = {}) {
       overrides.dismissCodePopupForWebFill ?? dismissCodePopupForWebFill,
     start2FASettingsCodeRequest:
       overrides.start2FASettingsCodeRequest ?? start2FASettingsCodeRequest,
+    ensureAccessibility: overrides.ensureAccessibility ?? ensureAccessibility,
   };
 }
 
@@ -136,6 +139,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_provider_error",
     "prepare_2fa",
     "settings_provider_start",
+    "settings_accessibility",
     "settings_provider_failed",
     "settings_provider_result",
     "settings_provider_cancelled",
@@ -172,6 +176,8 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "fallback_close_failed",
     "probe_or_provider_failed",
     "settings_start_failed",
+    "accessibility_denied",
+    "accessibility_unavailable",
     "cancelled",
     "settings_provider_failed",
     "popup_won",
@@ -211,7 +217,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "code_visible",
     "code_visible_late",
   ]),
-  outcome: new Set(["candidate_ready"]),
+  outcome: new Set(["candidate_ready", "prompting", "granted", "unavailable"]),
 });
 const AUDIT_STRING_KEYS = new Set(Object.keys(AUDIT_LABELS_BY_KEY));
 const AUDIT_BOOLEAN_KEYS = new Set([
@@ -313,6 +319,9 @@ export function createMac2FACollector(options = {}) {
   let settingsProviderPromise = null;
   let settingsAttempt = 0;
   let settingsCancelPromise = null;
+  let settingsAccessibilityAttempted = false;
+  let settingsAccessibilityController = null;
+  let settingsAccessibilityOutcome = null;
   let activeAcquisition = null;
   let manualAbortController = null;
   let manualCompletion = null;
@@ -833,6 +842,84 @@ export function createMac2FACollector(options = {}) {
     return preparePromise;
   };
 
+  const cancelSettingsAccessibility = () => {
+    settingsAccessibilityController?.abort();
+    settingsAccessibilityOutcome?.resolve({ kind: "cancelled" });
+  };
+
+  const recoverSettingsAccessibility = async (acquisition, attempt) => {
+    if (settingsAccessibilityAttempted) return "unavailable";
+    settingsAccessibilityAttempted = true;
+
+    const remainingMs = acquisition.deadline - runtime.now();
+    if (remainingMs <= 0 || disposed || acquisition.winner.settled) return "cancelled";
+
+    status("settings_accessibility", {
+      attempt,
+      source: "settings",
+      remainingSec: remainingSeconds(acquisition.deadline),
+    });
+    audit({
+      phase: "settings_accessibility",
+      reason: "accessibility_denied",
+      outcome: "prompting",
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+
+    const controller = new AbortController();
+    const outcomeGate = createDeferred();
+    settingsAccessibilityController = controller;
+    settingsAccessibilityOutcome = outcomeGate;
+
+    const deadlineDelay = scheduleDelay(remainingMs);
+    deadlineDelay.promise.then((elapsed) => {
+      if (!elapsed) return;
+      controller.abort();
+      outcomeGate.resolve({ kind: "cancelled" });
+    });
+
+    void Promise.resolve()
+      .then(() =>
+        runtime.ensureAccessibility({
+          quiet: false,
+          timeoutMs: remainingMs,
+          signal: controller.signal,
+        })
+      )
+      .then(
+        (result) =>
+          outcomeGate.resolve({
+            kind: result?.granted === true ? "granted" : "unavailable",
+          }),
+        () => outcomeGate.resolve({ kind: "unavailable" })
+      );
+
+    const outcome = await outcomeGate.promise;
+    deadlineDelay.cancel();
+    if (settingsAccessibilityController === controller) {
+      settingsAccessibilityController = null;
+    }
+    if (settingsAccessibilityOutcome === outcomeGate) {
+      settingsAccessibilityOutcome = null;
+    }
+
+    if (outcome.kind === "granted") {
+      audit({
+        phase: "settings_accessibility",
+        outcome: "granted",
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
+    } else if (outcome.kind === "unavailable") {
+      audit({
+        phase: "settings_accessibility",
+        reason: "accessibility_unavailable",
+        outcome: "unavailable",
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
+    }
+    return outcome.kind;
+  };
+
   const startSettingsProvider = async (acquisition) => {
     if (!config.settingsFallback) return;
     const waitMs = Math.max(0, preparedAt + config.settingsFallbackAfterMs - runtime.now());
@@ -883,6 +970,7 @@ export function createMac2FACollector(options = {}) {
           (error) =>
             outcomeGate.resolve({
               kind: error?.code === "2FA_SETTINGS_CANCELLED" ? "cancelled" : "failed",
+              error,
             })
         );
         const completion = outcomeGate.promise;
@@ -907,14 +995,27 @@ export function createMac2FACollector(options = {}) {
           outcome = { kind: "failed" };
         }
 
+        const accessibilityDenied =
+          outcome.kind === "failed" && isAccessibilityDeniedError(outcome.error);
         audit({
           phase:
             outcome.kind === "cancelled"
               ? "settings_provider_cancelled"
               : "settings_provider_failed",
-          reason: outcome.kind === "cancelled" ? "cancelled" : "settings_provider_failed",
+          reason:
+            outcome.kind === "cancelled"
+              ? "cancelled"
+              : accessibilityDenied
+                ? "accessibility_denied"
+                : "settings_provider_failed",
           elapsedSincePrepareMs: elapsedSincePrepare(),
         });
+
+        if (accessibilityDenied && !settingsAccessibilityAttempted) {
+          const recovery = await recoverSettingsAccessibility(acquisition, attempt);
+          if (recovery === "granted") continue;
+          return;
+        }
       }
 
       if (outcome.kind === "cancelled" || disposed || acquisition.winner.settled) return;
@@ -942,6 +1043,7 @@ export function createMac2FACollector(options = {}) {
     settingsCancelPromise = (async () => {
       settingsStartDelay?.cancel();
       settingsStartDelay = null;
+      cancelSettingsAccessibility();
       const request = settingsRequest;
       const completion = settingsCompletion;
       const outcomeGate = settingsOutcome;

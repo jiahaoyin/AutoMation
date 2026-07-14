@@ -142,6 +142,13 @@ async function runFixedTwoFactorStatusPromptsTest() {
       source: "settings",
       remainingSec: 192,
     });
+    harness.emitStatus({
+      status: "settings_accessibility",
+      attempt: 1,
+      source: "settings",
+      remainingSec: 190,
+      secret: SECRET_FIXTURE,
+    });
     harness.emitStatus({ status: "manual_allow", remainingSec: 185 });
     harness.emitStatus({ status: "manual_code", source: "manual", remainingSec: 150 });
     harness.emitStatus({ status: "winner", source: "popup", remainingSec: 140 });
@@ -163,6 +170,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
   assert.deepEqual(statusLogs, [
     "[2FA] 正在尝试通过系统设置获取验证码（第 2/2 次）...",
     "[2FA] 系统设置取码失败，5 秒后进行第 2/2 次尝试...",
+    "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
     "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
     "[2FA] 已从 Apple 验证码弹窗取得验证码。",

@@ -143,10 +143,12 @@ async function runAccessibilityCapability(flag, options = {}) {
 
   const runHelper = options.execFile ?? execFileAsync;
   try {
-    const { stdout } = await runHelper(binaryPath, [flag], {
+    const execOptions = {
       timeout: 15_000,
       maxBuffer: 16 * 1024,
-    });
+    };
+    if (options.signal) execOptions.signal = options.signal;
+    const { stdout } = await runHelper(binaryPath, [flag], execOptions);
     return parseAccessibilityCapability(stdout);
   } catch {
     return { capability: "permission_missing" };

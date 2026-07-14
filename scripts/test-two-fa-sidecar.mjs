@@ -73,6 +73,12 @@ function cancellationError() {
   return error;
 }
 
+function accessibilityDeniedError() {
+  const error = new Error("fixed accessibility failure");
+  error.code = "2FA_SETTINGS_ACCESSIBILITY_DENIED";
+  return error;
+}
+
 function createManualProviderHarness() {
   const calls = [];
   const provider = ({ signal, timeoutMs }) => {
@@ -111,6 +117,7 @@ function createNativeHarness(
     dismissAction = "dismissed_stale",
     popupCapability = null,
     initialAllowVisible = false,
+    accessibilityProvider = null,
   } = {}
 ) {
   let popup = null;
@@ -125,6 +132,8 @@ function createNativeHarness(
     settingsStarts: 0,
     settingsCancels: 0,
     settingsForceStops: 0,
+    accessibilityStarts: 0,
+    accessibilityOptions: [],
     allowAttempts: [],
     popupReads: [],
     fullAllowWaits: 0,
@@ -239,6 +248,12 @@ function createNativeHarness(
       };
       settingsRequests.push(request);
       return request;
+    },
+    async ensureAccessibility(options) {
+      stats.accessibilityStarts += 1;
+      stats.accessibilityOptions.push(options);
+      if (accessibilityProvider) return accessibilityProvider(options);
+      return { granted: true };
     },
   };
 
@@ -1058,6 +1073,168 @@ async function cancelledSettingsDoesNotRetryTest() {
   await rejected;
 }
 
+async function settingsAccessibilityRecoveryRestartsImmediatelyTest() {
+  const authorization = deferred();
+  const authorizationCalls = [];
+  const { clock, native, collector, audits, statuses } = createHarness({
+    settingsFallbackAfterMs: 20,
+    accessibilityProvider(options) {
+      authorizationCalls.push(options);
+      return authorization.promise;
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+
+  await clock.advance(20);
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(native.stats.accessibilityStarts, 1);
+  assert.equal(authorizationCalls.length, 1);
+  assert.equal(authorizationCalls[0].signal.aborted, false);
+  assert.equal(authorizationCalls[0].timeoutMs, 29_980);
+  assert.equal(
+    statuses.some(
+      ({ status, source, attempt }) =>
+        status === "settings_accessibility" && source === "settings" && attempt === 1
+    ),
+    true
+  );
+
+  authorization.resolve({ granted: true });
+  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 2, "authorization must retry without a 5 second delay");
+
+  native.settingsRequests[1].resolve({ code: "606060" });
+  await clock.flush();
+  assert.equal(await codePromise, "606060");
+  assert.equal(
+    audits.some(
+      ({ phase, outcome }) => phase === "settings_accessibility" && outcome === "granted"
+    ),
+    true
+  );
+  await collector.dispose();
+}
+
+async function settingsAccessibilityDisposePreventsRestartTest() {
+  const authorization = deferred();
+  let authorizationSignal = null;
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 20,
+    accessibilityProvider({ signal }) {
+      authorizationSignal = signal;
+      return authorization.promise;
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  const rejected = assert.rejects(codePromise, /disposed/i);
+
+  await clock.advance(20);
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  assert.equal(native.stats.accessibilityStarts, 1);
+
+  await collector.dispose();
+  assert.equal(authorizationSignal.aborted, true);
+  authorization.resolve({ granted: true });
+  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 1);
+  await rejected;
+}
+
+async function settingsAccessibilityWinnerPreventsRestartTest() {
+  const authorization = deferred();
+  let authorizationSignal = null;
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 20,
+    accessibilityProvider({ signal }) {
+      authorizationSignal = signal;
+      return authorization.promise;
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+
+  await clock.advance(20);
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  native.setPopup("717171");
+  await clock.advance(20);
+
+  assert.equal(await codePromise, "717171");
+  assert.equal(authorizationSignal.aborted, true);
+  authorization.resolve({ granted: true });
+  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 1);
+  await collector.dispose();
+}
+
+async function settingsAccessibilityDeadlinePreventsRestartTest() {
+  const authorization = deferred();
+  let authorizationSignal = null;
+  const { clock, native, collector } = createHarness({
+    timeoutMs: 100,
+    settingsFallbackAfterMs: 20,
+    accessibilityProvider({ signal }) {
+      authorizationSignal = signal;
+      return authorization.promise;
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  const timedOut = assert.rejects(codePromise, /超时/);
+
+  await clock.advance(20);
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  await clock.advance(80);
+  await timedOut;
+
+  assert.equal(authorizationSignal.aborted, true);
+  authorization.resolve({ granted: true });
+  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 1);
+  await collector.dispose();
+}
+
+async function settingsAccessibilityFailureIsFixedAndBoundedTest() {
+  const secret = "private authorization failure 123456";
+  const { clock, native, collector, audits, statuses } = createHarness({
+    settingsFallbackAfterMs: 20,
+    async accessibilityProvider() {
+      throw new Error(secret);
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+
+  await clock.advance(20);
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  assert.equal(native.stats.accessibilityStarts, 1);
+  assert.equal(native.stats.settingsStarts, 1);
+
+  native.setPopup("818181");
+  await clock.advance(20);
+  assert.equal(await codePromise, "818181");
+  const serialized = JSON.stringify({ audits, statuses });
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(
+    audits.some(
+      ({ phase, reason, outcome }) =>
+        phase === "settings_accessibility" &&
+        reason === "accessibility_unavailable" &&
+        outcome === "unavailable"
+    ),
+    true
+  );
+  await collector.dispose();
+}
+
 async function allowBudgetStopsAtTwoAndReportsManualOnceTest() {
   const { clock, native, collector, statuses } = createHarness({
     allowAttemptOutcome: "remain",
@@ -1832,6 +2009,11 @@ const focusedTests = {
   "settings-retry": settingsRetriesOnceAfterFiveSecondsTest,
   "settings-max": settingsNeverStartsThirdAttemptTest,
   "settings-cancel": cancelledSettingsDoesNotRetryTest,
+  "settings-accessibility": settingsAccessibilityRecoveryRestartsImmediatelyTest,
+  "settings-accessibility-dispose": settingsAccessibilityDisposePreventsRestartTest,
+  "settings-accessibility-winner": settingsAccessibilityWinnerPreventsRestartTest,
+  "settings-accessibility-deadline": settingsAccessibilityDeadlinePreventsRestartTest,
+  "settings-accessibility-failure": settingsAccessibilityFailureIsFixedAndBoundedTest,
   "allow-budget": allowBudgetStopsAtTwoAndReportsManualOnceTest,
   "manual-start": manualFallbackStartsAtNinetySecondsTest,
   "manual-auto": automaticWinnerAbortsManualFallbackTest,
@@ -1883,6 +2065,11 @@ if (focusedTest) {
   await settingsRetriesOnceAfterFiveSecondsTest();
   await settingsNeverStartsThirdAttemptTest();
   await cancelledSettingsDoesNotRetryTest();
+  await settingsAccessibilityRecoveryRestartsImmediatelyTest();
+  await settingsAccessibilityDisposePreventsRestartTest();
+  await settingsAccessibilityWinnerPreventsRestartTest();
+  await settingsAccessibilityDeadlinePreventsRestartTest();
+  await settingsAccessibilityFailureIsFixedAndBoundedTest();
   await allowBudgetStopsAtTwoAndReportsManualOnceTest();
   await manualFallbackStartsAtNinetySecondsTest();
   await automaticWinnerAbortsManualFallbackTest();
