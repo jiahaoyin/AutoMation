@@ -91,26 +91,42 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.doesNotMatch(pageWait, /(?:true\s*\|\||\|\|\s*true)/);
   assert.match(
     pageWait,
-    /let hasEvidence\s*=\s*hasVisibleExactMatch\([\s\S]{0,220}expectedPid:\s*pid[\s\S]{0,180}names:\s*appleAccountPageEvidence[\s\S]{0,180}if hasEvidence[\s\S]{0,400}owner\.processIdentifier\s*==\s*pid[\s\S]{0,200}return owner/,
-    "a running extension is accepted only from visible target-page evidence owned by the same PID"
+    /if let owner\s*=\s*firstVisibleExactMatchOwner\([\s\S]{0,220}rootPid:\s*rootPid[\s\S]{0,180}names:\s*appleAccountPageEvidence[\s\S]{0,400}trustedSettingsUIOwner\([\s\S]{0,180}owner\.processIdentifier[\s\S]{0,180}return owner/,
+    "page discovery must return the exact trusted owner of the visible evidence element"
   );
   assert.doesNotMatch(pageWait, /treeContainsExactText|stableHits|stableSince/);
-  const fastEvidence = swiftFunctionBodyFromSource(source, "hasVisibleExactMatch");
-  assert.match(fastEvidence, /elementBelongsToProcess\(appElement,\s*pid:\s*expectedPid\)/);
-  const evidenceMatch = fastEvidence.indexOf("if elementBelongsToProcess(node");
-  const earlyReturn = fastEvidence.indexOf("return isTrustedSystemSettingsProcess", evidenceMatch);
+  const fastEvidence = swiftFunctionBodyFromSource(source, "firstVisibleExactMatchOwner");
+  assert.match(fastEvidence, /elementBelongsToProcess\(appElement,\s*pid:\s*rootPid\)/);
+  assert.match(fastEvidence, /let nodePid\s*=\s*elementProcessIdentifier\(node\)/);
+  assert.match(fastEvidence, /trustedSettingsUIOwner\(processIdentifier:\s*nodePid\)/);
+  assert.match(fastEvidence, /owner\.processIdentifier\s*==\s*nodePid/);
+  const exactMatch = fastEvidence.indexOf("if axBool(node", 0);
+  const earlyReturn = fastEvidence.indexOf("return owner", exactMatch);
   const continuedTraversal = fastEvidence.indexOf("queue.append(contentsOf:", earlyReturn);
   assert.ok(
-    evidenceMatch >= 0 && earlyReturn > evidenceMatch && continuedTraversal > earlyReturn,
-    "owner discovery must return on the first same-PID visible exact evidence"
+    exactMatch >= 0 && earlyReturn > exactMatch && continuedTraversal > earlyReturn,
+    "owner discovery must return on the first visible exact evidence with a trusted element PID"
   );
   assert.match(pageWait, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.match(pageWait, /remainingMilliseconds\(until:\s*boundedDeadline/);
-  assert.match(pageWait, /let owner\s*=\s*matches\[0\]/);
-  assert.match(pageWait, /owner\.processIdentifier\s*==\s*pid/);
-  assert.match(pageWait, /isTrustedAppleIDSettingsExtension\(owner\)/);
+  assert.match(pageWait, /rootPids:\s*\[pid_t\]\s*=\s*matches\.map/);
+  assert.match(pageWait, /uniqueTrustedSettingsApp\(\)/);
+  assert.match(pageWait, /trustedSettingsUIOwner\([\s\S]{0,120}owner\.processIdentifier/);
   assert.match(pageWait, /return owner/);
+
+  const exactTree = swiftFunctionBodyFromSource(source, "treeContainsExactText");
+  assert.match(
+    exactTree,
+    /if elementBelongsToProcess\(node,\s*pid:\s*expectedPid\),[\s\S]{0,180}hasExactName\(node,\s*names:\s*names\)/,
+    "page context may only come from nodes owned by the selected PID"
+  );
+  const codeTree = swiftFunctionBodyFromSource(source, "findSixDigitCodeInAlert");
+  assert.match(
+    codeTree,
+    /if elementBelongsToProcess\(node,\s*pid:\s*expectedPid\),[\s\S]{0,180}kAXStaticTextRole[\s\S]{0,120}kAXGroupRole/,
+    "verification-code text may only come from nodes owned by the alert PID"
+  );
 
   const actionGate = swiftFunctionBodyFromSource(source, "actionMayProceed");
   assert.match(actionGate, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
@@ -230,6 +246,11 @@ function assertSettingsOwnerSafetyContract(source) {
   );
   const ownerLoop = source.slice(ownerLoopStart, ownerLoopEnd);
   const windowlessProbe = ownerLoop.indexOf("let verifiedWindowlessOwner");
+  const modernHostBranch = ownerLoop.indexOf("if modernHostOwner", windowlessProbe);
+  const preservingFocus = ownerLoop.indexOf(
+    "focusExistingSettingsWindow(",
+    modernHostBranch
+  );
   const windowedBranch = ownerLoop.indexOf("if !verifiedWindowlessOwner", windowlessProbe);
   const activationCall = ownerLoop.indexOf("guard activateSystemSettings(", windowedBranch);
   const readyPause = ownerLoop.indexOf("let readyPauseMs");
@@ -240,12 +261,24 @@ function assertSettingsOwnerSafetyContract(source) {
   const prepareCall = ownerLoop.indexOf("switch prepareVerificationCodeAlert(");
   assert.ok(
     windowlessProbe >= 0 &&
-      windowedBranch > windowlessProbe &&
+      modernHostBranch > windowlessProbe &&
+      preservingFocus > modernHostBranch &&
+      windowedBranch > preservingFocus &&
       activationCall > windowedBranch &&
       readyPause > activationCall &&
       postSettleEvidence > readyPause &&
       prepareCall > postSettleEvidence,
     "windowless verified owners must bypass activation while windowed owners are revalidated after settling"
+  );
+  const existingFocus = swiftFunctionBodyFromSource(source, "focusExistingSettingsWindow");
+  assert.match(existingFocus, /focusedWindowForProcess\(expectedPid\)/);
+  assert.match(existingFocus, /mainWindows\.count\s*==\s*1/);
+  assert.match(existingFocus, /visibleWindows\.count\s*==\s*1/);
+  assert.match(existingFocus, /focusTrustedSettingsWindow\(/);
+  assert.doesNotMatch(
+    existingFocus,
+    /openApplication|OpenConfiguration|launchApplication/,
+    "modern host preservation must never reopen System Settings"
   );
   const postSettleGuard = ownerLoop.slice(postSettleEvidence, prepareCall);
   assert.match(postSettleGuard, /names:\s*appleAccountPageEvidence/);
@@ -288,8 +321,8 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const unconditionalPageEvidence = source.replace(
-    "if hasEvidence {",
-    "if true {"
+    "if let owner = firstVisibleExactMatchOwner(",
+    "if let owner = trustedSettingsUIOwner("
   );
   assert.notEqual(
     unconditionalPageEvidence,
@@ -302,8 +335,8 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const delayedEvidenceReturn = source.replace(
-    "            return isTrustedSystemSettingsProcess(expectedPid) &&\n                elementBelongsToProcess(node, pid: expectedPid)",
-    "            _ = isTrustedSystemSettingsProcess(expectedPid)\n            _ = elementBelongsToProcess(node, pid: expectedPid)"
+    "            return owner",
+    "            _ = owner"
   );
   assert.notEqual(
     delayedEvidenceReturn,
@@ -312,12 +345,12 @@ function runSettingsOwnerMutationResistanceTest() {
   );
   assert.throws(
     () => assertSettingsOwnerSafetyContract(delayedEvidenceReturn),
-    /first same-PID visible exact evidence/
+    /first visible exact evidence/
   );
 
   const crossProcessPageEvidence = source.replace(
-    "expectedPid: pid,\n                names: appleAccountPageEvidence,",
-    "expectedPid: 0,\n                names: appleAccountPageEvidence,"
+    "let nodePid = elementProcessIdentifier(node),",
+    "let nodePid = Optional(rootPid),"
   );
   assert.notEqual(
     crossProcessPageEvidence,
@@ -330,7 +363,7 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const unboundVerifiedOwner = source.replace(
-    "owner.processIdentifier == pid,",
+    "owner.processIdentifier == nodePid,",
     "true,"
   );
   assert.notEqual(
@@ -341,6 +374,30 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(unboundVerifiedOwner),
     assert.AssertionError
+  );
+
+  const exactTreeBody = swiftFunctionBodyFromSource(source, "treeContainsExactText");
+  const crossPidContextBody = exactTreeBody.replace(
+    "if elementBelongsToProcess(node, pid: expectedPid),",
+    "if true,"
+  );
+  const crossPidContext = source.replace(exactTreeBody, crossPidContextBody);
+  assert.notEqual(crossPidContext, source, "cross-PID context mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(crossPidContext),
+    /page context may only come/
+  );
+
+  const codeTreeBody = swiftFunctionBodyFromSource(source, "findSixDigitCodeInAlert");
+  const crossPidCodeBody = codeTreeBody.replace(
+    "if elementBelongsToProcess(node, pid: expectedPid),",
+    "if true,"
+  );
+  const crossPidCode = source.replace(codeTreeBody, crossPidCodeBody);
+  assert.notEqual(crossPidCode, source, "cross-PID code mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(crossPidCode),
+    /verification-code text may only come/
   );
 
   const ownerLoopStart = source.indexOf("for uiOwnerAttempt in 1...2");
@@ -359,6 +416,20 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingPostSettleEvidence),
     /revalidated after settling|windowless verified owners/
+  );
+
+  const reopenedModernHost = source.replace(
+    "              focusExistingSettingsWindow(\n                  app: app,",
+    "              activateSystemSettings(\n                  app,"
+  );
+  assert.notEqual(
+    reopenedModernHost,
+    source,
+    "modern-host reopen mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(reopenedModernHost),
+    assert.AssertionError
   );
 
   const finalClickGuard = [
@@ -1114,8 +1185,8 @@ function runSwiftCancellationContractTest() {
   );
   assert.match(
     ownerRecovery,
-    /let verifiedWindowlessOwner\s*=\s*windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible[\s\S]{0,100}if !verifiedWindowlessOwner\s*\{/,
-    "a verified windowless owner must bypass host activation"
+    /let verifiedWindowlessOwner\s*=\s*windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible[\s\S]{0,180}if modernHostOwner\s*\{[\s\S]{0,300}focusExistingSettingsWindow\([\s\S]{0,220}else if !verifiedWindowlessOwner\s*\{/,
+    "modern host and verified windowless owners must bypass host reopening"
   );
   assert.doesNotMatch(source, /func waitForSettingsUIOwner\(/);
   assert.match(
@@ -1124,7 +1195,7 @@ function runSwiftCancellationContractTest() {
   );
   assert.match(
     ownerRecovery,
-    /guard !settingsUIApp\.isTerminated,[\s\S]{0,180}isTrustedSystemSettingsProcess\(settingsPid\)[\s\S]{0,260}isTrustedAppleIDSettingsExtension\(settingsUIApp\)/,
+    /guard !settingsUIApp\.isTerminated,[\s\S]{0,180}isTrustedSystemSettingsProcess\(settingsPid\)[\s\S]{0,260}if isTrustedSystemSettings\(settingsUIApp\)[\s\S]{0,180}else\s*\{[\s\S]{0,120}isTrustedAppleIDSettingsExtension\(settingsUIApp\)/,
     "the exact owner that passed page verification must remain trusted before AX traversal"
   );
 
@@ -1150,16 +1221,15 @@ function runSwiftCancellationContractTest() {
     processTrustStart,
     source.indexOf("\nfunc ", processTrustStart + 5)
   );
-  assert.match(processTrust, /extensions\.count\s*==\s*1/);
-  assert.match(processTrust, /extensions\[0\]\.processIdentifier\s*==\s*pid/);
-  assert.match(processTrust, /extensions\.isEmpty/);
-  assert.match(processTrust, /majorVersion\s*<\s*13/);
-  assert.match(processTrust, /settingsApps\.count\s*==\s*1/);
-  assert.ok(
-    processTrust.indexOf("extensions.count == 1") <
-      processTrust.indexOf("NSRunningApplication(processIdentifier: pid)"),
-    "the unique extension owner must take precedence over the host fallback"
-  );
+  assert.match(processTrust, /trustedSettingsUIOwner\(processIdentifier:\s*pid\)\s*!=\s*nil/);
+  const trustedOwner = swiftFunctionBodyFromSource(source, "trustedSettingsUIOwner");
+  assert.match(trustedOwner, /NSRunningApplication\(processIdentifier:\s*pid\)/);
+  assert.match(trustedOwner, /!app\.isTerminated/);
+  assert.match(trustedOwner, /isTrustedAppleIDSettingsExtension\(app\)/);
+  assert.match(trustedOwner, /extensions\.count\s*==\s*1/);
+  assert.match(trustedOwner, /isTrustedSystemSettings\(app\)/);
+  assert.match(trustedOwner, /settingsApps\.count\s*==\s*1/);
+  assert.doesNotMatch(trustedOwner, /localizedName|hasPrefix/);
 
   const accountUrlBlock = source.slice(
     source.indexOf("let modernAccountUrls"),
@@ -1198,11 +1268,11 @@ function runSwiftCancellationContractTest() {
     source.indexOf("\nfunc ", pageWaitStart + 5)
   );
   assert.match(pageWait, /matches\.count\s*>\s*1[\s\S]{0,80}return nil/);
-  assert.match(pageWait, /AXUIElementCreateApplication\(pid\)/);
-  assert.match(pageWait, /hasVisibleExactMatch\(/);
+  assert.match(pageWait, /AXUIElementCreateApplication\(rootPid\)/);
+  assert.match(pageWait, /firstVisibleExactMatchOwner\(/);
   assert.match(pageWait, /names:\s*appleAccountPageEvidence/);
-  assert.match(pageWait, /expectedPid:\s*pid/);
-  assert.match(pageWait, /if hasEvidence/);
+  assert.match(pageWait, /rootPid:\s*rootPid/);
+  assert.match(pageWait, /if let owner\s*=\s*firstVisibleExactMatchOwner/);
   assert.doesNotMatch(pageWait, /stablePid|stableHits|stableSince|timeIntervalSince/);
   assert.match(pageWait, /cappedAt:\s*50/);
   assert.match(
@@ -1213,7 +1283,7 @@ function runSwiftCancellationContractTest() {
   assert.match(pageWait, /Date\(\)\s*>=\s*boundedDeadline/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.ok(
-    pageWait.indexOf("hasVisibleExactMatch(") < pageWait.indexOf("return owner"),
+    pageWait.indexOf("firstVisibleExactMatchOwner(") < pageWait.indexOf("return owner"),
     "a pre-existing extension is not success until the target Apple Account page is visible"
   );
 

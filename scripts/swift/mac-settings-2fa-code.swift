@@ -174,7 +174,8 @@ func treeContainsExactText(
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        if axBool(node, kAXHiddenAttribute as String) != true,
+        if elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
            axFrame(node) != nil,
            hasExactName(node, names: names) {
             return isTrustedSystemSettingsProcess(expectedPid)
@@ -185,9 +186,13 @@ func treeContainsExactText(
     return false
 }
 
-func elementBelongsToProcess(_ element: AXUIElement, pid: pid_t) -> Bool {
+func elementProcessIdentifier(_ element: AXUIElement) -> pid_t? {
     var elementPid: pid_t = 0
-    return AXUIElementGetPid(element, &elementPid) == .success && elementPid == pid
+    return AXUIElementGetPid(element, &elementPid) == .success ? elementPid : nil
+}
+
+func elementBelongsToProcess(_ element: AXUIElement, pid: pid_t) -> Bool {
+    elementProcessIdentifier(element) == pid
 }
 
 func supportsPressAction(_ element: AXUIElement) -> Bool {
@@ -324,14 +329,14 @@ func visibleExactMatchCounts(
     return (visible, pressable)
 }
 
-func hasVisibleExactMatch(
+func firstVisibleExactMatchOwner(
     appElement: AXUIElement,
-    expectedPid: pid_t,
+    rootPid: pid_t,
     names: [String],
     maxNodes: Int = 2_000
-) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          elementBelongsToProcess(appElement, pid: expectedPid) else { return false }
+) -> NSRunningApplication? {
+    guard trustedSettingsUIOwner(processIdentifier: rootPid) != nil,
+          elementBelongsToProcess(appElement, pid: rootPid) else { return nil }
     var queue = axSheets(appElement) + axChildren(appElement)
     var seen: [AXUIElement] = []
     var cursor = 0
@@ -342,17 +347,19 @@ func hasVisibleExactMatch(
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        if elementBelongsToProcess(node, pid: expectedPid),
-           axBool(node, kAXHiddenAttribute as String) != true,
+        if axBool(node, kAXHiddenAttribute as String) != true,
            axFrame(node) != nil,
-           hasExactName(node, names: names) {
-            return isTrustedSystemSettingsProcess(expectedPid) &&
-                elementBelongsToProcess(node, pid: expectedPid)
+           hasExactName(node, names: names),
+           let nodePid = elementProcessIdentifier(node),
+           let owner = trustedSettingsUIOwner(processIdentifier: nodePid),
+           owner.processIdentifier == nodePid,
+           elementBelongsToProcess(node, pid: nodePid) {
+            return owner
         }
         queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
     }
-    return false
+    return nil
 }
 
 func findVerificationCodeAlertRoot(
@@ -415,7 +422,9 @@ func findSixDigitCodeInAlert(
         let node = queue.removeFirst()
         visited += 1
         let role = axRole(node)
-        if role == kAXStaticTextRole as String || role == kAXGroupRole as String {
+        if elementBelongsToProcess(node, pid: expectedPid),
+           (role == kAXStaticTextRole as String ||
+            role == kAXGroupRole as String) {
             for text in axExactTexts(node) {
                 candidates.formUnion(sixDigitCodeCandidates(text))
             }
@@ -495,19 +504,26 @@ func isTrustedAppleIDSettingsExtension(_ app: NSRunningApplication) -> Bool {
     return appleIDSettingsExecutablePaths.contains(path)
 }
 
-func isTrustedSystemSettingsProcess(_ pid: pid_t) -> Bool {
-    let extensions = NSWorkspace.shared.runningApplications.filter(
-        isTrustedAppleIDSettingsExtension
-    )
-    if extensions.count == 1 {
-        return extensions[0].processIdentifier == pid
+func trustedSettingsUIOwner(processIdentifier pid: pid_t) -> NSRunningApplication? {
+    guard let app = NSRunningApplication(processIdentifier: pid),
+          !app.isTerminated else { return nil }
+    if isTrustedAppleIDSettingsExtension(app) {
+        let extensions = NSWorkspace.shared.runningApplications.filter(
+            isTrustedAppleIDSettingsExtension
+        )
+        return extensions.count == 1 && extensions[0].processIdentifier == pid
+            ? app
+            : nil
     }
-    guard extensions.isEmpty,
-          ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 13,
-          let app = NSRunningApplication(processIdentifier: pid),
-          isTrustedSystemSettings(app) else { return false }
+    guard isTrustedSystemSettings(app) else { return nil }
     let settingsApps = NSWorkspace.shared.runningApplications.filter(isTrustedSystemSettings)
     return settingsApps.count == 1 && settingsApps[0].processIdentifier == pid
+        ? app
+        : nil
+}
+
+func isTrustedSystemSettingsProcess(_ pid: pid_t) -> Bool {
+    trustedSettingsUIOwner(processIdentifier: pid) != nil
 }
 
 func waitForSettingsApp(timeoutMs: Int) -> NSRunningApplication? {
@@ -547,22 +563,24 @@ func waitForAppleAccountSettingsPage(
             isTrustedAppleIDSettingsExtension
         )
         if matches.count > 1 { return nil }
-        if matches.count == 1 {
-            let owner = matches[0]
-            let pid = owner.processIdentifier
-            let appElement = AXUIElementCreateApplication(pid)
-            let hasEvidence = hasVisibleExactMatch(
+        var rootPids: [pid_t] = matches.map(\.processIdentifier)
+        if let settingsHost = uniqueTrustedSettingsApp(),
+           !rootPids.contains(settingsHost.processIdentifier) {
+            rootPids.append(settingsHost.processIdentifier)
+        }
+        for rootPid in rootPids {
+            let appElement = AXUIElementCreateApplication(rootPid)
+            if let owner = firstVisibleExactMatchOwner(
                 appElement: appElement,
-                expectedPid: pid,
+                rootPid: rootPid,
                 names: appleAccountPageEvidence,
                 maxNodes: 2_000
-            )
-            if hasEvidence {
+            ) {
                 stopIfCancelled()
                 guard Date() < boundedDeadline else { return nil }
-                guard !owner.isTerminated,
-                      owner.processIdentifier == pid,
-                      isTrustedAppleIDSettingsExtension(owner) else { return nil }
+                guard trustedSettingsUIOwner(
+                    processIdentifier: owner.processIdentifier
+                )?.processIdentifier == owner.processIdentifier else { return nil }
                 logStep(1, "Apple Account settings page ready")
                 return owner
             }
@@ -1053,6 +1071,46 @@ func focusTrustedSettingsWindow(
         if focusedWindowForProcess(expectedPid) == window { return true }
         usleep(100_000)
     } while true
+}
+
+func focusExistingSettingsWindow(
+    app: NSRunningApplication,
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date
+) -> Bool {
+    guard Date() < deadline,
+          isTrustedSystemSettings(app),
+          app.processIdentifier == expectedPid,
+          isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    if let focusedWindow = focusedWindowForProcess(expectedPid),
+       axBool(focusedWindow, kAXHiddenAttribute as String) != true,
+       axFrame(focusedWindow) != nil {
+        return true
+    }
+    let visibleWindows = collectWindows(
+        appElement: appElement,
+        expectedPid: expectedPid
+    ).filter {
+        elementBelongsToProcess($0, pid: expectedPid) &&
+            axRole($0) == kAXWindowRole as String &&
+            axBool($0, kAXHiddenAttribute as String) != true &&
+            axFrame($0) != nil
+    }
+    let mainWindows = visibleWindows.filter {
+        axBool($0, kAXMainAttribute as String) == true
+    }
+    let target = mainWindows.count == 1
+        ? mainWindows[0]
+        : visibleWindows.count == 1 ? visibleWindows[0] : nil
+    let focusTimeoutMs = remainingMilliseconds(until: deadline, cappedAt: 500)
+    guard let target, focusTimeoutMs > 0 else { return false }
+    return focusTrustedSettingsWindow(
+        target,
+        app: app,
+        expectedPid: expectedPid,
+        timeoutMs: focusTimeoutMs
+    )
 }
 
 func activateSystemSettings(
@@ -1654,20 +1712,30 @@ for uiOwnerAttempt in 1...2 {
           isTrustedSystemSettingsProcess(settingsPid) else { continue }
 
     var settingsHost: NSRunningApplication?
-    if expectsExtension {
-        guard isTrustedAppleIDSettingsExtension(settingsUIApp) else { continue }
+    if isTrustedSystemSettings(settingsUIApp) {
+        settingsHost = settingsUIApp
     } else {
-        guard let app = waitForSettingsApp(
-            timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
-        ), settingsPid == app.processIdentifier else { continue }
-        settingsHost = app
+        guard expectsExtension,
+              isTrustedAppleIDSettingsExtension(settingsUIApp) else { continue }
+    }
+    if !expectsExtension {
+        guard settingsHost?.processIdentifier == settingsPid else { continue }
     }
 
     let verifiedWindowlessOwner = windowlessAppleIDSettingsStatus(
         appElement: appElement,
         expectedPid: settingsPid
     ) == .eligible
-    if !verifiedWindowlessOwner {
+    let modernHostOwner = expectsExtension && isTrustedSystemSettings(settingsUIApp)
+    if modernHostOwner {
+        guard let app = settingsHost,
+              focusExistingSettingsWindow(
+                  app: app,
+                  appElement: appElement,
+                  expectedPid: settingsPid,
+                  deadline: deadline
+              ) else { continue }
+    } else if !verifiedWindowlessOwner {
         guard let app = settingsHost ?? waitForSettingsApp(
             timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
         ) else { continue }
