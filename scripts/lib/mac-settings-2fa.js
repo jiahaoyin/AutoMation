@@ -9,9 +9,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveNativeHelperPath } from "./native-helper-path.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-settings-2fa-code.swift");
-const BIN = path.resolve(__dirname, "../bin/mac-settings-2fa-code");
+const BIN = resolveNativeHelperPath(
+  path.resolve(__dirname, "../bin"),
+  "mac-settings-2fa-code"
+);
 const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
 
 function swiftNeedsRecompile(sourcePath = SWIFT_SRC, binaryPath = BIN) {

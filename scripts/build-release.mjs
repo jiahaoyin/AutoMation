@@ -56,6 +56,7 @@ export const COPY_PATHS = [
   "scripts/lib/mac-2fa-allow.js",
   "scripts/lib/mac-2fa-ocr.js",
   "scripts/lib/mac-2fa-popup.js",
+  "scripts/lib/native-helper-path.js",
   "scripts/lib/manual-2fa-prompt.js",
   "scripts/lib/report.js",
   "scripts/ruyipage/apple_account_flow.py",

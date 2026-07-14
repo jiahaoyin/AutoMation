@@ -1,10 +1,13 @@
 import { strict as assert } from "node:assert";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildRuyiPageProcessSupervisorScript,
   createChildStopper,
   createRuyiPageBackendRunner,
   resolveBackendTimeouts,
@@ -487,6 +490,76 @@ async function runChildStopperCleanupDeadlineSelfTest() {
   );
 }
 
+async function runChildStopperIdentityChangeSelfTest() {
+  const signals = [];
+  let identityMatches = true;
+  const child = {
+    pid: 6543,
+    stdin: { end() {} },
+    kill(signal) {
+      signals.push(["child", signal]);
+    },
+  };
+  const stopper = createChildStopper(child, {
+    platform: "darwin",
+    graceMs: 20,
+    cleanupPollIntervalMs: 5,
+    forceCleanupTimeoutMs: 30,
+    verifyProcessGroupIdentity: () => identityMatches,
+    signalProcessGroup(pid, signal) {
+      signals.push([pid, signal]);
+    },
+  });
+
+  stopper.stop();
+  identityMatches = false;
+  const failure = await stopper.waitForCleanup().then(
+    () => null,
+    (error) => error
+  );
+  assert.equal(failure?.message, "ruyipage backend cleanup failed");
+  assert.ok(signals.some(([, signal]) => signal === "SIGINT"));
+  assert.equal(
+    signals.some(([, signal]) => signal === "SIGKILL"),
+    false,
+    "identity changes must block force signals"
+  );
+}
+
+async function runChildStopperFallbackIdentityChangeSelfTest() {
+  const childSignals = [];
+  let identityMatches = true;
+  const child = {
+    pid: 7654,
+    stdin: { end() {} },
+    kill(signal) {
+      childSignals.push(signal);
+    },
+  };
+  const stopper = createChildStopper(child, {
+    platform: "darwin",
+    graceMs: 20,
+    cleanupPollIntervalMs: 5,
+    forceCleanupTimeoutMs: 30,
+    verifyProcessGroupIdentity: () => identityMatches,
+    signalProcessGroup(_pid, signal) {
+      if (signal === "SIGINT") {
+        identityMatches = false;
+        throw Object.assign(new Error("group signal failed"), { code: "EPERM" });
+      }
+      throw Object.assign(new Error("group is gone"), { code: "ESRCH" });
+    },
+  });
+
+  stopper.stop();
+  await stopper.waitForCleanup();
+  assert.deepEqual(
+    childSignals,
+    [],
+    "a failed non-Windows group signal must never fall back to a single-PID signal"
+  );
+}
+
 function processIsAlive(pid) {
   if (!pid) return false;
   try {
@@ -494,6 +567,237 @@ function processIsAlive(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function readDarwinProcessIdentity(pid) {
+  const read = (field) => {
+    const args =
+      field === "command"
+        ? ["-ww", "-p", String(pid), "-o", `${field}=`]
+        : ["-p", String(pid), "-o", `${field}=`];
+    return spawnSync("/bin/ps", args, {
+      encoding: "utf8",
+    }).stdout.trim();
+  };
+  const pgid = Number(read("pgid"));
+  const startedAt = read("lstart").replace(/\s+/g, " ");
+  const command = read("command");
+  return Number.isInteger(pgid) && pgid > 0 && startedAt && command
+    ? { pgid, startedAt, command }
+    : null;
+}
+
+async function runSupervisorParentExitBeforeGateSelfTest() {
+  if (process.platform === "win32" || !fs.existsSync("/bin/zsh")) return;
+
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "ruyipage-supervisor-gate-"));
+  const statePath = path.join(testDir, ".ruyipage-process.json");
+  const gatePath = path.join(testDir, ".ruyipage-launch.ready");
+  const cancelPath = path.join(testDir, ".ruyipage-launch.cancel");
+  const markerPath = path.join(testDir, "target-ran");
+  const parent = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+  let parentIdentity = null;
+  for (let attempt = 0; attempt < 100 && !parentIdentity; attempt += 1) {
+    parentIdentity = readDarwinProcessIdentity(parent.pid);
+    if (!parentIdentity) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(parentIdentity, "test parent identity is unavailable");
+  const nonce = "a".repeat(32);
+  let supervisor = null;
+  let supervisorClosed = null;
+  try {
+    supervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildRuyiPageProcessSupervisorScript(),
+        "ruyipage-supervisor",
+        String(parent.pid),
+        String(parentIdentity.pgid),
+        parentIdentity.startedAt,
+        parentIdentity.command,
+        nonce,
+        String(Date.now() + 30_000),
+        gatePath,
+        cancelPath,
+        "/usr/bin/touch",
+        markerPath,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    supervisorClosed = new Promise((resolve, reject) => {
+      supervisor.once("error", reject);
+      supervisor.once("close", resolve);
+    });
+    let supervisorStartedAt = "";
+    for (let attempt = 0; attempt < 100 && !supervisorStartedAt; attempt += 1) {
+      supervisorStartedAt = spawnSync(
+        "/bin/ps",
+        ["-p", String(supervisor.pid), "-o", "lstart="],
+        { encoding: "utf8" }
+      ).stdout.trim().replace(/\s+/g, " ");
+      if (!supervisorStartedAt) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(supervisorStartedAt, "test supervisor identity is unavailable");
+    fs.writeFileSync(
+      statePath,
+      `${JSON.stringify({
+        version: 1,
+        pid: supervisor.pid,
+        pgid: supervisor.pid,
+        startedAt: supervisorStartedAt,
+        nonce,
+        commandId: "ruyipage-supervisor-v1",
+        commandSha256: "a".repeat(64),
+        state: "starting",
+      })}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 }
+    );
+
+    const parentClosed = new Promise((resolve) => parent.once("close", resolve));
+    parent.kill("SIGKILL");
+    await withRejectGuard(
+      parentClosed,
+      2_000,
+      "test parent did not terminate"
+    );
+    const exitCode = await withRejectGuard(
+      supervisorClosed,
+      2_000,
+      "ruyipage supervisor survived a dead parent before launch gate"
+    );
+    assert.equal(exitCode, 125);
+    assert.equal(fs.existsSync(markerPath), false, "supervisor must not execute before the gate");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(state.state, "starting");
+  } finally {
+    if (processIsAlive(parent.pid)) parent.kill("SIGKILL");
+    if (supervisor && processIsAlive(supervisor.pid)) {
+      try {
+        process.kill(-supervisor.pid, "SIGKILL");
+      } catch {
+        /* process group may already be gone */
+      }
+    }
+    for (const file of [markerPath, gatePath, cancelPath, statePath]) {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        /* each test artifact is removed individually when present */
+      }
+    }
+    fs.rmdirSync(testDir);
+  }
+}
+
+async function runSupervisorRuntimePolicySelfTest() {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "ruyipage-supervisor-runtime-"));
+  const cancelPath = path.join(testDir, "cancel");
+  const markerPath = path.join(testDir, "target-ran");
+  const nonce = "b".repeat(32);
+  const parent = spawn("/bin/sleep", ["30"], { stdio: "ignore" });
+  let parentIdentity = null;
+  let helperSupervisor = null;
+  let monitoredSupervisor = null;
+  try {
+    for (let attempt = 0; attempt < 100 && !parentIdentity; attempt += 1) {
+      parentIdentity = readDarwinProcessIdentity(parent.pid);
+      if (!parentIdentity) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(parentIdentity, "runtime test parent identity is unavailable");
+    const spawnSupervisor = (gatePath, targetArgs) =>
+      spawn(
+        "/bin/zsh",
+        [
+          "-c",
+          buildRuyiPageProcessSupervisorScript(),
+          "ruyipage-supervisor",
+          String(parent.pid),
+          String(parentIdentity.pgid),
+          parentIdentity.startedAt,
+          parentIdentity.command,
+          nonce,
+          String(Date.now() + 30_000),
+          gatePath,
+          cancelPath,
+          ...targetArgs,
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env, TMPDIR: testDir },
+        }
+      );
+    const waitForClose = (child, label, timeoutMs = 8_000) =>
+      withRejectGuard(
+        new Promise((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", resolve);
+        }),
+        timeoutMs,
+        label
+      );
+    const openGate = (gatePath, pid) =>
+      fs.writeFileSync(
+        gatePath,
+        `${JSON.stringify({ version: 1, nonce, pid })}\n`,
+        { encoding: "utf8", flag: "wx", mode: 0o600 }
+      );
+
+    const helperGatePath = path.join(testDir, "helper-ready");
+    helperSupervisor = spawnSupervisor(helperGatePath, ["/usr/bin/true"]);
+    const helperClosed = waitForClose(
+      helperSupervisor,
+      "snapshot helper was counted as a residual group member",
+      5_000
+    );
+    openGate(helperGatePath, helperSupervisor.pid);
+    assert.equal(await helperClosed, 0);
+
+    const monitoredGatePath = path.join(testDir, "monitored-ready");
+    monitoredSupervisor = spawnSupervisor(monitoredGatePath, [
+      "/bin/zsh",
+      "-c",
+      `trap 'exit 0' TERM; print -r -- started > '${markerPath.replaceAll("'", `'"'"'`)}'; while :; do /bin/sleep 1; done`,
+    ]);
+    const monitoredClosed = waitForClose(
+      monitoredSupervisor,
+      "runtime cancellation did not stop the supervisor"
+    );
+    openGate(monitoredGatePath, monitoredSupervisor.pid);
+    for (let attempt = 0; attempt < 300 && !fs.existsSync(markerPath); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(markerPath), true, "monitored target did not start");
+    fs.writeFileSync(cancelPath, "cancel\n", { encoding: "utf8", flag: "wx" });
+    assert.equal(
+      await monitoredClosed,
+      130,
+      "a target that exits zero on TERM must not erase the cancellation status"
+    );
+  } finally {
+    if (processIsAlive(parent.pid)) parent.kill("SIGKILL");
+    for (const child of [helperSupervisor, monitoredSupervisor]) {
+      if (child && processIsAlive(child.pid)) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          /* process group may already be gone */
+        }
+      }
+    }
+    for (const entry of fs.readdirSync(testDir)) {
+      const artifact = path.join(testDir, entry);
+      try {
+        fs.unlinkSync(artifact);
+      } catch {
+        /* each test artifact is removed individually when present */
+      }
+    }
+    fs.rmdirSync(testDir);
   }
 }
 
@@ -1567,9 +1871,30 @@ async function runNodeRunnerSplitUtf8ChunkSelfTest() {
   assert.deepEqual(warningMessages, [SPLIT_UTF8_MESSAGE]);
 }
 
+const supervisorContract = buildRuyiPageProcessSupervisorScript();
+assert.match(
+  supervisorContract,
+  /parent_pgid=\$2[\s\S]*parent_command=\$4[\s\S]*launch_nonce=\$5[\s\S]*expected_gate=/
+);
+assert.match(
+  supervisorContract,
+  /if launch_is_allowed; then[\s\S]*continue[\s\S]*else[\s\S]*monitor_status=\$\?/
+);
+assert.match(
+  supervisorContract,
+  /group_snapshot=\$\(\/usr\/bin\/mktemp[\s\S]*snapshot_helper_pid=\$![\s\S]*"\$member_pid" == "\$snapshot_helper_pid"/
+);
+assert.doesNotMatch(supervisorContract, /group_member_pids|\/usr\/bin\/awk/);
+assert.match(
+  supervisorContract,
+  /target_identity_is_current[\s\S]*current_backend_started_at[\s\S]*current_backend_command[\s\S]*\/bin\/kill -TERM[\s\S]*target_identity_is_current[\s\S]*\/bin\/kill -KILL/
+);
+
 const focusedTests = {
   "live-descendant": runChildStopperLiveDescendantSelfTest,
   "cleanup-timeout": runChildStopperCleanupDeadlineSelfTest,
+  "identity-change": runChildStopperIdentityChangeSelfTest,
+  "fallback-identity-change": runChildStopperFallbackIdentityChangeSelfTest,
   "runner-cleanup": runNodeRunnerProcessGroupSettlementSelfTest,
   "runner-cleanup-failure": runNodeRunnerCleanupFailureWithoutChildExitSelfTest,
   "normal-close-descendant": runNodeRunnerNormalCloseDescendantCleanupSelfTest,
@@ -1584,6 +1909,8 @@ const focusedTests = {
   "close-boundary": runNodeRunnerCloseBoundarySelfTest,
   "strict-result": runNodeRunnerStrictResultContractSelfTest,
   "utf8-chunks": runNodeRunnerSplitUtf8ChunkSelfTest,
+  "supervisor-parent-exit": runSupervisorParentExitBeforeGateSelfTest,
+  "supervisor-runtime-policy": runSupervisorRuntimePolicySelfTest,
 };
 
 const focusedTest = process.env.RUYIPAGE_PROTOCOL_FOCUSED_TEST;
@@ -1598,6 +1925,8 @@ if (focusedTest) {
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();
+await runChildStopperIdentityChangeSelfTest();
+await runChildStopperFallbackIdentityChangeSelfTest();
 await runNodeRunnerProcessGroupSettlementSelfTest();
 await runNodeRunnerCleanupFailureWithoutChildExitSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupSelfTest();
@@ -1626,5 +1955,7 @@ await runNodeRunnerSpawnFailureSelfTest();
 await runNodeRunnerCloseBoundarySelfTest();
 await runNodeRunnerStrictResultContractSelfTest();
 await runNodeRunnerSplitUtf8ChunkSelfTest();
+await runSupervisorParentExitBeforeGateSelfTest();
+await runSupervisorRuntimePolicySelfTest();
 
 console.log("ruyipage protocol: ok");

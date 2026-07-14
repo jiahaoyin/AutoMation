@@ -1657,6 +1657,48 @@ async function generationTwoRejectsAndCannotReusePreviousCodeTest() {
   await collector.dispose();
 }
 
+async function generationTwoSettingsWaitsBeforeRequestingFreshCodeTest() {
+  const { clock, native, collector } = createHarness({
+    timeoutMs: 240_000,
+    settingsFallbackAfterMs: 8_000,
+    manualFallback: false,
+    pollIntervalMs: 100,
+  });
+  await collector.prepare();
+
+  const first = collector.getCode({ generation: 1 });
+  await clock.advance(8_000);
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(await first, "111111");
+
+  await clock.advance(2_000);
+  let secondSettled = false;
+  const second = collector
+    .getCode({ generation: 2, rejectPrevious: true })
+    .finally(() => {
+      secondSettled = true;
+    });
+  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 1, "generation 2 must not request immediately");
+
+  await clock.advance(4_999);
+  assert.equal(native.stats.settingsStarts, 1, "generation 2 must keep the full retry delay");
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 2, "generation 2 may request after five seconds");
+
+  native.settingsRequests[1].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(secondSettled, false, "generation 2 must reject the previous Settings code");
+
+  native.setPopup("222222");
+  await clock.advance(200);
+  assert.equal(await second, "222222");
+  assert.equal(native.stats.settingsStarts, 2, "Settings attempts must remain globally bounded");
+  await collector.dispose();
+}
+
 async function generationSequenceIsStrictTest() {
   const { clock, native, collector } = createHarness({
     settingsFallback: false,
@@ -1714,6 +1756,10 @@ function sidecarHasNoScreenshotOrAppleScriptAuditContractTest() {
   const source = fs.readFileSync(new URL("./lib/two-fa-sidecar.js", import.meta.url), "utf8");
   assert.doesNotMatch(source, /screenshot\s*:/);
   assert.doesNotMatch(source, /["']applescript["']/i);
+  assert.match(source, /options\.isTTY \?\?/);
+  assert.match(source, /process\.stdin\?\.isTTY === true/);
+  assert.match(source, /process\.stdout\?\.isTTY === true/);
+  assert.match(source, /process\.env\.APPLE_AUTOMATION_SUPERVISED_GUI === "1"/);
 }
 
 async function latePopupBeatsSettingsTest() {
@@ -2028,6 +2074,7 @@ const focusedTests = {
   "manual-noncooperative": disposeDoesNotWaitForNonCooperativeManualProviderTest,
   "manual-provider-error": manualProviderFailureDoesNotStopPopupWinnerTest,
   generation: generationTwoRejectsAndCannotReusePreviousCodeTest,
+  "generation-settings-retry": generationTwoSettingsWaitsBeforeRequestingFreshCodeTest,
   "generation-sequence": generationSequenceIsStrictTest,
   "generation-deadline": generationsShareOneDeadlineTest,
   "retry-dispose": disposeCancelsSettingsRetryDelayTest,
@@ -2084,6 +2131,7 @@ if (focusedTest) {
   await disposeDoesNotWaitForNonCooperativeManualProviderTest();
   await manualProviderFailureDoesNotStopPopupWinnerTest();
   await generationTwoRejectsAndCannotReusePreviousCodeTest();
+  await generationTwoSettingsWaitsBeforeRequestingFreshCodeTest();
   await generationSequenceIsStrictTest();
   await generationsShareOneDeadlineTest();
   await disposeCancelsSettingsRetryDelayTest();

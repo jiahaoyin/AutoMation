@@ -245,6 +245,41 @@ npm.cmd run -s mac:codex -- --task-file .\mac-supervised-task.txt --round 2 --al
 或打印 `.env`；生产流程可以在进程内部加载凭据，但命令、日志、报告和文件名不得出现
 密码、完整 Apple ID、OTP、URL query、raw AX/OCR 或截图。
 
+受监督模式不会让 Codex sandbox 直接启动 GUI App。调度器会在进入 sandbox 前，通过
+当前 SSH 用户的 LaunchServices 预启动一个一次性 Terminal bridge；bridge 只读取本轮
+`$TMPDIR` 中带随机令牌的 trigger，并且只在已预检的专用只读 sandbox 中执行固定生产
+命令 `./run.sh --skip-mac`。
+Mac Codex 必须使用下面的受控入口触发并等待结果，不得自行调用 `open`、`launchctl`、
+AppleScript 或其他 GUI 启动方案：
+
+```bash
+node scripts/supervised-mac-acceptance.mjs
+```
+
+Codex 可写的 `$TMPDIR` 只保存一次性 trigger/cancel。bridge、helper、进程状态和可信
+attestation 位于 Codex 不可写的本轮 control 目录；生产 sandbox 的唯一 write 条目是
+control 下独立的 `production/`。Terminal、production 与 ruyiPage 的进程状态均为受限
+JSON，不使用裸 PID 文件。三层状态均绑定 PID、PGID、规范化启动时间、本轮 nonce、固定
+命令或完整命令摘要与固定状态枚举；只有 PID=PGID 且完整命令符合固定入口的进程组才允许
+清理。production 和 ruyiPage supervisor 在启动固定目标前等待带 nonce 的一次性 launch gate，
+并重新验证父 PID、PGID、启动时间与完整命令；production 还验证取消状态、绝对截止时间、HEAD 和 Git
+clean。supervisor 本身始终保留为进程组长，目标运行期间持续监控父身份、cancel 与 deadline，
+目标退出后清理同组残留进程再退出。每次 TERM/KILL 紧前都重新核对 PID、PGID、启动时间与
+完整命令；身份不匹配时一律不发送信号，并以 `PROCESS_CLEANUP_FAILED` 保留 writer lock。
+production 可写的 ruyiPage process state 由仓库内 verifier 使用 `O_NOFOLLOW`、同一 fd、
+有界读取和精确 JSON schema 一次验证，外层 shell 不通过多次打开拼接身份。
+
+bridge 最多读取 1 MiB 生产输出，但不透传原文，只在 Terminal 显示固定阶段、隐藏验证码
+输入提示和固定失败类别；原文不进入 events、final 或固定证据清单。模型 permission
+profile 还会对仓库 `.env`、Codex auth、SSH 与常见 Git 凭据路径设置硬 `deny`，启动前用
+无输出读取探针验证模型侧确实被拒绝；生产 profile 则单独验证可读取 `.env`。任一 setup
+探针失败时会在 Codex 启动前清理并写入固定失败证据，模型和生产流程都不会继续。Codex
+退出后，trigger/cancel 通过 `O_NOFOLLOW`、同一文件描述符和严格 JSON schema 复核，已验收
+状态不得残留 cancel。清理状态只有在 Terminal、production 和 ruyiPage 进程组都确认结束后
+才进入 complete 并释放 writer lock。这个机制不改变浏览器只能由 ruyiPage 操作的约束。
+远端 supervised deadline 从脚本入口开始覆盖锁等待、同步、setup 和生产流程；Windows SSH
+总期限另保留 60 秒，仅用于可信证据与进程/锁清理，不延长生产任务本身。
+
 长任务避免 PowerShell 多层引号，写入 UTF-8 文本后运行：
 
 ```powershell
@@ -271,8 +306,11 @@ Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 re
    根目录、仓库、`$HOME` 或共享系统临时目录。调度器还会强制把报告、截图、2FA audit、
    cancel marker 和 Firefox profile 定向到该 `tmp`，不依赖任务文本自行设置。
 7. Mac Codex 说明任务理解和环境识别；默认运行相关非交互测试，只有显式受监督开关才
-   运行任务限定的真实 GUI/账号验收。
-8. 下载固定九项证据文件到 Windows 并输出一行 JSON 摘要。
+   运行任务限定的真实 GUI/账号验收。受监督模式先在 sandbox 外启动一次性 Terminal
+   bridge，Mac Codex 再通过固定零参数 helper 触发生产流程并只回传固定状态。
+8. 受监督通过同时要求：helper 命令事件退出 0 且只输出固定成功行；可信 attestation
+   绑定随机 nonce、固定命令摘要、前后 HEAD、退出码和 acceptance marker；任一缺失均失败。
+9. 下载固定十项证据文件到 Windows 并输出一行 JSON 摘要。
 
 ## 8. 阅读测试结果
 
@@ -292,6 +330,7 @@ Windows 产物目录：
 | `stderr.log` | Codex/工具标准错误 |
 | `codex-exit.txt` | Mac Codex 退出码 |
 | `supervised-acceptance.txt` | 受监督流程的固定验收哨兵状态；只有生产流程确认账号首页后才为 `accepted` |
+| `supervised-attestation.json` | sandbox 外 bridge 生成的可信验收收据，绑定 nonce、命令摘要、HEAD、退出码和 marker |
 | `git-before.txt`, `git-after.txt` | Mac 执行前后工作区状态 |
 | `head-before.txt`, `head-after.txt` | Mac 执行前后提交 SHA |
 | Mac 端 `tmp/` | 每轮独立的沙箱临时目录；唯一额外可写路径，不在固定证据回传清单中 |
@@ -302,7 +341,7 @@ JSONL 与 `final.json` 有效、报告状态通过、Mac 前后 Git 状态都为
 HEAD”也必须失败。
 
 远端调度器使用 `umask 077`；round 与 `tmp` 目录为 0700，普通新建文件默认为 0600。
-`tmp/` 只保留在 Mac，不会被固定九项证据文件的 scp 清单下载到 Windows；它采用同一
+`tmp/` 只保留在 Mac，不会被固定十项证据文件的 scp 清单下载到 Windows；它采用同一
 证据保留和逐项清理周期。运行证据的维护策略为保留 30 天；不得向 `tmp/` 写入秘密或
 无界增长的大文件。本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐
 文件、逐目录清理。调度器不会自动递归删除历史证据。

@@ -191,6 +191,10 @@ export function maskAppleId(appleId) {
   return `${visible}***`;
 }
 
+export function shouldAutoConfirmAppleCredentials(env = process.env) {
+  return env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+}
+
 /**
  * .env 已有账号时回车确认；否则完整输入并备份
  */
@@ -202,6 +206,10 @@ export async function confirmOrPromptAppleCredentials() {
   if (existingId && existingPw) {
     const masked = maskAppleId(existingId);
     console.log(`已读取 .env 中的账号: ${masked}`);
+    if (shouldAutoConfirmAppleCredentials()) {
+      console.log(`✓ 受监督验收自动使用 .env 账号 ${masked}\n`);
+      return { appleId: existingId, password: existingPw };
+    }
     console.log("按回车确认使用该账号，或输入新的 Apple ID 邮箱：");
 
     const rl = readline.createInterface({ input, output });

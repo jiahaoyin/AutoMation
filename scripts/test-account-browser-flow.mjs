@@ -8,6 +8,7 @@ import {
   loadEnvFile,
   maskAppleId,
   parseEnvValue,
+  shouldAutoConfirmAppleCredentials,
 } from "./lib/credentials.js";
 import {
   resolveReportRoot,
@@ -376,6 +377,18 @@ function runFullFlowSourceContractTest() {
   assert.match(source, /REAL_ACCOUNT_HOME_CONFIRMED/);
 }
 
+function runSupervisedCredentialConfirmationTest() {
+  assert.equal(
+    shouldAutoConfirmAppleCredentials({ APPLE_AUTOMATION_SUPERVISED_GUI: "1" }),
+    true
+  );
+  assert.equal(shouldAutoConfirmAppleCredentials({}), false);
+  assert.equal(
+    shouldAutoConfirmAppleCredentials({ APPLE_AUTOMATION_SUPERVISED_GUI: "0" }),
+    false
+  );
+}
+
 function runReportRootOverrideTest() {
   const requested = "tmp/mac-supervised-reports";
   assert.equal(
@@ -425,6 +438,7 @@ const focusedTests = {
     runAppleIdMaskingTest();
     runEnvDataParsingTest();
     runFullFlowSourceContractTest();
+    runSupervisedCredentialConfirmationTest();
     runReportRootOverrideTest();
     runAcceptanceMarkerTest();
   },
@@ -456,6 +470,7 @@ await runCleanupErrorSanitizationTest();
 runAppleIdMaskingTest();
 runEnvDataParsingTest();
 runFullFlowSourceContractTest();
+runSupervisedCredentialConfirmationTest();
 runReportRootOverrideTest();
 runAcceptanceMarkerTest();
 runTwoFASidecarSettingsScreenshotSourceContractTest();

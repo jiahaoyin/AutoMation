@@ -100,12 +100,12 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 |------|------|
 | `scripts/apple-id-full-flow.mjs` | 总流程与报告 |
 | `scripts/lib/account-browser-flow.js` | ruyiPage 子进程、macOS 2FA 编排 |
-| `scripts/lib/ruyipage-backend-runner.js` | JSONL、超时、子进程错误处理 |
+| `scripts/lib/ruyipage-backend-runner.js` | JSONL、超时、常驻组长与有界子进程清理 |
 | `scripts/ruyipage/apple_account_flow.py` | 唯一浏览器实现 |
 | `scripts/lib/ruyipage-runtime.js` | Python/ruyiPage 探测与隔离安装 |
 | `scripts/lib/firefox-runtime.js` | Firefox 路径和 Profile 路径策略；不启动浏览器 |
 | `scripts/lib/env-setup.js` | macOS 环境和权限探测 |
-| `scripts/lib/two-fa-sidecar.js` | macOS popup/系统设置双通道 collector 与 loser 清理 |
+| `scripts/lib/two-fa-sidecar.js` | macOS popup/系统设置/隐藏手输 collector 与 loser 清理 |
 | `scripts/lib/mac-settings-2fa.js` | 可取消的系统设置验证码 helper 子进程 |
 | `scripts/build-release.mjs` | 发布包复制清单与依赖校验 |
 
@@ -149,9 +149,10 @@ npm run test:account-browser-flow
 captcha、锁定和未知错误停止。固定 `onStatus` 阶段提示、第一次 acquisition 起算的
 manual/240 秒期限以及 runner deadline cleanup 也已接入。
 
-主控 fresh Windows 验证已通过 Python 126/126、ruyipage flow、protocol、sidecar、
-account-browser-flow、Allow 61/61、permissions 和 release，四路最终专项复审均为 PASS。这些结果只证明逻辑、
-协议与 source-contract；Swift typecheck/TCC 和 macOS 15 原生 UI 仍待测试机验收。
+Windows 发布门槛包括 Python 126 项、ruyipage flow/protocol、sidecar、
+account-browser-flow、Allow 61 项、permissions、release 和 mac-codex contract；每个待发布
+提交都必须重新执行，不能沿用旧提交的 PASS。这些结果只证明逻辑、协议与 source-contract；
+Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试机验收。
 
 ## 9. 故障排查
 
@@ -182,11 +183,13 @@ macOS 15 测试机验证：
 
 ```bash
 ./install.sh
-/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-ax-fill.swift
-/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-click-allow.swift
-/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-read.swift
-/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-ocr.swift
-/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-2fa-code.swift
+SWIFT_MODULE_CACHE="$TMPDIR/apple-automation-swift-module-cache"
+/bin/mkdir -p "$SWIFT_MODULE_CACHE"
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-ax-fill.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-click-allow.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-read.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-ocr.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-2fa-code.swift
 npm run test:2fa-allow-unit
 npm run test:2fa-sidecar
 npm run test:2fa-settings

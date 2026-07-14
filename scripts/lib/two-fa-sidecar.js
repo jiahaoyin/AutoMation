@@ -292,7 +292,12 @@ export function createMac2FACollector(options = {}) {
   const reportDir = options.reportDir;
   const manualCodeProvider = options.manualCodeProvider ?? promptForHidden2FACode;
   const isTTY =
-    options.isTTY ?? Boolean(process.stdin?.isTTY === true && process.stdout?.isTTY === true);
+    options.isTTY ??
+    Boolean(
+      process.stdin?.isTTY === true &&
+        (process.stdout?.isTTY === true ||
+          process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1")
+    );
   const rejectedCodes = new Set();
   let popupReady = createDeferred();
   const delays = new Set();
@@ -318,6 +323,7 @@ export function createMac2FACollector(options = {}) {
   let settingsStartDelay = null;
   let settingsProviderPromise = null;
   let settingsAttempt = 0;
+  let lastSettingsCandidateAt = null;
   let settingsCancelPromise = null;
   let settingsAccessibilityAttempted = false;
   let settingsAccessibilityController = null;
@@ -921,9 +927,24 @@ export function createMac2FACollector(options = {}) {
   };
 
   const startSettingsProvider = async (acquisition) => {
-    if (!config.settingsFallback) return;
-    const waitMs = Math.max(0, preparedAt + config.settingsFallbackAfterMs - runtime.now());
+    if (!config.settingsFallback || settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
+    const now = runtime.now();
+    const generationRetryAt =
+      acquisition.generation === 2 && lastSettingsCandidateAt != null
+        ? Math.max(lastSettingsCandidateAt, acquisition.startedAt) + SETTINGS_RETRY_DELAY_MS
+        : 0;
+    const waitMs = Math.max(
+      0,
+      Math.max(preparedAt + config.settingsFallbackAfterMs, generationRetryAt) - now
+    );
     if (waitMs > 0) {
+      if (generationRetryAt > now) {
+        status("settings_retry", {
+          attempt: settingsAttempt + 1,
+          source: "settings",
+          remainingSec: remainingSeconds(acquisition.deadline),
+        });
+      }
       settingsStartDelay = scheduleDelay(waitMs);
       const elapsed = await settingsStartDelay.promise;
       settingsStartDelay = null;
@@ -989,7 +1010,9 @@ export function createMac2FACollector(options = {}) {
               outcome: "candidate_ready",
               elapsedSincePrepareMs: elapsedSincePrepare(),
             });
-            acquisition.offer({ source: "settings", code });
+            if (acquisition.offer({ source: "settings", code })) {
+              lastSettingsCandidateAt = runtime.now();
+            }
             return;
           }
           outcome = { kind: "failed" };
@@ -1177,8 +1200,9 @@ export function createMac2FACollector(options = {}) {
     if (activeAcquisition) throw new Error("a 2FA acquisition is already active");
 
     lastRequestedGeneration = generation;
+    const startedAt = runtime.now();
     if (sharedDeadline == null) {
-      sharedAcquisitionStartedAt = runtime.now();
+      sharedAcquisitionStartedAt = startedAt;
       sharedDeadline = sharedAcquisitionStartedAt + config.timeoutMs;
     }
     initializeGeneration(generation, rejectPrevious);
@@ -1192,6 +1216,7 @@ export function createMac2FACollector(options = {}) {
     const acquisition = {
       winner,
       generation,
+      startedAt,
       deadline: sharedDeadline,
       offer(candidate) {
         if (

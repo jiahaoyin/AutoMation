@@ -9,11 +9,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { sleep } from "./prompt.js";
+import { resolveNativeHelperPath } from "./native-helper-path.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-settings-ax-fill.swift");
-const AX_BIN = path.resolve(__dirname, "../bin/mac-settings-ax-fill");
+const AX_BIN = resolveNativeHelperPath(
+  path.resolve(__dirname, "../bin"),
+  "mac-settings-ax-fill"
+);
 
 /** 编译 Swift helper（install.sh 也会调用） */
 export function compileAxFillHelper(options = {}) {

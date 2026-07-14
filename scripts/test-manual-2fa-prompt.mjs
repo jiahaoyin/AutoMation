@@ -172,10 +172,73 @@ async function nonTtyAndAlreadyAbortedDoNothingTest() {
   assert.deepEqual(input.rawModes, []);
 }
 
+async function pipedOutputRequiresControlledBridgeTest() {
+  const environmentKey = "APPLE_AUTOMATION_SUPERVISED_GUI";
+  const hadEnvironmentValue = Object.prototype.hasOwnProperty.call(process.env, environmentKey);
+  const previousEnvironmentValue = process.env[environmentKey];
+
+  try {
+    delete process.env[environmentKey];
+
+    const ordinaryInput = new FakeInput();
+    const ordinaryOutput = new FakeOutput({ isTTY: false });
+    assert.equal(
+      await promptForHidden2FACode({
+        timeoutMs: 60_000,
+        input: ordinaryInput,
+        output: ordinaryOutput,
+      }),
+      null
+    );
+    assert.deepEqual(ordinaryInput.rawModes, []);
+    assert.equal(ordinaryOutput.text, "");
+
+    const injectedInput = new FakeInput();
+    const injectedOutput = new FakeOutput({ isTTY: false });
+    const injectedResult = promptForHidden2FACode({
+      timeoutMs: 60_000,
+      input: injectedInput,
+      output: injectedOutput,
+      allowPipedOutput: true,
+    });
+    injectedInput.emit("data", Buffer.from("246810\r", "ascii"));
+    assert.equal(await injectedResult, "246810");
+    assert.equal(injectedOutput.text.includes("246810"), false);
+
+    process.env[environmentKey] = "true";
+    const nonExactEnvironmentInput = new FakeInput();
+    assert.equal(
+      await promptForHidden2FACode({
+        timeoutMs: 60_000,
+        input: nonExactEnvironmentInput,
+        output: new FakeOutput({ isTTY: false }),
+      }),
+      null
+    );
+    assert.deepEqual(nonExactEnvironmentInput.rawModes, []);
+
+    process.env[environmentKey] = "1";
+    const supervisedInput = new FakeInput();
+    const supervisedOutput = new FakeOutput({ isTTY: false });
+    const supervisedResult = promptForHidden2FACode({
+      timeoutMs: 60_000,
+      input: supervisedInput,
+      output: supervisedOutput,
+    });
+    supervisedInput.emit("data", Buffer.from("135790\r", "ascii"));
+    assert.equal(await supervisedResult, "135790");
+    assert.equal(supervisedOutput.text.includes("135790"), false);
+  } finally {
+    if (hadEnvironmentValue) process.env[environmentKey] = previousEnvironmentValue;
+    else delete process.env[environmentKey];
+  }
+}
+
 await hiddenAsciiCodeTest();
 await rejectsNonAsciiAndMalformedInputTest();
 await abortRestoresRawModeTest();
 await timeoutRestoresRawModeTest();
 await nonTtyAndAlreadyAbortedDoNothingTest();
+await pipedOutputRequiresControlledBridgeTest();
 
 console.log("manual 2FA prompt: ok");

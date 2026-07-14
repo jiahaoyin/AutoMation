@@ -12,11 +12,15 @@ import { fileURLToPath } from "node:url";
 import { sleep } from "./prompt.js";
 import { readPopupCodeViaOcr } from "./mac-2fa-ocr.js";
 import { runPopupPhase } from "./mac-2fa-popup.js";
+import { resolveNativeHelperPath } from "./native-helper-path.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLICK_ALLOW_SRC = path.resolve(__dirname, "../swift/mac-2fa-click-allow.swift");
-const CLICK_ALLOW_BIN = path.resolve(__dirname, "../bin/mac-2fa-click-allow");
+const CLICK_ALLOW_BIN = resolveNativeHelperPath(
+  path.resolve(__dirname, "../bin"),
+  "mac-2fa-click-allow"
+);
 
 function needsRecompile(src, bin) {
   if (!fs.existsSync(src)) return true;

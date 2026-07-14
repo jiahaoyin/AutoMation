@@ -9,6 +9,7 @@ const FIXED_PROMPT = "[2FA] 自动取码仍未完成，请输入 Mac 上显示�
  *   timeoutMs: number,
  *   input?: NodeJS.ReadStream,
  *   output?: NodeJS.WriteStream,
+ *   allowPipedOutput?: boolean,
  *   setTimeout?: typeof globalThis.setTimeout,
  *   clearTimeout?: typeof globalThis.clearTimeout,
  * }} options
@@ -20,6 +21,7 @@ export function promptForHidden2FACode(options) {
     timeoutMs,
     input = process.stdin,
     output = process.stdout,
+    allowPipedOutput = process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1",
     setTimeout: schedule = globalThis.setTimeout,
     clearTimeout: cancel = globalThis.clearTimeout,
   } = options ?? {};
@@ -27,7 +29,8 @@ export function promptForHidden2FACode(options) {
   if (
     signal?.aborted ||
     input?.isTTY !== true ||
-    output?.isTTY !== true ||
+    typeof output?.write !== "function" ||
+    (output?.isTTY !== true && allowPipedOutput !== true) ||
     typeof input.setRawMode !== "function" ||
     !Number.isFinite(timeoutMs) ||
     timeoutMs <= 0

@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,10 +15,42 @@ import {
   summarizeRun,
   validateFinalReport,
 } from "./mac-codex-orchestrator.mjs";
+import {
+  SUPERVISED_COMMAND_ID,
+  SUPERVISED_COMMAND_SHA256,
+  SUPERVISED_SUCCESS_MARKER,
+  createMacVerificationPermissionProfile,
+  createSupervisedAttestation,
+  parseSupervisedAttestation,
+} from "./lib/supervised-attestation.js";
+import {
+  DEFAULT_RUYIPAGE_BACKEND_TIMEOUT_MS,
+  DEFAULT_SUPERVISED_HELPER_WAIT_MS,
+  SUPERVISED_HELPER_CLEANUP_MARGIN_MS,
+  runSupervisedMacAcceptance,
+} from "./supervised-mac-acceptance.mjs";
+import { validateSupervisedRequestArtifacts } from "./supervised-request-verifier.mjs";
+import {
+  readVerifiedRuyiPageProcessState,
+  validateRuyiPageProcessState,
+} from "./supervised-process-state-verifier.mjs";
+import {
+  RUYIPAGE_SUPERVISOR_COMMAND_ID,
+  buildRuyiPageProcessSupervisorScript,
+} from "./lib/ruyipage-backend-runner.js";
+import {
+  buildProductionProcessSupervisorScript,
+  readBoundedRegularFile,
+} from "./supervised-terminal-bridge.mjs";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000;
 const DEFAULT_REMOTE_REPO = "/Users/admin/Desktop/Apple-AutoMation";
 const EXPECTED_HEAD = "0123456789abcdef0123456789abcdef01234567";
+const OTHER_HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+const SUPERVISED_TOKEN = "0123456789abcdef0123456789abcdef";
+const OTHER_SUPERVISED_TOKEN = "fedcba9876543210fedcba9876543210";
+const SUPERVISED_HELPER_COMMAND = "node scripts/supervised-mac-acceptance.mjs";
+const RAW_SECRET_CANARY = "raw-secret-canary-must-not-leak";
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
   "utf8"
@@ -25,6 +58,14 @@ const projectInstructions = fs.readFileSync(
 const operationsGuide = fs.readFileSync(
   new URL("../docs/WINDOWS_MAC_CODEX.md", import.meta.url),
   "utf8"
+);
+const macCodexSource = fs.readFileSync(
+  new URL("./mac-codex-orchestrator.mjs", import.meta.url),
+  "utf8"
+);
+assert.match(
+  macCodexSource,
+  /"@\{upstream\}"[\s\S]*upstreamHead !== expectedHead[\s\S]*must be pushed to its upstream/
 );
 
 for (const contract of [projectInstructions, operationsGuide]) {
@@ -56,6 +97,825 @@ function removeTreeOneFileAtATime(directory) {
     else fs.unlinkSync(entryPath);
   }
   fs.rmdirSync(directory);
+}
+
+async function waitUntil(predicate, timeoutMs, message) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(message);
+}
+
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runCleanupSignalDeferralTest(remoteScript) {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  const functionStart = remoteScript.indexOf("acquire_gate() {");
+  const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const cleanupFunctions = remoteScript.slice(functionStart, functionEnd);
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-cleanup-signal-"));
+  const controlDir = path.join(testDir, "supervised-control");
+  const writerLock = path.join(testDir, "writer-lock");
+  const readyPath = path.join(testDir, "ready");
+  const scriptPath = path.join(testDir, "cleanup-signal.zsh");
+  const quote = (value) => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  fs.mkdirSync(controlDir, { mode: 0o700 });
+  fs.mkdirSync(writerLock, { mode: 0o700 });
+  const harness = [
+    "#!/bin/zsh",
+    "set -u",
+    `REMOTE_ROUND_DIR=${quote(testDir)}`,
+    `REMOTE_REPO=${quote(process.cwd())}`,
+    `SUPERVISED_TOKEN=${quote(SUPERVISED_TOKEN)}`,
+    `EXPECTED_HEAD=${quote(EXPECTED_HEAD)}`,
+    "SUPERVISED_GUI=1",
+    "BRIDGE_SETUP_OK=1",
+    "SUPERVISED_CLEANUP_STATE=not_started",
+    "SUPERVISED_CLEANUP_RESULT=1",
+    "SUPERVISED_PENDING_SIGNAL=0",
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=1",
+    "LOCK_MODE=writer",
+    `LOCK_ROOT=${quote(testDir)}`,
+    `GATE_LOCK=${quote(path.join(testDir, "gate"))}`,
+    `WRITER_LOCK=${quote(writerLock)}`,
+    `READERS_DIR=${quote(path.join(testDir, "readers"))}`,
+    `RUN_READER=${quote(path.join(testDir, "reader"))}`,
+    cleanupFunctions,
+    `/bin/zsh -c "/bin/sleep 1; :" ${quote(
+      path.join(process.cwd(), "scripts", "supervised-terminal-bridge.mjs")
+    )} &`,
+    "bridge_pid=$!",
+    'bridge_pgid="$(/bin/ps -p "$bridge_pid" -o pgid= | /usr/bin/xargs)"',
+    'bridge_started_at="$(/bin/ps -p "$bridge_pid" -o lstart= | /usr/bin/xargs)"',
+    'printf \'{"version":1,"nonce":"%s","pid":%s,"pgid":%s,"startedAt":"%s"}\\n\' "$SUPERVISED_TOKEN" "$bridge_pid" "$bridge_pgid" "$bridge_started_at" > "$REMOTE_ROUND_DIR/supervised-control/supervised-terminal.json"',
+    "trap cleanup_all EXIT",
+    "trap 'handle_supervised_signal 130' INT",
+    "trap 'handle_supervised_signal 143' TERM",
+    "trap 'handle_supervised_signal 129' HUP",
+    `print -r -- ready > ${quote(readyPath)}`,
+    "cleanup_all",
+    "exit 0",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scriptPath, harness, { encoding: "utf8", mode: 0o700 });
+
+  const child = spawn("/bin/zsh", [scriptPath], { stdio: "ignore" });
+  const closed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
+  });
+  try {
+    await waitUntil(() => fs.existsSync(readyPath), 2_000, "cleanup harness did not start");
+    child.kill("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(
+      fs.existsSync(writerLock),
+      true,
+      "a signal during process cleanup must not release the writer lock"
+    );
+    const outcome = await Promise.race([
+      closed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("cleanup harness did not finish")), 5_000)
+      ),
+    ]);
+    assert.deepEqual(outcome, { exitCode: 143, signal: null });
+    assert.equal(fs.existsSync(writerLock), false);
+  } finally {
+    if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+async function runLockCleanupSignalDeferralTest(remoteScript) {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  const functionStart = remoteScript.indexOf("acquire_gate() {");
+  const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const cleanupFunctions = remoteScript.slice(functionStart, functionEnd);
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-lock-signal-"));
+  const writerLock = path.join(testDir, "writer-lock");
+  const gateLock = path.join(testDir, "gate");
+  const readyPath = path.join(testDir, "ready");
+  const scriptPath = path.join(testDir, "lock-signal.zsh");
+  const quote = (value) => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  fs.mkdirSync(writerLock, { mode: 0o700 });
+  fs.mkdirSync(gateLock, { mode: 0o700 });
+  const harness = [
+    "#!/bin/zsh",
+    "set -u",
+    `REMOTE_ROUND_DIR=${quote(testDir)}`,
+    `REMOTE_REPO=${quote(process.cwd())}`,
+    `SUPERVISED_TOKEN=${quote(SUPERVISED_TOKEN)}`,
+    `EXPECTED_HEAD=${quote(EXPECTED_HEAD)}`,
+    "SUPERVISED_GUI=0",
+    "BRIDGE_SETUP_OK=0",
+    "SUPERVISED_CLEANUP_STATE=not_started",
+    "SUPERVISED_CLEANUP_RESULT=1",
+    "SUPERVISED_PENDING_SIGNAL=0",
+    "LOCK_CLEANUP_STATE=not_started",
+    "LOCK_CLEANUP_RESULT=1",
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=1",
+    "LOCK_MODE=writer",
+    `LOCK_ROOT=${quote(testDir)}`,
+    `GATE_LOCK=${quote(gateLock)}`,
+    `WRITER_LOCK=${quote(writerLock)}`,
+    `READERS_DIR=${quote(path.join(testDir, "readers"))}`,
+    `RUN_READER=${quote(path.join(testDir, "reader"))}`,
+    cleanupFunctions,
+    "trap cleanup_all EXIT",
+    "trap 'handle_supervised_signal 130' INT",
+    "trap 'handle_supervised_signal 143' TERM",
+    "trap 'handle_supervised_signal 129' HUP",
+    `( /bin/sleep 1; /bin/rmdir ${quote(gateLock)} ) &`,
+    `print -r -- ready > ${quote(readyPath)}`,
+    "cleanup_all",
+    "exit 0",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scriptPath, harness, { encoding: "utf8", mode: 0o700 });
+
+  const child = spawn("/bin/zsh", [scriptPath], { stdio: "ignore" });
+  const closed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
+  });
+  try {
+    await waitUntil(() => fs.existsSync(readyPath), 2_000, "lock cleanup did not start");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    child.kill("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(
+      fs.existsSync(writerLock),
+      true,
+      "a signal during gate acquisition must not bypass writer lock cleanup"
+    );
+    const outcome = await Promise.race([
+      closed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("lock cleanup did not finish")), 5_000)
+      ),
+    ]);
+    assert.deepEqual(outcome, { exitCode: 143, signal: null });
+    assert.equal(fs.existsSync(writerLock), false);
+    assert.equal(fs.existsSync(gateLock), false);
+  } finally {
+    if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+async function runLockCleanupFailureRetentionTest(remoteScript) {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  const functionStart = remoteScript.indexOf("acquire_gate() {");
+  const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const cleanupFunctions = remoteScript.slice(functionStart, functionEnd);
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-lock-failure-"));
+  const writerLock = path.join(testDir, "writer-lock");
+  const blockerPath = path.join(writerLock, "blocker");
+  const resultPath = path.join(testDir, "result");
+  const scriptPath = path.join(testDir, "lock-failure.zsh");
+  const quote = (value) => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  fs.mkdirSync(writerLock, { mode: 0o700 });
+  fs.writeFileSync(blockerPath, "blocked\n", "utf8");
+  const harness = [
+    "#!/bin/zsh",
+    "set -u",
+    `REMOTE_ROUND_DIR=${quote(testDir)}`,
+    `REMOTE_REPO=${quote(process.cwd())}`,
+    `SUPERVISED_TOKEN=${quote(SUPERVISED_TOKEN)}`,
+    `EXPECTED_HEAD=${quote(EXPECTED_HEAD)}`,
+    "SUPERVISED_GUI=0",
+    "BRIDGE_SETUP_OK=0",
+    "SUPERVISED_CLEANUP_STATE=not_started",
+    "SUPERVISED_CLEANUP_RESULT=1",
+    "SUPERVISED_PENDING_SIGNAL=0",
+    "LOCK_CLEANUP_STATE=not_started",
+    "LOCK_CLEANUP_RESULT=1",
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=1",
+    "LOCK_MODE=writer",
+    `LOCK_ROOT=${quote(testDir)}`,
+    `GATE_LOCK=${quote(path.join(testDir, "gate"))}`,
+    `WRITER_LOCK=${quote(writerLock)}`,
+    `READERS_DIR=${quote(path.join(testDir, "readers"))}`,
+    `RUN_READER=${quote(path.join(testDir, "reader"))}`,
+    cleanupFunctions,
+    "set +e",
+    "cleanup_all",
+    "cleanup_status=$?",
+    `print -r -- "$cleanup_status" > ${quote(resultPath)}`,
+    "exit 0",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scriptPath, harness, { encoding: "utf8", mode: 0o700 });
+  try {
+    const outcome = spawnSync("/bin/zsh", [scriptPath], { encoding: "utf8" });
+    assert.equal(outcome.status, 0);
+    assert.equal(fs.readFileSync(resultPath, "utf8").trim(), "1");
+    assert.equal(
+      fs.existsSync(writerLock),
+      true,
+      "failed cleanup must retain the writer lock"
+    );
+  } finally {
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+async function runLockAcquisitionSignalTest(remoteScript) {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  const functionStart = remoteScript.indexOf("acquire_gate() {");
+  const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const lockFunctionsAndTraps = remoteScript.slice(functionStart, functionEnd);
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-lock-acquire-signal-"));
+  const writerLock = path.join(testDir, "writer-lock");
+  const gateLock = path.join(testDir, "gate");
+  const readyPath = path.join(testDir, "ready");
+  const scriptPath = path.join(testDir, "lock-acquire-signal.zsh");
+  const quote = (value) => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  fs.mkdirSync(gateLock, { mode: 0o700 });
+  const harness = [
+    "#!/bin/zsh",
+    "set -u",
+    `REMOTE_ROUND_DIR=${quote(testDir)}`,
+    `REMOTE_REPO=${quote(process.cwd())}`,
+    `SUPERVISED_TOKEN=${quote(SUPERVISED_TOKEN)}`,
+    `EXPECTED_HEAD=${quote(EXPECTED_HEAD)}`,
+    "SUPERVISED_GUI=0",
+    "BRIDGE_SETUP_OK=0",
+    "SUPERVISED_CLEANUP_STATE=not_started",
+    "SUPERVISED_CLEANUP_RESULT=1",
+    "SUPERVISED_PENDING_SIGNAL=0",
+    "LOCK_CLEANUP_STATE=not_started",
+    "LOCK_CLEANUP_RESULT=1",
+    "GATE_TRANSITION_IN_PROGRESS=0",
+    "LOCK_ENTRY_TRANSITION_IN_PROGRESS=0",
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=0",
+    "LOCK_MODE=writer",
+    `LOCK_ROOT=${quote(testDir)}`,
+    `GATE_LOCK=${quote(gateLock)}`,
+    `WRITER_LOCK=${quote(writerLock)}`,
+    `READERS_DIR=${quote(path.join(testDir, "readers"))}`,
+    `RUN_READER=${quote(path.join(testDir, "reader"))}`,
+    lockFunctionsAndTraps,
+    `print -r -- ready > ${quote(readyPath)}`,
+    "acquire_gate || exit 22",
+    "exit 99",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scriptPath, harness, { encoding: "utf8", mode: 0o700 });
+
+  const child = spawn("/bin/zsh", [scriptPath], { stdio: "ignore" });
+  const closed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
+  });
+  try {
+    await waitUntil(() => fs.existsSync(readyPath), 2_000, "gate acquisition did not start");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    child.kill("SIGTERM");
+    const outcome = await Promise.race([
+      closed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("signal during gate acquisition was not handled")), 5_000)
+      ),
+    ]);
+    assert.deepEqual(outcome, { exitCode: 143, signal: null });
+    assert.equal(fs.existsSync(writerLock), false);
+    assert.equal(
+      fs.existsSync(gateLock),
+      true,
+      "a waiter must not remove a gate it never acquired"
+    );
+  } finally {
+    if (child.exitCode == null && child.signalCode == null) child.kill("SIGKILL");
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+async function runPreStateCleanupFailureRetentionTest(remoteScript) {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  const functionStart = remoteScript.indexOf("acquire_gate() {");
+  const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart);
+  const cleanupFunctions = remoteScript.slice(functionStart, functionEnd);
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-prestate-cleanup-"));
+  const controlDir = path.join(testDir, "supervised-control");
+  const writerLock = path.join(testDir, "writer-lock");
+  const resultPath = path.join(testDir, "result");
+  const scriptPath = path.join(testDir, "prestate-cleanup.zsh");
+  const quote = (value) => `'${String(value).replaceAll("'", `'"'"'`)}'`;
+  fs.mkdirSync(controlDir, { mode: 0o700 });
+  fs.mkdirSync(writerLock, { mode: 0o700 });
+  fs.writeFileSync(
+    path.join(controlDir, "supervised-attestation.json"),
+    `${JSON.stringify({ status: "failed", failureClass: "PROCESS_CLEANUP_FAILED" })}\n`,
+    "utf8"
+  );
+  const harness = [
+    "#!/bin/zsh",
+    "set -u",
+    `REMOTE_ROUND_DIR=${quote(testDir)}`,
+    `REMOTE_REPO=${quote(process.cwd())}`,
+    `SUPERVISED_TOKEN=${quote(SUPERVISED_TOKEN)}`,
+    `EXPECTED_HEAD=${quote(EXPECTED_HEAD)}`,
+    "SUPERVISED_GUI=1",
+    "BRIDGE_SETUP_OK=0",
+    "SUPERVISED_CLEANUP_STATE=not_started",
+    "SUPERVISED_CLEANUP_RESULT=1",
+    "SUPERVISED_PENDING_SIGNAL=0",
+    "LOCK_CLEANUP_STATE=not_started",
+    "LOCK_CLEANUP_RESULT=1",
+    "GATE_TRANSITION_IN_PROGRESS=0",
+    "LOCK_ENTRY_TRANSITION_IN_PROGRESS=0",
+    "GATE_HELD=0",
+    "LOCK_ACQUIRED=1",
+    "LOCK_MODE=writer",
+    `LOCK_ROOT=${quote(testDir)}`,
+    `GATE_LOCK=${quote(path.join(testDir, "gate"))}`,
+    `WRITER_LOCK=${quote(writerLock)}`,
+    `READERS_DIR=${quote(path.join(testDir, "readers"))}`,
+    `RUN_READER=${quote(path.join(testDir, "reader"))}`,
+    cleanupFunctions,
+    "trap - EXIT",
+    "trap - INT",
+    "trap - TERM",
+    "trap - HUP",
+    "set +e",
+    "cleanup_all",
+    "cleanup_status=$?",
+    `print -r -- "$cleanup_status" > ${quote(resultPath)}`,
+    "exit 0",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scriptPath, harness, { encoding: "utf8", mode: 0o700 });
+  try {
+    const outcome = spawnSync("/bin/zsh", [scriptPath], { encoding: "utf8" });
+    assert.equal(outcome.status, 0);
+    assert.equal(fs.readFileSync(resultPath, "utf8").trim(), "1");
+    assert.equal(
+      fs.existsSync(writerLock),
+      true,
+      "a pre-state PROCESS_CLEANUP_FAILED attestation must retain the writer lock"
+    );
+  } finally {
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+async function runSupervisorGateTests() {
+  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  for (const [name, source] of [
+    ["ruyipage", buildRuyiPageProcessSupervisorScript()],
+    ["production", buildProductionProcessSupervisorScript()],
+  ]) {
+    const syntax = spawnSync("/bin/zsh", ["-n", "-c", source], {
+      encoding: "utf8",
+    });
+    assert.equal(syntax.status, 0, `${name} supervisor zsh syntax failed`);
+  }
+
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "production-supervisor-gate-"));
+  const gatePath = path.join(testDir, "ready");
+  const cancelPath = path.join(testDir, "cancel.json");
+  const outerCancelPath = path.join(testDir, "outer-cancel.json");
+  const markerPath = path.join(testDir, "target-ran");
+  const head = spawnSync("/usr/bin/git", ["rev-parse", "HEAD"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  }).stdout.trim();
+  const parent = spawn(
+    process.execPath,
+    [
+      "-e",
+      "setTimeout(() => {}, 30000)",
+      path.join(process.cwd(), "scripts", "supervised-terminal-bridge.mjs"),
+    ],
+    { stdio: "ignore" }
+  );
+  let parentPgid = "";
+  let parentStartedAt = "";
+  let parentCommand = "";
+  await waitUntil(() => {
+    parentPgid = spawnSync(
+      "/bin/ps",
+      ["-p", String(parent.pid), "-o", "pgid="],
+      { encoding: "utf8" }
+    ).stdout.trim();
+    parentStartedAt = spawnSync(
+      "/bin/ps",
+      ["-p", String(parent.pid), "-o", "lstart="],
+      { encoding: "utf8" }
+    ).stdout.trim().replace(/\s+/g, " ");
+    parentCommand = spawnSync(
+      "/bin/ps",
+      ["-ww", "-p", String(parent.pid), "-o", "command="],
+      { encoding: "utf8" }
+    ).stdout.trim();
+    return parentPgid !== "" && parentStartedAt !== "" && parentCommand !== "";
+  }, 2_000, "production supervisor test parent identity is unavailable");
+  let staleSupervisor = null;
+  let supervisor = null;
+  let helperOnlySupervisor = null;
+  let residualSupervisor = null;
+  let monitoredSupervisor = null;
+  let supervisorClosed = null;
+  try {
+    const staleMarkerPath = path.join(testDir, "stale-target-ran");
+    staleSupervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildProductionProcessSupervisorScript(),
+        "supervised-production",
+        String(parent.pid),
+        parentPgid,
+        "Thu Jan  1 00:00:00 1970",
+        parentCommand,
+        SUPERVISED_TOKEN,
+        gatePath,
+        cancelPath,
+        outerCancelPath,
+        String(Date.now() + 30_000),
+        process.cwd(),
+        head,
+        "/usr/bin/touch",
+        staleMarkerPath,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    const staleOutcome = await Promise.race([
+      new Promise((resolve, reject) => {
+        staleSupervisor.once("error", reject);
+        staleSupervisor.once("close", (exitCode, signal) =>
+          resolve({ exitCode, signal })
+        );
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("stale parent identity was not rejected")), 3_000)
+      ),
+    ]);
+    assert.deepEqual(staleOutcome, { exitCode: 125, signal: null });
+    assert.equal(fs.existsSync(staleMarkerPath), false);
+
+    supervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildProductionProcessSupervisorScript(),
+        "supervised-production",
+        String(parent.pid),
+        parentPgid,
+        parentStartedAt,
+        parentCommand,
+        SUPERVISED_TOKEN,
+        gatePath,
+        cancelPath,
+        outerCancelPath,
+        String(Date.now() + 30_000),
+        process.cwd(),
+        head,
+        "/usr/bin/touch",
+        markerPath,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    supervisorClosed = new Promise((resolve, reject) => {
+      supervisor.once("error", reject);
+      supervisor.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
+    });
+    fs.writeFileSync(cancelPath, `${JSON.stringify({ version: 1 })}\n`, "utf8");
+    fs.writeFileSync(
+      gatePath,
+      `${JSON.stringify({ version: 1, nonce: SUPERVISED_TOKEN, pid: supervisor.pid })}\n`,
+      "utf8"
+    );
+    const outcome = await Promise.race([
+      supervisorClosed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("production supervisor ignored cancellation")), 3_000)
+      ),
+    ]);
+    assert.deepEqual(outcome, { exitCode: 130, signal: null });
+    assert.equal(fs.existsSync(markerPath), false);
+
+    fs.unlinkSync(cancelPath);
+    fs.unlinkSync(gatePath);
+    const helperOnlyGatePath = path.join(testDir, "helper-only-ready");
+    helperOnlySupervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildProductionProcessSupervisorScript(),
+        "supervised-production",
+        String(parent.pid),
+        parentPgid,
+        parentStartedAt,
+        parentCommand,
+        SUPERVISED_TOKEN,
+        helperOnlyGatePath,
+        cancelPath,
+        outerCancelPath,
+        String(Date.now() + 30_000),
+        process.cwd(),
+        head,
+        "/usr/bin/true",
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    const helperOnlyClosed = new Promise((resolve, reject) => {
+      helperOnlySupervisor.once("error", reject);
+      helperOnlySupervisor.once("close", (exitCode, signal) =>
+        resolve({ exitCode, signal })
+      );
+    });
+    fs.writeFileSync(
+      helperOnlyGatePath,
+      `${JSON.stringify({
+        version: 1,
+        nonce: SUPERVISED_TOKEN,
+        pid: helperOnlySupervisor.pid,
+      })}\n`,
+      "utf8"
+    );
+    const helperOnlyOutcome = await Promise.race([
+      helperOnlyClosed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("snapshot helper counted itself as a member")), 5_000)
+      ),
+    ]);
+    assert.deepEqual(helperOnlyOutcome, { exitCode: 0, signal: null });
+
+    const residualGatePath = path.join(testDir, "residual-ready");
+    const residualPidPath = path.join(testDir, "residual-pid");
+    const residualCommand = `/usr/bin/nohup /bin/sleep 30 >/dev/null 2>&1 & print -r -- $! > '${residualPidPath.replaceAll("'", `'"'"'`)}'`;
+    residualSupervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildProductionProcessSupervisorScript(),
+        "supervised-production",
+        String(parent.pid),
+        parentPgid,
+        parentStartedAt,
+        parentCommand,
+        SUPERVISED_TOKEN,
+        residualGatePath,
+        cancelPath,
+        outerCancelPath,
+        String(Date.now() + 30_000),
+        process.cwd(),
+        head,
+        "/bin/zsh",
+        "-c",
+        residualCommand,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    const residualClosed = new Promise((resolve, reject) => {
+      residualSupervisor.once("error", reject);
+      residualSupervisor.once("close", (exitCode, signal) =>
+        resolve({ exitCode, signal })
+      );
+    });
+    fs.writeFileSync(
+      residualGatePath,
+      `${JSON.stringify({
+        version: 1,
+        nonce: SUPERVISED_TOKEN,
+        pid: residualSupervisor.pid,
+      })}\n`,
+      "utf8"
+    );
+    await waitUntil(
+      () => fs.existsSync(residualPidPath),
+      3_000,
+      "residual child was not launched"
+    );
+    const residualOutcome = await Promise.race([
+      residualClosed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("residual process group was not cleaned")), 8_000)
+      ),
+    ]);
+    assert.deepEqual(residualOutcome, { exitCode: 0, signal: null });
+    const residualPid = Number(fs.readFileSync(residualPidPath, "utf8").trim());
+    assert.equal(pidIsAlive(residualPid), false, "supervisor must clean residual descendants");
+
+    const monitoredGatePath = path.join(testDir, "monitored-ready");
+    const monitoredMarkerPath = path.join(testDir, "monitored-target-ran");
+    monitoredSupervisor = spawn(
+      "/bin/zsh",
+      [
+        "-c",
+        buildProductionProcessSupervisorScript(),
+        "supervised-production",
+        String(parent.pid),
+        parentPgid,
+        parentStartedAt,
+        parentCommand,
+        SUPERVISED_TOKEN,
+        monitoredGatePath,
+        cancelPath,
+        outerCancelPath,
+        String(Date.now() + 30_000),
+        process.cwd(),
+        head,
+        "/bin/zsh",
+        "-c",
+        `trap 'exit 0' TERM; print -r -- started > '${monitoredMarkerPath.replaceAll("'", `'"'"'`)}'; while :; do /bin/sleep 1; done`,
+      ],
+      { detached: true, stdio: "ignore" }
+    );
+    const monitoredClosed = new Promise((resolve, reject) => {
+      monitoredSupervisor.once("error", reject);
+      monitoredSupervisor.once("close", (exitCode, signal) =>
+        resolve({ exitCode, signal })
+      );
+    });
+    fs.writeFileSync(
+      monitoredGatePath,
+      `${JSON.stringify({
+        version: 1,
+        nonce: SUPERVISED_TOKEN,
+        pid: monitoredSupervisor.pid,
+      })}\n`,
+      "utf8"
+    );
+    await waitUntil(
+      () => fs.existsSync(monitoredMarkerPath),
+      3_000,
+      "monitored target was not launched"
+    );
+    parent.kill("SIGKILL");
+    const monitoredOutcome = await Promise.race([
+      monitoredClosed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("supervisor ignored parent death after launch")), 8_000)
+      ),
+    ]);
+    assert.deepEqual(monitoredOutcome, { exitCode: 125, signal: null });
+  } finally {
+    if (pidIsAlive(parent.pid)) parent.kill("SIGKILL");
+    if (
+      staleSupervisor &&
+      staleSupervisor.exitCode == null &&
+      staleSupervisor.signalCode == null
+    ) {
+      try {
+        process.kill(-staleSupervisor.pid, "SIGKILL");
+      } catch {
+        /* process group may already be gone */
+      }
+    }
+    if (supervisor && supervisor.exitCode == null && supervisor.signalCode == null) {
+      try {
+        process.kill(-supervisor.pid, "SIGKILL");
+      } catch {
+        /* process group may already be gone */
+      }
+    }
+    for (const candidate of [helperOnlySupervisor, residualSupervisor, monitoredSupervisor]) {
+      if (candidate && candidate.exitCode == null && candidate.signalCode == null) {
+        try {
+          process.kill(-candidate.pid, "SIGKILL");
+        } catch {
+          /* process group may already be gone */
+        }
+      }
+    }
+    removeTreeOneFileAtATime(testDir);
+  }
+}
+
+const boundedReadDir = fs.mkdtempSync(path.join(os.tmpdir(), "mac-supervised-bounded-read-"));
+try {
+  const regularPath = path.join(boundedReadDir, "regular.json");
+  const oversizedPath = path.join(boundedReadDir, "oversized.json");
+  fs.writeFileSync(regularPath, '{"ok":true}\n', "utf8");
+  fs.writeFileSync(oversizedPath, "x".repeat(257), "utf8");
+  assert.deepEqual(readBoundedRegularFile(regularPath, 256), {
+    state: "present",
+    text: '{"ok":true}\n',
+  });
+  assert.equal(readBoundedRegularFile(oversizedPath, 256).state, "invalid");
+  assert.equal(
+    readBoundedRegularFile(path.join(boundedReadDir, "missing.json"), 256).state,
+    "missing"
+  );
+} finally {
+  removeTreeOneFileAtATime(boundedReadDir);
+}
+
+const processStateDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), "mac-supervised-process-state-")
+);
+try {
+  const statePath = path.join(processStateDir, ".ruyipage-process.json");
+  const validState = {
+    version: 1,
+    pid: 123,
+    pgid: 123,
+    startedAt: "Mon Jul 14 12:34:56 2026",
+    nonce: SUPERVISED_TOKEN,
+    commandId: RUYIPAGE_SUPERVISOR_COMMAND_ID,
+    commandSha256: "a".repeat(64),
+    state: "active",
+  };
+  fs.writeFileSync(statePath, `${JSON.stringify(validState)}\n`, "utf8");
+  assert.deepEqual(
+    readVerifiedRuyiPageProcessState(statePath, { nonce: SUPERVISED_TOKEN }),
+    validState
+  );
+  assert.equal(
+    validateRuyiPageProcessState(JSON.stringify({ ...validState, pid: "123" })),
+    null
+  );
+  assert.equal(
+    validateRuyiPageProcessState(JSON.stringify({ ...validState, extra: true })),
+    null
+  );
+  assert.equal(
+    validateRuyiPageProcessState(JSON.stringify({ ...validState, version: 2 })),
+    null
+  );
+  assert.equal(
+    validateRuyiPageProcessState(JSON.stringify(validState), {
+      nonce: "f".repeat(32),
+    }),
+    null
+  );
+  assert.equal(
+    validateRuyiPageProcessState(
+      JSON.stringify({ ...validState, commandSha256: "not-a-digest" })
+    ),
+    null
+  );
+} finally {
+  removeTreeOneFileAtATime(processStateDir);
+}
+
+const requestVerifierDir = fs.mkdtempSync(
+  path.join(os.tmpdir(), "mac-supervised-request-verifier-")
+);
+try {
+  const triggerPath = path.join(requestVerifierDir, "supervised-trigger.json");
+  const cancelPath = path.join(requestVerifierDir, "supervised-cancel.json");
+  fs.writeFileSync(
+    triggerPath,
+    `${JSON.stringify({
+      version: 1,
+      nonce: SUPERVISED_TOKEN,
+      commandId: SUPERVISED_COMMAND_ID,
+    })}\n`,
+    "utf8"
+  );
+  const validateRequests = (accepted) =>
+    validateSupervisedRequestArtifacts({
+      triggerPath,
+      cancelPath,
+      nonce: SUPERVISED_TOKEN,
+      accepted,
+    });
+  assert.equal(validateRequests(true), true);
+  fs.writeFileSync(
+    cancelPath,
+    `${JSON.stringify({ version: 1, nonce: SUPERVISED_TOKEN })}\n`,
+    "utf8"
+  );
+  assert.equal(validateRequests(false), true);
+  assert.equal(validateRequests(true), false, "accepted runs must not retain cancel");
+  fs.unlinkSync(cancelPath);
+  fs.writeFileSync(
+    triggerPath,
+    `${JSON.stringify({
+      version: 1,
+      nonce: SUPERVISED_TOKEN,
+      commandId: SUPERVISED_COMMAND_ID,
+      extra: true,
+    })}\n`,
+    "utf8"
+  );
+  assert.equal(validateRequests(false), false, "trigger keys must be exact");
+} finally {
+  removeTreeOneFileAtATime(requestVerifierDir);
 }
 
 assert.throws(() => parseArgs([]), /--task.*--task-file/);
@@ -129,6 +989,17 @@ assert.throws(
 
 const supervisedArgs = parseArgs(["--task", "执行受监督 GUI 验收", "--allow-supervised-gui"]);
 assert.equal(supervisedArgs.supervisedGui, true);
+assert.throws(
+  () =>
+    parseArgs([
+      "--task",
+      "执行受监督 GUI 验收",
+      "--allow-supervised-gui",
+      "--timeout-ms",
+      "119999",
+    ]),
+  /timeout of at least 120000ms/i
+);
 
 const prompt = buildAgentPrompt({ task: "检查中文任务与登录流程" });
 for (const requiredText of [
@@ -167,6 +1038,8 @@ for (const requiredText of [
   "固定成功标记",
   "supervised_gui",
   "REAL_ACCOUNT_HOME_CONFIRMED",
+  SUPERVISED_HELPER_COMMAND,
+  "不得自行调用 open、launchctl、AppleScript",
 ]) {
   assert.match(
     supervisedPrompt,
@@ -174,6 +1047,15 @@ for (const requiredText of [
   );
 }
 assert.doesNotMatch(supervisedPrompt, /不执行人工 2FA/);
+assert.match(
+  supervisedPrompt,
+  /零参数入口 `node scripts\/supervised-mac-acceptance\.mjs`/
+);
+assert.doesNotMatch(
+  supervisedPrompt,
+  /node scripts\/supervised-mac-acceptance\.mjs\s+--|supervised-mac-acceptance\.mjs[^`\r\n]+/
+);
+assert.doesNotMatch(prompt, /supervised-mac-acceptance\.mjs/);
 
 const remoteOptions = {
   task: "检查中文任务与登录流程",
@@ -196,11 +1078,15 @@ assert.match(
   remoteScript,
   /export PATH="\$REMOTE_REPO\/\.runtime\/node\/bin:\$HOME\/\.local\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin"/
 );
-assert.ok(
-  remoteScript.includes(
-    'PERMISSION_PROFILE="{ extends = \\":read-only\\", filesystem = { \\"$RUN_TMP_DIR\\" = \\"write\\" } }"'
-  )
+const expectedModelPermissionProfile = createMacVerificationPermissionProfile(
+  remoteOptions.remoteRoundDir + "/tmp",
+  remoteOptions.remoteRepo
 );
+assert.ok(
+  remoteScript.includes("PERMISSION_PROFILE='" + expectedModelPermissionProfile + "'")
+);
+assert.match(remoteScript, /Apple-AutoMation\/\.env" = "deny"/);
+assert.match(remoteScript, /~\/\.codex\/auth\.json" = "deny"/);
 assert.match(remoteScript, /RUN_TMP_DIR="\$REMOTE_ROUND_DIR\/tmp"/);
 assert.match(remoteScript, /export TMPDIR="\$RUN_TMP_DIR"/);
 assert.match(
@@ -216,11 +1102,27 @@ assert.match(remoteScript, /export BROWSER_PROFILE_MODE="persistent"/);
 for (const variable of [
   "APPLE_AUTOMATION_REPORT_ROOT",
   "APPLE_AUTOMATION_ACCEPTANCE_MARKER",
+  "APPLE_AUTOMATION_SUPERVISED_GUI",
+  "APPLE_AUTOMATION_SUPERVISED_TOKEN",
+  "APPLE_AUTOMATION_SUPERVISED_TRIGGER",
+  "APPLE_AUTOMATION_SUPERVISED_CANCEL",
+  "APPLE_AUTOMATION_SUPERVISED_ATTESTATION",
+  "APPLE_AUTOMATION_EXPECTED_HEAD",
   "FIREFOX_PROFILE_DIR",
   "BROWSER_PROFILE_MODE",
+  "APPLE_AUTOMATION_HELPER_DIR",
 ]) {
   assert.match(remoteScript, new RegExp(`SHELL_ENV_INCLUDE_ONLY=.*${variable}`));
 }
+assert.doesNotMatch(
+  remoteScript,
+  /SUPERVISED_CONTROL_DIR=|SUPERVISED_PRODUCTION_DIR=|PRODUCTION_PERMISSION_PROFILE=|terminal-bridge\.command|open -b com\.apple\.Terminal/
+);
+assert.match(remoteScript, /"status":"not_requested"/);
+assert.doesNotMatch(
+  remoteScript,
+  /supervised-terminal\.(?:status|trigger|cancel|exit|log)/
+);
 assert.equal((remoteScript.match(/PERMISSION_PROFILE=/g) ?? []).length, 1);
 assert.equal((remoteScript.match(/permissions\.mac_verification=/g) ?? []).length, 2);
 assert.equal((remoteScript.match(/default_permissions=/g) ?? []).length, 1);
@@ -308,9 +1210,399 @@ assert.ok(
 assert.match(remoteScript, /LOCK_MODE='writer'/);
 assert.match(remoteScript, /acquire_gate\(\)/);
 assert.match(remoteScript, /cleanup_lock\(\)/);
-assert.match(remoteScript, /trap cleanup_lock EXIT INT TERM/);
+assert.match(remoteScript, /cleanup_supervised_bridge\(\)/);
+assert.match(remoteScript, /cleanup_all\(\)/);
+assert.match(remoteScript, /trap cleanup_all EXIT/);
+assert.match(remoteScript, /SUPERVISED_CLEANUP_STATE=not_started/);
+assert.match(remoteScript, /SUPERVISED_CLEANUP_STATE=in_progress/);
+assert.match(remoteScript, /SUPERVISED_CLEANUP_STATE=complete/);
+assert.match(remoteScript, /SUPERVISED_PENDING_SIGNAL/);
+assert.match(remoteScript, /trap 'handle_supervised_signal 130' INT/);
+assert.match(remoteScript, /trap 'handle_supervised_signal 143' TERM/);
+assert.match(remoteScript, /trap 'handle_supervised_signal 129' HUP/);
 assert.match(remoteScript, /READERS_DIR/);
 assert.match(remoteScript, /WRITER_LOCK/);
+
+assert.throws(
+  () =>
+    buildRemoteScript({
+      ...remoteOptions,
+      task: "执行真实 Apple Account 登录验收",
+      supervisedGui: true,
+    }),
+  /random bridge token/i
+);
+
+const supervisedRemoteScript = buildRemoteScript({
+  ...remoteOptions,
+  task: "执行真实 Apple Account 登录验收",
+  supervisedGui: true,
+  supervisedToken: SUPERVISED_TOKEN,
+});
+for (const requiredText of [
+  `SUPERVISED_TOKEN='${SUPERVISED_TOKEN}'`,
+  'SUPERVISED_CONTROL_DIR="$REMOTE_ROUND_DIR/supervised-control"',
+  'SUPERVISED_PRODUCTION_DIR="$SUPERVISED_CONTROL_DIR/production"',
+  'SUPERVISED_HELPER_DIR="$SUPERVISED_CONTROL_DIR/helpers"',
+  'SUPERVISED_TRIGGER="$RUN_TMP_DIR/supervised-trigger.json"',
+  'SUPERVISED_CANCEL="$RUN_TMP_DIR/supervised-cancel.json"',
+  'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
+  'SUPERVISED_ATTESTATION="$SUPERVISED_CONTROL_DIR/supervised-attestation.json"',
+  'SUPERVISED_BRIDGE_SCRIPT="$SUPERVISED_CONTROL_DIR/terminal-bridge.command"',
+  `PRODUCTION_PERMISSION_PROFILE='{ extends = ":read-only", filesystem = { "${remoteOptions.remoteRoundDir}/supervised-control/production" = "write" } }'`,
+  'APPLE_AUTOMATION_SUPERVISED_WRITABLE_TMP=${(q)RUN_TMP_DIR}',
+  'APPLE_AUTOMATION_SUPERVISED_CONTROL_DIR=${(q)SUPERVISED_CONTROL_DIR}',
+  'APPLE_AUTOMATION_SUPERVISED_TRIGGER=${(q)SUPERVISED_TRIGGER}',
+  'APPLE_AUTOMATION_SUPERVISED_CANCEL=${(q)SUPERVISED_CANCEL}',
+  'APPLE_AUTOMATION_SUPERVISED_ATTESTATION=${(q)SUPERVISED_ATTESTATION}',
+  'APPLE_AUTOMATION_SUPERVISED_PRODUCTION_DIR=${(q)SUPERVISED_PRODUCTION_DIR}',
+  "exec /usr/bin/env -i",
+  'scripts/supervised-terminal-bridge.mjs',
+  '/bin/chmod 500 "$SUPERVISED_BRIDGE_SCRIPT"',
+  '/usr/bin/open -b com.apple.Terminal "$SUPERVISED_BRIDGE_SCRIPT"',
+  'scripts/supervised-request-verifier.mjs',
+  '/bin/cp -p "$SUPERVISED_ATTESTATION" "$SUPERVISED_ATTESTATION_ARTIFACT"',
+]) {
+  assert.ok(
+    supervisedRemoteScript.includes(requiredText),
+    `supervised remote script must include: ${requiredText}`
+  );
+}
+for (const forbiddenText of [
+  "supervised-terminal.status",
+  "supervised-terminal.trigger",
+  "supervised-terminal.cancel",
+  "supervised-terminal.exit",
+  "supervised-terminal.log",
+  'printf "\\n" | ./run.sh --skip-mac',
+]) {
+  assert.equal(
+    supervisedRemoteScript.includes(forbiddenText),
+    false,
+    `supervised remote script must exclude obsolete protocol text: ${forbiddenText}`
+  );
+}
+assert.doesNotMatch(
+  supervisedRemoteScript,
+  /SUPERVISED_(?:BRIDGE_SCRIPT|ATTESTATION|PRODUCTION_DIR|HELPER_DIR)="\$RUN_TMP_DIR/
+);
+assert.doesNotMatch(supervisedRemoteScript, /launchctl\s+asuser|osascript|open\s+-a/);
+assert.equal(
+  (supervisedRemoteScript.match(/open -b com\.apple\.Terminal/g) ?? []).length,
+  1,
+  "the outer wrapper must launch exactly one constrained Terminal bridge"
+);
+const gitVerificationIndex = supervisedRemoteScript.indexOf(
+  "Mac repository is not clean after synchronization"
+);
+const productionPreflightIndex = supervisedRemoteScript.indexOf(
+  'permissions.supervised_production=$PRODUCTION_PERMISSION_PROFILE'
+);
+const bridgeLaunchIndex = supervisedRemoteScript.indexOf(
+  '/usr/bin/open -b com.apple.Terminal "$SUPERVISED_BRIDGE_SCRIPT"'
+);
+const modelDenyProbeIndex = supervisedRemoteScript.indexOf(
+  'if (( BRIDGE_SETUP_OK == 1 )) && "$CODEX_BIN" sandbox -p automation -c "permissions.mac_verification=$PERMISSION_PROFILE"'
+);
+const supervisedSetupAbortIndex = supervisedRemoteScript.indexOf(
+  "if (( BRIDGE_SETUP_OK != 1 )); then"
+);
+const codexExecIndex = supervisedRemoteScript.indexOf('"$CODEX_BIN" exec -p automation');
+for (const [label, index] of [
+  ["post-sync Git verification", gitVerificationIndex],
+  ["production sandbox preflight", productionPreflightIndex],
+  ["model secret deny probe", modelDenyProbeIndex],
+  ["Terminal bridge launch", bridgeLaunchIndex],
+  ["supervised setup abort", supervisedSetupAbortIndex],
+  ["Codex exec", codexExecIndex],
+]) {
+  assert.notEqual(index, -1, `${label} must be present in the supervised script`);
+}
+assert.ok(
+  gitVerificationIndex < productionPreflightIndex &&
+    productionPreflightIndex < modelDenyProbeIndex &&
+    modelDenyProbeIndex < supervisedSetupAbortIndex &&
+    productionPreflightIndex < bridgeLaunchIndex &&
+    bridgeLaunchIndex < supervisedSetupAbortIndex &&
+    supervisedSetupAbortIndex < codexExecIndex,
+  "the production sandbox must be preflighted before the bridge launches and Codex starts"
+);
+const supervisedSetupAbortSlice = supervisedRemoteScript.slice(
+  supervisedSetupAbortIndex,
+  codexExecIndex
+);
+for (const required of [
+  "cleanup_supervised_bridge || true",
+  '"$SUPERVISED_ATTESTATION_ARTIFACT"',
+  '"$REMOTE_ROUND_DIR/final.json"',
+  '"$REMOTE_ROUND_DIR/events.jsonl"',
+  '"$REMOTE_ROUND_DIR/stderr.log"',
+  "exit 125",
+]) {
+  assert.ok(supervisedSetupAbortSlice.includes(required));
+}
+assert.doesNotMatch(supervisedSetupAbortSlice, /"\$CODEX_BIN" exec/);
+const supervisedSetupSlice = supervisedRemoteScript.slice(
+  supervisedRemoteScript.indexOf('SUPERVISED_CONTROL_DIR='),
+  supervisedSetupAbortIndex
+);
+assert.doesNotMatch(supervisedSetupSlice, /\brm\b|git\s|password|OTP/i);
+assert.equal(
+  (supervisedSetupSlice.match(/\/bin\/cat "\$REMOTE_REPO\/\.env"/g) ?? [])
+    .length,
+  2,
+  "model deny and production read access must both be probed with output discarded"
+);
+assert.match(
+  supervisedSetupSlice,
+  /write_supervised_attestation pending[\s\S]*if ! "\$CODEX_BIN" sandbox[\s\S]*\/usr\/bin\/true >\/dev\/null 2>&1; then[\s\S]*BRIDGE_SETUP_OK=0[\s\S]*SANDBOX_PREFLIGHT_FAILED/
+);
+assert.doesNotMatch(
+  supervisedRemoteScript.slice(
+    0,
+    supervisedRemoteScript.indexOf("write_supervised_attestation pending")
+  ),
+  /"\$CODEX_BIN" sandbox/
+);
+assert.match(
+  supervisedRemoteScript,
+  /permissions\.supervised_production=\$PRODUCTION_PERMISSION_PROFILE[\s\S]*-P supervised_production[\s\S]*--include-managed-config[\s\S]*\/bin\/cat "\$REMOTE_REPO\/\.env"/
+);
+assert.match(
+  supervisedRemoteScript,
+  /permissions\.mac_verification=\$PERMISSION_PROFILE[\s\S]*-P mac_verification[\s\S]*\/bin\/cat "\$REMOTE_REPO\/\.env"[\s\S]*BRIDGE_SETUP_OK=0/
+);
+assert.match(
+  supervisedRemoteScript,
+  /\{"version":1,"nonce":"'\$SUPERVISED_TOKEN'"/
+);
+assert.match(
+  supervisedRemoteScript,
+  /temporary_attestation="\$SUPERVISED_ATTESTATION\.tmp\.\$\$"[\s\S]*\/bin\/mv -f "\$temporary_attestation" "\$SUPERVISED_ATTESTATION"/
+);
+assert.match(
+  supervisedRemoteScript,
+  /local bridge_state_file="\$control_dir\/supervised-terminal\.json"/
+);
+
+const supervisedTerminalBridgeSource = fs.readFileSync(
+  new URL("./supervised-terminal-bridge.mjs", import.meta.url),
+  "utf8"
+);
+const productionSupervisorScript = buildProductionProcessSupervisorScript();
+assert.match(
+  productionSupervisorScript,
+  /if runtime_is_allowed; then\n\s+\/bin\/sleep 0\.25\n\s+continue\n\s+else\n\s+monitor_status=\$\?\n\s+fi/,
+  "the runtime policy status must be captured in the failing else branch"
+);
+assert.match(
+  productionSupervisorScript,
+  /target_identity_is_current\(\)[\s\S]*current_production_pgid[\s\S]*current_production_started_at[\s\S]*current_production_command[\s\S]*expected_production_command/
+);
+assert.match(
+  productionSupervisorScript,
+  /if target_identity_is_current; then\n\s+\/bin\/kill -TERM "\$production_pid"/
+);
+assert.match(
+  productionSupervisorScript,
+  /if target_identity_is_current; then\n\s+\/bin\/kill -KILL "\$production_pid"/
+);
+assert.match(
+  productionSupervisorScript,
+  /group_snapshot=\$\(\/usr\/bin\/mktemp[\s\S]*\/bin\/ps -ax -o pid= -o pgid= >\| "\$group_snapshot"[\s\S]*snapshot_helper_pid=\$!/
+);
+assert.match(
+  productionSupervisorScript,
+  /"\$member_pid" == "\$\$" \|\| "\$member_pid" == "\$snapshot_helper_pid"/
+);
+assert.doesNotMatch(
+  productionSupervisorScript,
+  /group_member_pids|\/usr\/bin\/awk/,
+  "group enumeration must not create untracked pipeline helpers"
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*"\.\/run\.sh",\s*"--skip-mac",\s*\]/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /child = spawnProcess\(\s*"\/bin\/zsh",\s*\[\s*"-c",\s*supervisorScript,[\s\S]*?productionLaunchGatePath,[\s\S]*?context\.codexBin,[\s\S]*?\.\.\.productionArgs/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /buildProductionProcessSupervisorScript[\s\S]*"parent_pid=\$1"[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"[\s\S]*"launch_gate=\$6"[\s\S]*"\\\"\$@\\\" <&0 >&1 2>&2 &"[\s\S]*monitor_runtime[\s\S]*cleanup_group_members/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /TERMINAL_BRIDGE_COMMAND_ID[\s\S]*PRODUCTION_SUPERVISOR_COMMAND_ID[\s\S]*commandSha256/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /writeProductionLaunchGate\(productionLaunchGatePath, child\.pid, context\.nonce\)/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /cleanupRecordedRuyiPageProcess\([\s\S]*context\.productionDir[\s\S]*apple_account_flow\.py"\),[\s\S]*context\.nonce/
+);
+assert.equal(
+  (supervisedTerminalBridgeSource.match(/"\.\/run\.sh"/g) ?? []).length,
+  1,
+  "the bridge must contain one fixed production entrypoint"
+);
+assert.doesNotMatch(supervisedTerminalBridgeSource, /shell:\s*true|["']-lc["']/);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /path\.join\(context\.controlDir, "supervised-terminal\.json"\)/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /path\.join\(context\.controlDir, "supervised-production\.json"\)/
+);
+assert.match(supervisedTerminalBridgeSource, /O_NOFOLLOW/);
+assert.match(supervisedTerminalBridgeSource, /fs\.fstatSync\(descriptor\)/);
+assert.doesNotMatch(
+  supervisedTerminalBridgeSource,
+  /output\.write\((?:buffer|chunk|.*subarray)/
+);
+assert.match(supervisedTerminalBridgeSource, /2FA 自动取码处理中/);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE/
+);
+assert.match(supervisedTerminalBridgeSource, /cleanupRecordedRuyiPageProcess/);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /fixedProcessIdentity[\s\S]*"-ww", "-p", String\(pid\), "-o", "command="/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /if \(cancellationRequested \|\| cancellationIsPresent\(context\)\)[\s\S]*if \(now\(\) >= context\.deadlineMs\)[\s\S]*const finalHead = git/
+);
+assert.match(supervisedRemoteScript, /PROCESS_CLEANUP_FAILED/);
+assert.match(
+  supervisedRemoteScript,
+  /plutil -extract failureClass raw[\s\S]*lifecycle_failure_class" != "PROCESS_CLEANUP_FAILED"[\s\S]*cleanup_failed=1/
+);
+assert.match(supervisedRemoteScript, /LOCK_CLEANUP_STATE=not_started/);
+assert.match(
+  supervisedRemoteScript,
+  /SUPERVISED_CLEANUP_STATE" == "in_progress" \|\| "\$LOCK_CLEANUP_STATE" == "in_progress"/
+);
+assert.doesNotMatch(supervisedRemoteScript, /acquire_gate \|\| return 0/);
+assert.match(
+  supervisedRemoteScript,
+  /lifecycle_status" == \(running\|accepted\)[\s\S]*cleanup_failed=1/
+);
+assert.match(
+  supervisedRemoteScript,
+  /SUPERVISED_CLEANUP_RESULT="\$cleanup_failed"[\s\S]*SUPERVISED_CLEANUP_STATE=complete/
+);
+assert.match(
+  supervisedRemoteScript,
+  /production\/reports\/\.ruyipage-process\.json[\s\S]*apple_account_flow\.py/
+);
+assert.ok(
+  (supervisedRemoteScript.match(/\/bin\/ps -ww -p/g) ?? []).length >= 6,
+  "supervised cleanup must revalidate untruncated commands before escalation"
+);
+assert.match(
+  supervisedRemoteScript,
+  /supervised-process-state-verifier\.mjs" ruyipage/
+);
+assert.doesNotMatch(supervisedRemoteScript, /-z "\$(?:\/bin\/)?ps .*command=/);
+assert.match(supervisedRemoteScript, /MODEL_TMP_OK=1/);
+assert.ok(
+  supervisedRemoteScript.indexOf("SUPERVISED_DEADLINE_EPOCH_MS=") <
+    supervisedRemoteScript.indexOf('acquire_gate || exit 22'),
+  "the supervised deadline must include lock acquisition, sync, and setup"
+);
+const exitTrapIndex = supervisedRemoteScript.indexOf("trap cleanup_all EXIT");
+assert.ok(exitTrapIndex >= 0);
+for (const lockOperation of [
+  '/bin/mkdir -p "$READERS_DIR"',
+  'acquire_gate || exit 22',
+  '/bin/mkdir "$WRITER_LOCK"',
+  '/usr/bin/touch "$RUN_READER"',
+]) {
+  assert.ok(
+    exitTrapIndex < supervisedRemoteScript.indexOf(lockOperation),
+    `cleanup traps must be installed before ${lockOperation}`
+  );
+}
+assert.match(
+  supervisedRemoteScript,
+  /GATE_TRANSITION_IN_PROGRESS=1[\s\S]*\/bin\/mkdir "\$GATE_LOCK"[\s\S]*GATE_HELD=1[\s\S]*GATE_TRANSITION_IN_PROGRESS=0/
+);
+assert.match(
+  supervisedRemoteScript,
+  /LOCK_ENTRY_TRANSITION_IN_PROGRESS=1[\s\S]*\/bin\/mkdir "\$WRITER_LOCK"[\s\S]*LOCK_ACQUIRED=1[\s\S]*LOCK_ENTRY_TRANSITION_IN_PROGRESS=0/
+);
+assert.match(macCodexSource, /SUPERVISED_OUTER_CLEANUP_RESERVE_MS/);
+await runSupervisorGateTests();
+await runCleanupSignalDeferralTest(supervisedRemoteScript);
+await runLockCleanupSignalDeferralTest(supervisedRemoteScript);
+await runLockCleanupFailureRetentionTest(supervisedRemoteScript);
+await runLockAcquisitionSignalTest(supervisedRemoteScript);
+await runPreStateCleanupFailureRetentionTest(supervisedRemoteScript);
+
+const ruyiPageRunnerSource = fs.readFileSync(
+  new URL("./lib/ruyipage-backend-runner.js", import.meta.url),
+  "utf8"
+);
+const ruyiPageSupervisorScript = buildRuyiPageProcessSupervisorScript();
+assert.match(
+  ruyiPageRunnerSource,
+  /buildRuyiPageProcessSupervisorScript[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"[\s\S]*"deadline_ms=\$6"[\s\S]*"launch_gate=\$7"[\s\S]*"launch_cancel=\$8"[\s\S]*monitor_runtime[\s\S]*cleanup_group_members[\s\S]*\.join\("\\n"\)/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /usesProcessStateSupervisor[\s\S]*buildRuyiPageProcessSupervisorScript\(\)/
+);
+assert.match(ruyiPageRunnerSource, /"active"[\s\S]*"inactive"[\s\S]*"cleanup_failed"/);
+assert.match(
+  ruyiPageRunnerSource,
+  /"parent_pid=\$1"[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"/
+);
+assert.match(ruyiPageRunnerSource, /parent_is_current/);
+assert.match(
+  ruyiPageRunnerSource,
+  /writeRuyiPageProcessState\([\s\S]*processStatePath,[\s\S]*processIdentity,[\s\S]*"starting",[\s\S]*processNonce/
+);
+assert.match(ruyiPageRunnerSource, /pgid[\s\S]*startedAt[\s\S]*commandSha256/);
+assert.match(
+  ruyiPageSupervisorScript,
+  /if launch_is_allowed; then[\s\S]*continue[\s\S]*else[\s\S]*monitor_status=\$\?/
+);
+assert.match(
+  ruyiPageSupervisorScript,
+  /group_snapshot=\$\(\/usr\/bin\/mktemp[\s\S]*snapshot_helper_pid=\$![\s\S]*"\$member_pid" == "\$snapshot_helper_pid"/
+);
+assert.doesNotMatch(ruyiPageSupervisorScript, /group_member_pids|\/usr\/bin\/awk/);
+assert.match(
+  ruyiPageSupervisorScript,
+  /target_identity_is_current[\s\S]*current_backend_started_at[\s\S]*current_backend_command[\s\S]*\/bin\/kill -TERM[\s\S]*target_identity_is_current[\s\S]*\/bin\/kill -KILL/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /"starting", "active", "inactive", "cleanup_failed"/
+);
+assert.match(supervisedRemoteScript, /ruyi_state=""/);
+assert.match(
+  supervisedRemoteScript,
+  /ruyi_state_fields[\s\S]*supervised-process-state-verifier\.mjs" ruyipage "\$ruyi_state_file" "\$SUPERVISED_TOKEN"[\s\S]*ruyi_state="\$\{ruyi_state_fields\[4\]\}"[\s\S]*ruyi_command_sha256="\$\{ruyi_state_fields\[5\]\}"/
+);
+assert.match(
+  supervisedRemoteScript,
+  /current_ruyi_pgid[\s\S]*current_ruyi_started_at[\s\S]*current_ruyi_command_sha256[\s\S]*"\$SUPERVISED_TOKEN"[\s\S]*apple_account_flow\.py/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /path\.join\(context\.controlDir, "supervised-production\.json"\)/
+);
+assert.doesNotMatch(
+  supervisedTerminalBridgeSource,
+  /supervised-terminal\.(?:status|trigger|cancel|exit|log)/
+);
 
 const multilineTask = "第一行\r\n第二行 '$(touch nope)' & 结束";
 const multilineScript = buildRemoteScript({ ...remoteOptions, task: multilineTask });
@@ -359,6 +1651,7 @@ const requiredArtifacts = [
   "head-after.txt",
   "codex-exit.txt",
   "supervised-acceptance.txt",
+  "supervised-attestation.json",
 ];
 assert.deepEqual(scpArgs.slice(0, 4), [
   "-o",
@@ -438,38 +1731,102 @@ function validReport(status = "passed", options = {}) {
   };
 }
 
-const supervisedAcceptanceEvents = [
-  { type: "thread.started" },
-  {
-    type: "item.completed",
-    item: {
-      id: "item-acceptance",
-      type: "command_execution",
-      command:
-        `/bin/zsh -lc 'printf "\\n" | env APPLE_AUTOMATION_REPORT_ROOT="$TMPDIR/reports" ./run.sh --skip-mac'`,
-      aggregated_output: "[验收] REAL_ACCOUNT_HOME_CONFIRMED\n",
-      exit_code: 0,
-      status: "completed",
-    },
-  },
-  { type: "turn.completed" },
-]
-  .map((event) => JSON.stringify(event))
-  .join("\n") + "\n";
+function supervisedAcceptanceEventStream(overrides = {}) {
+  const item = {
+    id: "item-acceptance",
+    type: "command_execution",
+    command: SUPERVISED_HELPER_COMMAND,
+    aggregated_output: `${SUPERVISED_SUCCESS_MARKER}\n`,
+    exit_code: 0,
+    status: "completed",
+    ...overrides.item,
+  };
+  return [
+    { type: "thread.started" },
+    { type: overrides.eventType ?? "item.completed", item },
+    { type: "turn.completed" },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join("\n") + "\n";
+}
 
+const supervisedAcceptanceEvents = supervisedAcceptanceEventStream();
 assert.equal(hasSupervisedAcceptanceEvent(supervisedAcceptanceEvents), true);
 assert.equal(
   hasSupervisedAcceptanceEvent(
-    supervisedAcceptanceEvents.replace("REAL_ACCOUNT_HOME_CONFIRMED", "ACCOUNT_FLOW_FAILED")
+    supervisedAcceptanceEvents.replace(
+      SUPERVISED_HELPER_COMMAND,
+      `/bin/zsh -lc '${SUPERVISED_HELPER_COMMAND}'`
+    )
   ),
+  true
+);
+const extraCommandEvent = `${JSON.stringify({
+  type: "item.completed",
+  item: {
+    id: "item-extra",
+    type: "command_execution",
+    command: "/bin/zsh -lc 'pwd'",
+    aggregated_output: "",
+    exit_code: 0,
+    status: "completed",
+  },
+})}\n`;
+assert.equal(
+  hasSupervisedAcceptanceEvent(`${supervisedAcceptanceEvents}${extraCommandEvent}`),
   false
 );
 assert.equal(
   hasSupervisedAcceptanceEvent(
-    supervisedAcceptanceEvents.replace("./run.sh --skip-mac", "printf marker")
+    `${supervisedAcceptanceEvents}${JSON.stringify({
+      type: "item.completed",
+      item: { id: "item-tool", type: "mcp_tool_call", status: "completed" },
+    })}\n`
   ),
   false
 );
+
+for (const command of [
+  `echo ${SUPERVISED_HELPER_COMMAND}`,
+  `${SUPERVISED_HELPER_COMMAND} # claimed success`,
+  `${SUPERVISED_HELPER_COMMAND} -- ./run.sh --skip-mac`,
+  `${SUPERVISED_HELPER_COMMAND} --unexpected`,
+  `/bin/zsh -lc '${SUPERVISED_HELPER_COMMAND}; echo marker'`,
+]) {
+  assert.equal(
+    hasSupervisedAcceptanceEvent(
+      supervisedAcceptanceEventStream({ item: { command } })
+    ),
+    false,
+    `acceptance events must reject non-exact helper command: ${command}`
+  );
+}
+for (const aggregatedOutput of [
+  "REAL_ACCOUNT_HOME_CONFIRMED\n",
+  `fake ${SUPERVISED_SUCCESS_MARKER}\n`,
+  `${SUPERVISED_SUCCESS_MARKER} forged\n`,
+  `before\n${SUPERVISED_SUCCESS_MARKER}\nafter\n`,
+  `[验收] ACCOUNT_FLOW_FAILED\n`,
+]) {
+  assert.equal(
+    hasSupervisedAcceptanceEvent(
+      supervisedAcceptanceEventStream({ item: { aggregated_output: aggregatedOutput } })
+    ),
+    false,
+    `acceptance events must reject forged marker output: ${aggregatedOutput.trim()}`
+  );
+}
+for (const overrides of [
+  { eventType: "item.started" },
+  { item: { type: "reasoning" } },
+  { item: { status: "failed" } },
+  { item: { exit_code: 1 } },
+]) {
+  assert.equal(
+    hasSupervisedAcceptanceEvent(supervisedAcceptanceEventStream(overrides)),
+    false
+  );
+}
 
 assert.deepEqual(validateFinalReport(validReport()), []);
 assert.deepEqual(
@@ -501,6 +1858,50 @@ assert.ok(
   validateFinalReport(failedTestPassedReport).some((error) => /failed test/i.test(error))
 );
 
+function nonSupervisedAttestation(overrides = {}) {
+  return {
+    ...createSupervisedAttestation({
+      expectedHead: EXPECTED_HEAD,
+      observedHeadBefore: EXPECTED_HEAD,
+      observedHeadAfter: EXPECTED_HEAD,
+      status: "not_requested",
+    }),
+    ...overrides,
+  };
+}
+
+function acceptedSupervisedAttestation(overrides = {}) {
+  return {
+    ...createSupervisedAttestation({
+      nonce: SUPERVISED_TOKEN,
+      expectedHead: EXPECTED_HEAD,
+      observedHeadBefore: EXPECTED_HEAD,
+      observedHeadAfter: EXPECTED_HEAD,
+      status: "accepted",
+      exitCode: 0,
+      markerConfirmed: true,
+      failureClass: "NONE",
+    }),
+    ...overrides,
+  };
+}
+
+function attestationArtifact(value) {
+  return `${JSON.stringify(value)}\n`;
+}
+
+const acceptedAttestation = acceptedSupervisedAttestation();
+assert.equal(acceptedAttestation.commandId, SUPERVISED_COMMAND_ID);
+assert.equal(acceptedAttestation.commandSha256, SUPERVISED_COMMAND_SHA256);
+assert.match(SUPERVISED_COMMAND_SHA256, /^[0-9a-f]{64}$/);
+assert.deepEqual(
+  parseSupervisedAttestation(attestationArtifact(acceptedAttestation), {
+    nonce: SUPERVISED_TOKEN,
+    expectedHead: EXPECTED_HEAD,
+  }).errors,
+  []
+);
+
 function writeArtifacts(roundDir, overrides = {}) {
   fs.mkdirSync(roundDir, { recursive: true });
   const artifacts = {
@@ -514,6 +1915,7 @@ function writeArtifacts(roundDir, overrides = {}) {
     "head-after.txt": `${EXPECTED_HEAD}\n`,
     "codex-exit.txt": "0\n",
     "supervised-acceptance.txt": "not_requested\n",
+    "supervised-attestation.json": attestationArtifact(nonSupervisedAttestation()),
     ...overrides,
   };
   for (const [name, content] of Object.entries(artifacts)) {
@@ -548,6 +1950,7 @@ try {
   writeArtifacts(supervisedDir, {
     "events.jsonl": supervisedAcceptanceEvents,
     "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(acceptedAttestation),
     "final.json": `${JSON.stringify(
       validReport("passed", { executionMode: "supervised_gui" })
     )}\n`,
@@ -556,15 +1959,129 @@ try {
     supervisedDir,
     processResults,
     EXPECTED_HEAD,
-    "supervised_gui"
+    "supervised_gui",
+    SUPERVISED_TOKEN
   );
   assert.equal(supervised.status, "passed");
+  assert.deepEqual(supervised.errors, []);
   assert.equal(supervised.expectedExecutionMode, "supervised_gui");
   assert.equal(supervised.supervisedAcceptance, "accepted");
+  assert.deepEqual(supervised.supervisedAttestation, acceptedAttestation);
+
+  const invalidAttestationCases = [
+    {
+      name: "nonce",
+      overrides: { nonce: OTHER_SUPERVISED_TOKEN },
+      message: /nonce does not match/i,
+    },
+    {
+      name: "expected-head",
+      overrides: {
+        expectedHead: OTHER_HEAD,
+        observedHeadBefore: OTHER_HEAD,
+        observedHeadAfter: OTHER_HEAD,
+      },
+      message: /expected head does not match/i,
+    },
+    {
+      name: "observed-head-before",
+      overrides: { observedHeadBefore: OTHER_HEAD },
+      message: /evidence is inconsistent/i,
+    },
+    {
+      name: "observed-head-after",
+      overrides: { observedHeadAfter: OTHER_HEAD },
+      message: /evidence is inconsistent/i,
+    },
+    {
+      name: "command-id",
+      overrides: { commandId: "not-the-fixed-command" },
+      message: /command id is invalid/i,
+    },
+    {
+      name: "command-hash",
+      overrides: { commandSha256: "0".repeat(64) },
+      message: /command digest is invalid/i,
+    },
+    {
+      name: "exit-code",
+      overrides: { exitCode: 17 },
+      message: /evidence is inconsistent/i,
+    },
+    {
+      name: "marker",
+      overrides: { markerConfirmed: false },
+      message: /evidence is inconsistent/i,
+    },
+    {
+      name: "failure-class",
+      overrides: { failureClass: "PRODUCTION_EXIT_NONZERO" },
+      message: /evidence is inconsistent/i,
+    },
+    {
+      name: "extra-key",
+      overrides: { extraEvidence: "must-not-be-trusted" },
+      message: /keys are invalid/i,
+    },
+  ];
+  for (const { name, overrides, message } of invalidAttestationCases) {
+    const invalidDir = path.join(artifactRoot, `supervised-invalid-${name}`);
+    writeArtifacts(invalidDir, {
+      "events.jsonl": supervisedAcceptanceEvents,
+      "supervised-acceptance.txt": "accepted\n",
+      "supervised-attestation.json": attestationArtifact(
+        acceptedSupervisedAttestation(overrides)
+      ),
+      "final.json": `${JSON.stringify(
+        validReport("passed", { executionMode: "supervised_gui" })
+      )}\n`,
+    });
+    const invalidSummary = summarizeRun(
+      invalidDir,
+      processResults,
+      EXPECTED_HEAD,
+      "supervised_gui",
+      SUPERVISED_TOKEN
+    );
+    assert.equal(invalidSummary.status, "failed", name);
+    const invalidError = invalidSummary.errors.find(
+      (error) => error.code === "invalid_supervised_attestation"
+    );
+    assert.ok(invalidError, name);
+    assert.match(invalidError.message, message, name);
+  }
+
+  const missingSupervisedToken = summarizeRun(
+    supervisedDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui"
+  );
+  assert.equal(missingSupervisedToken.status, "failed");
+  assert.ok(
+    missingSupervisedToken.errors.some(
+      (error) => error.code === "invalid_supervised_token"
+    )
+  );
+
+  const wrongSupervisedToken = summarizeRun(
+    supervisedDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    OTHER_SUPERVISED_TOKEN
+  );
+  assert.equal(wrongSupervisedToken.status, "failed");
+  assert.ok(
+    wrongSupervisedToken.errors.some(
+      (error) => error.code === "invalid_supervised_attestation"
+    )
+  );
 
   const missingAcceptanceDir = path.join(artifactRoot, "supervised-missing-acceptance");
   writeArtifacts(missingAcceptanceDir, {
     "supervised-acceptance.txt": "missing\n",
+    "supervised-attestation.json": attestationArtifact(acceptedAttestation),
     "final.json": `${JSON.stringify(
       validReport("passed", { executionMode: "supervised_gui" })
     )}\n`,
@@ -573,7 +2090,8 @@ try {
     missingAcceptanceDir,
     processResults,
     EXPECTED_HEAD,
-    "supervised_gui"
+    "supervised_gui",
+    SUPERVISED_TOKEN
   );
   assert.equal(missingAcceptance.status, "failed");
   assert.ok(
@@ -607,10 +2125,9 @@ try {
   assert.ok(dirtyBoth.errors.some((error) => error.code === "git_dirty"));
 
   const wrongHeadDir = path.join(artifactRoot, "wrong-head");
-  const wrongHead = "fedcba9876543210fedcba9876543210fedcba98";
   writeArtifacts(wrongHeadDir, {
-    "head-before.txt": `${wrongHead}\n`,
-    "head-after.txt": `${wrongHead}\n`,
+    "head-before.txt": `${OTHER_HEAD}\n`,
+    "head-after.txt": `${OTHER_HEAD}\n`,
   });
   const wrongHeadSummary = summarizeRun(wrongHeadDir, processResults, EXPECTED_HEAD);
   assert.equal(wrongHeadSummary.status, "failed");
@@ -688,11 +2205,313 @@ try {
   removeTreeOneFileAtATime(artifactRoot);
 }
 
+async function runSupervisedHelperHarness({
+  args = [],
+  attestationFactory = () => acceptedSupervisedAttestation(),
+  timeoutMs = 1_000,
+  useDefaultTimeout = false,
+  outerDeadlineMs = 10_000,
+  includeOuterDeadline = true,
+} = {}) {
+  const rootDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "apple-automation-supervised-helper-")
+  );
+  const tmpDir = path.join(rootDir, "tmp");
+  const controlDir = path.join(rootDir, "control");
+  fs.mkdirSync(tmpDir);
+  fs.mkdirSync(controlDir);
+  const triggerPath = path.join(tmpDir, "supervised-trigger.json");
+  const cancelPath = path.join(tmpDir, "supervised-cancel.json");
+  const attestationPath = path.join(controlDir, "supervised-attestation.json");
+  let time = 0;
+  let attestationWritten = false;
+  let exitCode = null;
+  let error = null;
+  const output = [];
+
+  try {
+    try {
+      const helperOptions = {
+        args,
+        env: {
+          TMPDIR: tmpDir,
+          APPLE_AUTOMATION_SUPERVISED_GUI: "1",
+          APPLE_AUTOMATION_SUPERVISED_TOKEN: SUPERVISED_TOKEN,
+          APPLE_AUTOMATION_EXPECTED_HEAD: EXPECTED_HEAD,
+          APPLE_AUTOMATION_SUPERVISED_TRIGGER: triggerPath,
+          APPLE_AUTOMATION_SUPERVISED_CANCEL: cancelPath,
+          APPLE_AUTOMATION_SUPERVISED_ATTESTATION: attestationPath,
+          APPLE_AUTOMATION_RAW_SECRET_CANARY: RAW_SECRET_CANARY,
+          ...(includeOuterDeadline
+            ? {
+                APPLE_AUTOMATION_SUPERVISED_DEADLINE_EPOCH_MS:
+                  String(outerDeadlineMs),
+              }
+            : {}),
+        },
+        now: () => time,
+        stdout: { write: (value) => output.push(String(value)) },
+        async sleep(ms) {
+          time += ms;
+          if (
+            !attestationWritten &&
+            attestationFactory &&
+            fs.existsSync(triggerPath)
+          ) {
+            const trigger = JSON.parse(fs.readFileSync(triggerPath, "utf8"));
+            const attestation = attestationFactory(trigger);
+            if (attestation !== null) {
+              const source =
+                typeof attestation === "string"
+                  ? attestation
+                  : attestationArtifact(attestation);
+              fs.writeFileSync(attestationPath, source, {
+                encoding: "utf8",
+                mode: 0o600,
+              });
+            }
+            attestationWritten = true;
+          }
+        },
+      };
+      if (!useDefaultTimeout) helperOptions.timeoutMs = timeoutMs;
+      exitCode = await runSupervisedMacAcceptance(helperOptions);
+    } catch (caught) {
+      error = caught;
+    }
+
+    const triggerStats = fs.existsSync(triggerPath)
+      ? fs.lstatSync(triggerPath)
+      : null;
+    return {
+      exitCode,
+      error,
+      output: output.join(""),
+      elapsedMs: time,
+      trigger: fs.existsSync(triggerPath)
+        ? JSON.parse(fs.readFileSync(triggerPath, "utf8"))
+        : null,
+      triggerIsRegularFile:
+        triggerStats?.isFile() === true && triggerStats?.isSymbolicLink() === false,
+      cancel: fs.existsSync(cancelPath)
+        ? JSON.parse(fs.readFileSync(cancelPath, "utf8"))
+        : null,
+      tmpEntries: fs.readdirSync(tmpDir).sort(),
+      controlEntries: fs.readdirSync(controlDir).sort(),
+    };
+  } finally {
+    removeTreeOneFileAtATime(rootDir);
+  }
+}
+
+const expectedTrigger = {
+  version: 1,
+  nonce: SUPERVISED_TOKEN,
+  commandId: SUPERVISED_COMMAND_ID,
+};
+const expectedCancel = { version: 1, nonce: SUPERVISED_TOKEN };
+
+assert.equal(DEFAULT_RUYIPAGE_BACKEND_TIMEOUT_MS, 720_000);
+assert.equal(
+  DEFAULT_SUPERVISED_HELPER_WAIT_MS,
+  DEFAULT_RUYIPAGE_BACKEND_TIMEOUT_MS + SUPERVISED_HELPER_CLEANUP_MARGIN_MS
+);
+assert.ok(
+  SUPERVISED_HELPER_CLEANUP_MARGIN_MS >= 60_000,
+  "the helper must leave bridge and process cleanup margin after the backend budget"
+);
+
+const supervisedHelper = await runSupervisedHelperHarness();
+assert.equal(supervisedHelper.error, null);
+assert.equal(supervisedHelper.exitCode, 0);
+assert.equal(supervisedHelper.output, `${SUPERVISED_SUCCESS_MARKER}\n`);
+assert.deepEqual(supervisedHelper.trigger, expectedTrigger);
+assert.equal(supervisedHelper.triggerIsRegularFile, true);
+assert.equal(supervisedHelper.cancel, null);
+assert.deepEqual(supervisedHelper.tmpEntries, ["supervised-trigger.json"]);
+assert.deepEqual(supervisedHelper.controlEntries, ["supervised-attestation.json"]);
+
+const failedSupervisedHelper = await runSupervisedHelperHarness({
+  attestationFactory: () =>
+    createSupervisedAttestation({
+      nonce: SUPERVISED_TOKEN,
+      expectedHead: EXPECTED_HEAD,
+      observedHeadBefore: EXPECTED_HEAD,
+      observedHeadAfter: EXPECTED_HEAD,
+      status: "failed",
+      exitCode: 17,
+      markerConfirmed: false,
+      failureClass: "PRODUCTION_EXIT_NONZERO",
+    }),
+});
+assert.equal(failedSupervisedHelper.error, null);
+assert.equal(failedSupervisedHelper.exitCode, 17);
+assert.equal(
+  failedSupervisedHelper.output,
+  "[mac:supervised] PRODUCTION_EXIT_NONZERO\n"
+);
+assert.deepEqual(failedSupervisedHelper.trigger, expectedTrigger);
+assert.equal(failedSupervisedHelper.cancel, null);
+
+const cancelledSupervisedHelper = await runSupervisedHelperHarness({
+  attestationFactory: () =>
+    createSupervisedAttestation({
+      nonce: SUPERVISED_TOKEN,
+      expectedHead: EXPECTED_HEAD,
+      observedHeadBefore: EXPECTED_HEAD,
+      observedHeadAfter: EXPECTED_HEAD,
+      status: "cancelled",
+      exitCode: 130,
+      markerConfirmed: false,
+      failureClass: "CANCELLED",
+    }),
+});
+assert.equal(cancelledSupervisedHelper.error, null);
+assert.equal(cancelledSupervisedHelper.exitCode, 130);
+assert.equal(cancelledSupervisedHelper.output, "[mac:supervised] CANCELLED\n");
+assert.deepEqual(cancelledSupervisedHelper.trigger, expectedTrigger);
+
+const timeoutSupervisedHelper = await runSupervisedHelperHarness({
+  timeoutMs: 500,
+  attestationFactory: null,
+});
+assert.equal(timeoutSupervisedHelper.exitCode, null);
+assert.equal(timeoutSupervisedHelper.error?.exitCode, 124);
+assert.match(timeoutSupervisedHelper.error?.message ?? "", /production timed out/i);
+assert.equal(timeoutSupervisedHelper.output, "");
+assert.deepEqual(timeoutSupervisedHelper.trigger, expectedTrigger);
+assert.deepEqual(timeoutSupervisedHelper.cancel, expectedCancel);
+assert.deepEqual(timeoutSupervisedHelper.tmpEntries, [
+  "supervised-cancel.json",
+  "supervised-trigger.json",
+]);
+assert.equal(timeoutSupervisedHelper.elapsedMs, 500);
+
+const defaultBudgetSupervisedHelper = await runSupervisedHelperHarness({
+  useDefaultTimeout: true,
+  outerDeadlineMs: DEFAULT_SUPERVISED_HELPER_WAIT_MS + 10_000,
+  attestationFactory: null,
+});
+assert.equal(defaultBudgetSupervisedHelper.error?.exitCode, 124);
+assert.equal(
+  defaultBudgetSupervisedHelper.elapsedMs,
+  DEFAULT_SUPERVISED_HELPER_WAIT_MS
+);
+assert.deepEqual(defaultBudgetSupervisedHelper.cancel, expectedCancel);
+
+const absoluteDeadlineSupervisedHelper = await runSupervisedHelperHarness({
+  timeoutMs: 5_000,
+  outerDeadlineMs: 600,
+  attestationFactory: null,
+});
+assert.equal(absoluteDeadlineSupervisedHelper.error?.exitCode, 124);
+assert.equal(absoluteDeadlineSupervisedHelper.elapsedMs, 600);
+assert.deepEqual(absoluteDeadlineSupervisedHelper.cancel, expectedCancel);
+
+for (const deadlineCase of [
+  { name: "missing", includeOuterDeadline: false },
+  { name: "invalid", outerDeadlineMs: "invalid" },
+  { name: "expired", outerDeadlineMs: 0 },
+]) {
+  const invalidDeadlineHelper = await runSupervisedHelperHarness({
+    timeoutMs: 5_000,
+    attestationFactory: null,
+    ...deadlineCase,
+  });
+  assert.equal(invalidDeadlineHelper.exitCode, null, deadlineCase.name);
+  assert.equal(invalidDeadlineHelper.error?.exitCode, 77, deadlineCase.name);
+  assert.match(
+    invalidDeadlineHelper.error?.message ?? "",
+    /absolute deadline is unavailable/i,
+    deadlineCase.name
+  );
+  assert.equal(invalidDeadlineHelper.trigger, null, deadlineCase.name);
+  assert.equal(invalidDeadlineHelper.cancel, null, deadlineCase.name);
+  assert.deepEqual(invalidDeadlineHelper.tmpEntries, [], deadlineCase.name);
+}
+
+const secretCanarySupervisedHelper = await runSupervisedHelperHarness({
+  attestationFactory: () => ({
+    ...acceptedSupervisedAttestation(),
+    rawSecretCanary: RAW_SECRET_CANARY,
+  }),
+});
+assert.equal(secretCanarySupervisedHelper.exitCode, null);
+assert.equal(secretCanarySupervisedHelper.error?.exitCode, 78);
+assert.match(
+  secretCanarySupervisedHelper.error?.message ?? "",
+  /attestation is invalid/i
+);
+assert.equal(secretCanarySupervisedHelper.output, "");
+assert.deepEqual(secretCanarySupervisedHelper.trigger, expectedTrigger);
+assert.equal(secretCanarySupervisedHelper.cancel, null);
+
+const helperWithArguments = await runSupervisedHelperHarness({
+  args: ["--", "./run.sh", "--skip-mac"],
+  attestationFactory: null,
+});
+assert.equal(helperWithArguments.exitCode, null);
+assert.equal(helperWithArguments.error?.exitCode, 64);
+assert.match(helperWithArguments.error?.message ?? "", /takes no arguments/i);
+assert.equal(helperWithArguments.trigger, null);
+assert.deepEqual(helperWithArguments.tmpEntries, []);
+
+for (const helperResult of [
+  supervisedHelper,
+  failedSupervisedHelper,
+  cancelledSupervisedHelper,
+  timeoutSupervisedHelper,
+  defaultBudgetSupervisedHelper,
+  absoluteDeadlineSupervisedHelper,
+  secretCanarySupervisedHelper,
+  helperWithArguments,
+]) {
+  assert.doesNotMatch(helperResult.output, new RegExp(RAW_SECRET_CANARY));
+}
+
 const timeoutResult = await runProcess(
   process.execPath,
   ["-e", "setTimeout(() => {}, 10000)"],
   { timeoutMs: 100 }
 );
 assert.equal(timeoutResult.timedOut, true);
+
+const inheritedPipeStartedAt = Date.now();
+const inheritedPipePidPath = path.join(
+  os.tmpdir(),
+  `mac-codex-inherited-pipe-${process.pid}.pid`
+);
+assert.equal(fs.existsSync(inheritedPipePidPath), false);
+let inheritedPipePid = null;
+try {
+  const inheritedPipeResult = await runProcess(
+    process.execPath,
+    [
+      "-e",
+      `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{detached:true,stdio:['ignore',1,2]});fs.writeFileSync(${JSON.stringify(inheritedPipePidPath)},String(child.pid));setTimeout(()=>{},10000);`,
+    ],
+    { timeoutMs: 100, terminateGraceMs: 50, cleanupDeadlineMs: 100 }
+  );
+  assert.equal(inheritedPipeResult.timedOut, true);
+  assert.ok(
+    Date.now() - inheritedPipeStartedAt < 1_000,
+    "runProcess must finish after its bounded cleanup deadline even when a descendant holds pipes"
+  );
+  inheritedPipePid = Number(fs.readFileSync(inheritedPipePidPath, "utf8").trim());
+  assert.ok(Number.isInteger(inheritedPipePid) && inheritedPipePid > 0);
+} finally {
+  if (Number.isInteger(inheritedPipePid) && inheritedPipePid > 0) {
+    try {
+      process.kill(inheritedPipePid, "SIGKILL");
+    } catch {
+      /* descendant may already be gone */
+    }
+  }
+  try {
+    fs.unlinkSync(inheritedPipePidPath);
+  } catch {
+    /* a failed launch may not have created the single-use pid file */
+  }
+}
 
 console.log("mac codex orchestrator contract: ok");
