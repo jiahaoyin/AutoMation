@@ -203,7 +203,10 @@ async function runFixedTwoFactorStatusPromptsTest() {
   ]);
   assert.deepEqual(
     logs.filter((line) => !line.startsWith("[Firefox]") && !line.startsWith("[2FA]")),
-    []
+    [
+      "[ruyipage] status:runtime_resolving",
+      "[ruyipage] status:backend_starting",
+    ]
   );
   assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
 }
@@ -291,7 +294,7 @@ async function runReadyModeSanitizationTest() {
   const logs = await captureConsole("log", () =>
     runAccountBrowserPhase(params, harness.runtime)
   );
-  const readyLogs = logs.filter((line) => line.includes("[ruyipage]"));
+  const readyLogs = logs.filter((line) => line.includes("[ruyipage] 浏览器已就绪"));
   assert.deepEqual(
     {
       count: readyLogs.length,
@@ -301,6 +304,8 @@ async function runReadyModeSanitizationTest() {
     },
     { count: 4, mappedUnknownCount: 3, preservedKnown: true, leaked: false }
   );
+  assert.ok(logs.includes("[ruyipage] status:runtime_resolving"));
+  assert.ok(logs.includes("[ruyipage] status:backend_starting"));
 }
 
 async function runCleanupErrorSanitizationTest() {

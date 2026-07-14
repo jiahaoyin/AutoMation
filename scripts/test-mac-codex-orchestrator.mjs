@@ -1624,6 +1624,10 @@ assert.match(
   supervisedTerminalBridgeSource,
   /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*"\.\/run\.sh",\s*"--skip-mac",\s*\]/
 );
+assert.match(supervisedTerminalBridgeSource, /runtime_resolving/);
+assert.match(supervisedTerminalBridgeSource, /backend_starting/);
+assert.match(supervisedTerminalBridgeSource, /BROWSER_RUNTIME_UNAVAILABLE/);
+assert.match(supervisedTerminalBridgeSource, /BROWSER_BACKEND_START_FAILED/);
 assert.match(
   supervisedTerminalBridgeSource,
   /child = spawnProcess\(\s*"\/bin\/zsh",\s*\[\s*"-c",\s*supervisorScript,[\s\S]*?productionLaunchGatePath,[\s\S]*?context\.codexBin,[\s\S]*?\.\.\.productionArgs/

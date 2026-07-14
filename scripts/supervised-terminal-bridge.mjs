@@ -1050,6 +1050,16 @@ export async function runSupervisedTerminalBridge(options = {}) {
         }
         return;
       }
+      if (line === "[ruyipage] status:runtime_resolving") {
+        productionStage = "browser_runtime_resolving";
+        emitStatus("runtime-resolving", "[mac:supervised] ruyiPage runtime resolving");
+        return;
+      }
+      if (line === "[ruyipage] status:backend_starting") {
+        productionStage = "browser_backend_starting";
+        emitStatus("backend-starting", "[mac:supervised] ruyiPage backend starting");
+        return;
+      }
       if (line === SUPERVISED_SUCCESS_MARKER) {
         emitStatus("success", SUPERVISED_SUCCESS_MARKER);
       } else if (line.startsWith("[Firefox]")) {
@@ -1401,6 +1411,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
         ["accessibility_preflight", "accessibility_missing"].includes(productionStage)
       ) {
         failureClass = "ACCESSIBILITY_PERMISSION_REQUIRED";
+      } else if (productionStage === "browser_runtime_resolving") {
+        failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
+      } else if (productionStage === "browser_backend_starting") {
+        failureClass = "BROWSER_BACKEND_START_FAILED";
       } else {
         failureClass = "PRODUCTION_EXIT_NONZERO";
       }

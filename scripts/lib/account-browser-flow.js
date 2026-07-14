@@ -125,7 +125,9 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
   let result;
   let runError = null;
   try {
+    console.log("[ruyipage] status:runtime_resolving");
     const runner = createRunner();
+    console.log("[ruyipage] status:backend_starting");
     result = await runner.run({
       creds,
       reportDir,
