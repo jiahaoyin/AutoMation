@@ -570,26 +570,52 @@ function processIsAlive(pid) {
   }
 }
 
+function readSpawnStdout(outcome) {
+  return typeof outcome?.stdout === "string" ? outcome.stdout : "";
+}
+
+function probeProcessEnumeration() {
+  if (process.platform === "win32" || !fs.existsSync("/bin/ps")) return false;
+  const outcome = spawnSync(
+    "/bin/ps",
+    ["-p", String(process.pid), "-o", "pid="],
+    { encoding: "utf8" }
+  );
+  if (["EPERM", "EACCES"].includes(outcome.error?.code)) return false;
+  assert.ifError(outcome.error);
+  assert.equal(outcome.status, 0, "process enumeration probe failed");
+  return readSpawnStdout(outcome).trim() === String(process.pid);
+}
+
+const PROCESS_ENUMERATION_AVAILABLE = probeProcessEnumeration();
+
+function readDarwinProcessField(pid, field) {
+  const args =
+    field === "command"
+      ? ["-ww", "-p", String(pid), "-o", `${field}=`]
+      : ["-p", String(pid), "-o", `${field}=`];
+  const outcome = spawnSync("/bin/ps", args, { encoding: "utf8" });
+  if (outcome.error || outcome.status !== 0) return "";
+  return readSpawnStdout(outcome).trim();
+}
+
 function readDarwinProcessIdentity(pid) {
-  const read = (field) => {
-    const args =
-      field === "command"
-        ? ["-ww", "-p", String(pid), "-o", `${field}=`]
-        : ["-p", String(pid), "-o", `${field}=`];
-    return spawnSync("/bin/ps", args, {
-      encoding: "utf8",
-    }).stdout.trim();
-  };
-  const pgid = Number(read("pgid"));
-  const startedAt = read("lstart").replace(/\s+/g, " ");
-  const command = read("command");
+  const pgid = Number(readDarwinProcessField(pid, "pgid"));
+  const startedAt = readDarwinProcessField(pid, "lstart").replace(/\s+/g, " ");
+  const command = readDarwinProcessField(pid, "command");
   return Number.isInteger(pgid) && pgid > 0 && startedAt && command
     ? { pgid, startedAt, command }
     : null;
 }
 
 async function runSupervisorParentExitBeforeGateSelfTest() {
-  if (process.platform === "win32" || !fs.existsSync("/bin/zsh")) return;
+  if (
+    process.platform === "win32" ||
+    !fs.existsSync("/bin/zsh") ||
+    !PROCESS_ENUMERATION_AVAILABLE
+  ) {
+    return;
+  }
 
   const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "ruyipage-supervisor-gate-"));
   const statePath = path.join(testDir, ".ruyipage-process.json");
@@ -632,11 +658,10 @@ async function runSupervisorParentExitBeforeGateSelfTest() {
     });
     let supervisorStartedAt = "";
     for (let attempt = 0; attempt < 100 && !supervisorStartedAt; attempt += 1) {
-      supervisorStartedAt = spawnSync(
-        "/bin/ps",
-        ["-p", String(supervisor.pid), "-o", "lstart="],
-        { encoding: "utf8" }
-      ).stdout.trim().replace(/\s+/g, " ");
+      supervisorStartedAt = readDarwinProcessField(
+        supervisor.pid,
+        "lstart"
+      ).replace(/\s+/g, " ");
       if (!supervisorStartedAt) await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(supervisorStartedAt, "test supervisor identity is unavailable");
@@ -692,7 +717,13 @@ async function runSupervisorParentExitBeforeGateSelfTest() {
 }
 
 async function runSupervisorRuntimePolicySelfTest() {
-  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  if (
+    process.platform !== "darwin" ||
+    !fs.existsSync("/bin/zsh") ||
+    !PROCESS_ENUMERATION_AVAILABLE
+  ) {
+    return;
+  }
 
   const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "ruyipage-supervisor-runtime-"));
   const cancelPath = path.join(testDir, "cancel");
@@ -1872,6 +1903,12 @@ async function runNodeRunnerSplitUtf8ChunkSelfTest() {
 }
 
 const supervisorContract = buildRuyiPageProcessSupervisorScript();
+if (process.platform !== "win32" && fs.existsSync("/bin/zsh")) {
+  const syntax = spawnSync("/bin/zsh", ["-n", "-c", supervisorContract], {
+    encoding: "utf8",
+  });
+  assert.equal(syntax.status, 0, "ruyipage supervisor zsh syntax failed");
+}
 assert.match(
   supervisorContract,
   /parent_pgid=\$2[\s\S]*parent_command=\$4[\s\S]*launch_nonce=\$5[\s\S]*expected_gate=/

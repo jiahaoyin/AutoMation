@@ -118,8 +118,33 @@ function pidIsAlive(pid) {
   }
 }
 
+function readSpawnStdout(outcome) {
+  return typeof outcome?.stdout === "string" ? outcome.stdout : "";
+}
+
+function probeDarwinProcessEnumeration() {
+  if (process.platform !== "darwin") return true;
+  const outcome = spawnSync(
+    "/bin/ps",
+    ["-p", String(process.pid), "-o", "pid="],
+    { encoding: "utf8" }
+  );
+  if (["EPERM", "EACCES"].includes(outcome.error?.code)) return false;
+  assert.ifError(outcome.error);
+  assert.equal(outcome.status, 0, "Darwin process enumeration probe failed");
+  return readSpawnStdout(outcome).trim() === String(process.pid);
+}
+
+const DARWIN_PROCESS_ENUMERATION_AVAILABLE = probeDarwinProcessEnumeration();
+
 async function runCleanupSignalDeferralTest(remoteScript) {
-  if (process.platform !== "darwin" || !fs.existsSync("/bin/zsh")) return;
+  if (
+    process.platform !== "darwin" ||
+    !fs.existsSync("/bin/zsh") ||
+    !DARWIN_PROCESS_ENUMERATION_AVAILABLE
+  ) {
+    return;
+  }
   const functionStart = remoteScript.indexOf("acquire_gate() {");
   const functionEnd = remoteScript.indexOf('/bin/mkdir -p "$READERS_DIR"', functionStart);
   assert.ok(functionStart >= 0 && functionEnd > functionStart);
@@ -491,16 +516,19 @@ async function runSupervisorGateTests() {
     });
     assert.equal(syntax.status, 0, `${name} supervisor zsh syntax failed`);
   }
+  if (!DARWIN_PROCESS_ENUMERATION_AVAILABLE) return;
 
   const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "production-supervisor-gate-"));
   const gatePath = path.join(testDir, "ready");
   const cancelPath = path.join(testDir, "cancel.json");
   const outerCancelPath = path.join(testDir, "outer-cancel.json");
   const markerPath = path.join(testDir, "target-ran");
-  const head = spawnSync("/usr/bin/git", ["rev-parse", "HEAD"], {
+  const headOutcome = spawnSync("/usr/bin/git", ["rev-parse", "HEAD"], {
     cwd: process.cwd(),
     encoding: "utf8",
-  }).stdout.trim();
+  });
+  assert.equal(headOutcome.status, 0, "test HEAD is unavailable");
+  const head = readSpawnStdout(headOutcome).trim();
   const parent = spawn(
     process.execPath,
     [
@@ -514,21 +542,21 @@ async function runSupervisorGateTests() {
   let parentStartedAt = "";
   let parentCommand = "";
   await waitUntil(() => {
-    parentPgid = spawnSync(
+    parentPgid = readSpawnStdout(spawnSync(
       "/bin/ps",
       ["-p", String(parent.pid), "-o", "pgid="],
       { encoding: "utf8" }
-    ).stdout.trim();
-    parentStartedAt = spawnSync(
+    )).trim();
+    parentStartedAt = readSpawnStdout(spawnSync(
       "/bin/ps",
       ["-p", String(parent.pid), "-o", "lstart="],
       { encoding: "utf8" }
-    ).stdout.trim().replace(/\s+/g, " ");
-    parentCommand = spawnSync(
+    )).trim().replace(/\s+/g, " ");
+    parentCommand = readSpawnStdout(spawnSync(
       "/bin/ps",
       ["-ww", "-p", String(parent.pid), "-o", "command="],
       { encoding: "utf8" }
-    ).stdout.trim();
+    )).trim();
     return parentPgid !== "" && parentStartedAt !== "" && parentCommand !== "";
   }, 2_000, "production supervisor test parent identity is unavailable");
   let staleSupervisor = null;
