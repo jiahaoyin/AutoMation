@@ -59,23 +59,6 @@ func axElementArrayStrict(_ element: AXUIElement, _ attr: String) -> [AXUIElemen
     return elements
 }
 
-func axOptionalElementStrict(
-    _ element: AXUIElement,
-    _ attr: String
-) -> (known: Bool, value: AXUIElement?) {
-    var value: CFTypeRef?
-    let error = AXUIElementCopyAttributeValue(element, attr as CFString, &value)
-    if error == .success {
-        guard let rawValue = value,
-              CFGetTypeID(rawValue) == AXUIElementGetTypeID() else { return (false, nil) }
-        return (true, rawValue as! AXUIElement)
-    }
-    if error == .noValue || error == .attributeUnsupported {
-        return (true, nil)
-    }
-    return (false, nil)
-}
-
 func axString(_ element: AXUIElement, _ attr: String) -> String? {
     guard let v: CFTypeRef = axCopy(element, attr) else { return nil }
     if let s = v as? String { return s }
@@ -728,19 +711,16 @@ func isWindowlessAppleIDSettingsOwner(
         appElement,
         kAXWindowsAttribute as String
     ) else { return false }
-    let focused = axOptionalElementStrict(
+    if let focused: AXUIElement = axCopy(
         appElement,
         kAXFocusedWindowAttribute as String
-    )
-    let main = axOptionalElementStrict(
-        appElement,
-        kAXMainWindowAttribute as String
-    )
-    guard focused.known, main.known else { return false }
-    if let focused = focused.value {
+    ) {
         candidates.append(focused)
     }
-    if let main = main.value {
+    if let main: AXUIElement = axCopy(
+        appElement,
+        kAXMainWindowAttribute as String
+    ) {
         candidates.append(main)
     }
     var hasStandardWindow = false
