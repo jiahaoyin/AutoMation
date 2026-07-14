@@ -30,7 +30,10 @@ let legacyAccountUrls = [
     "x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings",
     "x-apple.systempreferences:com.apple.preferences.AppleIDPref",
 ]
-let signInSecurity = ["登录与安全性", "登入與安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性"]
+let signInSecurity = [
+    "登录与安全性", "登入與安全性", "Sign-In & Security", "Sign-In and Security", "登录和安全性",
+    "密码与安全性", "密碼與安全性", "Password & Security", "Password and Security",
+]
 let twoFactor = ["双重认证", "雙重認證", "Two-Factor Authentication", "双因素认证"]
 let getCodeBtn = ["获取验证码", "取得驗證碼", "Get Verification Code", "Get a Verification Code"]
 let appleAccountPageEvidence = signInSecurity + twoFactor + getCodeBtn
@@ -529,30 +532,26 @@ func remainingMilliseconds(until deadline: Date, cappedAt cap: Int) -> Int {
     min(max(0, Int(deadline.timeIntervalSinceNow * 1_000)), max(0, cap))
 }
 
-func findAppleIDSettingsExtension() -> NSRunningApplication? {
-    let matches = NSWorkspace.shared.runningApplications.filter(
-        isTrustedAppleIDSettingsExtension
-    )
-    return matches.count == 1 ? matches[0] : nil
-}
-
-func waitForAppleAccountSettingsPage(timeoutMs: Int, deadline: Date) -> Bool {
+func waitForAppleAccountSettingsPage(
+    timeoutMs: Int,
+    deadline: Date
+) -> NSRunningApplication? {
     let timeoutDeadline = Date().addingTimeInterval(
         TimeInterval(max(0, timeoutMs)) / 1000.0
     )
     let boundedDeadline = min(deadline, timeoutDeadline)
     var stablePid: pid_t = 0
     var stableHits = 0
-    var stableSince: Date?
     repeat {
         stopIfCancelled()
-        if Date() >= boundedDeadline { return false }
+        if Date() >= boundedDeadline { return nil }
         let matches = NSWorkspace.shared.runningApplications.filter(
             isTrustedAppleIDSettingsExtension
         )
-        if matches.count > 1 { return false }
+        if matches.count > 1 { return nil }
         if matches.count == 1 {
-            let pid = matches[0].processIdentifier
+            let owner = matches[0]
+            let pid = owner.processIdentifier
             let appElement = AXUIElementCreateApplication(pid)
             if treeContainsExactText(
                 appElement,
@@ -561,87 +560,64 @@ func waitForAppleAccountSettingsPage(timeoutMs: Int, deadline: Date) -> Bool {
                 maxNodes: 2_000
             ) {
                 stopIfCancelled()
-                guard Date() < boundedDeadline else { return false }
+                guard Date() < boundedDeadline else { return nil }
                 if stablePid == pid {
                     stableHits += 1
                 } else {
                     stablePid = pid
                     stableHits = 1
-                    stableSince = Date()
                 }
-                if stableHits >= 3,
-                   let stableSince,
-                   Date().timeIntervalSince(stableSince) >= 1.2 {
-                    return true
+                if stableHits >= 2 {
+                    guard !owner.isTerminated,
+                          owner.processIdentifier == stablePid,
+                          isTrustedAppleIDSettingsExtension(owner) else { return nil }
+                    logStep(1, "Apple Account settings page ready")
+                    return owner
                 }
             } else {
                 stablePid = 0
                 stableHits = 0
-                stableSince = nil
             }
         } else {
             stablePid = 0
             stableHits = 0
-            stableSince = nil
         }
-        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 150)
-        if pauseMs <= 0 { return false }
+        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 75)
+        if pauseMs <= 0 { return nil }
         cancellablePause(UInt32(pauseMs * 1_000))
     } while true
 }
 
-func waitForSettingsUIOwner(
-    fallbackApp: NSRunningApplication,
-    timeoutMs: Int = 4_000
-) -> NSRunningApplication? {
-    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
-    repeat {
-        stopIfCancelled()
-        let matches = NSWorkspace.shared.runningApplications.filter(
-            isTrustedAppleIDSettingsExtension
-        )
-        if matches.count == 1 { return matches[0] }
-        if matches.count > 1 { return nil }
-        if Date() >= deadline {
-            return isTrustedSystemSettingsProcess(fallbackApp.processIdentifier)
-                ? fallbackApp
-                : nil
-        }
-        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 100)
-        if pauseMs <= 0 {
-            return isTrustedSystemSettingsProcess(fallbackApp.processIdentifier)
-                ? fallbackApp
-                : nil
-        }
-        cancellablePause(UInt32(pauseMs * 1_000))
-    } while true
-}
-
-@discardableResult
-func openAppleAccountSettings(deadline: Date) -> Bool {
+func openAppleAccountSettings(deadline: Date) -> NSRunningApplication? {
     let expectsExtension = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 13
     for s in orderedAccountUrls() {
         stopIfCancelled()
-        guard Date() < deadline else { return false }
+        guard Date() < deadline else { return nil }
         guard let url = URL(string: s), NSWorkspace.shared.open(url) else { continue }
         if !expectsExtension {
             stopIfCancelled()
-            return Date() < deadline
+            guard Date() < deadline else { return nil }
+            return waitForSettingsApp(
+                timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
+            )
         }
-        if waitForAppleAccountSettingsPage(
+        if let owner = waitForAppleAccountSettingsPage(
             timeoutMs: 5_000,
             deadline: deadline
         ) {
-            return true
+            return owner
         }
     }
-    guard !expectsExtension, Date() < deadline else { return false }
+    guard !expectsExtension, Date() < deadline else { return nil }
     stopIfCancelled()
-    return NSWorkspace.shared.launchApplication(
+    guard NSWorkspace.shared.launchApplication(
         withBundleIdentifier: "com.apple.systempreferences",
         options: [],
         additionalEventParamDescriptor: nil,
         launchIdentifier: nil
+    ) else { return nil }
+    return waitForSettingsApp(
+        timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
     )
 }
 
@@ -1692,19 +1668,19 @@ for uiOwnerAttempt in 1...2 {
     } else {
         logStep(1, "recovering Apple Account settings UI")
     }
-    guard Date() < deadline, openAppleAccountSettings(deadline: deadline) else { continue }
-    let settleMs = remainingMilliseconds(until: deadline, cappedAt: 150)
-    guard settleMs > 0 else { continue }
-    cancellablePause(UInt32(settleMs * 1_000))
-
+    guard Date() < deadline,
+          let settingsUIApp = openAppleAccountSettings(deadline: deadline) else { continue }
     guard let app = waitForSettingsApp(
-        timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
-    ), let settingsUIApp = waitForSettingsUIOwner(
-        fallbackApp: app,
         timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
     ) else { continue }
     let appElement = AXUIElementCreateApplication(settingsUIApp.processIdentifier)
     let settingsPid = settingsUIApp.processIdentifier
+    let expectsExtension = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 13
+    guard !settingsUIApp.isTerminated,
+          isTrustedSystemSettingsProcess(settingsPid),
+          (expectsExtension
+            ? isTrustedAppleIDSettingsExtension(settingsUIApp)
+            : settingsPid == app.processIdentifier) else { continue }
     guard activateSystemSettings(
         app,
         appElement: appElement,
@@ -1731,6 +1707,15 @@ for uiOwnerAttempt in 1...2 {
     )
     guard Date() < deadline else { continue }
     guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
+    guard treeContainsExactText(
+        appElement,
+        names: appleAccountPageEvidence,
+        expectedPid: settingsPid,
+        maxNodes: 2_000
+    ) else { continue }
+    stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
+    guard Date() < deadline else { continue }
+    guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
     logStep(2, "System Settings ready")
 
     switch prepareVerificationCodeAlert(
@@ -1743,6 +1728,7 @@ for uiOwnerAttempt in 1...2 {
     case .timedOut:
         continue
     case .twoFactorNotFound:
+        if uiOwnerAttempt < 2 { continue }
         emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
     case .alertNotOpened:
         _ = closeVerificationCodeAlert(

@@ -72,7 +72,10 @@ function swiftFunctionBodyFromSource(source, name) {
 
 function assertSettingsOwnerSafetyContract(source) {
   const openSettings = swiftFunctionBodyFromSource(source, "openAppleAccountSettings");
-  assert.match(openSettings, /openAppleAccountSettings\(deadline:\s*Date\)/);
+  assert.match(
+    openSettings,
+    /openAppleAccountSettings\(deadline:\s*Date\)\s*->\s*NSRunningApplication\?/
+  );
   assert.match(
     openSettings,
     /guard\s+let url\s*=\s*URL\(string:\s*s\),\s*NSWorkspace\.shared\.open\(url\)\s+else\s*\{\s*continue\s*\}/,
@@ -80,7 +83,7 @@ function assertSettingsOwnerSafetyContract(source) {
   );
   assert.match(
     openSettings,
-    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return false\s*\}[\s\S]{0,180}launchApplication/,
+    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return nil\s*\}[\s\S]{0,180}launchApplication/,
     "macOS 13+ must fail closed when every verified account-settings route fails"
   );
 
@@ -88,12 +91,16 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.doesNotMatch(pageWait, /(?:true\s*\|\||\|\|\s*true)/);
   assert.match(
     pageWait,
-    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,800}stableHits\s*>=\s*3[\s\S]{0,160}Date\(\)\.timeIntervalSince\(stableSince\)\s*>=\s*1\.2[\s\S]{0,80}return true/,
-    "a running extension is success only after stable visible target-page AX evidence"
+    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,800}stableHits\s*>=\s*2[\s\S]{0,300}return owner/,
+    "a running extension is success only after consecutive visible target-page AX evidence"
   );
   assert.match(pageWait, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.match(pageWait, /remainingMilliseconds\(until:\s*boundedDeadline/);
+  assert.match(pageWait, /let owner\s*=\s*matches\[0\]/);
+  assert.match(pageWait, /owner\.processIdentifier\s*==\s*stablePid/);
+  assert.match(pageWait, /isTrustedAppleIDSettingsExtension\(owner\)/);
+  assert.match(pageWait, /return owner/);
 
   const actionGate = swiftFunctionBodyFromSource(source, "actionMayProceed");
   assert.match(actionGate, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
@@ -206,6 +213,30 @@ function assertSettingsOwnerSafetyContract(source) {
     "a verified windowless target page must return before host reactivation"
   );
 
+  const ownerLoopStart = source.indexOf("for uiOwnerAttempt in 1...2");
+  const ownerLoopEnd = source.indexOf(
+    'emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable"))',
+    ownerLoopStart
+  );
+  const ownerLoop = source.slice(ownerLoopStart, ownerLoopEnd);
+  const readyPause = ownerLoop.indexOf("let readyPauseMs");
+  const postSettleEvidence = ownerLoop.indexOf("guard treeContainsExactText(", readyPause);
+  const prepareCall = ownerLoop.indexOf("switch prepareVerificationCodeAlert(");
+  assert.ok(
+    readyPause >= 0 && postSettleEvidence > readyPause && prepareCall > postSettleEvidence,
+    "a short-lived ExtensionKit page must be revalidated after settling and before navigation"
+  );
+  const postSettleGuard = ownerLoop.slice(postSettleEvidence, prepareCall);
+  assert.match(postSettleGuard, /names:\s*appleAccountPageEvidence/);
+  assert.match(postSettleGuard, /expectedPid:\s*settingsPid/);
+  assert.match(postSettleGuard, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*settingsPid\)/);
+  assert.match(postSettleGuard, /guard Date\(\)\s*<\s*deadline else \{ continue \}/);
+  assert.match(
+    ownerLoop,
+    /case \.twoFactorNotFound:[\s\S]{0,100}if uiOwnerAttempt\s*<\s*2\s*\{\s*continue\s*\}[\s\S]{0,180}Two-Factor Authentication not found/,
+    "a transient first navigation miss must reopen before failing"
+  );
+
   const exactButton = swiftFunctionBodyFromSource(source, "findExactButton");
   assert.match(
     exactButton,
@@ -246,6 +277,52 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(unconditionalPageEvidence),
     assert.AssertionError
+  );
+
+  const oneFramePageEvidence = source.replace(
+    "if stableHits >= 2 {",
+    "if stableHits >= 1 {"
+  );
+  assert.notEqual(
+    oneFramePageEvidence,
+    source,
+    "single-frame page-evidence mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(oneFramePageEvidence),
+    assert.AssertionError
+  );
+
+  const unboundVerifiedOwner = source.replace(
+    "owner.processIdentifier == stablePid,",
+    "true,"
+  );
+  assert.notEqual(
+    unboundVerifiedOwner,
+    source,
+    "verified-owner PID mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(unboundVerifiedOwner),
+    assert.AssertionError
+  );
+
+  const ownerLoopStart = source.indexOf("for uiOwnerAttempt in 1...2");
+  const prepareCall = source.indexOf("switch prepareVerificationCodeAlert(", ownerLoopStart);
+  const postSettleEvidence = source.lastIndexOf(
+    "    guard treeContainsExactText(",
+    prepareCall
+  );
+  const postSettleEnd = source.indexOf('    logStep(2, "System Settings ready")', postSettleEvidence);
+  assert.ok(
+    postSettleEvidence > ownerLoopStart && postSettleEnd > postSettleEvidence,
+    "post-settle evidence mutation fixture must locate the lifecycle guard"
+  );
+  const missingPostSettleEvidence =
+    source.slice(0, postSettleEvidence) + source.slice(postSettleEnd);
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingPostSettleEvidence),
+    /revalidated after settling/
   );
 
   const finalClickGuard = [
@@ -944,11 +1021,11 @@ function runSwiftCancellationContractTest() {
 
   const finder = swiftFunctionBodyFromSource(source, "waitForSettingsApp");
   const ownerLoop = source.indexOf("for uiOwnerAttempt in 1...2");
-  const findCall = source.indexOf("guard let app = waitForSettingsApp(", ownerLoop);
-  const uiOwnerCall = source.indexOf(
-    "let settingsUIApp = waitForSettingsUIOwner(",
-    findCall
+  const verifiedOwnerCall = source.indexOf(
+    "let settingsUIApp = openAppleAccountSettings(deadline: deadline)",
+    ownerLoop
   );
+  const findCall = source.indexOf("guard let app = waitForSettingsApp(", verifiedOwnerCall);
   const axCreate = source.indexOf(
     "AXUIElementCreateApplication(settingsUIApp.processIdentifier)"
   );
@@ -966,8 +1043,11 @@ function runSwiftCancellationContractTest() {
   assert.match(settingsWait, /matches\.count\s*>\s*1/);
   assert.match(settingsWait, /Date\(\)\s*>=\s*deadline/);
   assert.ok(
-    ownerLoop >= 0 && findCall > ownerLoop && uiOwnerCall > findCall && axCreate > uiOwnerCall,
-    "each bounded owner attempt must resolve the trusted UI before AX enumeration"
+    ownerLoop >= 0 &&
+      verifiedOwnerCall > ownerLoop &&
+      findCall > verifiedOwnerCall &&
+      axCreate > findCall,
+    "each bounded owner attempt must preserve the verified UI owner before AX enumeration"
   );
   const ownerLoopEnd = source.indexOf(
     'emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable"))',
@@ -980,6 +1060,19 @@ function runSwiftCancellationContractTest() {
   assert.match(ownerRecovery, /waitForSettingsApp\(/);
   assert.match(ownerRecovery, /remainingMilliseconds\(until:\s*deadline,\s*cappedAt:\s*4_000\)/);
   assert.match(ownerRecovery, /openAppleAccountSettings\(deadline:\s*deadline\)/);
+  const verifiedOpen = ownerRecovery.indexOf(
+    "openAppleAccountSettings(deadline: deadline)"
+  );
+  const immediateRebind = ownerRecovery.indexOf(
+    "guard let app = waitForSettingsApp(",
+    verifiedOpen
+  );
+  assert.ok(verifiedOpen >= 0 && immediateRebind > verifiedOpen);
+  assert.doesNotMatch(
+    ownerRecovery.slice(verifiedOpen, immediateRebind),
+    /cancellablePause|settleMs/,
+    "the verified ExtensionKit owner must be rebound without a blind settle delay"
+  );
   assert.match(
     ownerRecovery,
     /activateSystemSettings\([\s\S]{0,220}deadline:\s*deadline/,
@@ -990,17 +1083,25 @@ function runSwiftCancellationContractTest() {
     /windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible\s*\{\s*continue\s*\}/,
     "a transient windowless pane loss must reopen the target page instead of failing immediately"
   );
-  assert.ok(
-    ownerRecovery.indexOf("let settingsUIApp = waitForSettingsUIOwner(") >= 0 &&
-      ownerRecovery.indexOf("let settingsUIApp = waitForSettingsUIOwner(") <
-        ownerRecovery.indexOf("AXUIElementCreateApplication(settingsUIApp.processIdentifier)"),
-    "a restarted ExtensionKit owner must be rebound before any new AX traversal"
+  assert.doesNotMatch(source, /func waitForSettingsUIOwner\(/);
+  assert.match(
+    ownerRecovery,
+    /let settingsUIApp\s*=\s*openAppleAccountSettings\(deadline:\s*deadline\)[\s\S]{0,500}let settingsPid\s*=\s*settingsUIApp\.processIdentifier/
+  );
+  assert.match(
+    ownerRecovery,
+    /guard !settingsUIApp\.isTerminated,[\s\S]{0,180}isTrustedSystemSettingsProcess\(settingsPid\)[\s\S]{0,260}isTrustedAppleIDSettingsExtension\(settingsUIApp\)/,
+    "the exact owner that passed page verification must remain trusted before AX traversal"
   );
 
   assert.match(
     source,
     /appleIDSettingsExecutablePaths[\s\S]*\/System\/Library\/ExtensionKit\/Extensions\/AppleIDSettings\.appex\/Contents\/MacOS\/AppleIDSettings/
   );
+  assert.match(source, /let signInSecurity\s*=\s*\[[\s\S]*"Password & Security"/);
+  assert.match(source, /let signInSecurity\s*=\s*\[[\s\S]*"密码与安全性"/);
+  assert.match(source, /let signInSecurity\s*=\s*\[[\s\S]*"密碼與安全性"/);
+  assert.match(source, /let appleAccountPageEvidence\s*=\s*signInSecurity\s*\+/);
   const extensionTrustStart = source.indexOf("func isTrustedAppleIDSettingsExtension(");
   const extensionTrust = source.slice(
     extensionTrustStart,
@@ -1009,15 +1110,6 @@ function runSwiftCancellationContractTest() {
   assert.match(extensionTrust, /standardizedFileURL\.path/);
   assert.match(extensionTrust, /appleIDSettingsExecutablePaths\.contains\(path\)/);
   assert.doesNotMatch(extensionTrust, /hasPrefix|localizedName/);
-  const uiOwnerStart = source.indexOf("func waitForSettingsUIOwner(");
-  const uiOwner = source.slice(
-    uiOwnerStart,
-    source.indexOf("\nfunc ", uiOwnerStart + 5)
-  );
-  assert.match(uiOwner, /isTrustedAppleIDSettingsExtension/);
-  assert.match(uiOwner, /matches\.count\s*==\s*1/);
-  assert.match(uiOwner, /matches\.count\s*>\s*1[\s\S]{0,80}return nil/);
-  assert.match(uiOwner, /isTrustedSystemSettingsProcess\(fallbackApp\.processIdentifier\)/);
 
   const processTrustStart = source.indexOf("func isTrustedSystemSettingsProcess(");
   const processTrust = source.slice(
@@ -1056,13 +1148,13 @@ function runSwiftCancellationContractTest() {
   assert.match(openSettings, /else\s*\{\s*continue\s*\}/);
   assert.match(openSettings, /waitForAppleAccountSettingsPage/);
   assert.match(openSettings, /stopIfCancelled\(\)/);
-  assert.match(openSettings, /guard Date\(\)\s*<\s*deadline else \{ return false \}/);
+  assert.match(openSettings, /guard Date\(\)\s*<\s*deadline else \{ return nil \}/);
   assert.match(
     openSettings,
-    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return false\s*\}/
+    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return nil\s*\}/
   );
   assert.ok(
-    openSettings.indexOf("continue") < openSettings.indexOf("return true"),
+    openSettings.indexOf("continue") < openSettings.indexOf("return owner"),
     "a rejected URL must fall through to the next account-settings route"
   );
 
@@ -1071,17 +1163,16 @@ function runSwiftCancellationContractTest() {
     pageWaitStart,
     source.indexOf("\nfunc ", pageWaitStart + 5)
   );
-  assert.match(pageWait, /matches\.count\s*>\s*1[\s\S]{0,80}return false/);
+  assert.match(pageWait, /matches\.count\s*>\s*1[\s\S]{0,80}return nil/);
   assert.match(pageWait, /AXUIElementCreateApplication\(pid\)/);
   assert.match(pageWait, /treeContainsExactText\(/);
   assert.match(pageWait, /names:\s*appleAccountPageEvidence/);
   assert.match(pageWait, /expectedPid:\s*pid/);
   assert.match(pageWait, /var stablePid:\s*pid_t/);
   assert.match(pageWait, /var stableHits\s*=\s*0/);
-  assert.match(pageWait, /var stableSince:\s*Date\?/);
-  assert.match(pageWait, /stableSince\s*=\s*Date\(\)/);
-  assert.match(pageWait, /stableSince\s*=\s*nil/);
-  assert.match(pageWait, /stableHits\s*>=\s*3[\s\S]{0,160}timeIntervalSince\(stableSince\)\s*>=\s*1\.2/);
+  assert.doesNotMatch(pageWait, /stableSince|timeIntervalSince/);
+  assert.match(pageWait, /stableHits\s*>=\s*2/);
+  assert.match(pageWait, /cappedAt:\s*75/);
   assert.match(
     openSettings,
     /waitForAppleAccountSettingsPage\([\s\S]{0,100}timeoutMs:\s*5_000,[\s\S]{0,80}deadline:\s*deadline/
@@ -1090,7 +1181,7 @@ function runSwiftCancellationContractTest() {
   assert.match(pageWait, /Date\(\)\s*>=\s*boundedDeadline/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.ok(
-    pageWait.indexOf("treeContainsExactText(") < pageWait.indexOf("return true"),
+    pageWait.indexOf("treeContainsExactText(") < pageWait.indexOf("return owner"),
     "a pre-existing extension is not success until the target Apple Account page is visible"
   );
 
