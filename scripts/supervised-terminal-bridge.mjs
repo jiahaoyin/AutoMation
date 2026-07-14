@@ -773,6 +773,25 @@ export function classifySupervisorStatus(
   return status.cleanupFailed === true ? "cleanup_failed" : "valid";
 }
 
+export function classifyProcessCleanup({
+  productionGroupClean,
+  ruyiPageGroupClean,
+  supervisorStatusOutcome,
+  markerConfirmed,
+  ruyiPageStateSeen,
+}) {
+  if (
+    productionGroupClean !== true ||
+    ruyiPageGroupClean !== true
+  ) {
+    return "failed";
+  }
+  if (supervisorStatusOutcome === "cleanup_failed") {
+    return ruyiPageStateSeen === true ? "recovered" : "failed";
+  }
+  return markerConfirmed === true && ruyiPageStateSeen !== true ? "failed" : "clean";
+}
+
 function productionEnvironment(context) {
   const runtimeTmp = path.join(context.productionDir, "tmp");
   const reportRoot = path.join(context.productionDir, "reports");
@@ -1302,6 +1321,13 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const markerValue = markerFile.state === "present" ? markerFile.text.trim() : "";
     const markerConfirmed =
       markerConfirmedInOutput && markerValue === SUPERVISED_ACCEPTANCE_VALUE;
+    const processCleanupOutcome = classifyProcessCleanup({
+      productionGroupClean: cleanupSucceeded,
+      ruyiPageGroupClean: ruyiPageCleanup.ok,
+      supervisorStatusOutcome,
+      markerConfirmed,
+      ruyiPageStateSeen: ruyiPageCleanup.seen,
+    });
     const productionStateFile = readBoundedRegularFile(productionStatePath, 512);
     let productionStateConfirmed = false;
     if (productionStateFile.state === "present") {
@@ -1332,14 +1358,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     }
 
     let failureClass = "NONE";
-    if (
-      !cleanupSucceeded ||
-      !ruyiPageCleanup.ok ||
-      supervisorStatusOutcome === "cleanup_failed"
-    ) {
-      failureClass = "PROCESS_CLEANUP_FAILED";
-    }
-    else if (markerConfirmed && !ruyiPageCleanup.seen) {
+    if (processCleanupOutcome === "failed") {
       failureClass = "PROCESS_CLEANUP_FAILED";
     }
     else if (!productionStateConfirmed) failureClass = "INTERNAL_ERROR";
@@ -1388,6 +1407,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
     if (accepted) {
       emitStatus("accepted", "[mac:supervised] Apple Account 首页验收通过");
     } else {
+      if (processCleanupOutcome === "recovered") {
+        emitStatus(
+          "cleanup-recovered",
+          "[mac:supervised] inner cleanup recovered by trusted outer cleanup"
+        );
+      }
       emitStatus("failed-class", `[mac:supervised] ${failureClass}`);
     }
     return attestedExitCode;

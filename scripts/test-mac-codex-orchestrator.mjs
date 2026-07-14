@@ -40,6 +40,7 @@ import {
 } from "./lib/ruyipage-backend-runner.js";
 import {
   buildProductionProcessSupervisorScript,
+  classifyProcessCleanup,
   classifySupervisorStatus,
   createSupervisorStatusProtocol,
   readBoundedRegularFile,
@@ -1512,6 +1513,66 @@ assert.equal(
     1
   ),
   "valid"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: true,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "cleanup_failed",
+    markerConfirmed: false,
+    ruyiPageStateSeen: true,
+  }),
+  "recovered"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: false,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "cleanup_failed",
+    markerConfirmed: false,
+    ruyiPageStateSeen: true,
+  }),
+  "failed"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: true,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "cleanup_failed",
+    markerConfirmed: false,
+    ruyiPageStateSeen: false,
+  }),
+  "failed"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: true,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "valid",
+    markerConfirmed: false,
+    ruyiPageStateSeen: false,
+  }),
+  "clean"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: true,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "invalid",
+    markerConfirmed: false,
+    ruyiPageStateSeen: false,
+  }),
+  "clean"
+);
+assert.equal(
+  classifyProcessCleanup({
+    productionGroupClean: true,
+    ruyiPageGroupClean: true,
+    supervisorStatusOutcome: "valid",
+    markerConfirmed: true,
+    ruyiPageStateSeen: false,
+  }),
+  "failed"
 );
 assert.equal(
   classifySupervisorStatus(
