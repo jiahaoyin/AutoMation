@@ -128,8 +128,6 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
   assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
   assert.match(windowlessOwner, /axElementArrayStrict\(/);
-  assert.match(windowlessOwner, /kAXFocusedWindowAttribute/);
-  assert.match(windowlessOwner, /kAXMainWindowAttribute/);
   assert.match(
     windowlessOwner,
     /return\s+!hasStandardWindow\s*&&\s*isTrustedSystemSettingsProcess\(expectedPid\)/,
@@ -1065,8 +1063,6 @@ function runStrictVerificationCodeSourceContractTest() {
   const windowlessOwner = functionBody("isWindowlessAppleIDSettingsOwner");
   assert.match(windowlessOwner, /isTrustedAppleIDSettingsExtension\(owner\)/);
   assert.match(windowlessOwner, /kAXWindowsAttribute/);
-  assert.match(windowlessOwner, /kAXFocusedWindowAttribute/);
-  assert.match(windowlessOwner, /kAXMainWindowAttribute/);
   assert.match(windowlessOwner, /axElementArrayStrict\(/);
   assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
   assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);

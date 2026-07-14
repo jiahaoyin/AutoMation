@@ -707,22 +707,10 @@ func isWindowlessAppleIDSettingsOwner(
           elementBelongsToProcess(appElement, pid: expectedPid),
           let owner = NSRunningApplication(processIdentifier: expectedPid),
           isTrustedAppleIDSettingsExtension(owner) else { return false }
-    guard var candidates = axElementArrayStrict(
+    guard let candidates = axElementArrayStrict(
         appElement,
         kAXWindowsAttribute as String
     ) else { return false }
-    if let focused: AXUIElement = axCopy(
-        appElement,
-        kAXFocusedWindowAttribute as String
-    ) {
-        candidates.append(focused)
-    }
-    if let main: AXUIElement = axCopy(
-        appElement,
-        kAXMainWindowAttribute as String
-    ) {
-        candidates.append(main)
-    }
     var hasStandardWindow = false
     for candidate in candidates {
         guard elementBelongsToProcess(candidate, pid: expectedPid),
