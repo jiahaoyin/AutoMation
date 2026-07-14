@@ -324,35 +324,35 @@ func visibleExactMatchCounts(
     return (visible, pressable)
 }
 
-func logNavigationState(
+func hasVisibleExactMatch(
     appElement: AXUIElement,
     expectedPid: pid_t,
-    signInNames: [String],
-    twoFactorNames: [String],
-    buttonNames: [String]
-) {
-    let signIn = visibleExactMatchCounts(
-        appElement: appElement,
-        expectedPid: expectedPid,
-        names: signInNames
-    )
-    let twoFactor = visibleExactMatchCounts(
-        appElement: appElement,
-        expectedPid: expectedPid,
-        names: twoFactorNames
-    )
-    let focused = focusedWindowForProcess(expectedPid) == nil ? 0 : 1
-    let sheets = collectSheetRoots(appElement, expectedPid: expectedPid).count
-    let getCode = findGetCodeButton(
-        appElement: appElement,
-        expectedPid: expectedPid,
-        twoFactorNames: twoFactorNames,
-        buttonNames: buttonNames
-    ) == nil ? 0 : 1
-    logStep(
-        2,
-        "navigation state focused=\(focused) sheets=\(sheets) signInVisible=\(signIn.visible) signInPressable=\(signIn.pressable) twoFactorVisible=\(twoFactor.visible) twoFactorPressable=\(twoFactor.pressable) getCode=\(getCode)"
-    )
+    names: [String],
+    maxNodes: Int = 2_000
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(appElement, pid: expectedPid) else { return false }
+    var queue = axSheets(appElement) + axChildren(appElement)
+    var seen: [AXUIElement] = []
+    var cursor = 0
+    var visited = 0
+    while cursor < queue.count && visited < maxNodes {
+        let node = queue[cursor]
+        cursor += 1
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        if elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil,
+           hasExactName(node, names: names) {
+            return isTrustedSystemSettingsProcess(expectedPid) &&
+                elementBelongsToProcess(node, pid: expectedPid)
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return false
 }
 
 func findVerificationCodeAlertRoot(
@@ -540,8 +540,6 @@ func waitForAppleAccountSettingsPage(
         TimeInterval(max(0, timeoutMs)) / 1000.0
     )
     let boundedDeadline = min(deadline, timeoutDeadline)
-    var stablePid: pid_t = 0
-    var stableHits = 0
     repeat {
         stopIfCancelled()
         if Date() >= boundedDeadline { return nil }
@@ -553,36 +551,23 @@ func waitForAppleAccountSettingsPage(
             let owner = matches[0]
             let pid = owner.processIdentifier
             let appElement = AXUIElementCreateApplication(pid)
-            if treeContainsExactText(
-                appElement,
-                names: appleAccountPageEvidence,
+            let hasEvidence = hasVisibleExactMatch(
+                appElement: appElement,
                 expectedPid: pid,
+                names: appleAccountPageEvidence,
                 maxNodes: 2_000
-            ) {
+            )
+            if hasEvidence {
                 stopIfCancelled()
                 guard Date() < boundedDeadline else { return nil }
-                if stablePid == pid {
-                    stableHits += 1
-                } else {
-                    stablePid = pid
-                    stableHits = 1
-                }
-                if stableHits >= 2 {
-                    guard !owner.isTerminated,
-                          owner.processIdentifier == stablePid,
-                          isTrustedAppleIDSettingsExtension(owner) else { return nil }
-                    logStep(1, "Apple Account settings page ready")
-                    return owner
-                }
-            } else {
-                stablePid = 0
-                stableHits = 0
+                guard !owner.isTerminated,
+                      owner.processIdentifier == pid,
+                      isTrustedAppleIDSettingsExtension(owner) else { return nil }
+                logStep(1, "Apple Account settings page ready")
+                return owner
             }
-        } else {
-            stablePid = 0
-            stableHits = 0
         }
-        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 75)
+        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 50)
         if pauseMs <= 0 { return nil }
         cancellablePause(UInt32(pauseMs * 1_000))
     } while true
@@ -1504,14 +1489,6 @@ func prepareVerificationCodeAlert(
     ) else {
         return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
     }
-    logNavigationState(
-        appElement: appElement,
-        expectedPid: expectedPid,
-        signInNames: signInSecurity,
-        twoFactorNames: twoFactor,
-        buttonNames: getCodeBtn
-    )
-
     guard actionMayProceed(
         deadline: deadline,
         appElement: appElement,
@@ -1670,49 +1647,55 @@ for uiOwnerAttempt in 1...2 {
     }
     guard Date() < deadline,
           let settingsUIApp = openAppleAccountSettings(deadline: deadline) else { continue }
-    guard let app = waitForSettingsApp(
-        timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
-    ) else { continue }
     let appElement = AXUIElementCreateApplication(settingsUIApp.processIdentifier)
     let settingsPid = settingsUIApp.processIdentifier
     let expectsExtension = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 13
     guard !settingsUIApp.isTerminated,
-          isTrustedSystemSettingsProcess(settingsPid),
-          (expectsExtension
-            ? isTrustedAppleIDSettingsExtension(settingsUIApp)
-            : settingsPid == app.processIdentifier) else { continue }
-    guard activateSystemSettings(
-        app,
-        appElement: appElement,
-        expectedPid: settingsPid,
-        deadline: deadline
-    ) else {
-        if windowlessAppleIDSettingsStatus(
-            appElement: appElement,
-            expectedPid: settingsPid
-        ) == .eligible {
-            continue
-        }
-        if isTrustedSystemSettingsProcess(settingsPid) {
-            emit(Output(ok: false, code: nil, message: "System Settings focus unavailable"))
-        }
-        continue
+          isTrustedSystemSettingsProcess(settingsPid) else { continue }
+
+    var settingsHost: NSRunningApplication?
+    if expectsExtension {
+        guard isTrustedAppleIDSettingsExtension(settingsUIApp) else { continue }
+    } else {
+        guard let app = waitForSettingsApp(
+            timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
+        ), settingsPid == app.processIdentifier else { continue }
+        settingsHost = app
     }
-    let readyPauseMs = remainingMilliseconds(until: deadline, cappedAt: 300)
-    guard readyPauseMs > 0 else { continue }
-    cancellablePause(
-        UInt32(readyPauseMs * 1_000),
+
+    let verifiedWindowlessOwner = windowlessAppleIDSettingsStatus(
         appElement: appElement,
         expectedPid: settingsPid
-    )
-    guard Date() < deadline else { continue }
-    guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
-    guard treeContainsExactText(
-        appElement,
-        names: appleAccountPageEvidence,
-        expectedPid: settingsPid,
-        maxNodes: 2_000
-    ) else { continue }
+    ) == .eligible
+    if !verifiedWindowlessOwner {
+        guard let app = settingsHost ?? waitForSettingsApp(
+            timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
+        ) else { continue }
+        guard activateSystemSettings(
+            app,
+            appElement: appElement,
+            expectedPid: settingsPid,
+            deadline: deadline
+        ) else {
+            continue
+        }
+        let readyPauseMs = remainingMilliseconds(until: deadline, cappedAt: 300)
+        guard readyPauseMs > 0 else { continue }
+        cancellablePause(
+            UInt32(readyPauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: settingsPid
+        )
+        guard Date() < deadline else { continue }
+        guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
+        let settledEvidence = visibleExactMatchCounts(
+            appElement: appElement,
+            expectedPid: settingsPid,
+            names: appleAccountPageEvidence,
+            maxNodes: 2_000
+        )
+        guard settledEvidence.visible > 0 else { continue }
+    }
     stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
     guard Date() < deadline else { continue }
     guard isTrustedSystemSettingsProcess(settingsPid) else { continue }

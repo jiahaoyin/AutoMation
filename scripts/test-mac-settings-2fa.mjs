@@ -91,14 +91,24 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.doesNotMatch(pageWait, /(?:true\s*\|\||\|\|\s*true)/);
   assert.match(
     pageWait,
-    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,800}stableHits\s*>=\s*2[\s\S]{0,300}return owner/,
-    "a running extension is success only after consecutive visible target-page AX evidence"
+    /let hasEvidence\s*=\s*hasVisibleExactMatch\([\s\S]{0,220}expectedPid:\s*pid[\s\S]{0,180}names:\s*appleAccountPageEvidence[\s\S]{0,180}if hasEvidence[\s\S]{0,400}owner\.processIdentifier\s*==\s*pid[\s\S]{0,200}return owner/,
+    "a running extension is accepted only from visible target-page evidence owned by the same PID"
+  );
+  assert.doesNotMatch(pageWait, /treeContainsExactText|stableHits|stableSince/);
+  const fastEvidence = swiftFunctionBodyFromSource(source, "hasVisibleExactMatch");
+  assert.match(fastEvidence, /elementBelongsToProcess\(appElement,\s*pid:\s*expectedPid\)/);
+  const evidenceMatch = fastEvidence.indexOf("if elementBelongsToProcess(node");
+  const earlyReturn = fastEvidence.indexOf("return isTrustedSystemSettingsProcess", evidenceMatch);
+  const continuedTraversal = fastEvidence.indexOf("queue.append(contentsOf:", earlyReturn);
+  assert.ok(
+    evidenceMatch >= 0 && earlyReturn > evidenceMatch && continuedTraversal > earlyReturn,
+    "owner discovery must return on the first same-PID visible exact evidence"
   );
   assert.match(pageWait, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.match(pageWait, /remainingMilliseconds\(until:\s*boundedDeadline/);
   assert.match(pageWait, /let owner\s*=\s*matches\[0\]/);
-  assert.match(pageWait, /owner\.processIdentifier\s*==\s*stablePid/);
+  assert.match(pageWait, /owner\.processIdentifier\s*==\s*pid/);
   assert.match(pageWait, /isTrustedAppleIDSettingsExtension\(owner\)/);
   assert.match(pageWait, /return owner/);
 
@@ -219,16 +229,28 @@ function assertSettingsOwnerSafetyContract(source) {
     ownerLoopStart
   );
   const ownerLoop = source.slice(ownerLoopStart, ownerLoopEnd);
+  const windowlessProbe = ownerLoop.indexOf("let verifiedWindowlessOwner");
+  const windowedBranch = ownerLoop.indexOf("if !verifiedWindowlessOwner", windowlessProbe);
+  const activationCall = ownerLoop.indexOf("guard activateSystemSettings(", windowedBranch);
   const readyPause = ownerLoop.indexOf("let readyPauseMs");
-  const postSettleEvidence = ownerLoop.indexOf("guard treeContainsExactText(", readyPause);
+  const postSettleEvidence = ownerLoop.indexOf(
+    "let settledEvidence = visibleExactMatchCounts(",
+    readyPause
+  );
   const prepareCall = ownerLoop.indexOf("switch prepareVerificationCodeAlert(");
   assert.ok(
-    readyPause >= 0 && postSettleEvidence > readyPause && prepareCall > postSettleEvidence,
-    "a short-lived ExtensionKit page must be revalidated after settling and before navigation"
+    windowlessProbe >= 0 &&
+      windowedBranch > windowlessProbe &&
+      activationCall > windowedBranch &&
+      readyPause > activationCall &&
+      postSettleEvidence > readyPause &&
+      prepareCall > postSettleEvidence,
+    "windowless verified owners must bypass activation while windowed owners are revalidated after settling"
   );
   const postSettleGuard = ownerLoop.slice(postSettleEvidence, prepareCall);
   assert.match(postSettleGuard, /names:\s*appleAccountPageEvidence/);
   assert.match(postSettleGuard, /expectedPid:\s*settingsPid/);
+  assert.match(postSettleGuard, /guard settledEvidence\.visible\s*>\s*0 else \{ continue \}/);
   assert.match(postSettleGuard, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*settingsPid\)/);
   assert.match(postSettleGuard, /guard Date\(\)\s*<\s*deadline else \{ continue \}/);
   assert.match(
@@ -266,8 +288,8 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const unconditionalPageEvidence = source.replace(
-    "if treeContainsExactText(\n                appElement,",
-    "if true || treeContainsExactText(\n                appElement,"
+    "if hasEvidence {",
+    "if true {"
   );
   assert.notEqual(
     unconditionalPageEvidence,
@@ -279,22 +301,36 @@ function runSettingsOwnerMutationResistanceTest() {
     assert.AssertionError
   );
 
-  const oneFramePageEvidence = source.replace(
-    "if stableHits >= 2 {",
-    "if stableHits >= 1 {"
+  const delayedEvidenceReturn = source.replace(
+    "            return isTrustedSystemSettingsProcess(expectedPid) &&\n                elementBelongsToProcess(node, pid: expectedPid)",
+    "            _ = isTrustedSystemSettingsProcess(expectedPid)\n            _ = elementBelongsToProcess(node, pid: expectedPid)"
   );
   assert.notEqual(
-    oneFramePageEvidence,
+    delayedEvidenceReturn,
     source,
-    "single-frame page-evidence mutation fixture must apply"
+    "early evidence-return mutation fixture must apply"
   );
   assert.throws(
-    () => assertSettingsOwnerSafetyContract(oneFramePageEvidence),
+    () => assertSettingsOwnerSafetyContract(delayedEvidenceReturn),
+    /first same-PID visible exact evidence/
+  );
+
+  const crossProcessPageEvidence = source.replace(
+    "expectedPid: pid,\n                names: appleAccountPageEvidence,",
+    "expectedPid: 0,\n                names: appleAccountPageEvidence,"
+  );
+  assert.notEqual(
+    crossProcessPageEvidence,
+    source,
+    "same-process page-evidence mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(crossProcessPageEvidence),
     assert.AssertionError
   );
 
   const unboundVerifiedOwner = source.replace(
-    "owner.processIdentifier == stablePid,",
+    "owner.processIdentifier == pid,",
     "true,"
   );
   assert.notEqual(
@@ -310,7 +346,7 @@ function runSettingsOwnerMutationResistanceTest() {
   const ownerLoopStart = source.indexOf("for uiOwnerAttempt in 1...2");
   const prepareCall = source.indexOf("switch prepareVerificationCodeAlert(", ownerLoopStart);
   const postSettleEvidence = source.lastIndexOf(
-    "    guard treeContainsExactText(",
+    "    let settledEvidence = visibleExactMatchCounts(",
     prepareCall
   );
   const postSettleEnd = source.indexOf('    logStep(2, "System Settings ready")', postSettleEvidence);
@@ -322,7 +358,7 @@ function runSettingsOwnerMutationResistanceTest() {
     source.slice(0, postSettleEvidence) + source.slice(postSettleEnd);
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingPostSettleEvidence),
-    /revalidated after settling/
+    /revalidated after settling|windowless verified owners/
   );
 
   const finalClickGuard = [
@@ -1025,7 +1061,6 @@ function runSwiftCancellationContractTest() {
     "let settingsUIApp = openAppleAccountSettings(deadline: deadline)",
     ownerLoop
   );
-  const findCall = source.indexOf("guard let app = waitForSettingsApp(", verifiedOwnerCall);
   const axCreate = source.indexOf(
     "AXUIElementCreateApplication(settingsUIApp.processIdentifier)"
   );
@@ -1045,8 +1080,7 @@ function runSwiftCancellationContractTest() {
   assert.ok(
     ownerLoop >= 0 &&
       verifiedOwnerCall > ownerLoop &&
-      findCall > verifiedOwnerCall &&
-      axCreate > findCall,
+      axCreate > verifiedOwnerCall,
     "each bounded owner attempt must preserve the verified UI owner before AX enumeration"
   );
   const ownerLoopEnd = source.indexOf(
@@ -1063,15 +1097,15 @@ function runSwiftCancellationContractTest() {
   const verifiedOpen = ownerRecovery.indexOf(
     "openAppleAccountSettings(deadline: deadline)"
   );
-  const immediateRebind = ownerRecovery.indexOf(
-    "guard let app = waitForSettingsApp(",
+  const immediateRoot = ownerRecovery.indexOf(
+    "let appElement = AXUIElementCreateApplication(",
     verifiedOpen
   );
-  assert.ok(verifiedOpen >= 0 && immediateRebind > verifiedOpen);
+  assert.ok(verifiedOpen >= 0 && immediateRoot > verifiedOpen);
   assert.doesNotMatch(
-    ownerRecovery.slice(verifiedOpen, immediateRebind),
-    /cancellablePause|settleMs/,
-    "the verified ExtensionKit owner must be rebound without a blind settle delay"
+    ownerRecovery.slice(verifiedOpen, immediateRoot),
+    /cancellablePause|settleMs|waitForSettingsApp/,
+    "the verified ExtensionKit owner must become the AX root without a blind delay or re-resolution"
   );
   assert.match(
     ownerRecovery,
@@ -1080,8 +1114,8 @@ function runSwiftCancellationContractTest() {
   );
   assert.match(
     ownerRecovery,
-    /windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible\s*\{\s*continue\s*\}/,
-    "a transient windowless pane loss must reopen the target page instead of failing immediately"
+    /let verifiedWindowlessOwner\s*=\s*windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible[\s\S]{0,100}if !verifiedWindowlessOwner\s*\{/,
+    "a verified windowless owner must bypass host activation"
   );
   assert.doesNotMatch(source, /func waitForSettingsUIOwner\(/);
   assert.match(
@@ -1165,14 +1199,12 @@ function runSwiftCancellationContractTest() {
   );
   assert.match(pageWait, /matches\.count\s*>\s*1[\s\S]{0,80}return nil/);
   assert.match(pageWait, /AXUIElementCreateApplication\(pid\)/);
-  assert.match(pageWait, /treeContainsExactText\(/);
+  assert.match(pageWait, /hasVisibleExactMatch\(/);
   assert.match(pageWait, /names:\s*appleAccountPageEvidence/);
   assert.match(pageWait, /expectedPid:\s*pid/);
-  assert.match(pageWait, /var stablePid:\s*pid_t/);
-  assert.match(pageWait, /var stableHits\s*=\s*0/);
-  assert.doesNotMatch(pageWait, /stableSince|timeIntervalSince/);
-  assert.match(pageWait, /stableHits\s*>=\s*2/);
-  assert.match(pageWait, /cappedAt:\s*75/);
+  assert.match(pageWait, /if hasEvidence/);
+  assert.doesNotMatch(pageWait, /stablePid|stableHits|stableSince|timeIntervalSince/);
+  assert.match(pageWait, /cappedAt:\s*50/);
   assert.match(
     openSettings,
     /waitForAppleAccountSettingsPage\([\s\S]{0,100}timeoutMs:\s*5_000,[\s\S]{0,80}deadline:\s*deadline/
@@ -1181,7 +1213,7 @@ function runSwiftCancellationContractTest() {
   assert.match(pageWait, /Date\(\)\s*>=\s*boundedDeadline/);
   assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.ok(
-    pageWait.indexOf("treeContainsExactText(") < pageWait.indexOf("return owner"),
+    pageWait.indexOf("hasVisibleExactMatch(") < pageWait.indexOf("return owner"),
     "a pre-existing extension is not success until the target Apple Account page is visible"
   );
 
@@ -1343,14 +1375,11 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(actionScope, /return isWindowlessAppleIDSettingsOwner\(/);
 
-  const navigationDiagnostics = functionBody("logNavigationState");
-  assert.match(navigationDiagnostics, /visibleExactMatchCounts\(/);
-  assert.match(navigationDiagnostics, /focused=/);
-  assert.match(navigationDiagnostics, /sheets=/);
-  assert.match(navigationDiagnostics, /signInVisible=/);
-  assert.match(navigationDiagnostics, /twoFactorVisible=/);
-  assert.match(navigationDiagnostics, /getCode=/);
-  assert.doesNotMatch(navigationDiagnostics, /axDescription|axExactTexts|codeRaw|print\(/);
+  assert.doesNotMatch(
+    source,
+    /func logNavigationState\(/,
+    "the short-lived ExtensionKit owner must not be consumed by redundant diagnostic traversals"
+  );
 
   const activation = functionBody("activateSystemSettings");
   assertOrdered(
