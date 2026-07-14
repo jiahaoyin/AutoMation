@@ -1385,6 +1385,11 @@ assert.match(
   supervisedSetupSlice,
   /write_supervised_attestation pending[\s\S]*if ! "\$CODEX_BIN" sandbox[\s\S]*\/usr\/bin\/true >\/dev\/null 2>&1; then[\s\S]*BRIDGE_SETUP_OK=0[\s\S]*SANDBOX_PREFLIGHT_FAILED/
 );
+assert.doesNotMatch(supervisedSetupSlice, /\blocal status=/);
+assert.match(
+  supervisedSetupSlice,
+  /local attestation_status="\$1"[\s\S]*"status":"'"\$attestation_status"'"/
+);
 assert.doesNotMatch(
   supervisedRemoteScript.slice(
     0,
