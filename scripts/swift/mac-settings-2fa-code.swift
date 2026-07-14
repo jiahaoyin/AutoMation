@@ -954,6 +954,20 @@ func activateSystemSettings(
     guard isTrustedSystemSettings(app),
           isTrustedSystemSettingsProcess(expectedPid) else { return false }
 
+    let initialWindowlessStatus = windowlessAppleIDSettingsStatus(
+        appElement: appElement,
+        expectedPid: expectedPid
+    )
+    if initialWindowlessStatus == .eligible,
+       treeContainsExactText(
+           appElement,
+           names: appleAccountPageEvidence,
+           expectedPid: expectedPid,
+           maxNodes: 2_000
+       ) {
+        return true
+    }
+
     _ = app.unhide()
     if let bundleURL = app.bundleURL {
         let configuration = NSWorkspace.OpenConfiguration()

@@ -148,6 +148,14 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.match(actionScope, /return isWindowlessAppleIDSettingsOwner\(/);
   assert.doesNotMatch(actionScope, /focusedWindow\s*==\s*nil/);
 
+  const activation = swiftFunctionBodyFromSource(source, "activateSystemSettings");
+  const beforeHostActivation = activation.slice(0, activation.indexOf("app.unhide()"));
+  assert.match(
+    beforeHostActivation,
+    /initialWindowlessStatus\s*==\s*\.eligible[\s\S]{0,500}treeContainsExactText\([\s\S]{0,500}return true/,
+    "a verified windowless target page must return before host reactivation"
+  );
+
   const exactButton = swiftFunctionBodyFromSource(source, "findExactButton");
   assert.match(
     exactButton,
@@ -277,6 +285,20 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingSecondPressScope),
     /before every AX press/
+  );
+
+  const missingInitialWindowlessReturn = source.replace(
+    "        return true\n    }\n\n    _ = app.unhide()",
+    "        _ = initialWindowlessStatus\n    }\n\n    _ = app.unhide()"
+  );
+  assert.notEqual(
+    missingInitialWindowlessReturn,
+    source,
+    "initial-windowless-return mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingInitialWindowlessReturn),
+    /return before host reactivation/
   );
 }
 
@@ -1096,6 +1118,12 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(navigationDiagnostics, /axDescription|axExactTexts|codeRaw|print\(/);
 
   const activation = functionBody("activateSystemSettings");
+  assertOrdered(
+    activation,
+    ["let initialWindowlessStatus", "treeContainsExactText(", "app.unhide()", "NSWorkspace.OpenConfiguration()"],
+    "a verified windowless Apple Account page must be accepted before host reactivation can reset it"
+  );
+  assert.match(activation, /initialWindowlessStatus\s*==\s*\.eligible/);
   assert.match(activation, /NSWorkspace\.OpenConfiguration\(\)/);
   assert.match(activation, /app\.unhide\(\)/);
   assert.match(activation, /configuration\.activates\s*=\s*true/);
