@@ -36,6 +36,7 @@ const TWO_FACTOR_WINNER_MESSAGES = Object.freeze({
   settings: "[2FA] 已从系统设置取得验证码。",
   manual: "[2FA] 已使用终端手动输入的验证码。",
 });
+const SUPERVISED_TWO_FACTOR_STATUS_PREFIX = "[2FA] status:";
 
 function sanitizeReadyMode(mode) {
   const normalized = typeof mode === "string" ? mode.trim() : "";
@@ -44,6 +45,27 @@ function sanitizeReadyMode(mode) {
 
 function reportTwoFactorStatus(event) {
   if (!event || typeof event !== "object") return;
+
+  if (process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1") {
+    if (
+      event.status === "winner" &&
+      Object.hasOwn(TWO_FACTOR_WINNER_MESSAGES, event.source)
+    ) {
+      console.log(`${SUPERVISED_TWO_FACTOR_STATUS_PREFIX}winner:${event.source}`);
+    } else if (
+      [
+        "settings_start",
+        "settings_retry",
+        "settings_accessibility",
+        "manual_allow",
+        "manual_code",
+        "ocr_permission_missing",
+        "timeout",
+      ].includes(event.status)
+    ) {
+      console.log(`${SUPERVISED_TWO_FACTOR_STATUS_PREFIX}${event.status}`);
+    }
+  }
 
   if (event.status === "settings_start" && (event.attempt === 1 || event.attempt === 2)) {
     console.log(

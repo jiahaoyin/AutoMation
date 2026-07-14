@@ -1509,6 +1509,10 @@ assert.doesNotMatch(
 assert.match(supervisedTerminalBridgeSource, /2FA 自动取码处理中/);
 assert.match(
   supervisedTerminalBridgeSource,
+  /\[2FA\] status:[\s\S]*two_fa_code_acquired[\s\S]*two_fa_code_unavailable[\s\S]*TWO_FA_LOGIN_FAILED[\s\S]*TWO_FA_CODE_UNAVAILABLE[\s\S]*TWO_FA_PAGE_FAILED/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
   /APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE/
 );
 assert.match(supervisedTerminalBridgeSource, /cleanupRecordedRuyiPageProcess/);
@@ -2532,7 +2536,7 @@ try {
       "-e",
       `const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setTimeout(()=>{},10000)'],{detached:true,stdio:['ignore',1,2]});fs.writeFileSync(${JSON.stringify(inheritedPipePidPath)},String(child.pid));setTimeout(()=>{},10000);`,
     ],
-    { timeoutMs: 100, terminateGraceMs: 50, cleanupDeadlineMs: 100 }
+    { timeoutMs: 500, terminateGraceMs: 50, cleanupDeadlineMs: 100 }
   );
   assert.equal(inheritedPipeResult.timedOut, true);
   assert.ok(

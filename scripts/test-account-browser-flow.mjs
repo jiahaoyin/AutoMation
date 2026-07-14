@@ -356,6 +356,14 @@ function runEnvDataParsingTest() {
 }
 
 function runFullFlowSourceContractTest() {
+  const browserFlowSource = fs.readFileSync(
+    new URL("./lib/account-browser-flow.js", import.meta.url),
+    "utf8"
+  );
+  assert.match(
+    browserFlowSource,
+    /SUPERVISED_TWO_FACTOR_STATUS_PREFIX = "\[2FA\] status:"[\s\S]*APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*winner:\$\{event\.source\}/
+  );
   const source = fs.readFileSync(
     new URL("./apple-id-full-flow.mjs", import.meta.url),
     "utf8"

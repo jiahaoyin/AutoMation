@@ -847,6 +847,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let markerConfirmedInOutput = false;
     let manualPromptVisible = false;
     let manualPromptCount = 0;
+    let productionStage = "starting";
     const emittedStatuses = new Set();
     const successMarkerBytes = Buffer.from(SUPERVISED_SUCCESS_MARKER, "utf8");
     const manualPromptBytes = Buffer.from(MANUAL_CODE_PROMPT, "utf8");
@@ -864,6 +865,27 @@ export async function runSupervisedTerminalBridge(options = {}) {
       safeWrite(`${value}\n`);
     };
     const processSafeLine = (line) => {
+      if (line.startsWith("[2FA] status:")) {
+        const status = line.slice("[2FA] status:".length);
+        if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
+          productionStage = "two_fa_code_acquired";
+        } else if (status === "timeout") {
+          productionStage = "two_fa_code_unavailable";
+        } else if (
+          [
+            "settings_start",
+            "settings_retry",
+            "settings_accessibility",
+            "manual_allow",
+            "manual_code",
+            "ocr_permission_missing",
+          ].includes(status) &&
+          productionStage !== "two_fa_code_acquired"
+        ) {
+          productionStage = "two_fa_code_pending";
+        }
+        return;
+      }
       if (line.includes(MANUAL_CODE_PROMPT)) {
         if (manualPromptVisible) {
           safeWrite("\n");
@@ -874,12 +896,16 @@ export async function runSupervisedTerminalBridge(options = {}) {
       if (line === SUPERVISED_SUCCESS_MARKER) {
         emitStatus("success", SUPERVISED_SUCCESS_MARKER);
       } else if (line.startsWith("[Firefox]")) {
+        productionStage = "browser_started";
         emitStatus("browser", "[mac:supervised] ruyiPage 浏览器流程已启动");
       } else if (line.startsWith("[ruyipage] 浏览器已就绪")) {
+        productionStage = "browser_ready";
         emitStatus("browser-ready", "[mac:supervised] ruyiPage 浏览器已就绪");
       } else if (line.startsWith("[ruyipage] 密码提交前")) {
+        productionStage = "two_fa_page_pending";
         emitStatus("2fa-prepare", "[mac:supervised] 正在准备 2FA 自动取码");
       } else if (line.startsWith("[ruyipage] 页面已确认进入 2FA")) {
+        productionStage = "two_fa_code_pending";
         emitStatus("2fa-page", "[mac:supervised] 网页已进入 2FA 验证");
       } else if (line.startsWith("[2FA]")) {
         emitStatus("2fa-progress", "[mac:supervised] 2FA 自动取码处理中");
@@ -1181,7 +1207,19 @@ export async function runSupervisedTerminalBridge(options = {}) {
     else if (timedOut) failureClass = "PRODUCTION_TIMEOUT";
     else if (headAfter !== context.expectedHead) failureClass = "HEAD_MISMATCH";
     else if (finalStatus !== "") failureClass = "GIT_DIRTY";
-    else if (productionExit !== 0) failureClass = "PRODUCTION_EXIT_NONZERO";
+    else if (productionExit !== 0) {
+      if (productionStage === "two_fa_code_acquired") {
+        failureClass = "TWO_FA_LOGIN_FAILED";
+      } else if (
+        ["two_fa_code_pending", "two_fa_code_unavailable"].includes(productionStage)
+      ) {
+        failureClass = "TWO_FA_CODE_UNAVAILABLE";
+      } else if (productionStage === "two_fa_page_pending") {
+        failureClass = "TWO_FA_PAGE_FAILED";
+      } else {
+        failureClass = "PRODUCTION_EXIT_NONZERO";
+      }
+    }
     else if (!markerConfirmed) failureClass = "ACCEPTANCE_EVIDENCE_MISSING";
 
     const accepted = failureClass === "NONE";
