@@ -867,7 +867,17 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const processSafeLine = (line) => {
       if (line.startsWith("[2FA] status:")) {
         const status = line.slice("[2FA] status:".length);
-        if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
+        if (status === "permission_preflight_start") {
+          productionStage = "accessibility_preflight";
+        } else if (status === "permission_preflight_ready") {
+          productionStage = "accessibility_ready";
+        } else if (status === "permission_preflight_missing") {
+          productionStage = "accessibility_missing";
+          emitStatus(
+            "accessibility-missing",
+            "[mac:supervised] Terminal 辅助功能权限未就绪，将继续浏览器并保留手动验证码兜底"
+          );
+        } else if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
           productionStage = "two_fa_code_acquired";
         } else if (status === "timeout") {
           productionStage = "two_fa_code_unavailable";
@@ -1216,6 +1226,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
         failureClass = "TWO_FA_CODE_UNAVAILABLE";
       } else if (productionStage === "two_fa_page_pending") {
         failureClass = "TWO_FA_PAGE_FAILED";
+      } else if (
+        ["accessibility_preflight", "accessibility_missing"].includes(productionStage)
+      ) {
+        failureClass = "ACCESSIBILITY_PERMISSION_REQUIRED";
       } else {
         failureClass = "PRODUCTION_EXIT_NONZERO";
       }

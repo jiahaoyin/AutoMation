@@ -29,6 +29,16 @@ const popupSwiftSource = fs.readFileSync(
   new URL("./swift/mac-2fa-popup-read.swift", import.meta.url),
   "utf8"
 );
+const preflightEntrySource = fs.readFileSync(
+  new URL("./preflight-2fa-permissions.mjs", import.meta.url),
+  "utf8"
+);
+
+assert.match(
+  preflightEntrySource,
+  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityDeniedError[\s\S]*permission_preflight_missing/
+);
+assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 
 function exportedFunctionSource(source, name) {
   const start = source.indexOf(`export async function ${name}`);
@@ -131,7 +141,7 @@ const malformed = await checkNativeAccessibilityCapability({
     return { stdout: '{"capability":"unexpected","raw":"secret"}' };
   },
 });
-assert.deepEqual(malformed, { capability: "permission_missing" });
+assert.deepEqual(malformed, { capability: "unavailable" });
 
 const failedAvailable = await checkNativeAccessibilityCapability({
   platform: "darwin",
@@ -142,7 +152,7 @@ const failedAvailable = await checkNativeAccessibilityCapability({
     throw error;
   },
 });
-assert.deepEqual(failedAvailable, { capability: "permission_missing" });
+assert.deepEqual(failedAvailable, { capability: "unavailable" });
 
 const prepareFailure = await checkNativeAccessibilityCapability({
   platform: "darwin",
@@ -150,9 +160,21 @@ const prepareFailure = await checkNativeAccessibilityCapability({
     throw new Error("compiler details must not escape");
   },
 });
-assert.deepEqual(prepareFailure, { capability: "permission_missing" });
+assert.deepEqual(prepareFailure, { capability: "unavailable" });
 assert.deepEqual(nativeCalls, []);
 assert.doesNotMatch(popupSource, /osascript|System Events/);
+
+await assert.rejects(
+  isAccessibilityGranted({
+    runtime: {
+      platform: "darwin",
+      async checkCapability() {
+        return { capability: "unavailable" };
+      },
+    },
+  }),
+  (error) => error?.code === "2FA_ACCESSIBILITY_UNAVAILABLE"
+);
 
 const preflightCalls = [];
 const capabilitySequence = ["permission_missing", "available"];

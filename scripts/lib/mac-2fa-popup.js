@@ -127,23 +127,26 @@ function parseAccessibilityCapability(stdout) {
     if (parsed?.capability === "available") {
       return { capability: "available" };
     }
+    if (parsed?.capability === "permission_missing") {
+      return { capability: "permission_missing" };
+    }
   } catch {
     /* fixed fail-closed capability below */
   }
-  return { capability: "permission_missing" };
+  return { capability: "unavailable" };
 }
 
 async function runAccessibilityCapability(flag, options = {}) {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") return { capability: "permission_missing" };
+  if (platform !== "darwin") return { capability: "unavailable" };
 
   const sourcePath = options.sourcePath ?? SWIFT_SRC;
   const binaryPath = options.binaryPath ?? SWIFT_BIN;
   const ensureHelper = options.ensureHelper ?? (() => ensureBin(sourcePath, binaryPath, options));
   try {
-    if (!ensureHelper()) return { capability: "permission_missing" };
+    if (!ensureHelper()) return { capability: "unavailable" };
   } catch {
-    return { capability: "permission_missing" };
+    return { capability: "unavailable" };
   }
 
   const runHelper = options.execFile ?? execFileAsync;
@@ -155,8 +158,11 @@ async function runAccessibilityCapability(flag, options = {}) {
     if (options.signal) execOptions.signal = options.signal;
     const { stdout } = await runHelper(binaryPath, [flag], execOptions);
     return parseAccessibilityCapability(stdout);
-  } catch {
-    return { capability: "permission_missing" };
+  } catch (error) {
+    const parsed = parseAccessibilityCapability(error?.stdout);
+    return parsed.capability === "permission_missing"
+      ? parsed
+      : { capability: "unavailable" };
   }
 }
 

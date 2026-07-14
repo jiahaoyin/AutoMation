@@ -119,6 +119,11 @@ export async function isAccessibilityGranted(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return true;
   const result = await runtime.checkCapability({ signal: options.signal });
+  if (result.capability === "unavailable") {
+    const error = new Error("Accessibility capability probe is unavailable");
+    error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
+    throw error;
+  }
   return result.capability === "available";
 }
 
@@ -126,7 +131,13 @@ export async function isAccessibilityGranted(options = {}) {
 export async function triggerAccessibilityPrompt(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return { capability: "available" };
-  return runtime.promptPermission({ signal: options.signal });
+  const result = await runtime.promptPermission({ signal: options.signal });
+  if (result.capability === "unavailable") {
+    const error = new Error("Accessibility permission prompt is unavailable");
+    error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
+    throw error;
+  }
+  return result;
 }
 
 /**
@@ -327,9 +338,11 @@ export async function ensureAccessibility(options = {}) {
     }
   }
 
-  throw new Error(
+  const error = new Error(
     `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完成后重新运行 ./run.sh`
   );
+  error.code = "2FA_ACCESSIBILITY_DENIED";
+  throw error;
 }
 
 /**

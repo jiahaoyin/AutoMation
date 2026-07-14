@@ -5,15 +5,25 @@
  *   node scripts/preflight-2fa-permissions.mjs --quiet
  */
 
-import { run2FAPermissionPreflight } from "./lib/accessibility.js";
+import {
+  isAccessibilityDeniedError,
+  run2FAPermissionPreflight,
+} from "./lib/accessibility.js";
 
 const quiet = process.argv.includes("--quiet");
+const supervised = process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
 
 async function main() {
+  if (supervised) console.log("[2FA] status:permission_preflight_start");
   await run2FAPermissionPreflight({ quiet, timeoutMs: 120_000 });
+  if (supervised) console.log("[2FA] status:permission_preflight_ready");
 }
 
 main().catch((e) => {
+  if (supervised && isAccessibilityDeniedError(e)) {
+    console.warn("[2FA] status:permission_preflight_missing");
+    return;
+  }
   console.error("[2FA 权限]", e.message || e);
   process.exit(1);
 });

@@ -1509,7 +1509,7 @@ assert.doesNotMatch(
 assert.match(supervisedTerminalBridgeSource, /2FA 自动取码处理中/);
 assert.match(
   supervisedTerminalBridgeSource,
-  /\[2FA\] status:[\s\S]*two_fa_code_acquired[\s\S]*two_fa_code_unavailable[\s\S]*TWO_FA_LOGIN_FAILED[\s\S]*TWO_FA_CODE_UNAVAILABLE[\s\S]*TWO_FA_PAGE_FAILED/
+  /\[2FA\] status:[\s\S]*permission_preflight_missing[\s\S]*two_fa_code_acquired[\s\S]*two_fa_code_unavailable[\s\S]*TWO_FA_LOGIN_FAILED[\s\S]*TWO_FA_CODE_UNAVAILABLE[\s\S]*TWO_FA_PAGE_FAILED[\s\S]*ACCESSIBILITY_PERMISSION_REQUIRED/
 );
 assert.match(
   supervisedTerminalBridgeSource,
