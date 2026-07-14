@@ -72,25 +72,43 @@ function swiftFunctionBodyFromSource(source, name) {
 
 function assertSettingsOwnerSafetyContract(source) {
   const openSettings = swiftFunctionBodyFromSource(source, "openAppleAccountSettings");
+  assert.match(openSettings, /openAppleAccountSettings\(deadline:\s*Date\)/);
   assert.match(
     openSettings,
     /guard\s+let url\s*=\s*URL\(string:\s*s\),\s*NSWorkspace\.shared\.open\(url\)\s+else\s*\{\s*continue\s*\}/,
     "each account URL must use the NSWorkspace.open result as its fallback gate"
+  );
+  assert.match(
+    openSettings,
+    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return false\s*\}[\s\S]{0,180}launchApplication/,
+    "macOS 13+ must fail closed when every verified account-settings route fails"
   );
 
   const pageWait = swiftFunctionBodyFromSource(source, "waitForAppleAccountSettingsPage");
   assert.doesNotMatch(pageWait, /(?:true\s*\|\||\|\|\s*true)/);
   assert.match(
     pageWait,
-    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,300}\)\s*\{\s*return true\s*\}/,
-    "a running extension is success only after visible target-page AX evidence"
+    /if\s+treeContainsExactText\([\s\S]{0,500}names:\s*appleAccountPageEvidence[\s\S]{0,800}stableHits\s*>=\s*3[\s\S]{0,160}Date\(\)\.timeIntervalSince\(stableSince\)\s*>=\s*1\.2[\s\S]{0,80}return true/,
+    "a running extension is success only after stable visible target-page AX evidence"
   );
+  assert.match(pageWait, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
+  assert.match(pageWait, /stopIfCancelled\(\)/);
+  assert.match(pageWait, /remainingMilliseconds\(until:\s*boundedDeadline/);
+
+  const actionGate = swiftFunctionBodyFromSource(source, "actionMayProceed");
+  assert.match(actionGate, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
+  assert.match(actionGate, /isTrustedSystemSettingsProcess\(expectedPid\)/);
+  assert.match(actionGate, /deadline\.map\s*\{\s*Date\(\)\s*<\s*\$0\s*\}/);
 
   const frameClick = swiftFunctionBodyFromSource(source, "clickElementAtVerifiedFrame");
+  const uniqueSettings = swiftFunctionBodyFromSource(source, "uniqueTrustedSettingsApp");
+  assert.match(uniqueSettings, /runningApplications\.filter\(isTrustedSystemSettings\)/);
+  assert.match(uniqueSettings, /matches\.count\s*==\s*1\s*\?\s*matches\[0\]\s*:\s*nil/);
+  assert.doesNotMatch(uniqueSettings, /stopIfCancelled|cancellablePause/);
+  assert.match(frameClick, /let settingsApp\s*=\s*uniqueTrustedSettingsApp\(\)/);
+  assert.doesNotMatch(frameClick, /waitForSettingsApp\(/);
   const mouseUpCreated = frameClick.indexOf("let mouseUp = CGEvent(");
-  const finalOwnerCheck = frameClick.lastIndexOf(
-    "guard isTrustedSystemSettingsProcess(expectedPid)"
-  );
+  const finalOwnerCheck = frameClick.lastIndexOf("guard actionMayProceed(");
   const mouseDownPosted = frameClick.indexOf("mouseDown.post");
   assert.ok(
     mouseUpCreated >= 0 &&
@@ -98,6 +116,12 @@ function assertSettingsOwnerSafetyContract(source) {
       mouseDownPosted > finalOwnerCheck,
     "the current unique UI owner must be revalidated immediately before CGEvent posting"
   );
+  assert.match(
+    frameClick,
+    /elementBelongsToProcess\(element,\s*pid:\s*expectedPid\)\s+else\s*\{\s*return false\s*\}[\s\S]{0,220}guard actionMayProceed\([\s\S]{0,180}\)\s+else\s*\{\s*return false\s*\}\s+defer/,
+    "no AX query may occur between the final deadline gate and CGEvent posting"
+  );
+  assert.match(frameClick, /deadline:\s*Date\?\s*=\s*nil/);
 
   const press = swiftFunctionBodyFromSource(source, "pressElement");
   const scopeChecks = [...press.matchAll(/settingsActionScopeAllowsElement\(/g)].map(
@@ -106,13 +130,35 @@ function assertSettingsOwnerSafetyContract(source) {
   const pressActions = [...press.matchAll(/AXUIElementPerformAction/g)].map(
     (match) => match.index
   );
+  const deadlineChecks = [...press.matchAll(/actionMayProceed\(/g)].map(
+    (match) => match.index
+  );
   assert.ok(
     scopeChecks.length >= 3 &&
+      deadlineChecks.length >= 3 &&
       pressActions.length >= 2 &&
       scopeChecks[0] < pressActions[0] &&
       scopeChecks.at(-1) > pressActions[0] &&
       scopeChecks.at(-1) < pressActions.at(-1),
     "the complete action scope must be revalidated before every AX press"
+  );
+  assert.match(
+    press,
+    /guard actionMayProceed\([\s\S]{0,180}\)\s+else\s*\{\s*return false\s*\}\s+let err\s*=\s*AXUIElementPerformAction/,
+    "the first AX press must immediately follow its final deadline gate"
+  );
+  assert.match(
+    press,
+    /elementBelongsToProcess\(element,\s*pid:\s*expectedPid\)\s+else\s*\{\s*return false\s*\}[\s\S]{0,220}guard actionMayProceed\([\s\S]{0,180}\)\s+else\s*\{\s*return false\s*\}\s+return AXUIElementPerformAction/,
+    "the retry AX press must immediately follow its final deadline gate"
+  );
+
+  const request = swiftFunctionBodyFromSource(source, "requestVerificationCodeAlert");
+  const requestAttemptFlag = request.indexOf("verificationCodeRequested = true");
+  const requestActionBranch = request.indexOf("if attempt < 3");
+  assert.ok(
+    requestAttemptFlag >= 0 && requestAttemptFlag < requestActionBranch,
+    "request cleanup state must be set before either button action is attempted"
   );
 
   const windowlessStatus = swiftFunctionBodyFromSource(
@@ -149,6 +195,10 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.doesNotMatch(actionScope, /focusedWindow\s*==\s*nil/);
 
   const activation = swiftFunctionBodyFromSource(source, "activateSystemSettings");
+  assert.match(activation, /deadline:\s*Date/);
+  assert.match(activation, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
+  assert.match(activation, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
+  assert.match(activation, /focusTimeoutMs\s*=\s*remainingMilliseconds\([\s\S]{0,120}boundedDeadline/);
   const beforeHostActivation = activation.slice(0, activation.indexOf("app.unhide()"));
   assert.match(
     beforeHostActivation,
@@ -199,8 +249,11 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const finalClickGuard = [
-    "    guard isTrustedSystemSettingsProcess(expectedPid),",
-    "          elementBelongsToProcess(element, pid: expectedPid) else { return false }",
+    "    guard actionMayProceed(",
+    "        deadline: deadline,",
+    "        appElement: appElement,",
+    "        expectedPid: expectedPid",
+    "    ) else { return false }",
     "    defer { mouseUp.post(tap: .cghidEventTap) }",
   ].join("\n");
   const missingFinalClickGuard = source.replace(
@@ -214,7 +267,35 @@ function runSettingsOwnerMutationResistanceTest() {
   );
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingFinalClickGuard),
-    /immediately before CGEvent/
+    /final deadline gate|immediately before CGEvent/
+  );
+
+  const missingRequestAttemptState = source.replace(
+    "verificationCodeRequested = true",
+    "_ = verificationCodeRequested"
+  );
+  assert.notEqual(
+    missingRequestAttemptState,
+    source,
+    "request-attempt state mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingRequestAttemptState),
+    /before either button action/
+  );
+
+  const recursiveCancelCleanup = source.replace(
+    "let settingsApp = uniqueTrustedSettingsApp()",
+    "let settingsApp = waitForSettingsApp(timeoutMs: 0)"
+  );
+  assert.notEqual(
+    recursiveCancelCleanup,
+    source,
+    "cleanup-cancellation mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(recursiveCancelCleanup),
+    assert.AssertionError
   );
 
   const genericWindowlessOwner = source.replace(
@@ -287,9 +368,28 @@ function runSettingsOwnerMutationResistanceTest() {
     /before every AX press/
   );
 
+  const ignoredActionDeadline = source.replace(
+    "return deadline.map { Date() < $0 } ?? true",
+    "return true"
+  );
+  assert.notEqual(
+    ignoredActionDeadline,
+    source,
+    "action-deadline mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(ignoredActionDeadline),
+    assert.AssertionError
+  );
+
+  const activationBody = swiftFunctionBodyFromSource(source, "activateSystemSettings");
+  const weakenedActivationBody = activationBody.replace(
+    "        return true",
+    "        _ = initialWindowlessStatus"
+  );
   const missingInitialWindowlessReturn = source.replace(
-    "        return true\n    }\n\n    _ = app.unhide()",
-    "        _ = initialWindowlessStatus\n    }\n\n    _ = app.unhide()"
+    activationBody,
+    weakenedActivationBody
   );
   assert.notEqual(
     missingInitialWindowlessReturn,
@@ -834,7 +934,7 @@ function runSwiftCancellationContractTest() {
   assert.doesNotMatch(source, /\bscreenshot\s*:/);
 
   const timeoutFailure = source.slice(
-    source.indexOf("guard stableHits >= 2, let finalCode = code else"),
+    source.indexOf("guard Date() < deadline, stableHits >= 2, let finalCode = code else"),
     source.indexOf('logStep(7, "verification code detected")')
   );
   const timeoutClose = timeoutFailure.indexOf("closeVerificationCodeAlert");
@@ -842,14 +942,11 @@ function runSwiftCancellationContractTest() {
   assert.ok(timeoutClose >= 0, "normal timeout must attempt alert cleanup");
   assert.ok(timeoutEmit > timeoutClose, "timeout cleanup must precede failure output");
 
-  const finder = source.slice(
-    source.indexOf("func findSettingsApp"),
-    source.indexOf("func openAppleAccountSettings")
-  );
+  const finder = swiftFunctionBodyFromSource(source, "waitForSettingsApp");
   const ownerLoop = source.indexOf("for uiOwnerAttempt in 1...2");
-  const findCall = source.indexOf("guard let app = findSettingsApp(),", ownerLoop);
+  const findCall = source.indexOf("guard let app = waitForSettingsApp(", ownerLoop);
   const uiOwnerCall = source.indexOf(
-    "let settingsUIApp = waitForSettingsUIOwner(fallbackApp: app)",
+    "let settingsUIApp = waitForSettingsUIOwner(",
     findCall
   );
   const axCreate = source.indexOf(
@@ -857,8 +954,17 @@ function runSwiftCancellationContractTest() {
   );
   assert.match(source, /func isAppleSystemExecutable/);
   assert.match(source, /executableURL\.lastPathComponent/);
-  assert.match(finder, /guard isTrustedSystemSettings\(app\) else/);
+  assert.doesNotMatch(source, /\bfindSettingsApp\s*\(/);
+  assert.match(finder, /runningApplications\.filter\(isTrustedSystemSettings\)/);
   assert.doesNotMatch(finder, /localizedName/);
+  const settingsWaitStart = source.indexOf("func waitForSettingsApp(");
+  const settingsWait = source.slice(
+    settingsWaitStart,
+    source.indexOf("\nfunc ", settingsWaitStart + 5)
+  );
+  assert.match(settingsWait, /matches\.count\s*==\s*1/);
+  assert.match(settingsWait, /matches\.count\s*>\s*1/);
+  assert.match(settingsWait, /Date\(\)\s*>=\s*deadline/);
   assert.ok(
     ownerLoop >= 0 && findCall > ownerLoop && uiOwnerCall > findCall && axCreate > uiOwnerCall,
     "each bounded owner attempt must resolve the trusted UI before AX enumeration"
@@ -871,9 +977,23 @@ function runSwiftCancellationContractTest() {
   assert.match(ownerRecovery, /guard isTrustedSystemSettingsProcess\(settingsPid\) else \{ continue \}/);
   assert.match(ownerRecovery, /case \.ownerLost:\s*continue/);
   assert.match(ownerRecovery, /if ownerLost \{ continue \}/);
+  assert.match(ownerRecovery, /waitForSettingsApp\(/);
+  assert.match(ownerRecovery, /remainingMilliseconds\(until:\s*deadline,\s*cappedAt:\s*4_000\)/);
+  assert.match(ownerRecovery, /openAppleAccountSettings\(deadline:\s*deadline\)/);
+  assert.match(
+    ownerRecovery,
+    /activateSystemSettings\([\s\S]{0,220}deadline:\s*deadline/,
+    "the settings activation phase must share the global deadline"
+  );
+  assert.match(
+    ownerRecovery,
+    /windowlessAppleIDSettingsStatus\([\s\S]{0,180}==\s*\.eligible\s*\{\s*continue\s*\}/,
+    "a transient windowless pane loss must reopen the target page instead of failing immediately"
+  );
   assert.ok(
-    ownerRecovery.indexOf("waitForSettingsUIOwner(fallbackApp: app)") <
-      ownerRecovery.indexOf("AXUIElementCreateApplication(settingsUIApp.processIdentifier)"),
+    ownerRecovery.indexOf("let settingsUIApp = waitForSettingsUIOwner(") >= 0 &&
+      ownerRecovery.indexOf("let settingsUIApp = waitForSettingsUIOwner(") <
+        ownerRecovery.indexOf("AXUIElementCreateApplication(settingsUIApp.processIdentifier)"),
     "a restarted ExtensionKit owner must be rebound before any new AX traversal"
   );
 
@@ -935,6 +1055,12 @@ function runSwiftCancellationContractTest() {
   assert.match(openSettings, /NSWorkspace\.shared\.open\(url\)/);
   assert.match(openSettings, /else\s*\{\s*continue\s*\}/);
   assert.match(openSettings, /waitForAppleAccountSettingsPage/);
+  assert.match(openSettings, /stopIfCancelled\(\)/);
+  assert.match(openSettings, /guard Date\(\)\s*<\s*deadline else \{ return false \}/);
+  assert.match(
+    openSettings,
+    /guard\s+!expectsExtension,\s*Date\(\)\s*<\s*deadline\s+else\s*\{\s*return false\s*\}/
+  );
   assert.ok(
     openSettings.indexOf("continue") < openSettings.indexOf("return true"),
     "a rejected URL must fall through to the next account-settings route"
@@ -950,10 +1076,28 @@ function runSwiftCancellationContractTest() {
   assert.match(pageWait, /treeContainsExactText\(/);
   assert.match(pageWait, /names:\s*appleAccountPageEvidence/);
   assert.match(pageWait, /expectedPid:\s*pid/);
+  assert.match(pageWait, /var stablePid:\s*pid_t/);
+  assert.match(pageWait, /var stableHits\s*=\s*0/);
+  assert.match(pageWait, /var stableSince:\s*Date\?/);
+  assert.match(pageWait, /stableSince\s*=\s*Date\(\)/);
+  assert.match(pageWait, /stableSince\s*=\s*nil/);
+  assert.match(pageWait, /stableHits\s*>=\s*3[\s\S]{0,160}timeIntervalSince\(stableSince\)\s*>=\s*1\.2/);
+  assert.match(
+    openSettings,
+    /waitForAppleAccountSettingsPage\([\s\S]{0,100}timeoutMs:\s*5_000,[\s\S]{0,80}deadline:\s*deadline/
+  );
+  assert.match(pageWait, /let boundedDeadline\s*=\s*min\(deadline,\s*timeoutDeadline\)/);
+  assert.match(pageWait, /Date\(\)\s*>=\s*boundedDeadline/);
+  assert.match(pageWait, /stopIfCancelled\(\)/);
   assert.ok(
     pageWait.indexOf("treeContainsExactText(") < pageWait.indexOf("return true"),
     "a pre-existing extension is not success until the target Apple Account page is visible"
   );
+
+  const actionGate = swiftFunctionBodyFromSource(source, "actionMayProceed");
+  assert.match(actionGate, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
+  assert.match(actionGate, /isTrustedSystemSettingsProcess\(expectedPid\)/);
+  assert.match(actionGate, /deadline\.map\s*\{\s*Date\(\)\s*<\s*\$0\s*\}/);
 
   const guardedFunctions = [
     "findExactButton",
@@ -970,7 +1114,7 @@ function runSwiftCancellationContractTest() {
     const body = source.slice(start, source.indexOf("\nfunc ", start + 5));
     assert.match(
       body,
-      /isTrustedSystemSettingsProcess\(expectedPid\)/,
+      /(?:isTrustedSystemSettingsProcess\(expectedPid\)|actionMayProceed\()/,
       `${name} must revalidate the current unique Settings UI owner`
     );
   }
@@ -979,7 +1123,7 @@ function runSwiftCancellationContractTest() {
   const pressBody = source.slice(pressStart, source.indexOf("\nfunc ", pressStart + 5));
   assert.match(pressBody, /expectedPid:\s*pid_t/);
   assert.ok(
-    pressBody.indexOf("isTrustedSystemSettingsProcess(expectedPid)") <
+    pressBody.indexOf("actionMayProceed(") <
       pressBody.indexOf("AXUIElementPerformAction"),
     "AX press must revalidate the UI owner immediately before acting"
   );
@@ -1176,6 +1320,16 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(source, /activateIgnoringOtherApps/);
 
   const request = functionBody("requestVerificationCodeAlert");
+  assert.match(request, /deadline:\s*Date/);
+  assert.match(request, /actionMayProceed\([\s\S]{0,120}deadline:\s*deadline/);
+  assert.match(
+    request,
+    /pressExactButton\([\s\S]{0,180}deadline:\s*deadline/
+  );
+  assert.match(
+    request,
+    /waitForVerificationCodeAlert\([\s\S]{0,180}deadline:\s*deadline/
+  );
   const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
   assert.ok(retryMatch, "verification-code request must have a bounded retry loop");
   assert.ok(
@@ -1222,7 +1376,19 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(frameClick, /mouseDown\.post/);
   assert.match(frameClick, /defer[\s\S]*mouseUp\.post/);
   assert.doesNotMatch(frameClick, /screenshot|ocr|screencapture|CGWindowList/i);
-  assert.match(request, /clickElementAtVerifiedFrame\(\s*button,\s*expectedPid:/);
+  assert.match(
+    request,
+    /clickElementAtVerifiedFrame\(\s*button,\s*appElement:\s*appElement,\s*expectedPid:[\s\S]{0,120}deadline:\s*deadline/
+  );
+
+  const prepare = functionBody("prepareVerificationCodeAlert");
+  assert.match(prepare, /deadline:\s*Date/);
+  assert.match(prepare, /clickNamed\([\s\S]{0,180}deadline:\s*deadline/);
+  assert.match(
+    prepare,
+    /requestVerificationCodeAlert\([\s\S]{0,220}deadline:\s*deadline/
+  );
+  assert.match(prepare, /\.timedOut/);
 
   const alertRoot = functionBody("findVerificationCodeAlertRoot");
   assert.match(alertRoot, /roots\.append\(appElement\)/);
@@ -1279,8 +1445,9 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(closeAlert, /clickNamed/);
 
   assert.match(source, /let settingsPid\s*=\s*settingsUIApp\.processIdentifier/);
-  const requestCall = source.slice(source.indexOf("guard requestVerificationCodeAlert("));
-  assert.match(requestCall, /expectedPid:\s*settingsPid/);
+  const prepareCall = source.slice(source.indexOf("switch prepareVerificationCodeAlert("));
+  assert.match(prepareCall, /expectedPid:\s*settingsPid/);
+  assert.match(prepareCall, /deadline:\s*deadline/);
   assert.doesNotMatch(source, /blobDeep|findFormattedCodeInTree|extractSixDigit|looksLikeFormattedCode/);
   assert.doesNotMatch(source, /screencapture|captureWindowScreenshot|captureSheetScreenshot|OCR/i);
 }
@@ -1430,10 +1597,13 @@ function runVerificationCodeHardeningSourceContractTest() {
     "alert disappearance must be followed by a final owner revalidation"
   );
 
-  const stabilityPath = source.slice(source.indexOf("var stableHits"), successStart);
+  const stabilityPath = source.slice(
+    source.lastIndexOf("var stableHits", successStart),
+    successStart
+  );
   assert.match(
     stabilityPath,
-    /guard\s+stableHits\s*>=\s*2/,
+    /guard\s+Date\(\)\s*<\s*deadline,\s*stableHits\s*>=\s*2/,
     "a single candidate at the deadline must not become the returned code"
   );
 
@@ -1503,8 +1673,11 @@ function runTraditionalChineseStateContractTest() {
   assert.match(source, /let twoFactor\s*=\s*\[[^\]]*"雙重認證"/);
   assert.match(source, /let getCodeBtn\s*=\s*\[[^\]]*"取得驗證碼"/);
 
-  const resumeProbe = source.indexOf("if findGetCodeButton(", source.indexOf("let getCodeBtn"));
-  const signInClick = source.indexOf("clickNamed(in: appElement, names: signInSecurity,");
+  const resumeProbe = source.indexOf(
+    "let existingButton = findGetCodeButton(",
+    source.indexOf("func prepareVerificationCodeAlert(")
+  );
+  const signInClick = source.indexOf("if clickNamed(", resumeProbe);
   assert.ok(
     resumeProbe >= 0 && resumeProbe < signInClick,
     "Settings navigation must resume an already-open Two-Factor Authentication sheet"

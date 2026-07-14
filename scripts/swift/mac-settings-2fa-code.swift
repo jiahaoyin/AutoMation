@@ -507,12 +507,26 @@ func isTrustedSystemSettingsProcess(_ pid: pid_t) -> Bool {
     return settingsApps.count == 1 && settingsApps[0].processIdentifier == pid
 }
 
-func findSettingsApp() -> NSRunningApplication? {
-    for app in NSWorkspace.shared.runningApplications {
-        guard isTrustedSystemSettings(app) else { continue }
-        return app
-    }
-    return nil
+func waitForSettingsApp(timeoutMs: Int) -> NSRunningApplication? {
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    repeat {
+        stopIfCancelled()
+        let matches = NSWorkspace.shared.runningApplications.filter(isTrustedSystemSettings)
+        if matches.count == 1 { return matches[0] }
+        if matches.count > 1 || Date() >= deadline { return nil }
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 100)
+        if pauseMs <= 0 { return nil }
+        cancellablePause(UInt32(pauseMs * 1_000))
+    } while true
+}
+
+func uniqueTrustedSettingsApp() -> NSRunningApplication? {
+    let matches = NSWorkspace.shared.runningApplications.filter(isTrustedSystemSettings)
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func remainingMilliseconds(until deadline: Date, cappedAt cap: Int) -> Int {
+    min(max(0, Int(deadline.timeIntervalSinceNow * 1_000)), max(0, cap))
 }
 
 func findAppleIDSettingsExtension() -> NSRunningApplication? {
@@ -522,9 +536,17 @@ func findAppleIDSettingsExtension() -> NSRunningApplication? {
     return matches.count == 1 ? matches[0] : nil
 }
 
-func waitForAppleAccountSettingsPage(timeoutMs: Int) -> Bool {
-    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+func waitForAppleAccountSettingsPage(timeoutMs: Int, deadline: Date) -> Bool {
+    let timeoutDeadline = Date().addingTimeInterval(
+        TimeInterval(max(0, timeoutMs)) / 1000.0
+    )
+    let boundedDeadline = min(deadline, timeoutDeadline)
+    var stablePid: pid_t = 0
+    var stableHits = 0
+    var stableSince: Date?
     repeat {
+        stopIfCancelled()
+        if Date() >= boundedDeadline { return false }
         let matches = NSWorkspace.shared.runningApplications.filter(
             isTrustedAppleIDSettingsExtension
         )
@@ -538,11 +560,33 @@ func waitForAppleAccountSettingsPage(timeoutMs: Int) -> Bool {
                 expectedPid: pid,
                 maxNodes: 2_000
             ) {
-                return true
+                stopIfCancelled()
+                guard Date() < boundedDeadline else { return false }
+                if stablePid == pid {
+                    stableHits += 1
+                } else {
+                    stablePid = pid
+                    stableHits = 1
+                    stableSince = Date()
+                }
+                if stableHits >= 3,
+                   let stableSince,
+                   Date().timeIntervalSince(stableSince) >= 1.2 {
+                    return true
+                }
+            } else {
+                stablePid = 0
+                stableHits = 0
+                stableSince = nil
             }
+        } else {
+            stablePid = 0
+            stableHits = 0
+            stableSince = nil
         }
-        if Date() >= deadline { return false }
-        usleep(100_000)
+        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 150)
+        if pauseMs <= 0 { return false }
+        cancellablePause(UInt32(pauseMs * 1_000))
     } while true
 }
 
@@ -552,6 +596,7 @@ func waitForSettingsUIOwner(
 ) -> NSRunningApplication? {
     let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
     repeat {
+        stopIfCancelled()
         let matches = NSWorkspace.shared.runningApplications.filter(
             isTrustedAppleIDSettingsExtension
         )
@@ -562,19 +607,36 @@ func waitForSettingsUIOwner(
                 ? fallbackApp
                 : nil
         }
-        usleep(100_000)
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 100)
+        if pauseMs <= 0 {
+            return isTrustedSystemSettingsProcess(fallbackApp.processIdentifier)
+                ? fallbackApp
+                : nil
+        }
+        cancellablePause(UInt32(pauseMs * 1_000))
     } while true
 }
 
 @discardableResult
-func openAppleAccountSettings() -> Bool {
+func openAppleAccountSettings(deadline: Date) -> Bool {
     let expectsExtension = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 13
     for s in orderedAccountUrls() {
+        stopIfCancelled()
+        guard Date() < deadline else { return false }
         guard let url = URL(string: s), NSWorkspace.shared.open(url) else { continue }
-        if !expectsExtension || waitForAppleAccountSettingsPage(timeoutMs: 3_000) {
+        if !expectsExtension {
+            stopIfCancelled()
+            return Date() < deadline
+        }
+        if waitForAppleAccountSettingsPage(
+            timeoutMs: 5_000,
+            deadline: deadline
+        ) {
             return true
         }
     }
+    guard !expectsExtension, Date() < deadline else { return false }
+    stopIfCancelled()
     return NSWorkspace.shared.launchApplication(
         withBundleIdentifier: "com.apple.systempreferences",
         options: [],
@@ -583,12 +645,29 @@ func openAppleAccountSettings() -> Bool {
     )
 }
 
-func pressElement(
-    _ element: AXUIElement,
+func actionMayProceed(
+    deadline: Date?,
     appElement: AXUIElement,
     expectedPid: pid_t
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
+    if deadline != nil {
+        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+    }
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    return deadline.map { Date() < $0 } ?? true
+}
+
+func pressElement(
+    _ element: AXUIElement,
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date? = nil
+) -> Bool {
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           settingsActionScopeAllowsElement(
               element,
               appElement: appElement,
@@ -596,21 +675,56 @@ func pressElement(
           ),
           elementBelongsToProcess(element, pid: expectedPid),
           axBool(element, kAXEnabledAttribute as String) == true else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return false }
     let err = AXUIElementPerformAction(element, kAXPressAction as CFString)
     if err == .success { return true }
-    guard settingsActionScopeAllowsElement(
-        element,
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
+          settingsActionScopeAllowsElement(
+              element,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ) else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
         appElement: appElement,
         expectedPid: expectedPid
     ) else { return false }
     _ = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    usleep(80_000)
-    guard settingsActionScopeAllowsElement(
+    if let deadline {
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 80)
+        guard pauseMs > 0 else { return false }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
+    } else {
+        usleep(80_000)
+    }
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
+          settingsActionScopeAllowsElement(
               element,
               appElement: appElement,
               expectedPid: expectedPid
           ),
           elementBelongsToProcess(element, pid: expectedPid) else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return false }
     return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
 }
 
@@ -618,9 +732,14 @@ func pressExactButton(
     _ element: AXUIElement,
     appElement: AXUIElement,
     expectedPid: pid_t,
-    names: [String]
+    names: [String],
+    deadline: Date? = nil
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           settingsActionScopeAllowsElement(
               element,
               appElement: appElement,
@@ -634,7 +753,8 @@ func pressExactButton(
     return pressElement(
         element,
         appElement: appElement,
-        expectedPid: expectedPid
+        expectedPid: expectedPid,
+        deadline: deadline
     )
 }
 
@@ -795,17 +915,27 @@ func hitTestMatchesButton(
 
 func clickElementAtVerifiedFrame(
     _ element: AXUIElement,
+    appElement: AXUIElement,
     expectedPid: pid_t,
-    names: [String]
+    names: [String],
+    deadline: Date? = nil
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          let settingsApp = findSettingsApp(),
+    let focusTimeoutMs = deadline.map {
+        remainingMilliseconds(until: $0, cappedAt: 1_500)
+    } ?? 1_500
+    guard focusTimeoutMs > 0,
+          actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
+          let settingsApp = uniqueTrustedSettingsApp(),
           let buttonWindow = axWindowForElement(element, expectedPid: expectedPid),
           focusTrustedSettingsWindow(
               buttonWindow,
               app: settingsApp,
               expectedPid: expectedPid,
-              timeoutMs: 1_500
+              timeoutMs: focusTimeoutMs
           ),
           let buttonFrame = axFrame(element),
           buttonFrame.width >= 24,
@@ -844,8 +974,17 @@ func clickElementAtVerifiedFrame(
               mouseButton: .left
           ) else { return false }
 
-    guard isTrustedSystemSettingsProcess(expectedPid),
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: appElement,
+              expectedPid: expectedPid
+          ),
           elementBelongsToProcess(element, pid: expectedPid) else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return false }
     defer { mouseUp.post(tap: .cghidEventTap) }
     mouseDown.post(tap: .cghidEventTap)
     usleep(80_000)
@@ -856,9 +995,14 @@ func clickNamed(
     in root: AXUIElement,
     names: [String],
     expectedPid: pid_t,
+    deadline: Date,
     maxNodes: Int = 2_000
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: root,
+        expectedPid: expectedPid
+    ) else { return false }
     var queue: [AXUIElement] = [root]
     var seen: [AXUIElement] = []
     var matches: [AXUIElement] = []
@@ -885,7 +1029,11 @@ func clickNamed(
         queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
     }
-    guard isTrustedSystemSettingsProcess(expectedPid),
+    guard actionMayProceed(
+              deadline: deadline,
+              appElement: root,
+              expectedPid: expectedPid
+          ),
           matches.count == 1 else { return false }
     guard settingsActionScopeAllowsElement(
         matches[0],
@@ -895,7 +1043,8 @@ func clickNamed(
     return pressElement(
         matches[0],
         appElement: root,
-        expectedPid: expectedPid
+        expectedPid: expectedPid,
+        deadline: deadline
     )
 }
 
@@ -939,8 +1088,8 @@ func focusTrustedSettingsWindow(
     let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
     repeat {
         guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
-        if focusedWindowForProcess(expectedPid) == window { return true }
         if Date() >= deadline { return false }
+        if focusedWindowForProcess(expectedPid) == window { return true }
         usleep(100_000)
     } while true
 }
@@ -949,9 +1098,12 @@ func activateSystemSettings(
     _ app: NSRunningApplication,
     appElement: AXUIElement,
     expectedPid: pid_t,
+    deadline: Date,
     timeoutMs: Int = 4_000
 ) -> Bool {
-    guard isTrustedSystemSettings(app),
+    stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+    guard Date() < deadline,
+          isTrustedSystemSettings(app),
           isTrustedSystemSettingsProcess(expectedPid) else { return false }
 
     let initialWindowlessStatus = windowlessAppleIDSettingsStatus(
@@ -964,9 +1116,11 @@ func activateSystemSettings(
            names: appleAccountPageEvidence,
            expectedPid: expectedPid,
            maxNodes: 2_000
-       ) {
+       ), Date() < deadline {
         return true
     }
+    stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+    guard Date() < deadline else { return false }
 
     _ = app.unhide()
     if let bundleURL = app.bundleURL {
@@ -985,7 +1139,10 @@ func activateSystemSettings(
         kCFBooleanFalse
     )
 
-    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    let timeoutDeadline = Date().addingTimeInterval(
+        TimeInterval(max(0, timeoutMs)) / 1000.0
+    )
+    let boundedDeadline = min(deadline, timeoutDeadline)
     var lastWindowCount = 0
     var lastVisibleCount = 0
     var lastDialogCount = 0
@@ -1003,6 +1160,8 @@ func activateSystemSettings(
     var lastFrameMissingCount = 0
     var lastWindowlessStatus = WindowlessOwnerStatus.ownerUntrusted.rawValue
     repeat {
+        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+        if Date() >= boundedDeadline { break }
         guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
         if let focusedWindow = focusedWindowForProcess(expectedPid),
            axBool(focusedWindow, kAXHiddenAttribute as String) != true,
@@ -1019,7 +1178,7 @@ func activateSystemSettings(
                 names: appleAccountPageEvidence,
                 expectedPid: expectedPid,
                 maxNodes: 2_000
-            ) {
+            ), Date() < boundedDeadline {
             return true
         }
 
@@ -1085,12 +1244,17 @@ func activateSystemSettings(
             : mainWindows.count == 1
                 ? mainWindows[0]
                 : visibleWindows.count == 1 ? visibleWindows[0] : nil
+        let focusTimeoutMs = remainingMilliseconds(
+            until: boundedDeadline,
+            cappedAt: 500
+        )
         if let target,
+           focusTimeoutMs > 0,
            focusTrustedSettingsWindow(
                target,
                app: app,
                expectedPid: expectedPid,
-               timeoutMs: 500
+               timeoutMs: focusTimeoutMs
            ) {
             return true
         }
@@ -1101,8 +1265,13 @@ func activateSystemSettings(
             kAXHiddenAttribute as CFString,
             kCFBooleanFalse
         )
-        if Date() >= deadline { break }
-        usleep(100_000)
+        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 100)
+        if pauseMs <= 0 { break }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
     } while true
 
     logStep(
@@ -1160,6 +1329,7 @@ func closeVerificationCodeAlert(
             } else if !coordinateFallbackUsed {
                 _ = clickElementAtVerifiedFrame(
                     closeButton,
+                    appElement: appElement,
                     expectedPid: expectedPid,
                     names: verificationAlertCloseButtons
                 )
@@ -1210,17 +1380,31 @@ func cancellablePause(
 func waitForVerificationCodeAlert(
     appElement: AXUIElement,
     expectedPid: pid_t,
-    timeoutMs: Int
+    timeoutMs: Int,
+    deadline: Date
 ) -> Bool {
-    let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutMs)) / 1000.0)
+    let timeoutDeadline = Date().addingTimeInterval(
+        TimeInterval(max(0, timeoutMs)) / 1000.0
+    )
+    let boundedDeadline = min(deadline, timeoutDeadline)
     repeat {
-        guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
         stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+        if Date() >= boundedDeadline { return false }
+        guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
         if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
-            return true
+            return actionMayProceed(
+                deadline: boundedDeadline,
+                appElement: appElement,
+                expectedPid: expectedPid
+            )
         }
-        if Date() >= deadline { return false }
-        usleep(100_000)
+        let pauseMs = remainingMilliseconds(until: boundedDeadline, cappedAt: 100)
+        if pauseMs <= 0 { return false }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
     } while true
 }
 
@@ -1228,35 +1412,60 @@ func requestVerificationCodeAlert(
     appElement: AXUIElement,
     expectedPid: pid_t,
     twoFactorNames: [String],
-    buttonNames: [String]
+    buttonNames: [String],
+    deadline: Date
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return false }
     if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
+        let closeWaitMs = remainingMilliseconds(until: deadline, cappedAt: 1_000)
+        guard closeWaitMs > 0 else { return false }
         guard closeVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid,
-            waitForAlertMs: 1_000
+            waitForAlertMs: closeWaitMs
+        ), actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
         ), !hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) else {
             return false
         }
     }
 
     for attempt in 1...3 {
-        guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
-        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else { return false }
         if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
-            return true
+            return actionMayProceed(
+                deadline: deadline,
+                appElement: appElement,
+                expectedPid: expectedPid
+            )
         }
-        guard let button = findGetCodeButton(
+        let button = findGetCodeButton(
             appElement: appElement,
             expectedPid: expectedPid,
             twoFactorNames: twoFactorNames,
             buttonNames: buttonNames
-        ) else {
+        )
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else { return false }
+        guard let button else {
             if waitForVerificationCodeAlert(
                 appElement: appElement,
                 expectedPid: expectedPid,
-                timeoutMs: 250
+                timeoutMs: 250,
+                deadline: deadline
             ) {
                 return true
             }
@@ -1269,20 +1478,24 @@ func requestVerificationCodeAlert(
                 button,
                 appElement: appElement,
                 expectedPid: expectedPid,
-                names: buttonNames
+                names: buttonNames,
+                deadline: deadline
             )
         } else {
             _ = clickElementAtVerifiedFrame(
                 button,
+                appElement: appElement,
                 expectedPid: expectedPid,
-                names: buttonNames
+                names: buttonNames,
+                deadline: deadline
             )
         }
 
         if waitForVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid,
-            timeoutMs: 2_000
+            timeoutMs: 2_000,
+            deadline: deadline
         ) {
             return true
         }
@@ -1290,22 +1503,31 @@ func requestVerificationCodeAlert(
     return waitForVerificationCodeAlert(
         appElement: appElement,
         expectedPid: expectedPid,
-        timeoutMs: 500
+        timeoutMs: 500,
+        deadline: deadline
     )
 }
 
 enum VerificationPreparationResult {
     case ready
     case ownerLost
+    case timedOut
     case twoFactorNotFound
     case alertNotOpened
 }
 
 func prepareVerificationCodeAlert(
     appElement: AXUIElement,
-    expectedPid: pid_t
+    expectedPid: pid_t,
+    deadline: Date
 ) -> VerificationPreparationResult {
-    guard isTrustedSystemSettingsProcess(expectedPid) else { return .ownerLost }
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else {
+        return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+    }
     logNavigationState(
         appElement: appElement,
         expectedPid: expectedPid,
@@ -1314,23 +1536,53 @@ func prepareVerificationCodeAlert(
         buttonNames: getCodeBtn
     )
 
-    stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
-    if findGetCodeButton(
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else {
+        return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+    }
+    let existingButton = findGetCodeButton(
         appElement: appElement,
         expectedPid: expectedPid,
         twoFactorNames: twoFactor,
         buttonNames: getCodeBtn
-    ) != nil {
+    )
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else {
+        return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+    }
+    if existingButton != nil {
         logStep(3, "Sign-In & Security already open")
         logStep(4, "Two-Factor Authentication already open")
     } else {
         logStep(3, "click Sign-In & Security")
-        if clickNamed(in: appElement, names: signInSecurity, expectedPid: expectedPid) {
-            cancellablePause(1_200_000, appElement: appElement, expectedPid: expectedPid)
+        if clickNamed(
+            in: appElement,
+            names: signInSecurity,
+            expectedPid: expectedPid,
+            deadline: deadline
+        ) {
+            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 1_200)
+            guard pauseMs > 0 else { return .timedOut }
+            cancellablePause(
+                UInt32(pauseMs * 1_000),
+                appElement: appElement,
+                expectedPid: expectedPid
+            )
         }
-        guard isTrustedSystemSettingsProcess(expectedPid) else { return .ownerLost }
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else {
+            return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+        }
 
-        stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
         if findGetCodeButton(
             appElement: appElement,
             expectedPid: expectedPid,
@@ -1340,30 +1592,72 @@ func prepareVerificationCodeAlert(
             logStep(4, "Two-Factor Authentication already open")
         } else {
             logStep(4, "click Two-Factor Authentication")
-            if !clickNamed(in: appElement, names: twoFactor, expectedPid: expectedPid),
-               findGetCodeButton(
+            let openedTwoFactor = clickNamed(
+                in: appElement,
+                names: twoFactor,
+                expectedPid: expectedPid,
+                deadline: deadline
+            )
+            if !openedTwoFactor {
+                let fallbackButton = findGetCodeButton(
                    appElement: appElement,
                    expectedPid: expectedPid,
                    twoFactorNames: twoFactor,
                    buttonNames: getCodeBtn
-               ) == nil {
-                return isTrustedSystemSettingsProcess(expectedPid)
-                    ? .twoFactorNotFound
-                    : .ownerLost
+                )
+                guard actionMayProceed(
+                    deadline: deadline,
+                    appElement: appElement,
+                    expectedPid: expectedPid
+                ) else {
+                    return isTrustedSystemSettingsProcess(expectedPid)
+                        ? .timedOut
+                        : .ownerLost
+                }
+                if fallbackButton == nil {
+                    return .twoFactorNotFound
+                }
             }
-            cancellablePause(1_200_000, appElement: appElement, expectedPid: expectedPid)
-            guard isTrustedSystemSettingsProcess(expectedPid) else { return .ownerLost }
+            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 1_200)
+            guard pauseMs > 0 else { return .timedOut }
+            cancellablePause(
+                UInt32(pauseMs * 1_000),
+                appElement: appElement,
+                expectedPid: expectedPid
+            )
+            guard actionMayProceed(
+                deadline: deadline,
+                appElement: appElement,
+                expectedPid: expectedPid
+            ) else {
+                return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+            }
         }
     }
 
-    stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else {
+        return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+    }
     logStep(5, "click Get Verification Code")
-    guard requestVerificationCodeAlert(
+    let alertRequested = requestVerificationCodeAlert(
         appElement: appElement,
         expectedPid: expectedPid,
         twoFactorNames: twoFactor,
-        buttonNames: getCodeBtn
+        buttonNames: getCodeBtn,
+        deadline: deadline
+    )
+    guard actionMayProceed(
+        deadline: deadline,
+        appElement: appElement,
+        expectedPid: expectedPid
     ) else {
+        return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+    }
+    guard alertRequested else {
         return isTrustedSystemSettingsProcess(expectedPid)
             ? .alertNotOpened
             : .ownerLost
@@ -1398,32 +1692,55 @@ for uiOwnerAttempt in 1...2 {
     } else {
         logStep(1, "recovering Apple Account settings UI")
     }
-    guard Date() < deadline, openAppleAccountSettings() else { continue }
-    cancellablePause(1_500_000)
+    guard Date() < deadline, openAppleAccountSettings(deadline: deadline) else { continue }
+    let settleMs = remainingMilliseconds(until: deadline, cappedAt: 150)
+    guard settleMs > 0 else { continue }
+    cancellablePause(UInt32(settleMs * 1_000))
 
-    guard let app = findSettingsApp(),
-          let settingsUIApp = waitForSettingsUIOwner(fallbackApp: app) else { continue }
+    guard let app = waitForSettingsApp(
+        timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
+    ), let settingsUIApp = waitForSettingsUIOwner(
+        fallbackApp: app,
+        timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 4_000)
+    ) else { continue }
     let appElement = AXUIElementCreateApplication(settingsUIApp.processIdentifier)
     let settingsPid = settingsUIApp.processIdentifier
     guard activateSystemSettings(
         app,
         appElement: appElement,
-        expectedPid: settingsPid
+        expectedPid: settingsPid,
+        deadline: deadline
     ) else {
+        if windowlessAppleIDSettingsStatus(
+            appElement: appElement,
+            expectedPid: settingsPid
+        ) == .eligible {
+            continue
+        }
         if isTrustedSystemSettingsProcess(settingsPid) {
             emit(Output(ok: false, code: nil, message: "System Settings focus unavailable"))
         }
         continue
     }
-    cancellablePause(300_000, appElement: appElement, expectedPid: settingsPid)
+    let readyPauseMs = remainingMilliseconds(until: deadline, cappedAt: 300)
+    guard readyPauseMs > 0 else { continue }
+    cancellablePause(
+        UInt32(readyPauseMs * 1_000),
+        appElement: appElement,
+        expectedPid: settingsPid
+    )
+    guard Date() < deadline else { continue }
     guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
     logStep(2, "System Settings ready")
 
     switch prepareVerificationCodeAlert(
         appElement: appElement,
-        expectedPid: settingsPid
+        expectedPid: settingsPid,
+        deadline: deadline
     ) {
     case .ownerLost:
+        continue
+    case .timedOut:
         continue
     case .twoFactorNotFound:
         emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
@@ -1444,15 +1761,24 @@ for uiOwnerAttempt in 1...2 {
     var stableHits = 0
     var ownerLost = false
     while Date() < deadline {
-        cancellablePause(250_000, appElement: appElement, expectedPid: settingsPid)
+        let pollPauseMs = remainingMilliseconds(until: deadline, cappedAt: 250)
+        if pollPauseMs <= 0 { break }
+        cancellablePause(
+            UInt32(pollPauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: settingsPid
+        )
+        guard Date() < deadline else { break }
         guard isTrustedSystemSettingsProcess(settingsPid) else {
             ownerLost = true
             break
         }
-        if let detectedCode = scanCodeFromAlertOnly(
+        let detectedCode = scanCodeFromAlertOnly(
             appElement: appElement,
             expectedPid: settingsPid
-        ) {
+        )
+        guard Date() < deadline else { break }
+        if let detectedCode {
             if code == detectedCode {
                 stableHits += 1
             } else {
@@ -1467,7 +1793,7 @@ for uiOwnerAttempt in 1...2 {
     }
     if ownerLost { continue }
 
-    guard stableHits >= 2, let finalCode = code else {
+    guard Date() < deadline, stableHits >= 2, let finalCode = code else {
         _ = closeVerificationCodeAlert(
             appElement: appElement,
             expectedPid: settingsPid,
