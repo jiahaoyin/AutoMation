@@ -1151,9 +1151,15 @@ export async function runSupervisedTerminalBridge(options = {}) {
           state?.pid === child.pid &&
           state?.pgid === child.pid &&
           state?.startedAt === productionIdentity?.startedAt &&
+          state?.commandId === PRODUCTION_SUPERVISOR_COMMAND_ID &&
+          state?.commandSha256 ===
+            crypto
+              .createHash("sha256")
+              .update(productionIdentity.command, "utf8")
+              .digest("hex") &&
           ["inactive", "cleanup_failed"].includes(state?.state) &&
           Object.keys(state).sort().join(",") ===
-            "nonce,pgid,pid,startedAt,state,version";
+            "commandId,commandSha256,nonce,pgid,pid,startedAt,state,version";
       } catch {
         productionStateConfirmed = false;
       }

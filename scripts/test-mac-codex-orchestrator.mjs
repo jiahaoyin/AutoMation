@@ -1476,6 +1476,10 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
+  /productionStateConfirmed\s*=[\s\S]*state\?\.commandId === PRODUCTION_SUPERVISOR_COMMAND_ID[\s\S]*state\?\.commandSha256 ===[\s\S]*productionIdentity\.command[\s\S]*commandId,commandSha256,nonce,pgid,pid,startedAt,state,version/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
   /writeProductionLaunchGate\(productionLaunchGatePath, child\.pid, context\.nonce\)/
 );
 assert.match(
