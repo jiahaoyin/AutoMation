@@ -115,24 +115,30 @@ function assertSettingsOwnerSafetyContract(source) {
     "the complete action scope must be revalidated before every AX press"
   );
 
+  const windowlessStatus = swiftFunctionBodyFromSource(
+    source,
+    "windowlessAppleIDSettingsStatus"
+  );
+  assert.match(
+    windowlessStatus,
+    /isTrustedAppleIDSettingsExtension\(owner\)/,
+    "windowless actions require the exact AppleIDSettings ExtensionKit owner"
+  );
+  assert.match(windowlessStatus, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
+  assert.match(windowlessStatus, /!role\.isEmpty\s+else\s*\{\s*return \.windowRoleInvalid\s*\}/);
+  assert.match(windowlessStatus, /if role\s*==\s*kAXWindowRole/);
+  assert.match(windowlessStatus, /axElementArrayStrict\(/);
+  assert.match(
+    windowlessStatus,
+    /if hasStandardWindow\s*\{\s*return \.standardWindowPresent\s*\}/,
+    "windowless actions must prove the same PID exposes no standard AXWindow"
+  );
   const windowlessOwner = swiftFunctionBodyFromSource(
     source,
     "isWindowlessAppleIDSettingsOwner"
   );
-  assert.match(
-    windowlessOwner,
-    /isTrustedAppleIDSettingsExtension\(owner\)/,
-    "windowless actions require the exact AppleIDSettings ExtensionKit owner"
-  );
-  assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
-  assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
-  assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
-  assert.match(windowlessOwner, /axElementArrayStrict\(/);
-  assert.match(
-    windowlessOwner,
-    /return\s+!hasStandardWindow\s*&&\s*isTrustedSystemSettingsProcess\(expectedPid\)/,
-    "windowless actions must prove the same PID exposes no standard AXWindow"
-  );
+  assert.match(windowlessOwner, /windowlessAppleIDSettingsStatus\(/);
+  assert.match(windowlessOwner, /==\s*\.eligible/);
 
   const actionScope = swiftFunctionBodyFromSource(
     source,
@@ -204,8 +210,8 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const genericWindowlessOwner = source.replace(
-    "isTrustedAppleIDSettingsExtension(owner) else { return false }",
-    "isTrustedSystemSettings(owner) else { return false }"
+    "isTrustedAppleIDSettingsExtension(owner) else { return .ownerUntrusted }",
+    "isTrustedSystemSettings(owner) else { return .ownerUntrusted }"
   );
   assert.notEqual(
     genericWindowlessOwner,
@@ -218,8 +224,8 @@ function runSettingsOwnerMutationResistanceTest() {
   );
 
   const uncheckedStandardWindow = source.replace(
-    "return !hasStandardWindow && isTrustedSystemSettingsProcess(expectedPid)",
-    "return isTrustedSystemSettingsProcess(expectedPid)"
+    "if hasStandardWindow { return .standardWindowPresent }",
+    "_ = hasStandardWindow"
   );
   assert.notEqual(
     uncheckedStandardWindow,
@@ -1060,14 +1066,17 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(navigationClick, /matches\.count\s*==\s*1/);
   assert.doesNotMatch(navigationClick, /blob\.contains|blob\s*=|names\.contains/);
 
+  const windowlessStatus = functionBody("windowlessAppleIDSettingsStatus");
+  assert.match(windowlessStatus, /isTrustedAppleIDSettingsExtension\(owner\)/);
+  assert.match(windowlessStatus, /kAXWindowsAttribute/);
+  assert.match(windowlessStatus, /axElementArrayStrict\(/);
+  assert.match(windowlessStatus, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
+  assert.match(windowlessStatus, /!role\.isEmpty\s+else\s*\{\s*return \.windowRoleInvalid\s*\}/);
+  assert.match(windowlessStatus, /if role\s*==\s*kAXWindowRole/);
+  assert.match(windowlessStatus, /if hasStandardWindow\s*\{\s*return \.standardWindowPresent\s*\}/);
   const windowlessOwner = functionBody("isWindowlessAppleIDSettingsOwner");
-  assert.match(windowlessOwner, /isTrustedAppleIDSettingsExtension\(owner\)/);
-  assert.match(windowlessOwner, /kAXWindowsAttribute/);
-  assert.match(windowlessOwner, /axElementArrayStrict\(/);
-  assert.match(windowlessOwner, /let role\s*=\s*axString\(candidate,\s*kAXRoleAttribute/);
-  assert.match(windowlessOwner, /!role\.isEmpty\s+else\s*\{\s*return false\s*\}/);
-  assert.match(windowlessOwner, /if role\s*==\s*kAXWindowRole/);
-  assert.match(windowlessOwner, /!hasStandardWindow/);
+  assert.match(windowlessOwner, /windowlessAppleIDSettingsStatus\(/);
+  assert.match(windowlessOwner, /==\s*\.eligible/);
 
   const actionScope = functionBody("settingsActionScopeAllowsElement");
   assert.match(actionScope, /if let focusedWindow = focusedWindowForProcess\(expectedPid\)/);
@@ -1107,7 +1116,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /focusedWindowForProcess\(expectedPid\)[\s\S]{0,180}kAXHiddenAttribute[\s\S]{0,120}axFrame\(focusedWindow\)/);
   assert.match(
     activation,
-    /isWindowlessAppleIDSettingsOwner\([\s\S]{0,220}treeContainsExactText\([\s\S]{0,260}names:\s*appleAccountPageEvidence[\s\S]{0,220}return true/
+    /windowlessAppleIDSettingsStatus\([\s\S]{0,260}windowlessStatus\s*==\s*\.eligible[\s\S]{0,220}treeContainsExactText\([\s\S]{0,260}names:\s*appleAccountPageEvidence[\s\S]{0,220}return true/
   );
   assert.ok(
     activation.indexOf("treeContainsExactText(") < activation.indexOf("let windows = collectWindows("),
@@ -1122,6 +1131,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(activation, /roleOther=/);
   assert.match(activation, /hidden=/);
   assert.match(activation, /frameMissing=/);
+  assert.match(activation, /windowless=/);
   assert.match(activation, /unhidden=/);
   assert.match(activation, /framed=/);
   assert.match(activation, /minimized=/);

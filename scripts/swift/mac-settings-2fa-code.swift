@@ -699,26 +699,52 @@ func focusedWindowForProcess(_ pid: pid_t) -> AXUIElement? {
     return window
 }
 
+enum WindowlessOwnerStatus: String {
+    case ownerUntrusted = "owner_untrusted"
+    case rootPidInvalid = "root_pid_invalid"
+    case windowsUnavailable = "windows_unavailable"
+    case windowPidInvalid = "window_pid_invalid"
+    case windowRoleInvalid = "window_role_invalid"
+    case standardWindowPresent = "standard_window_present"
+    case ownerChanged = "owner_changed"
+    case eligible
+}
+
+func windowlessAppleIDSettingsStatus(
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> WindowlessOwnerStatus {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          let owner = NSRunningApplication(processIdentifier: expectedPid),
+          isTrustedAppleIDSettingsExtension(owner) else { return .ownerUntrusted }
+    guard elementBelongsToProcess(appElement, pid: expectedPid) else {
+        return .rootPidInvalid
+    }
+    guard let candidates = axElementArrayStrict(
+        appElement,
+        kAXWindowsAttribute as String
+    ) else { return .windowsUnavailable }
+    var hasStandardWindow = false
+    for candidate in candidates {
+        guard elementBelongsToProcess(candidate, pid: expectedPid) else {
+            return .windowPidInvalid
+        }
+        guard let role = axString(candidate, kAXRoleAttribute as String),
+              !role.isEmpty else { return .windowRoleInvalid }
+        if role == kAXWindowRole as String { hasStandardWindow = true }
+    }
+    if hasStandardWindow { return .standardWindowPresent }
+    return isTrustedSystemSettingsProcess(expectedPid) ? .eligible : .ownerChanged
+}
+
 func isWindowlessAppleIDSettingsOwner(
     appElement: AXUIElement,
     expectedPid: pid_t
 ) -> Bool {
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          elementBelongsToProcess(appElement, pid: expectedPid),
-          let owner = NSRunningApplication(processIdentifier: expectedPid),
-          isTrustedAppleIDSettingsExtension(owner) else { return false }
-    guard let candidates = axElementArrayStrict(
-        appElement,
-        kAXWindowsAttribute as String
-    ) else { return false }
-    var hasStandardWindow = false
-    for candidate in candidates {
-        guard elementBelongsToProcess(candidate, pid: expectedPid),
-              let role = axString(candidate, kAXRoleAttribute as String),
-              !role.isEmpty else { return false }
-        if role == kAXWindowRole as String { hasStandardWindow = true }
-    }
-    return !hasStandardWindow && isTrustedSystemSettingsProcess(expectedPid)
+    windowlessAppleIDSettingsStatus(
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) == .eligible
 }
 
 func settingsActionScopeAllowsElement(
@@ -961,6 +987,7 @@ func activateSystemSettings(
     var lastRoleOtherCount = 0
     var lastHiddenCount = 0
     var lastFrameMissingCount = 0
+    var lastWindowlessStatus = WindowlessOwnerStatus.ownerUntrusted.rawValue
     repeat {
         guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
         if let focusedWindow = focusedWindowForProcess(expectedPid),
@@ -968,10 +995,12 @@ func activateSystemSettings(
            axFrame(focusedWindow) != nil {
             return true
         }
-        if isWindowlessAppleIDSettingsOwner(
+        let windowlessStatus = windowlessAppleIDSettingsStatus(
             appElement: appElement,
             expectedPid: expectedPid
-        ), treeContainsExactText(
+        )
+        lastWindowlessStatus = windowlessStatus.rawValue
+        if windowlessStatus == .eligible, treeContainsExactText(
                 appElement,
                 names: appleAccountPageEvidence,
                 expectedPid: expectedPid,
@@ -1064,7 +1093,7 @@ func activateSystemSettings(
 
     logStep(
         1,
-        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) pid=\(lastPidCount) roleWindow=\(lastRoleCount) roleEmpty=\(lastRoleEmptyCount) roleSheet=\(lastRoleSheetCount) roleGroup=\(lastRoleGroupCount) roleOther=\(lastRoleOtherCount) hidden=\(lastHiddenCount) frameMissing=\(lastFrameMissingCount) unhidden=\(lastUnhiddenCount) framed=\(lastFramedCount) minimized=\(lastMinimizedCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount)"
+        "activation state trusted=\(AXIsProcessTrusted() ? 1 : 0) active=\(app.isActive ? 1 : 0) windows=\(lastWindowCount) pid=\(lastPidCount) roleWindow=\(lastRoleCount) roleEmpty=\(lastRoleEmptyCount) roleSheet=\(lastRoleSheetCount) roleGroup=\(lastRoleGroupCount) roleOther=\(lastRoleOtherCount) hidden=\(lastHiddenCount) frameMissing=\(lastFrameMissingCount) unhidden=\(lastUnhiddenCount) framed=\(lastFramedCount) minimized=\(lastMinimizedCount) visible=\(lastVisibleCount) dialogs=\(lastDialogCount) main=\(lastMainCount) windowless=\(lastWindowlessStatus)"
     )
     return false
 }
