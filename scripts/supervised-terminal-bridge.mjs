@@ -451,7 +451,9 @@ export function buildProductionProcessSupervisorScript() {
     "trap 'interrupted_status=143' TERM",
     "trap 'interrupted_status=129' HUP",
     "expected_production_command=\"$*\"",
-    "\"$@\" <&0 >&1 2>&2 &",
+    'supervisor_status() { print -r -- "$1" >&3; }',
+    'supervisor_status "target-launch" || exit 125',
+    "\"$@\" 3>&- <&0 >&1 2>&2 &",
     "production_pid=$!",
     "production_pgid=''",
     "production_started_at=''",
@@ -485,6 +487,7 @@ export function buildProductionProcessSupervisorScript() {
     "  /usr/bin/unlink \"$group_snapshot\" 2>/dev/null || true",
     "  exit 125",
     "fi",
+    'if [[ -n "$production_pgid" ]]; then supervisor_status "target-identity-ready" || exit 125; else supervisor_status "target-identity-unavailable" || exit 125; fi',
     "monitor_runtime() {",
     "  while target_identity_is_current; do",
     "    if runtime_is_allowed; then",
@@ -519,15 +522,18 @@ export function buildProductionProcessSupervisorScript() {
     "set +e",
     "wait \"$production_pid\"",
     "production_status=$?",
+    'supervisor_status "target-exit:$production_status" || exit 125',
     "wait \"$monitor_pid\"",
     "monitor_status=$?",
+    'supervisor_status "monitor-exit:$monitor_status" || exit 125',
     "set -e",
     "[[ \"$monitor_status\" == (124|125|130) ]] && production_status=$monitor_status",
     "(( interrupted_status == 0 )) || production_status=$interrupted_status",
+    'supervisor_status "final-exit:$production_status" || exit 125',
     "cleanup_status=0",
     "cleanup_group_members || cleanup_status=125",
     "/usr/bin/unlink \"$group_snapshot\" 2>/dev/null || cleanup_status=125",
-    "(( cleanup_status == 0 )) || exit \"$cleanup_status\"",
+    'if (( cleanup_status != 0 )); then supervisor_status "cleanup-failed" || exit 125; fi',
     "exit \"$production_status\"",
   ].join("\n");
 }
@@ -664,6 +670,107 @@ function createOutcome(now = Date.now) {
     promise,
     resolve,
   };
+}
+
+export function createSupervisorStatusProtocol() {
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+  let state = 0;
+  let invalid = false;
+  let targetExit = null;
+  let monitorExit = null;
+  let finalExit = null;
+  let cleanupFailed = false;
+  let finished = false;
+
+  const accept = (line) => {
+    if (invalid || finished || line.length === 0 || line.length > 64) {
+      invalid = true;
+      return;
+    }
+    if (state === 0 && line === "target-launch") {
+      state = 1;
+      return;
+    }
+    if (
+      state === 1 &&
+      ["target-identity-ready", "target-identity-unavailable"].includes(line)
+    ) {
+      state = 2;
+      return;
+    }
+    const targetMatch = state === 2 ? line.match(/^target-exit:(\d{1,3})$/) : null;
+    if (targetMatch && Number(targetMatch[1]) <= 255) {
+      targetExit = Number(targetMatch[1]);
+      state = 3;
+      return;
+    }
+    const monitorMatch = state === 3 ? line.match(/^monitor-exit:(\d{1,3})$/) : null;
+    if (monitorMatch && [0, 124, 125, 130, 143].includes(Number(monitorMatch[1]))) {
+      monitorExit = Number(monitorMatch[1]);
+      state = 4;
+      return;
+    }
+    const finalMatch = state === 4 ? line.match(/^final-exit:(\d{1,3})$/) : null;
+    if (finalMatch && Number(finalMatch[1]) <= 255) {
+      finalExit = Number(finalMatch[1]);
+      state = 5;
+      return;
+    }
+    if (state === 5 && line === "cleanup-failed") {
+      cleanupFailed = true;
+      state = 6;
+      return;
+    }
+    invalid = true;
+  };
+
+  const push = (chunk) => {
+    if (finished || invalid) return;
+    buffer += decoder.write(Buffer.from(chunk));
+    if (Buffer.byteLength(buffer, "utf8") > 1024) {
+      invalid = true;
+      return;
+    }
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      accept(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+    }
+  };
+
+  const finish = () => {
+    if (!finished) {
+      buffer += decoder.end();
+      if (buffer.length !== 0) invalid = true;
+      finished = true;
+    }
+    return {
+      complete: !invalid && (state === 5 || state === 6),
+      targetExit,
+      monitorExit,
+      finalExit,
+      cleanupFailed,
+    };
+  };
+
+  return { push, finish };
+}
+
+export function classifySupervisorStatus(
+  status,
+  productionExit,
+  { externalTerminationAttempted = false } = {}
+) {
+  if (
+    status?.complete !== true ||
+    !Number.isInteger(productionExit) ||
+    status.finalExit !== productionExit ||
+    (status.monitorExit === 143 && externalTerminationAttempted !== true)
+  ) {
+    return "invalid";
+  }
+  return status.cleanupFailed === true ? "cleanup_failed" : "valid";
 }
 
 function productionEnvironment(context) {
@@ -848,6 +955,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let manualPromptVisible = false;
     let manualPromptCount = 0;
     let productionStage = "starting";
+    const supervisorStatusProtocol = createSupervisorStatusProtocol();
     const emittedStatuses = new Set();
     const successMarkerBytes = Buffer.from(SUPERVISED_SUCCESS_MARKER, "utf8");
     const manualPromptBytes = Buffer.from(MANUAL_CODE_PROMPT, "utf8");
@@ -875,7 +983,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
           productionStage = "accessibility_missing";
           emitStatus(
             "accessibility-missing",
-            "[mac:supervised] Terminal 辅助功能权限未就绪，将继续浏览器并保留手动验证码兜底"
+            "[mac:supervised] 原生 2FA helper 未获辅助功能授权；Terminal 已勾选时请同时允许系统新显示的 Codex/helper 项，流程将继续并保留手动验证码兜底"
           );
         } else if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
           productionStage = "two_fa_code_acquired";
@@ -1086,10 +1194,15 @@ export async function runSupervisedTerminalBridge(options = {}) {
         cwd: context.repo,
         detached: true,
         env,
-        stdio: [input?.isTTY === true ? input : "ignore", "pipe", "pipe"],
+        stdio: [input?.isTTY === true ? input : "ignore", "pipe", "pipe", "pipe"],
       }
     );
     outcome = createOutcome(now);
+    const supervisorStatusStream = child.stdio?.[3];
+    if (!supervisorStatusStream) {
+      throw new Error("production supervisor status stream is unavailable");
+    }
+    supervisorStatusStream.on("data", (chunk) => supervisorStatusProtocol.push(chunk));
     child.once("error", () => outcome.resolve({ exitCode: 1, signal: null }));
     child.once("close", (exitCode, signal) => outcome.resolve({ exitCode, signal }));
     if (!Number.isInteger(child?.pid) || child.pid <= 0) {
@@ -1144,6 +1257,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const timedOut =
       now() >= context.deadlineMs &&
       (!outcome.settled || outcome.settledAt >= context.deadlineMs);
+    const externalTerminationAttempted =
+      !outcome.settled &&
+      processGroupExists(child.pid) &&
+      processIdentityMatches(productionIdentity, productionIdentityMatches);
     let cleanupSucceeded = await terminateGroup(
       child,
       productionIdentity,
@@ -1170,6 +1287,15 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const productionExit = Number.isInteger(outcome.value?.exitCode)
       ? outcome.value.exitCode
       : 1;
+    const supervisorStatus = supervisorStatusProtocol.finish();
+    const supervisorStatusOutcome = classifySupervisorStatus(
+      supervisorStatus,
+      productionExit,
+      { externalTerminationAttempted }
+    );
+    if (supervisorStatusOutcome === "invalid") {
+      outputForwardingFailed = true;
+    }
     const headAfter = git(context.repo, ["rev-parse", "HEAD"]);
     const finalStatus = git(context.repo, ["status", "--porcelain=v1"]);
     const markerFile = readBoundedRegularFile(env.APPLE_AUTOMATION_ACCEPTANCE_MARKER, 64);
@@ -1206,7 +1332,13 @@ export async function runSupervisedTerminalBridge(options = {}) {
     }
 
     let failureClass = "NONE";
-    if (!cleanupSucceeded || !ruyiPageCleanup.ok) failureClass = "PROCESS_CLEANUP_FAILED";
+    if (
+      !cleanupSucceeded ||
+      !ruyiPageCleanup.ok ||
+      supervisorStatusOutcome === "cleanup_failed"
+    ) {
+      failureClass = "PROCESS_CLEANUP_FAILED";
+    }
     else if (markerConfirmed && !ruyiPageCleanup.seen) {
       failureClass = "PROCESS_CLEANUP_FAILED";
     }

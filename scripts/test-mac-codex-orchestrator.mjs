@@ -40,6 +40,8 @@ import {
 } from "./lib/ruyipage-backend-runner.js";
 import {
   buildProductionProcessSupervisorScript,
+  classifySupervisorStatus,
+  createSupervisorStatusProtocol,
   readBoundedRegularFile,
 } from "./supervised-terminal-bridge.mjs";
 
@@ -565,10 +567,19 @@ async function runSupervisorGateTests() {
   let residualSupervisor = null;
   let monitoredSupervisor = null;
   let supervisorClosed = null;
+  const spawnProductionSupervisor = (args) => {
+    const child = spawn("/bin/zsh", args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore", "pipe"],
+    });
+    const protocol = createSupervisorStatusProtocol();
+    child.stdio[3].on("data", (chunk) => protocol.push(chunk));
+    child.supervisorStatus = () => protocol.finish();
+    return child;
+  };
   try {
     const staleMarkerPath = path.join(testDir, "stale-target-ran");
-    staleSupervisor = spawn(
-      "/bin/zsh",
+    staleSupervisor = spawnProductionSupervisor(
       [
         "-c",
         buildProductionProcessSupervisorScript(),
@@ -586,8 +597,7 @@ async function runSupervisorGateTests() {
         head,
         "/usr/bin/touch",
         staleMarkerPath,
-      ],
-      { detached: true, stdio: "ignore" }
+      ]
     );
     const staleOutcome = await Promise.race([
       new Promise((resolve, reject) => {
@@ -603,8 +613,7 @@ async function runSupervisorGateTests() {
     assert.deepEqual(staleOutcome, { exitCode: 125, signal: null });
     assert.equal(fs.existsSync(staleMarkerPath), false);
 
-    supervisor = spawn(
-      "/bin/zsh",
+    supervisor = spawnProductionSupervisor(
       [
         "-c",
         buildProductionProcessSupervisorScript(),
@@ -622,8 +631,7 @@ async function runSupervisorGateTests() {
         head,
         "/usr/bin/touch",
         markerPath,
-      ],
-      { detached: true, stdio: "ignore" }
+      ]
     );
     supervisorClosed = new Promise((resolve, reject) => {
       supervisor.once("error", reject);
@@ -647,8 +655,7 @@ async function runSupervisorGateTests() {
     fs.unlinkSync(cancelPath);
     fs.unlinkSync(gatePath);
     const helperOnlyGatePath = path.join(testDir, "helper-only-ready");
-    helperOnlySupervisor = spawn(
-      "/bin/zsh",
+    helperOnlySupervisor = spawnProductionSupervisor(
       [
         "-c",
         buildProductionProcessSupervisorScript(),
@@ -665,8 +672,7 @@ async function runSupervisorGateTests() {
         process.cwd(),
         head,
         "/usr/bin/true",
-      ],
-      { detached: true, stdio: "ignore" }
+      ]
     );
     const helperOnlyClosed = new Promise((resolve, reject) => {
       helperOnlySupervisor.once("error", reject);
@@ -690,12 +696,18 @@ async function runSupervisorGateTests() {
       ),
     ]);
     assert.deepEqual(helperOnlyOutcome, { exitCode: 0, signal: null });
+    assert.deepEqual(helperOnlySupervisor.supervisorStatus(), {
+      complete: true,
+      targetExit: 0,
+      monitorExit: 0,
+      finalExit: 0,
+      cleanupFailed: false,
+    });
 
     const residualGatePath = path.join(testDir, "residual-ready");
     const residualPidPath = path.join(testDir, "residual-pid");
     const residualCommand = `/usr/bin/nohup /bin/sleep 30 >/dev/null 2>&1 & print -r -- $! > '${residualPidPath.replaceAll("'", `'"'"'`)}'`;
-    residualSupervisor = spawn(
-      "/bin/zsh",
+    residualSupervisor = spawnProductionSupervisor(
       [
         "-c",
         buildProductionProcessSupervisorScript(),
@@ -714,8 +726,7 @@ async function runSupervisorGateTests() {
         "/bin/zsh",
         "-c",
         residualCommand,
-      ],
-      { detached: true, stdio: "ignore" }
+      ]
     );
     const residualClosed = new Promise((resolve, reject) => {
       residualSupervisor.once("error", reject);
@@ -744,13 +755,19 @@ async function runSupervisorGateTests() {
       ),
     ]);
     assert.deepEqual(residualOutcome, { exitCode: 0, signal: null });
+    assert.deepEqual(residualSupervisor.supervisorStatus(), {
+      complete: true,
+      targetExit: 0,
+      monitorExit: 0,
+      finalExit: 0,
+      cleanupFailed: false,
+    });
     const residualPid = Number(fs.readFileSync(residualPidPath, "utf8").trim());
     assert.equal(pidIsAlive(residualPid), false, "supervisor must clean residual descendants");
 
     const monitoredGatePath = path.join(testDir, "monitored-ready");
     const monitoredMarkerPath = path.join(testDir, "monitored-target-ran");
-    monitoredSupervisor = spawn(
-      "/bin/zsh",
+    monitoredSupervisor = spawnProductionSupervisor(
       [
         "-c",
         buildProductionProcessSupervisorScript(),
@@ -769,8 +786,7 @@ async function runSupervisorGateTests() {
         "/bin/zsh",
         "-c",
         `trap 'exit 0' TERM; print -r -- started > '${monitoredMarkerPath.replaceAll("'", `'"'"'`)}'; while :; do /bin/sleep 1; done`,
-      ],
-      { detached: true, stdio: "ignore" }
+      ]
     );
     const monitoredClosed = new Promise((resolve, reject) => {
       monitoredSupervisor.once("error", reject);
@@ -800,6 +816,13 @@ async function runSupervisorGateTests() {
       ),
     ]);
     assert.deepEqual(monitoredOutcome, { exitCode: 125, signal: null });
+    assert.deepEqual(monitoredSupervisor.supervisorStatus(), {
+      complete: true,
+      targetExit: 0,
+      monitorExit: 125,
+      finalExit: 125,
+      cleanupFailed: false,
+    });
   } finally {
     if (pidIsAlive(parent.pid)) parent.kill("SIGKILL");
     if (
@@ -1459,6 +1482,83 @@ assert.doesNotMatch(
   "group enumeration must not create untracked pipeline helpers"
 );
 assert.match(
+  productionSupervisorScript,
+  /target-exit:\$production_status[\s\S]*monitor-exit:\$monitor_status[\s\S]*final-exit:\$production_status[\s\S]*cleanup-failed[\s\S]*exit "\$production_status"/
+);
+assert.match(productionSupervisorScript, /"\$@" 3>&- <&0 >&1 2>&2 &/);
+assert.doesNotMatch(
+  productionSupervisorScript,
+  /cleanup_status == 0 \)\) \|\| exit/
+);
+
+const validSupervisorProtocol = createSupervisorStatusProtocol();
+for (const chunk of [
+  "target-la",
+  "unch\ntarget-identity-ready\ntarget-exit:",
+  "1\nmonitor-exit:0\nfinal-exit:1\ncleanup-failed\n",
+]) {
+  validSupervisorProtocol.push(Buffer.from(chunk));
+}
+assert.deepEqual(validSupervisorProtocol.finish(), {
+  complete: true,
+  targetExit: 1,
+  monitorExit: 0,
+  finalExit: 1,
+  cleanupFailed: true,
+});
+assert.equal(
+  classifySupervisorStatus(
+    { complete: true, targetExit: 1, monitorExit: 0, finalExit: 1, cleanupFailed: false },
+    1
+  ),
+  "valid"
+);
+assert.equal(
+  classifySupervisorStatus(
+    { complete: true, targetExit: 1, monitorExit: 0, finalExit: 1, cleanupFailed: true },
+    1
+  ),
+  "cleanup_failed"
+);
+assert.equal(
+  classifySupervisorStatus(
+    { complete: true, targetExit: 1, monitorExit: 0, finalExit: 1, cleanupFailed: false },
+    0
+  ),
+  "invalid"
+);
+assert.equal(
+  classifySupervisorStatus(
+    { complete: true, targetExit: 143, monitorExit: 143, finalExit: 143, cleanupFailed: false },
+    143
+  ),
+  "invalid"
+);
+assert.equal(
+  classifySupervisorStatus(
+    { complete: true, targetExit: 143, monitorExit: 143, finalExit: 143, cleanupFailed: false },
+    143,
+    { externalTerminationAttempted: true }
+  ),
+  "valid"
+);
+for (const lines of [
+  ["target-launch", "target-identity-ready", "monitor-exit:0"],
+  ["target-launch", "target-launch", "target-identity-ready", "target-exit:0", "monitor-exit:0"],
+  ["target-launch", "target-identity-ready", "target-exit:999", "monitor-exit:0"],
+  ["target-launch", "target-identity-ready", "target-exit:0", "monitor-exit:142", "final-exit:0"],
+  ["target-launch", "target-identity-ready", "target-exit:0", "monitor-exit:0", "final-exit:0", "extra"],
+]) {
+  const protocol = createSupervisorStatusProtocol();
+  protocol.push(Buffer.from(`${lines.join("\n")}\n`));
+  assert.equal(protocol.finish().complete, false);
+}
+const unterminatedSupervisorProtocol = createSupervisorStatusProtocol();
+unterminatedSupervisorProtocol.push(
+  Buffer.from("target-launch\ntarget-identity-ready\ntarget-exit:0\nmonitor-exit:0")
+);
+assert.equal(unterminatedSupervisorProtocol.finish().complete, false);
+assert.match(
   supervisedTerminalBridgeSource,
   /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*"\.\/run\.sh",\s*"--skip-mac",\s*\]/
 );
@@ -1468,7 +1568,7 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
-  /buildProductionProcessSupervisorScript[\s\S]*"parent_pid=\$1"[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"[\s\S]*"launch_gate=\$6"[\s\S]*"\\\"\$@\\\" <&0 >&1 2>&2 &"[\s\S]*monitor_runtime[\s\S]*cleanup_group_members/
+  /buildProductionProcessSupervisorScript[\s\S]*"parent_pid=\$1"[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"[\s\S]*"launch_gate=\$6"[\s\S]*"\\\"\$@\\\" 3>&- <&0 >&1 2>&2 &"[\s\S]*monitor_runtime[\s\S]*cleanup_group_members/
 );
 assert.match(
   supervisedTerminalBridgeSource,
