@@ -16,9 +16,38 @@ const ROOT = path.resolve(__dirname, "../..");
 const DEFAULT_SCRIPT = path.join(ROOT, "scripts", "ruyipage", "apple_account_flow.py");
 const MAX_KILL_GRACE_MS = 5_000;
 const RUYIPAGE_PROCESS_STATE_NAME = ".ruyipage-process.json";
+export const RUYIPAGE_LIFECYCLE_STATE_NAME = ".ruyipage-lifecycle.json";
 const RUYIPAGE_LAUNCH_GATE_NAME = ".ruyipage-launch.ready";
 const RUYIPAGE_LAUNCH_CANCEL_NAME = ".ruyipage-launch.cancel";
 export const RUYIPAGE_SUPERVISOR_COMMAND_ID = "ruyipage-supervisor-v1";
+const RUYIPAGE_LIFECYCLE_STATES = new Set([
+  "preparing",
+  "active",
+  "inactive",
+  "cleanup_failed",
+]);
+
+export function validateRuyiPageLifecycleState(source, expectedNonce) {
+  let value;
+  try {
+    value = JSON.parse(String(source));
+  } catch {
+    return null;
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.version !== 1 ||
+    value.nonce !== expectedNonce ||
+    !/^[0-9a-f]{32}$/.test(String(value.nonce ?? "")) ||
+    !RUYIPAGE_LIFECYCLE_STATES.has(value.state) ||
+    Object.keys(value).sort().join(",") !== "nonce,state,version"
+  ) {
+    return null;
+  }
+  return value;
+}
 
 function resolveRuyiPageProcessStatePath(reportDir, env = process.env) {
   const configured = env.APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE?.trim();
@@ -111,6 +140,20 @@ function writeRuyiPageProcessState(filePath, identity, state, nonce) {
       commandSha256: crypto.createHash("sha256").update(identity.command, "utf8").digest("hex"),
       state,
     })}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 }
+  );
+  fs.renameSync(temporaryPath, filePath);
+}
+
+function writeRuyiPageLifecycleState(filePath, state, nonce) {
+  if (!filePath) return;
+  if (!RUYIPAGE_LIFECYCLE_STATES.has(state) || !/^[0-9a-f]{32}$/.test(nonce)) {
+    throw new Error("ruyipage lifecycle state is invalid");
+  }
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(
+    temporaryPath,
+    `${JSON.stringify({ version: 1, nonce, state })}\n`,
     { encoding: "utf8", flag: "wx", mode: 0o600 }
   );
   fs.renameSync(temporaryPath, filePath);
@@ -586,6 +629,9 @@ async function runRuyiPageBackend({
   const launchCancelPath = processStatePath
     ? path.join(path.dirname(processStatePath), RUYIPAGE_LAUNCH_CANCEL_NAME)
     : null;
+  const lifecycleStatePath = processStatePath
+    ? path.join(path.dirname(processStatePath), RUYIPAGE_LIFECYCLE_STATE_NAME)
+    : null;
   const backendDeadlineMs = Date.now() + timeoutMs;
   const backendArgs = [
     script,
@@ -612,6 +658,9 @@ async function runRuyiPageBackend({
     : null;
   if (usesProcessStateSupervisor && !parentProcessIdentity) {
     throw new Error("ruyipage parent process identity is unavailable");
+  }
+  if (usesProcessStateSupervisor) {
+    writeRuyiPageLifecycleState(lifecycleStatePath, "preparing", processNonce);
   }
   const child = spawn(
     usesProcessStateSupervisor ? "/bin/zsh" : python,
@@ -763,6 +812,7 @@ async function runRuyiPageBackend({
         "active",
         processNonce
       );
+      writeRuyiPageLifecycleState(lifecycleStatePath, "active", processNonce);
     } catch {
       writeRuyiPageLaunchCancel(launchCancelPath);
       stopper.stop();
@@ -772,6 +822,15 @@ async function runRuyiPageBackend({
       } catch {
         cleanupFailed = true;
       } finally {
+        try {
+          writeRuyiPageLifecycleState(
+            lifecycleStatePath,
+            cleanupFailed ? "cleanup_failed" : "inactive",
+            processNonce
+          );
+        } catch {
+          cleanupFailed = true;
+        }
         child.stdout.destroy();
         child.stderr.destroy();
         child.unref();
@@ -987,6 +1046,13 @@ async function runRuyiPageBackend({
           writeRuyiPageProcessState(
             processStatePath,
             processIdentity,
+            cleanupConfirmed ? "inactive" : "cleanup_failed",
+            processNonce
+          );
+        }
+        if (usesProcessStateSupervisor) {
+          writeRuyiPageLifecycleState(
+            lifecycleStatePath,
             cleanupConfirmed ? "inactive" : "cleanup_failed",
             processNonce
           );

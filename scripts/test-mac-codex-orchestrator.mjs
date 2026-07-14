@@ -37,6 +37,7 @@ import {
 import {
   RUYIPAGE_SUPERVISOR_COMMAND_ID,
   buildRuyiPageProcessSupervisorScript,
+  validateRuyiPageLifecycleState,
 } from "./lib/ruyipage-backend-runner.js";
 import {
   buildProductionProcessSupervisorScript,
@@ -1542,7 +1543,7 @@ assert.equal(
     markerConfirmed: false,
     ruyiPageStateSeen: false,
   }),
-  "failed"
+  "recovered"
 );
 assert.equal(
   classifyProcessCleanup({
@@ -1760,6 +1761,36 @@ const ruyiPageSupervisorScript = buildRuyiPageProcessSupervisorScript();
 assert.match(
   ruyiPageRunnerSource,
   /buildRuyiPageProcessSupervisorScript[\s\S]*"parent_pgid=\$2"[\s\S]*"parent_started_at=\$3"[\s\S]*"parent_command=\$4"[\s\S]*"launch_nonce=\$5"[\s\S]*"deadline_ms=\$6"[\s\S]*"launch_gate=\$7"[\s\S]*"launch_cancel=\$8"[\s\S]*monitor_runtime[\s\S]*cleanup_group_members[\s\S]*\.join\("\\n"\)/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /writeRuyiPageLifecycleState\(lifecycleStatePath, "preparing", processNonce\)[\s\S]*const child = spawn\(/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /writeRuyiPageLifecycleState\(lifecycleStatePath, "active", processNonce\)/
+);
+assert.match(
+  ruyiPageRunnerSource,
+  /cleanupConfirmed \? "inactive" : "cleanup_failed"/
+);
+assert.deepEqual(
+  validateRuyiPageLifecycleState(
+    JSON.stringify({ version: 1, nonce: SUPERVISED_TOKEN, state: "inactive" }),
+    SUPERVISED_TOKEN
+  ),
+  { version: 1, nonce: SUPERVISED_TOKEN, state: "inactive" }
+);
+assert.equal(
+  validateRuyiPageLifecycleState(
+    JSON.stringify({ version: 1, nonce: SUPERVISED_TOKEN, state: "unknown" }),
+    SUPERVISED_TOKEN
+  ),
+  null
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /path\.dirname\(filePath\),[\s\S]*RUYIPAGE_LIFECYCLE_STATE_NAME[\s\S]*validateRuyiPageLifecycleState/
 );
 assert.match(
   ruyiPageRunnerSource,

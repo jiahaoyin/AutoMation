@@ -15,6 +15,10 @@ import {
   createSupervisedProductionPermissionProfile,
   createSupervisedAttestation,
 } from "./lib/supervised-attestation.js";
+import {
+  RUYIPAGE_LIFECYCLE_STATE_NAME,
+  validateRuyiPageLifecycleState,
+} from "./lib/ruyipage-backend-runner.js";
 
 const POLL_MS = 250;
 const TERMINATE_GRACE_MS = 8_000;
@@ -582,7 +586,25 @@ async function cleanupRecordedRuyiPageProcess(
   expectedNonce
 ) {
   const file = readBoundedRegularFile(filePath, 512);
-  if (file.state === "missing") return { ok: true, seen: false };
+  const lifecyclePath = path.join(
+    path.dirname(filePath),
+    RUYIPAGE_LIFECYCLE_STATE_NAME
+  );
+  const lifecycleFile = readBoundedRegularFile(lifecyclePath, 256);
+  const lifecycle =
+    lifecycleFile.state === "present"
+      ? validateRuyiPageLifecycleState(lifecycleFile.text, expectedNonce)
+      : null;
+  if (file.state === "missing") {
+    if (lifecycleFile.state === "missing") {
+      return { ok: true, seen: false, lifecycleSeen: false };
+    }
+    return {
+      ok: lifecycle?.state === "inactive",
+      seen: false,
+      lifecycleSeen: lifecycle !== null,
+    };
+  }
   if (file.state !== "present") return { ok: false, seen: true };
   let value;
   try {
@@ -786,10 +808,8 @@ export function classifyProcessCleanup({
   ) {
     return "failed";
   }
-  if (supervisorStatusOutcome === "cleanup_failed") {
-    return ruyiPageStateSeen === true ? "recovered" : "failed";
-  }
-  return markerConfirmed === true && ruyiPageStateSeen !== true ? "failed" : "clean";
+  if (markerConfirmed === true && ruyiPageStateSeen !== true) return "failed";
+  return supervisorStatusOutcome === "cleanup_failed" ? "recovered" : "clean";
 }
 
 function productionEnvironment(context) {
