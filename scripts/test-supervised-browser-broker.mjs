@@ -589,6 +589,11 @@ assert.match(
   remoteScript,
   /supervised-process-state-verifier\.mjs" ruyipage[\s\S]*browser_broker_socket[\s\S]*browser_broker_gate[\s\S]*cleanup_failed=1/
 );
+assert.match(
+  remoteScript,
+  /network = \{ enabled = true, domains = \{\}, unix_sockets = \{ "\/tmp\/apple-automation-[0-9a-f]{32}\.sock" = "allow" \} \}/,
+  "production sandbox must allow only the per-run browser broker Unix socket"
+);
 assert.doesNotMatch(
   remoteScript,
   /(?:\/bin\/rm|\brm\b|\/usr\/bin\/unlink).*browser_broker_(?:socket|gate)/

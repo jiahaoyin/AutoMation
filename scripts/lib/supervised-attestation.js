@@ -44,7 +44,7 @@ export function createSupervisedProductionPermissionProfile(productionDir, nonce
     throw new Error("Supervised production nonce is invalid");
   }
   const socketPath = `/tmp/apple-automation-${nonce}.sock`;
-  return `{ extends = ":read-only", filesystem = { "${value}" = "write", "${socketPath}" = "write" } }`;
+  return `{ extends = ":read-only", filesystem = { "${value}" = "write", "${socketPath}" = "write" }, network = { enabled = true, domains = {}, unix_sockets = { "${socketPath}" = "allow" } } }`;
 }
 
 export function createMacVerificationPermissionProfile(runTmpDir, repository) {

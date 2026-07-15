@@ -1344,7 +1344,7 @@ for (const requiredText of [
   'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
   'SUPERVISED_ATTESTATION="$SUPERVISED_CONTROL_DIR/supervised-attestation.json"',
   'SUPERVISED_BRIDGE_SCRIPT="$SUPERVISED_CONTROL_DIR/terminal-bridge.command"',
-  `PRODUCTION_PERMISSION_PROFILE='{ extends = ":read-only", filesystem = { "${remoteOptions.remoteRoundDir}/supervised-control/production" = "write", "/tmp/apple-automation-${SUPERVISED_TOKEN}.sock" = "write" } }'`,
+  `PRODUCTION_PERMISSION_PROFILE='{ extends = ":read-only", filesystem = { "${remoteOptions.remoteRoundDir}/supervised-control/production" = "write", "/tmp/apple-automation-${SUPERVISED_TOKEN}.sock" = "write" }, network = { enabled = true, domains = {}, unix_sockets = { "/tmp/apple-automation-${SUPERVISED_TOKEN}.sock" = "allow" } } }'`,
   'APPLE_AUTOMATION_SUPERVISED_WRITABLE_TMP=${(q)RUN_TMP_DIR}',
   'APPLE_AUTOMATION_SUPERVISED_CONTROL_DIR=${(q)SUPERVISED_CONTROL_DIR}',
   'APPLE_AUTOMATION_SUPERVISED_TRIGGER=${(q)SUPERVISED_TRIGGER}',
