@@ -454,7 +454,11 @@ class InputTests(unittest.TestCase):
 
         self.assertEqual(
             field.inputs,
-            [("", True), ("person@example.com", False)],
+            [("person@example.com", False)],
+        )
+        self.assertEqual(
+            len([call for call in actions.calls if call[0] == "combo"]),
+            2,
         )
         self.assertEqual(field.value, "person@example.com")
 
@@ -576,14 +580,55 @@ class InputTests(unittest.TestCase):
         self.assertEqual(iframe.scroll.calls, [("to_see",)])
         self.assertEqual(field.value, "person@example.com")
 
-    def test_frame_input_sends_no_keys_when_element_focus_is_unconfirmed(self):
+    def test_frame_input_falls_back_to_the_element_owner_context_for_focus(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        field = FakeElement(
+            focused=False,
+            on_click=lambda: setattr(field, "focused", True),
+        )
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        action_scope = input_and_verify(
+            frame,
+            field,
+            "123456",
+            "2FA code",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=root,
+        )
+
+        self.assertIs(action_scope, frame)
+        self.assertEqual(
+            [call[0] for call in root.actions.calls],
+            ["human_click", "perform"],
+        )
+        self.assertEqual(
+            frame.actions.calls[0:2],
+            [("human_click", field), ("perform",)],
+        )
+        self.assertEqual(field.value, "123456")
+        self.assertEqual(field.scroll.calls, [("to_see",)])
+        self.assertEqual(iframe.scroll.calls, [("to_see",)])
+
+    def test_frame_input_sends_no_keys_when_both_focus_routes_fail(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         iframe = FakeElement(attrs={"src": auth_url})
         field = FakeElement(focused=False)
         root = FakePage(
             {"css:iframe": [iframe]},
             state={"href": "https://account.apple.com/sign-in"},
-            actions=FakeActions(coordinate_target=field),
+            actions=FakeActions(),
         )
         frame = FakePage(
             {"css:input": [field]},
@@ -606,8 +651,39 @@ class InputTests(unittest.TestCase):
             [call[0] for call in root.actions.calls],
             ["human_click", "perform"],
         )
-        self.assertEqual(field.scroll.calls, [("to_see",)])
-        self.assertEqual(iframe.scroll.calls, [("to_see",)])
+        self.assertEqual(
+            [call[0] for call in frame.actions.calls],
+            ["human_click", "perform"],
+        )
+
+    def test_frame_input_does_not_fall_back_after_the_target_becomes_disabled(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        field = FakeElement()
+        field.on_click = lambda: setattr(field.states, "is_enabled", False)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(coordinate_target=field),
+        )
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "not interactable"):
+            input_and_verify(
+                frame,
+                field,
+                "123456",
+                "2FA code",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=root,
+            )
+
+        self.assertEqual(frame.actions.calls, [])
 
     def test_top_level_input_rechecks_target_state_and_focus_before_keys(self):
         class StaleStates:
@@ -725,6 +801,39 @@ class InputTests(unittest.TestCase):
                 ("press", "ENTER"),
                 ("perform",),
             ],
+        )
+
+    def test_password_submit_falls_back_to_frame_context_for_enter(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        password = FakeElement(focused=False)
+        password.on_click = lambda: setattr(password, "focused", True)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input[type='password']": [password]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        submit_element_with_enter(
+            root,
+            frame,
+            password,
+            FakeKeys,
+            pause=lambda *_: None,
+        )
+
+        self.assertEqual(
+            [call[0] for call in root.actions.calls],
+            ["human_click", "perform"],
+        )
+        self.assertEqual(
+            [call[0] for call in frame.actions.calls],
+            ["human_click", "perform", "press", "perform"],
         )
 
     def test_submit_rechecks_focus_immediately_before_enter(self):
@@ -3474,10 +3583,19 @@ class FrameLocationTests(unittest.TestCase):
         self.assertIs(find_first_element(FakePage(frames=[frame]), ("css:#target",)), target)
 
     def test_finds_credential_element_inside_frame_shadow_root(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         password = FakeElement(attrs={"type": "password"})
         shadow_root = FakePage({"css:input[type='password']": [password]})
-        frame = FakePage(shadow_roots=[shadow_root])
-        page = FakePage(frames=[frame])
+        frame = FakePage(
+            shadow_roots=[shadow_root],
+            state={"href": auth_url},
+        )
+        iframe = FakeElement(attrs={"src": auth_url})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=password),
+        )
         frame.parent = page
 
         found = account_flow.find_first_scoped_element(
@@ -3488,6 +3606,19 @@ class FrameLocationTests(unittest.TestCase):
         self.assertEqual(found, (frame, password))
         self.assertEqual(frame.shadow_roots_calls, [("all", False)])
         self.assertIn(("css:input[type='password']", 0), shadow_root.eles_calls)
+
+        action_scope = input_and_verify(
+            found[0],
+            found[1],
+            "test-password",
+            "password",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=page,
+        )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(password.value, "test-password")
 
     def test_finds_credential_element_inside_top_level_shadow_root(self):
         password = FakeElement(attrs={"type": "password"})

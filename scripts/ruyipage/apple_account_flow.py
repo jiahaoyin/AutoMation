@@ -536,6 +536,38 @@ def human_click(
     scope.actions.human_click(element).perform()
 
 
+def focus_keyboard_target(
+    root_page: Any,
+    scope: Any,
+    field: Any,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    """Focus a field through the top context, then fall back to its owner context."""
+    validate_apple_scope(scope)
+    root_page = root_page or scope
+    if scope is root_page:
+        human_click(scope, field, pause=pause)
+        pause(180, 480)
+        require_keyboard_target_ready(field)
+        return scope
+
+    validate_apple_scope(root_page)
+    click_target = prepare_frame_input_target(root_page, scope, field)
+    human_click(root_page, click_target, pause=pause)
+    pause(180, 480)
+    if not element_is_interactable(field):
+        raise RuntimeError("ruyiPage input target is not interactable")
+    if element_focus_is_confirmed(field):
+        return root_page
+
+    # A shadow-root target can reject a top-context coordinate focus even when
+    # its owning frame context can target the same element directly.
+    human_click(scope, field, pause=pause)
+    pause(180, 480)
+    require_keyboard_target_ready(field)
+    return scope
+
+
 def input_and_verify(
     scope: Any,
     field: Any,
@@ -545,20 +577,8 @@ def input_and_verify(
     pause: Callable[[int, int], None] = human_pause,
     root_page: Any | None = None,
 ) -> Any:
-    validate_apple_scope(scope)
     root_page = root_page or scope
-    if scope is root_page:
-        action_scope = scope
-        click_target = field
-    else:
-        # Firefox routes iframe keyboard input only after a top-context pointer focus.
-        validate_apple_scope(root_page)
-        action_scope = root_page
-        click_target = prepare_frame_input_target(root_page, scope, field)
-
-    human_click(action_scope, click_target, pause=pause)
-    pause(180, 480)
-    require_keyboard_target_ready(field)
+    action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
     action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
     pause(120, 320)
     require_keyboard_target_ready(field)
@@ -571,7 +591,7 @@ def input_and_verify(
     if action_scope is scope:
         pause(180, 420)
         require_keyboard_target_ready(field)
-        field.input("", clear=True)
+        action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
         pause(120, 320)
         require_keyboard_target_ready(field)
         field.input(value, clear=False)
@@ -604,17 +624,7 @@ def submit_element_with_enter(
     min_ms: int = 350,
     max_ms: int = 800,
 ) -> None:
-    validate_apple_scope(scope)
-    if scope is root_page:
-        action_scope = scope
-        click_target = element
-    else:
-        validate_apple_scope(root_page)
-        action_scope = root_page
-        click_target = prepare_frame_input_target(root_page, scope, element)
-
-    human_click(action_scope, click_target, pause=pause)
-    require_keyboard_target_ready(element)
+    action_scope = focus_keyboard_target(root_page, scope, element, pause=pause)
     submit_with_enter(
         action_scope,
         element,
