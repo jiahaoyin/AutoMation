@@ -30,7 +30,7 @@ EMAIL_SELECTORS = (
     "css:input[type='email']",
 )
 PASSWORD_SELECTORS = (
-    "css:#password_text_field",
+    "css:input#password_text_field",
     "css:input[name='password']",
     "css:input[autocomplete='current-password']",
     "css:input[type='password']",
@@ -497,6 +497,9 @@ def require_keyboard_target_ready(element: Any) -> None:
 
 def element_uses_rendered_text(element: Any) -> bool:
     try:
+        input_type = str(element.attr("type") or "").strip().lower()
+        if input_type == "password":
+            return False
         if str(element.attr("contenteditable") or "").strip().lower() == "true":
             return True
         if str(element.attr("role") or "").strip().lower() != "textbox":

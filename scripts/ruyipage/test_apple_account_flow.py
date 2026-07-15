@@ -813,6 +813,39 @@ class InputTests(unittest.TestCase):
         self.assertEqual(password.value, "secret")
         self.assertEqual(password.inputs, [("secret", False)])
 
+    def test_password_value_never_falls_back_to_rendered_text(self):
+        class PasswordElement(FakeElement):
+            def run_js(self, script):
+                if "tagName" in script:
+                    raise RuntimeError("tag query unavailable")
+                return super().run_js(script)
+
+        password = PasswordElement(
+            attrs={"type": "password", "role": "textbox"},
+        )
+        password.value = "secret"
+
+        self.assertEqual(
+            account_flow.read_element_input_value(password),
+            (True, "secret"),
+        )
+
+    def test_contenteditable_with_a_text_type_keeps_rendered_text_semantics(self):
+        field = FakeElement(
+            attrs={
+                "contenteditable": "true",
+                "role": "textbox",
+                "type": "text",
+            },
+            rendered_text="rendered value",
+        )
+        field.value = "raw value"
+
+        self.assertEqual(
+            account_flow.read_element_input_value(field),
+            (True, "rendered value"),
+        )
+
     def test_non_password_input_still_rejects_an_unreadable_value(self):
         email = FakeElement(attrs={"type": "email"})
         page = FakePage({"css:input[type='email']": [email]})
@@ -3801,6 +3834,25 @@ class FrameLocationTests(unittest.TestCase):
 
         self.assertIs(action_scope, frame)
         self.assertEqual(password.value, "test-password")
+
+    def test_password_lookup_ignores_a_component_host_with_the_legacy_id(self):
+        host = FakeElement(attrs={"tagName": "DIV"})
+        password = FakeElement(attrs={"type": "password", "tagName": "INPUT"})
+        shadow_root = FakePage(
+            {
+                "css:#password_text_field": [host],
+                "css:input[type='password']": [password],
+            }
+        )
+        page = FakePage(shadow_roots=[shadow_root])
+
+        found = account_flow.find_first_scoped_element(
+            page,
+            account_flow.PASSWORD_SELECTORS,
+        )
+
+        self.assertEqual(found, (page, password))
+        self.assertNotIn(("css:#password_text_field", 0), shadow_root.eles_calls)
 
     def test_finds_credential_element_inside_top_level_shadow_root(self):
         password = FakeElement(attrs={"type": "password"})
