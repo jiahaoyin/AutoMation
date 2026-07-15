@@ -740,6 +740,39 @@ function runMissingSourceRejectsOldBinaryTest() {
   }
 }
 
+function runPreparedOnlySettingsStartNeverCompilesTest() {
+  let compilerCalls = 0;
+  let spawnCalls = 0;
+  const sourcePath = path.join(os.tmpdir(), "missing-active-settings-helper.swift");
+  const binaryPath = path.join(os.tmpdir(), "missing-active-settings-helper");
+
+  assert.throws(
+    () =>
+      start2FASettingsCodeRequest({
+        runtime: {
+          platform: "darwin",
+          compileIfNeeded: false,
+          sourcePath,
+          binaryPath,
+          spawnSync() {
+            compilerCalls += 1;
+            return { status: 1 };
+          },
+          spawn() {
+            spawnCalls += 1;
+            throw new Error("an unprepared helper must not spawn");
+          },
+        },
+      }),
+    (error) => {
+      assert.equal(error?.code, "2FA_SETTINGS_UNAVAILABLE");
+      return true;
+    }
+  );
+  assert.equal(compilerCalls, 0);
+  assert.equal(spawnCalls, 0);
+}
+
 function runNonExecutableCompilerOutputTest() {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "settings-helper-non-executable-"));
   const sourcePath = path.join(fixtureDir, "mac-settings-2fa-code.swift");
@@ -2090,6 +2123,7 @@ await runFixedHelperReasonMappingTest();
 await runChildErrorSanitizationTest();
 await runCancelTest();
 runMissingSourceRejectsOldBinaryTest();
+runPreparedOnlySettingsStartNeverCompilesTest();
 runStaleBinaryCompileFailureTest();
 runNonExecutableCompilerOutputTest();
 await runForceStopAllowsLatePopupCleanupTest();

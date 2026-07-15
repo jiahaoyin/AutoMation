@@ -14,6 +14,8 @@ import {
   SUPERVISED_NODE_FAILURES,
   SUPERVISED_PRODUCTION_ENV_POLICY,
   SUPERVISED_PRODUCTION_STAGES,
+  SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS,
+  SUPERVISED_SETTINGS_PROVIDER_STATES,
   SUPERVISED_SUCCESS_MARKER,
   SUPERVISED_STDOUT_STAGE_TOKENS,
   createSupervisedProductionPermissionProfile,
@@ -36,6 +38,21 @@ const BROWSER_BROKER_CONNECT_TIMEOUT_MS = 60_000;
 const BROWSER_BROKER_LISTEN_TIMEOUT_MS = 5_000;
 const BROWSER_BROKER_CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RAW_LOG_BYTES = 1024 * 1024;
+const SETTINGS_HELPER_NAME = "mac-settings-2fa-code";
+const SETTINGS_AUDIT_NAME = "2fa-audit.jsonl";
+const MAX_SETTINGS_AUDIT_BYTES = 64 * 1024;
+const MAX_SETTINGS_AUDIT_LINES = 256;
+const MAX_SETTINGS_REPORT_ENTRIES = 8;
+const MAX_SETTINGS_PROCESS_MEMBERS = 512;
+const SETTINGS_REPORT_DIRECTORY_NAME =
+  /^apple-id-flow-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+const SETTINGS_AUDIT_PHASES = new Set([
+  "settings_provider_start",
+  "settings_provider_failed",
+  "settings_provider_cancelled",
+  "settings_provider_result",
+  "2fa_winner",
+]);
 const MANUAL_CODE_PROMPT =
   "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
 const RUYIPAGE_FAILURE_STAGES = new Set(
@@ -47,18 +64,124 @@ const TWO_FA_PENDING_STATUSES = new Set([
   "settings_start",
   "settings_retry",
   "settings_accessibility",
+  "settings_failed",
   "manual_allow",
   "manual_code",
   "manual_unavailable",
   "ocr_permission_missing",
   "popup_accessibility",
+  "popup_scanning",
   "popup_close_pending",
 ]);
+const SUPERVISED_TWO_FA_STATUS_MESSAGES = Object.freeze({
+  native_helper_accessibility_granted:
+    "[mac:supervised] 原生 2FA helper 的辅助功能授权已确认",
+  native_helper_accessibility_missing:
+    "[mac:supervised] 原生 2FA helper 尚未获辅助功能授权；请以 macOS 弹窗或辅助功能列表实际显示的条目为准，不要只依据其他终端或宿主应用的勾选状态",
+  native_helper_accessibility_probe_unavailable:
+    "[mac:supervised] 原生 2FA helper 的辅助功能状态暂时无法探测；OCR、系统设置与手动兜底仍会继续",
+  settings_accessibility:
+    "[mac:supervised] 系统设置取码需要辅助功能授权，正在请求 macOS 授权",
+  settings_retry:
+    "[mac:supervised] 系统设置取码正在进行受限重试；其他可用取码路径仍在继续",
+  settings_failed:
+    "[mac:supervised] 系统设置取码未成功；其他可用取码路径仍在继续",
+  popup_close_pending:
+    "[mac:supervised] 原生弹窗验证码已读取，正在后台清理弹窗并继续网页登录",
+  popup_scanning:
+    "[mac:supervised] 网页已请求验证码；正在对受限 Apple 原生窗口进行持续读码",
+});
+const SUPERVISED_TWO_FA_WINNER_MESSAGES = Object.freeze({
+  "winner:popup":
+    "[mac:supervised] 已从原生 Apple 验证码弹窗取得验证码，正在继续网页登录",
+  "winner:settings":
+    "[mac:supervised] 已通过系统设置取得验证码，正在继续网页登录",
+  "winner:manual":
+    "[mac:supervised] 已收到终端隐藏输入的验证码，正在继续网页登录",
+});
+
+export function supervisedTwoFaStatusMessage(status) {
+  return typeof status === "string" &&
+    Object.hasOwn(SUPERVISED_TWO_FA_STATUS_MESSAGES, status)
+    ? SUPERVISED_TWO_FA_STATUS_MESSAGES[status]
+    : null;
+}
+
+export function supervisedTwoFaWinnerMessage(status) {
+  return typeof status === "string" &&
+    Object.hasOwn(SUPERVISED_TWO_FA_WINNER_MESSAGES, status)
+    ? SUPERVISED_TWO_FA_WINNER_MESSAGES[status]
+    : null;
+}
 
 export function createProductionProtocolState() {
   let productionStage = "not_started";
   let nodeFailure = "none";
   let accessibilityPreflight = "unknown";
+  let settingsProviderState = "not_started";
+  let settingsProviderAttempt = 0;
+  let settingsProviderFailureReason = "none";
+
+  const recordSettingsRequestCreated = (attempt) => {
+    if (!Number.isInteger(attempt) || attempt < 1 || attempt > 2) return false;
+    if (attempt < settingsProviderAttempt) return true;
+    if (attempt === settingsProviderAttempt) return true;
+    if (
+      attempt !== settingsProviderAttempt + 1 ||
+      ["winner", "cancelled"].includes(settingsProviderState)
+    ) {
+      return false;
+    }
+    settingsProviderState = "request_created";
+    settingsProviderAttempt = attempt;
+    settingsProviderFailureReason = "none";
+    return true;
+  };
+
+  const recordSettingsTerminalState = (state, attempt, reason = "none") => {
+    if (
+      !["failed", "cancelled", "winner"].includes(state) ||
+      !Number.isInteger(attempt) ||
+      attempt < 1 ||
+      attempt > 2 ||
+      !SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS.has(reason)
+    ) {
+      return false;
+    }
+    if (attempt < settingsProviderAttempt) return true;
+    if (attempt !== settingsProviderAttempt || settingsProviderAttempt === 0) {
+      return false;
+    }
+    if (settingsProviderState === "winner" || settingsProviderState === "cancelled") {
+      return true;
+    }
+    if (settingsProviderState === "failed") {
+      return state === "failed" && settingsProviderFailureReason === reason;
+    }
+    if (state === "failed" && reason === "none") return false;
+    if (state !== "failed" && reason !== "none") return false;
+    settingsProviderState = state;
+    settingsProviderFailureReason = reason;
+    return true;
+  };
+
+  const processSettingsAuditEvent = (event) => {
+    if (!event || typeof event !== "object") return false;
+    switch (event.phase) {
+      case "settings_provider_start":
+        return recordSettingsRequestCreated(event.attempt);
+      case "settings_provider_failed":
+        return recordSettingsTerminalState("failed", event.attempt, event.reason);
+      case "settings_provider_cancelled":
+        return recordSettingsTerminalState("cancelled", event.attempt);
+      case "settings_provider_result":
+        return Number.isInteger(event.attempt) && event.attempt === settingsProviderAttempt;
+      case "2fa_winner":
+        return recordSettingsTerminalState("winner", event.attempt);
+      default:
+        return false;
+    }
+  };
 
   const processStdoutLine = (line) => {
     if (typeof line !== "string") return false;
@@ -77,6 +200,20 @@ export function createProductionProtocolState() {
     const twoFaPrefix = "[2FA] status:";
     if (line.startsWith(twoFaPrefix)) {
       const status = line.slice(twoFaPrefix.length);
+      if (status === "native_helper_accessibility_granted") {
+        accessibilityPreflight = "ready";
+        productionStage = "accessibility_ready";
+        return true;
+      }
+      if (status === "native_helper_accessibility_missing") {
+        accessibilityPreflight = "missing";
+        productionStage = "accessibility_missing";
+        return true;
+      }
+      if (status === "native_helper_accessibility_probe_unavailable") {
+        productionStage = "accessibility_preflight";
+        return true;
+      }
       if (status === "permission_preflight_start") {
         productionStage = "accessibility_preflight";
         return true;
@@ -96,6 +233,9 @@ export function createProductionProtocolState() {
         return true;
       }
       if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
+        if (status === "winner:settings") {
+          recordSettingsTerminalState("winner", settingsProviderAttempt);
+        }
         productionStage = "two_fa_code_acquired";
         return true;
       }
@@ -104,6 +244,9 @@ export function createProductionProtocolState() {
         return true;
       }
       if (TWO_FA_PENDING_STATUSES.has(status)) {
+        if (status === "settings_start") {
+          recordSettingsRequestCreated(settingsProviderAttempt + 1);
+        }
         if (productionStage !== "two_fa_code_acquired") {
           productionStage = "two_fa_code_pending";
         }
@@ -148,6 +291,18 @@ export function createProductionProtocolState() {
 
   return {
     processStdoutLine,
+    processSettingsAuditEvent,
+    observeSettingsHelperSpawned() {
+      if (
+        settingsProviderState !== "request_created" ||
+        settingsProviderAttempt < 1 ||
+        settingsProviderAttempt > 2
+      ) {
+        return false;
+      }
+      settingsProviderState = "helper_spawned";
+      return true;
+    },
     get productionStage() {
       return productionStage;
     },
@@ -156,6 +311,15 @@ export function createProductionProtocolState() {
     },
     get accessibilityPreflight() {
       return accessibilityPreflight;
+    },
+    get settingsProviderState() {
+      return settingsProviderState;
+    },
+    get settingsProviderAttempt() {
+      return settingsProviderAttempt;
+    },
+    get settingsProviderFailureReason() {
+      return settingsProviderFailureReason;
     },
   };
 }
@@ -416,6 +580,226 @@ export function readBoundedRegularFile(filePath, maxBytes = 4096) {
       }
     }
   }
+}
+
+function isBoundedAuditTimestamp(value) {
+  return (
+    typeof value === "string" &&
+    value.length <= 64 &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+  );
+}
+
+function isBoundedAuditElapsed(value) {
+  return (
+    Number.isSafeInteger(value) && value >= 0 && value <= 24 * 60 * 60 * 1000
+  );
+}
+
+function parseSettingsAuditLine(line) {
+  if (typeof line !== "string" || Buffer.byteLength(line) > 1024) return null;
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!SETTINGS_AUDIT_PHASES.has(value.phase)) return null;
+  const keys = Object.keys(value);
+  const hasOnly = (allowed) => keys.every((key) => allowed.has(key));
+  if (!isBoundedAuditTimestamp(value.ts) || !isBoundedAuditElapsed(value.elapsedSincePrepareMs)) {
+    return null;
+  }
+  switch (value.phase) {
+    case "settings_provider_start":
+      return hasOnly(new Set(["ts", "phase", "elapsedSincePrepareMs"]))
+        ? { phase: value.phase }
+        : null;
+    case "settings_provider_failed":
+      return hasOnly(new Set(["ts", "phase", "reason", "elapsedSincePrepareMs"])) &&
+        SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS.has(value.reason) &&
+        value.reason !== "none"
+        ? { phase: value.phase, reason: value.reason }
+        : null;
+    case "settings_provider_cancelled":
+      return hasOnly(new Set(["ts", "phase", "reason", "elapsedSincePrepareMs"])) &&
+        value.reason === "cancelled"
+        ? { phase: value.phase }
+        : null;
+    case "settings_provider_result":
+      return hasOnly(new Set(["ts", "phase", "outcome", "elapsedSincePrepareMs"])) &&
+        value.outcome === "candidate_ready"
+        ? { phase: value.phase }
+        : null;
+    case "2fa_winner":
+      return hasOnly(new Set(["ts", "phase", "source", "elapsedSincePrepareMs"])) &&
+        value.source === "settings"
+        ? { phase: value.phase }
+        : null;
+    default:
+      return null;
+  }
+}
+
+export function readSettingsProviderAudit(reportRoot) {
+  if (typeof reportRoot !== "string" || !path.isAbsolute(reportRoot)) return [];
+  try {
+    const resolvedRoot = path.resolve(reportRoot);
+    const rootStats = fs.lstatSync(resolvedRoot);
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) return [];
+    const rootEntries = fs.readdirSync(resolvedRoot, { withFileTypes: true });
+    if (rootEntries.length > MAX_SETTINGS_REPORT_ENTRIES) return [];
+    const reportDirectories = rootEntries.filter(
+      (entry) =>
+        entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        SETTINGS_REPORT_DIRECTORY_NAME.test(entry.name)
+    );
+    if (reportDirectories.length !== 1) return [];
+    const reportDirectory = path.resolve(resolvedRoot, reportDirectories[0].name);
+    if (!pathIsWithin(resolvedRoot, reportDirectory)) return [];
+    const reportStats = fs.lstatSync(reportDirectory);
+    if (!reportStats.isDirectory() || reportStats.isSymbolicLink()) return [];
+    const auditPath = path.join(reportDirectory, SETTINGS_AUDIT_NAME);
+    const auditFile = readBoundedRegularFile(auditPath, MAX_SETTINGS_AUDIT_BYTES);
+    if (auditFile.state !== "present") return [];
+    const lines = auditFile.text.split(/\r?\n/).filter(Boolean);
+    if (lines.length > MAX_SETTINGS_AUDIT_LINES) return [];
+    const events = [];
+    let attempt = 0;
+    for (const line of lines) {
+      const event = parseSettingsAuditLine(line);
+      if (!event) continue;
+      if (event.phase === "settings_provider_start") {
+        attempt += 1;
+        if (attempt > 2) return [];
+        events.push({ phase: event.phase, attempt });
+        continue;
+      }
+      if (attempt === 0) continue;
+      if (event.phase === "settings_provider_failed") {
+        events.push({ phase: event.phase, attempt, reason: event.reason });
+      } else {
+        events.push({ phase: event.phase, attempt });
+      }
+    }
+    return events;
+  } catch {
+    return [];
+  }
+}
+
+function fixedProcessGroupMemberPids(pgid) {
+  try {
+    const result = spawnSync("/bin/ps", ["-ax", "-o", "pid=", "-o", "pgid="], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+    if (result.status !== 0) return null;
+    const lines = String(result.stdout ?? "").split(/\r?\n/).filter(Boolean);
+    if (lines.length > MAX_SETTINGS_PROCESS_MEMBERS * 16) return null;
+    const members = [];
+    for (const line of lines) {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (!match || Number(match[2]) !== pgid) continue;
+      const pid = Number(match[1]);
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      members.push(pid);
+      if (members.length > MAX_SETTINGS_PROCESS_MEMBERS) return null;
+    }
+    return members;
+  } catch {
+    return null;
+  }
+}
+
+function fixedProcessExecutable(pid) {
+  try {
+    const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "pgid=", "-o", "comm="], {
+      encoding: "utf8",
+      maxBuffer: 4096,
+    });
+    if (result.status !== 0) return null;
+    const match = /^\s*(\d+)\s+([^\r\n\0]+)\s*$/.exec(String(result.stdout ?? ""));
+    if (!match) return null;
+    const pgid = Number(match[1]);
+    const executable = match[2];
+    if (!Number.isInteger(pgid) || pgid <= 0 || executable.length > 2048) return null;
+    return { pgid, executable };
+  } catch {
+    return null;
+  }
+}
+
+export function hasTrustedSettingsHelperProcess(
+  productionIdentity,
+  helperPath,
+  dependencies = {}
+) {
+  if (
+    !Number.isInteger(productionIdentity?.pid) ||
+    productionIdentity.pid <= 0 ||
+    !Number.isInteger(productionIdentity?.pgid) ||
+    productionIdentity.pgid <= 0 ||
+    typeof helperPath !== "string" ||
+    !path.isAbsolute(helperPath) ||
+    helperPath.length > 2048 ||
+    /[\r\n\0]/.test(helperPath)
+  ) {
+    return false;
+  }
+  const listMembers = dependencies.listProcessGroupMembers ?? fixedProcessGroupMemberPids;
+  const inspectProcess = dependencies.inspectProcess ?? fixedProcessExecutable;
+  let members;
+  try {
+    members = listMembers(productionIdentity.pgid);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(members) || members.length > MAX_SETTINGS_PROCESS_MEMBERS) return false;
+  const expectedPath = path.resolve(helperPath);
+  for (const pid of members) {
+    if (!Number.isInteger(pid) || pid <= 0 || pid === productionIdentity.pid) continue;
+    let candidate;
+    try {
+      candidate = inspectProcess(pid);
+    } catch {
+      return false;
+    }
+    if (
+      candidate?.pgid === productionIdentity.pgid &&
+      candidate.executable === expectedPath
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function observeTrustedSettingsHelperSpawn(
+  productionProtocol,
+  productionIdentity,
+  helperPath,
+  dependencies = {}
+) {
+  if (
+    !productionProtocol ||
+    productionProtocol.settingsProviderState !== "request_created" ||
+    typeof productionProtocol.observeSettingsHelperSpawned !== "function"
+  ) {
+    return false;
+  }
+  if (
+    !hasTrustedSettingsHelperProcess(
+      productionIdentity,
+      helperPath,
+      dependencies
+    )
+  ) {
+    return false;
+  }
+  return productionProtocol.observeSettingsHelperSpawned();
 }
 
 function fixedGit(repo, args) {
@@ -2130,7 +2514,16 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let manualPromptVisible = false;
     let manualPromptObserved = false;
     let manualPromptCount = 0;
+    let twoFaWinnerConfirmations = 0;
     productionProtocol = createProductionProtocolState();
+    const settingsHelperPath = path.join(context.helperDir, SETTINGS_HELPER_NAME);
+    const observeSettingsHelperSpawn = () => {
+      return observeTrustedSettingsHelperSpawn(
+        productionProtocol,
+        productionIdentity,
+        settingsHelperPath
+      );
+    };
     const supervisorStatusProtocol = createSupervisorStatusProtocol();
     const emittedStatuses = new Set();
     const manualPromptBytes = Buffer.from(MANUAL_CODE_PROMPT, "utf8");
@@ -2147,6 +2540,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
       emittedStatuses.add(key);
       safeWrite(`${value}\n`);
     };
+    const emitTwoFaWinner = (status) => {
+      const message = supervisedTwoFaWinnerMessage(status);
+      if (!message || twoFaWinnerConfirmations >= 2) return;
+      twoFaWinnerConfirmations += 1;
+      safeWrite(`${message}\n`);
+    };
     const processSafeLine = (line) => {
       if (line === MANUAL_CODE_PROMPT) {
         if (manualPromptVisible) {
@@ -2162,18 +2561,23 @@ export async function runSupervisedTerminalBridge(options = {}) {
         return;
       }
       if (!productionProtocol.processStdoutLine(line)) return;
+      if (line === "[2FA] status:settings_start") observeSettingsHelperSpawn();
 
       if (line.startsWith("[2FA] status:")) {
         const status = line.slice("[2FA] status:".length);
-        if (status === "permission_preflight_prompted") {
+        if (supervisedTwoFaWinnerMessage(status)) {
+          emitTwoFaWinner(status);
+        } else if (supervisedTwoFaStatusMessage(status)) {
+          emitStatus(`2fa-${status}`, supervisedTwoFaStatusMessage(status));
+        } else if (status === "permission_preflight_prompted") {
           emitStatus(
             "accessibility-prompted",
-            "[mac:supervised] 正在请求原生辅助功能授权；请按 macOS 提示允许 Codex / 原生 2FA helper"
+            "[mac:supervised] 正在请求原生 2FA helper 的辅助功能授权；请按 macOS 弹窗实际显示的条目允许"
           );
         } else if (status === "permission_preflight_missing") {
           emitStatus(
             "accessibility-missing",
-            "[mac:supervised] 原生 2FA helper 尚未获辅助功能授权；此受监督流程实际运行于 Codex，不是仅 Terminal，流程将继续尝试 OCR、系统设置与手动兜底"
+            "[mac:supervised] 原生 2FA helper 尚未获辅助功能授权；请以 macOS 弹窗或辅助功能列表实际显示的条目为准，不要只依据其他终端或宿主应用的勾选状态；流程将继续尝试 OCR、系统设置与手动兜底"
           );
         } else if (status === "popup_accessibility") {
           emitStatus(
@@ -2456,6 +2860,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     ) {
       if (cancellationIsPresent(context)) cancellationRequested = true;
       if (!cancellationRequested) {
+        observeSettingsHelperSpawn();
         await Promise.race([outcome.promise, wait(POLL_MS)]);
       }
     }
@@ -2537,6 +2942,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
     if (manualPromptVisible) {
       safeWrite("\n");
       manualPromptVisible = false;
+    }
+
+    for (const event of readSettingsProviderAudit(env.APPLE_AUTOMATION_REPORT_ROOT)) {
+      productionProtocol.processSettingsAuditEvent(event);
     }
 
     const trustedProductionStage = productionProtocol.productionStage;
@@ -2708,6 +3117,9 @@ export async function runSupervisedTerminalBridge(options = {}) {
       twoFaDetail,
       productionStage: attestationProductionStage,
       nodeFailure: attestationNodeFailure,
+      settingsProviderState: productionProtocol.settingsProviderState,
+      settingsProviderAttempt: productionProtocol.settingsProviderAttempt,
+      settingsProviderFailureReason: productionProtocol.settingsProviderFailureReason,
       observedHeadBefore: headBefore,
       observedHeadAfter: headAfter,
     });

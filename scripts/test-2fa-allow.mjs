@@ -94,6 +94,7 @@ function assertAtomicHelperCompilation(module, availabilityExport, label) {
       sourcePath,
       binaryPath,
       quiet: true,
+      compileIfNeeded: true,
       spawnSync(command, args) {
         const outputPath = args[args.indexOf("-o") + 1];
         compilerCalls.push({ command, args: [...args], outputPath });
@@ -114,6 +115,7 @@ function assertAtomicHelperCompilation(module, availabilityExport, label) {
       sourcePath,
       binaryPath,
       quiet: true,
+      compileIfNeeded: true,
       spawnSync(command, args) {
         const outputPath = args[args.indexOf("-o") + 1];
         compilerCalls.push({ command, args: [...args], outputPath });
@@ -126,6 +128,44 @@ function assertAtomicHelperCompilation(module, availabilityExport, label) {
     assert.equal(compilerCalls[1].command, "/usr/bin/xcrun", `${label} must bypass PATH`);
     assert.equal(compilerCalls[1].args[0], "swiftc", `${label} must ask xcrun for swiftc`);
     assert.notEqual(compilerCalls[1].outputPath, binaryPath, `${label} must replace atomically`);
+  } finally {
+    for (const entry of fs.readdirSync(fixtureDir)) {
+      fs.unlinkSync(path.join(fixtureDir, entry));
+    }
+    fs.rmdirSync(fixtureDir);
+  }
+}
+
+function assertDefaultAvailabilityDoesNotCompile(module, availabilityExport, label) {
+  const isAvailable = module[availabilityExport];
+  assert.equal(typeof isAvailable, "function", `${label} availability API is required`);
+
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "prepared-native-helper-"));
+  const sourcePath = path.join(fixtureDir, `${label}.swift`);
+  const binaryPath = path.join(fixtureDir, label);
+  const oldTime = new Date(Date.now() - 10_000);
+  const newTime = new Date();
+  fs.writeFileSync(sourcePath, "// source\n");
+  fs.writeFileSync(binaryPath, "old-binary\n", { mode: 0o755 });
+  fs.utimesSync(binaryPath, oldTime, oldTime);
+  fs.utimesSync(sourcePath, newTime, newTime);
+
+  let compilerCalls = 0;
+  try {
+    const available = isAvailable({
+      platform: "darwin",
+      sourcePath,
+      binaryPath,
+      quiet: true,
+      spawnSync() {
+        compilerCalls += 1;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    assert.equal(available, false, `${label} must reject an unprepared helper`);
+    assert.equal(compilerCalls, 0, `${label} must not compile by default`);
+    assert.equal(fs.readFileSync(binaryPath, "utf8"), "old-binary\n");
   } finally {
     for (const entry of fs.readdirSync(fixtureDir)) {
       fs.unlinkSync(path.join(fixtureDir, entry));
@@ -149,6 +189,7 @@ function assertMissingSourceRejectsOldBinary(module, availabilityExport, label) 
       sourcePath,
       binaryPath,
       quiet: true,
+      compileIfNeeded: true,
       spawnSync() {
         compilerCalls += 1;
         return { status: 0, stdout: "", stderr: "" };
@@ -183,6 +224,7 @@ function assertRejectsNonExecutableCompilerOutput(module, availabilityExport, la
       sourcePath,
       binaryPath,
       quiet: true,
+      compileIfNeeded: true,
       spawnSync(_command, args) {
         compilerOutput = args[args.indexOf("-o") + 1];
         fs.writeFileSync(compilerOutput, "non-executable-output\n", { mode: 0o644 });
@@ -229,6 +271,7 @@ function assertOcrRejectsNonExecutableCompilerOutput() {
       sourcePath,
       binaryPath,
       quiet: true,
+      compileIfNeeded: true,
       spawnSync(_command, args) {
         compilerOutput = args[args.indexOf("-o") + 1];
         fs.writeFileSync(compilerOutput, "non-executable-output\n", { mode: 0o755 });
@@ -351,6 +394,25 @@ test("tryAllowOnce does not rotate after a non-attempt", async () => {
   });
 });
 
+test("public Allow runtime only accepts an already prepared helper", async () => {
+  const compileModes = [];
+  const result = await tryAllowOnce(1, {
+    runtime: {
+      ensureBin(_sourcePath, _binaryPath, options) {
+        compileModes.push(options.compileIfNeeded);
+        return false;
+      },
+    },
+  });
+
+  assert.deepEqual(result, {
+    attempted: false,
+    source: undefined,
+    strategy: "cg_ax",
+  });
+  assert.deepEqual(compileModes, [false, false]);
+});
+
 test("tryAllowOnce forwards cancellation to the selected native strategy", async () => {
   const controller = new AbortController();
   let receivedSignal = null;
@@ -369,6 +431,51 @@ test("tryAllowOnce forwards cancellation to the selected native strategy", async
 
   assert.equal(receivedSignal, controller.signal);
   assert.equal(result.attempted, true);
+});
+
+test("Allow cancellation drops aborted helper stdout and keeps a fixed non-attempt result", async () => {
+  const controller = new AbortController();
+  let beginAttempt;
+  const attemptStarted = new Promise((resolve) => {
+    beginAttempt = resolve;
+  });
+  const resultPromise = tryAllowOnce(1, {
+    signal: controller.signal,
+    runtime: {
+      ensureBin() {
+        return true;
+      },
+      async execFileAsync(_binary, args) {
+        if (args[0] === "--release-left-button") {
+          return { stdout: '{"ok":true,"action":"released_left_button"}\n' };
+        }
+        beginAttempt();
+        return new Promise((_, reject) => {
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("helper output 123456 must stay private");
+              error.name = "AbortError";
+              error.stdout =
+                '{"ok":true,"action":"attempted_allow","source":"FollowUpUI"}\n';
+              reject(error);
+            },
+            { once: true }
+          );
+        });
+      },
+    },
+  });
+
+  await attemptStarted;
+  controller.abort();
+  const result = await resultPromise;
+
+  assert.deepEqual(result, {
+    attempted: false,
+    source: undefined,
+    strategy: undefined,
+  });
 });
 
 test("the default automatic path contains only constrained atomic Swift", () => {
@@ -412,6 +519,16 @@ test("Allow helper rejects a stale binary when recompilation fails", () => {
     "is2FAAllowHelperAvailable",
     "mac-2fa-click-allow"
   );
+});
+
+test("helper availability defaults to prepared binaries without compiling", () => {
+  for (const [module, availabilityExport, label] of [
+    [allowModule, "is2FAAllowHelperAvailable", "mac-2fa-click-allow"],
+    [popupModule, "is2FAPopupHelperAvailable", "mac-2fa-popup-read"],
+    [ocrModule, "is2FAOcrHelperAvailable", "mac-2fa-popup-ocr"],
+  ]) {
+    assertDefaultAvailabilityDoesNotCompile(module, availabilityExport, label);
+  }
 });
 
 test("Allow helper rejects an old binary when its Swift source is missing", () => {
@@ -740,6 +857,22 @@ test("shared hosts require explicit Apple account evidence for every code operat
   assert.match(finder, /hasCodePrompt: hasCodePrompt/);
 });
 
+test("System Settings Apple Account sheets are a constrained shared 2FA host", () => {
+  assert.match(popupReadSwiftSource, /sharedHostExecutables:[\s\S]*"System Settings"/);
+  assert.match(popupReadSwiftSource, /sharedHostBundleIDs:[\s\S]*com\.apple\.systempreferences/);
+  assert.match(popupReadSwiftSource, /func isSystemSettingsSharedHost/);
+  assert.match(
+    popupReadSwiftSource,
+    /case \.sharedHost:[\s\S]*return hasCodePrompt && hasExplicitAppleAccountEvidence\(blob\)/
+  );
+  assert.match(
+    popupReadSwiftSource,
+    /!item\.isSystemSettingsSharedHost && looksLikeAllowDialog\(item\.scan\.blob\)/
+  );
+  assert.match(popupOcrSwiftSource, /requiresAppleAccountEvidence: Bool/);
+  assert.match(popupOcrSwiftSource, /hasSharedHostVisionEvidence\(fullLines\)/);
+});
+
 test("the Swift title predicate covers English and both Chinese scripts", () => {
   const predicate = swiftFunctionBody("isPositiveAllowButton");
 
@@ -830,6 +963,40 @@ test("zh-Hant verification prompts reach popup state and OCR targeting", () => {
   );
 });
 
+test("AX and OCR share one constrained verification-code prompt predicate", () => {
+  const axPrompt = sourceFunctionBody(
+    popupReadSwiftSource,
+    "func hasCodeDisplayPrompt"
+  );
+  const ocrPromptStart = popupOcrSwiftSource.indexOf("func looksLikeCodeDialog");
+  const ocrPromptEnd = popupOcrSwiftSource.indexOf(
+    "\nlet dedicatedAuthExecutables",
+    ocrPromptStart
+  );
+  assert.ok(ocrPromptStart >= 0 && ocrPromptEnd > ocrPromptStart);
+  const ocrPrompt = popupOcrSwiftSource.slice(ocrPromptStart, ocrPromptEnd);
+  const findOcrTargets = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func findCodeDialogs"
+  );
+  const normalizePredicate = (body) =>
+    body
+      .replace(/^func [^(]+\(_ blob: String\) -> Bool\s*/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  assert.equal(
+    normalizePredicate(ocrPrompt),
+    normalizePredicate(axPrompt),
+    "OCR must accept exactly the AX-approved English, zh-Hans, and zh-Hant code prompts"
+  );
+  assert.doesNotMatch(ocrPrompt, /正用于登录|新设备/);
+  assert.match(
+    findOcrTargets,
+    /let hasCodePrompt = looksLikeCodeDialog\(blob\)[\s\S]*isEligibleCodeWindow\([\s\S]*hasCodePrompt: hasCodePrompt/
+  );
+});
+
 test("zh-Hant code reading and completion cleanup share one state chain", () => {
   const doneTitle = sourceFunctionBody(popupReadSwiftSource, "func isDoneTitle");
   const collector = sourceFunctionBody(popupReadSwiftSource, "func walkCollect");
@@ -887,14 +1054,21 @@ test("zh-Hant code reading and completion cleanup share one state chain", () => 
     sidecarSource.indexOf("const tryClosePendingPopup"),
     sidecarSource.indexOf("const dismissRejectedPopup")
   );
-  const helperClose = closeHelper.indexOf("runtime.dismissCodePopupForWebFill(4,");
   const helperBuffer = closeHelper.indexOf('phase: "popup_code_buffered"');
+  const helperCleanup = closeHelper.indexOf(
+    "startPopupCloseCleanup(popupCandidate, generation)"
+  );
   assert.ok(
     sidecarRead >= 0 &&
       sidecarClose > sidecarRead &&
-      helperClose >= 0 &&
-      helperBuffer > helperClose,
-    "popup code must be read, given a bounded close attempt, and only then buffered"
+      helperBuffer >= 0 &&
+      helperCleanup > helperBuffer,
+    "popup code must be buffered before background close cleanup starts"
+  );
+  assert.doesNotMatch(
+    closeHelper.slice(0, helperBuffer),
+    /dismissCodePopupForWebFill|runPopupPhase\("dismiss_stale"/,
+    "popup close cleanup must not block delivery of a verified code"
   );
 });
 
@@ -1045,6 +1219,195 @@ test("OCR permission request adds the explicit native prompt flag once", async (
   assert.deepEqual(calls, [["--preflight-screen-capture", "--prompt-screen-capture"]]);
 });
 
+test("OCR permission prompt caches a timed-out helper and rechecks without prompting", async () => {
+  const calls = [];
+  const capabilityCache = {};
+  let nowMs = 0;
+  let attempt = 0;
+  const options = {
+    requestPermission: true,
+    capabilityCache,
+    now: () => nowMs,
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      calls.push([...args]);
+      attempt += 1;
+      if (attempt === 1) {
+        const error = new Error("preflight helper timed out");
+        error.code = "ETIMEDOUT";
+        throw error;
+      }
+      return {
+        stdout:
+          '{"ok":true,"capability":"permission_missing","message":"preflight"}\n',
+        stderr: "",
+      };
+    },
+  };
+
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "unavailable");
+  assert.equal(capabilityCache.permissionPrompted, true);
+  assert.equal(capabilityCache.permissionPromptInFlight, undefined);
+  assert.equal(capabilityCache.capability, "unavailable");
+  assert.equal(capabilityCache.permissionRecheckAt, 2_000);
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "unavailable");
+  nowMs += 2_000;
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "permission_missing");
+  assert.deepEqual(calls, [
+    ["--preflight-screen-capture", "--prompt-screen-capture"],
+    ["--preflight-screen-capture"],
+  ]);
+});
+
+test("public OCR collection never synchronously compiles a missing helper", async () => {
+  let compilerCalls = 0;
+  let helperCalls = 0;
+  const result = await ocrModule.readPopupCodeViaOcr(4, {
+    platform: "darwin",
+    sourcePath: path.join(os.tmpdir(), "missing-2fa-ocr-source.swift"),
+    binaryPath: path.join(os.tmpdir(), "missing-2fa-ocr-helper"),
+    spawnSync() {
+      compilerCalls += 1;
+      return { status: 1 };
+    },
+    async execFileAsync() {
+      helperCalls += 1;
+      throw new Error("unprepared helper must not run");
+    },
+  });
+
+  assert.deepEqual(result, {
+    code: null,
+    source: "vision",
+    capability: "unavailable",
+  });
+  assert.equal(compilerCalls, 0);
+  assert.equal(helperCalls, 0);
+});
+
+test("OCR helper availability honors the runtime no-compile contract", () => {
+  let compilerCalls = 0;
+  const available = ocrModule.is2FAOcrHelperAvailable({
+    platform: "darwin",
+    sourcePath: path.join(os.tmpdir(), "missing-2fa-ocr-source.swift"),
+    binaryPath: path.join(os.tmpdir(), "missing-2fa-ocr-helper"),
+    compileIfNeeded: false,
+    spawnSync() {
+      compilerCalls += 1;
+      return { status: 0 };
+    },
+  });
+
+  assert.equal(available, false);
+  assert.equal(compilerCalls, 0);
+});
+
+test("public popup phase never synchronously compiles a missing helper", async () => {
+  let compilerCalls = 0;
+  let helperCalls = 0;
+  const result = await popupModule.runPopupPhase("probe", 2, {
+    platform: "darwin",
+    sourcePath: path.join(os.tmpdir(), "missing-2fa-popup-source.swift"),
+    binaryPath: path.join(os.tmpdir(), "missing-2fa-popup-helper"),
+    spawnSync() {
+      compilerCalls += 1;
+      return { status: 1 };
+    },
+    async execFile() {
+      helperCalls += 1;
+      throw new Error("unprepared helper must not run");
+    },
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    action: "none",
+    code: null,
+    source: null,
+  });
+  assert.equal(compilerCalls, 0);
+  assert.equal(helperCalls, 0);
+});
+
+test("OCR permission rechecks without prompting and recovers after a same-run grant", async () => {
+  let nowMs = 0;
+  let preflightCount = 0;
+  const calls = [];
+  const capabilityCache = {};
+  const resultOptions = {
+    requestPermission: true,
+    capabilityCache,
+    now: () => nowMs,
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      calls.push([...args]);
+      if (args[0] === "--preflight-screen-capture") {
+        preflightCount += 1;
+        return {
+          stdout:
+            preflightCount === 1
+              ? '{"ok":true,"capability":"permission_missing","message":"preflight"}\n'
+              : '{"ok":true,"capability":"available","message":"preflight"}\n',
+          stderr: "",
+        };
+      }
+      return {
+        stdout: '{"ok":true,"code":"012345","source":"vision","message":"ok"}\n',
+        stderr: "",
+      };
+    },
+  };
+
+  const beforeGrant = await ocrModule.readPopupCodeViaOcr(4, resultOptions);
+  const beforeRetry = await ocrModule.readPopupCodeViaOcr(4, resultOptions);
+  nowMs += 2_000;
+  const afterGrant = await ocrModule.readPopupCodeViaOcr(4, resultOptions);
+
+  assert.deepEqual(beforeGrant, {
+    code: null,
+    source: "vision",
+    capability: "permission_missing",
+  });
+  assert.deepEqual(beforeRetry, beforeGrant);
+  assert.deepEqual(afterGrant, { code: "012345", source: "vision" });
+  assert.deepEqual(calls, [
+    ["--preflight-screen-capture", "--prompt-screen-capture"],
+    ["--preflight-screen-capture"],
+    ["--timeout", "4"],
+  ]);
+});
+
+test("OCR permission retry stays prompt-free while Screen Recording remains denied", async () => {
+  let nowMs = 0;
+  const calls = [];
+  const capabilityCache = {};
+  const options = {
+    requestPermission: true,
+    capabilityCache,
+    now: () => nowMs,
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      calls.push([...args]);
+      return {
+        stdout: '{"ok":true,"capability":"permission_missing","message":"preflight"}\n',
+        stderr: "",
+      };
+    },
+  };
+
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "permission_missing");
+  nowMs += 2_000;
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "permission_missing");
+  nowMs += 2_000;
+  assert.equal(await ocrModule.get2FAOcrCapability(options), "permission_missing");
+
+  assert.deepEqual(calls, [
+    ["--preflight-screen-capture", "--prompt-screen-capture"],
+    ["--preflight-screen-capture"],
+    ["--preflight-screen-capture"],
+  ]);
+});
+
 test("OCR permission denial is cached and never spawns capture attempts", async () => {
   const calls = [];
   const capabilityCache = {};
@@ -1086,6 +1449,57 @@ test("OCR reports fixed unavailable capability without spawning a missing helper
 
   assert.equal(capability, "unavailable");
   assert.equal(spawns, 0);
+});
+
+test("OCR deadline prevents a late screen-capture preflight", async () => {
+  let helperChecks = 0;
+  let spawns = 0;
+  const capability = await ocrModule.get2FAOcrCapability({
+    deadlineMs: 10_000,
+    now: () => 10_000,
+    isHelperAvailable() {
+      helperChecks += 1;
+      return true;
+    },
+    async execFileAsync() {
+      spawns += 1;
+      throw new Error("must not start after the collector deadline");
+    },
+  });
+
+  assert.equal(capability, "unavailable");
+  assert.equal(helperChecks, 0);
+  assert.equal(spawns, 0);
+});
+
+test("OCR helper subprocesses are capped by the shared acquisition deadline", async () => {
+  const calls = [];
+  const result = await ocrModule.readPopupCodeViaOcr(4, {
+    capabilityCache: {},
+    deadlineMs: 6_000,
+    now: () => 1_000,
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args, options) {
+      calls.push({ args: [...args], timeout: options.timeout });
+      if (args[0] === "--preflight-screen-capture") {
+        return {
+          stdout:
+            '{"ok":true,"capability":"available","message":"preflight"}\n',
+          stderr: "",
+        };
+      }
+      return {
+        stdout: '{"ok":true,"code":"012345","source":"vision","message":"ok"}\n',
+        stderr: "",
+      };
+    },
+  });
+
+  assert.deepEqual(result, { code: "012345", source: "vision" });
+  assert.deepEqual(calls, [
+    { args: ["--preflight-screen-capture"], timeout: 2_000 },
+    { args: ["--timeout", "4"], timeout: 5_000 },
+  ]);
 });
 
 test("OCR permission availability preflights before one constrained read", async () => {
@@ -1142,6 +1556,74 @@ test("OCR helper forwards cancellation to both constrained subprocess calls", as
   assert.deepEqual(signals, [controller.signal, controller.signal]);
 });
 
+test("OCR cancellation maps an aborted helper with stdout to fixed unavailable", async () => {
+  const controller = new AbortController();
+  const result = await ocrModule.readPopupCodeViaOcr(4, {
+    signal: controller.signal,
+    capabilityCache: {},
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      if (args[0] === "--preflight-screen-capture") {
+        return {
+          stdout: '{"ok":true,"capability":"available","message":"preflight"}\n',
+          stderr: "",
+        };
+      }
+      controller.abort();
+      const error = new Error("raw OCR 123456 must not escape");
+      error.name = "AbortError";
+      error.stdout = '{"ok":true,"code":"123456","source":"vision"}\n';
+      throw error;
+    },
+  });
+
+  assert.deepEqual(result, {
+    code: null,
+    source: "vision",
+    capability: "unavailable",
+  });
+});
+
+test("popup phase cancellation drops helper stdout and returns the fixed empty phase", async () => {
+  const controller = new AbortController();
+  const result = await popupModule.runPopupPhase("read_code", 4, {
+    platform: "darwin",
+    signal: controller.signal,
+    ensureHelper: () => true,
+    async execFile() {
+      controller.abort();
+      const error = new Error("raw AX 123456 must not escape");
+      error.name = "AbortError";
+      error.stdout =
+        '{"ok":true,"action":"read_code","code":"123456","source":"FollowUpUI"}\n';
+      throw error;
+    },
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    action: "none",
+    code: null,
+    source: null,
+  });
+});
+
+test("native Accessibility cancellation maps late helper output to fixed unavailable", async () => {
+  const controller = new AbortController();
+  const result = await popupModule.checkNativeAccessibilityCapability({
+    platform: "darwin",
+    signal: controller.signal,
+    ensureHelper: () => true,
+    async execFile(_binary, _args, options) {
+      assert.equal(options.signal, controller.signal);
+      controller.abort();
+      return { stdout: '{"capability":"permission_missing","raw":"123456"}\n' };
+    },
+  });
+
+  assert.deepEqual(result, { capability: "unavailable" });
+});
+
 test("popup code acquisition is AX-first even when legacy callers prefer OCR", async () => {
   const calls = [];
   const result = await allowModule.readPopupCode(8, {
@@ -1162,6 +1644,84 @@ test("popup code acquisition is AX-first even when legacy callers prefer OCR", a
   assert.deepEqual(calls, [["ax", 2]]);
 });
 
+test("AX rejected popup codes use a fixed private result and skip OCR", async () => {
+  const rejectedCode = "314159";
+  const calls = [];
+  const consoleLines = [];
+  const originalLog = console.log;
+  let result;
+
+  try {
+    console.log = (...args) => consoleLines.push(args.map(String).join(" "));
+    result = await allowModule.readPopupCode(8, {
+      rejectCodes: new Set([rejectedCode]),
+      runtime: {
+        async readPopupCodeViaSwift(timeoutSec) {
+          calls.push(["ax", timeoutSec]);
+          return { code: rejectedCode, source: "swift_ax" };
+        },
+        async readPopupCodeViaOcr(timeoutSec) {
+          calls.push(["ocr", timeoutSec]);
+          return { code: "654321", source: "vision" };
+        },
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.deepEqual(result, { code: null, rejected: true });
+  assert.equal(result.rejected, true, "callers must distinguish a rejected code from no code");
+  assert.deepEqual(calls, [["ax", 2]]);
+  assert.equal(JSON.stringify(result).includes(rejectedCode), false);
+  assert.equal(consoleLines.join("\n").includes(rejectedCode), false);
+});
+
+test("OCR rejected popup codes use the same fixed private result", async () => {
+  const rejectedCode = "271828";
+  const calls = [];
+  const consoleLines = [];
+  const originalLog = console.log;
+  let result;
+
+  try {
+    console.log = (...args) => consoleLines.push(args.map(String).join(" "));
+    result = await allowModule.readPopupCode(8, {
+      rejectCodes: new Set([rejectedCode]),
+      runtime: {
+        async readPopupCodeViaSwift(timeoutSec) {
+          calls.push(["ax", timeoutSec]);
+          return {
+            code: null,
+            source: "swift_ax",
+            capability: "accessibility_missing",
+          };
+        },
+        async readPopupCodeViaOcr(timeoutSec, options) {
+          calls.push(["ocr", timeoutSec, options.requestPermission]);
+          return {
+            code: rejectedCode,
+            source: "vision",
+            raw: "untrusted-recognition-text",
+            reason: "stale-code",
+          };
+        },
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.deepEqual(result, { code: null, rejected: true });
+  assert.equal(result.rejected, true, "callers must distinguish a rejected code from no code");
+  assert.deepEqual(calls, [
+    ["ax", 2],
+    ["ocr", 4, true],
+  ]);
+  assert.equal(JSON.stringify(result).includes(rejectedCode), false);
+  assert.equal(consoleLines.join("\n").includes(rejectedCode), false);
+});
+
 test("popup code acquisition falls back to OCR after an AX permission failure", async () => {
   const calls = [];
   const result = await allowModule.readPopupCode(8, {
@@ -1180,7 +1740,7 @@ test("popup code acquisition falls back to OCR after an AX permission failure", 
   assert.deepEqual(result, { code: "654321", source: "vision" });
   assert.deepEqual(calls, [
     ["ax", 2],
-    ["ocr", 6, true],
+    ["ocr", 4, true],
   ]);
 });
 
@@ -1202,7 +1762,7 @@ test("popup code acquisition falls back to OCR only after AX has no legal code",
   assert.deepEqual(result, { code: "654321", source: "vision" });
   assert.deepEqual(calls, [
     ["ax", 2],
-    ["ocr", 6],
+    ["ocr", 4],
   ]);
 });
 
@@ -1224,7 +1784,140 @@ test("popup code readers forward cancellation to AX and OCR helpers", async () =
   });
 
   assert.deepEqual(result, { code: "654321", source: "vision" });
-  assert.deepEqual(signals, [controller.signal, controller.signal]);
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0], signals[1]);
+  assert.notEqual(signals[0], controller.signal);
+  assert.equal(signals[0].aborted, false);
+});
+
+test("popup code reader reserves a bounded OCR stability window", async () => {
+  const calls = [];
+  const result = await allowModule.readPopupCode(4, {
+    runtime: {
+      async readPopupCodeViaSwift(timeoutSec) {
+        calls.push(["ax", timeoutSec]);
+        return null;
+      },
+      async readPopupCodeViaOcr(timeoutSec) {
+        calls.push(["ocr", timeoutSec]);
+        return { code: "654321", source: "vision" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { code: "654321", source: "vision" });
+  assert.deepEqual(calls, [
+    ["ax", 2],
+    ["ocr", 4],
+  ]);
+});
+
+test("slow AX retains the complete two-pass OCR stability window", async () => {
+  let nowMs = 10_000;
+  const calls = [];
+  const result = await allowModule.readPopupCode(4, {
+    now: () => nowMs,
+    runtime: {
+      async readPopupCodeViaSwift(timeoutSec) {
+        calls.push(["ax", timeoutSec]);
+        nowMs += 2_001;
+        return null;
+      },
+      async readPopupCodeViaOcr(timeoutSec) {
+        calls.push(["ocr", timeoutSec]);
+        return { code: "654321", source: "vision" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { code: "654321", source: "vision" });
+  assert.deepEqual(calls, [
+    ["ax", 2],
+    ["ocr", 4],
+  ]);
+});
+
+test("capped popup reads reserve scheduling slack for OCR completion", async () => {
+  let nowMs = 10_000;
+  const calls = [];
+  const result = await allowModule.readPopupCode(12, {
+    now: () => nowMs,
+    runtime: {
+      setTimer() {
+        return null;
+      },
+      clearTimer() {},
+      async readPopupCodeViaSwift(timeoutSec) {
+        calls.push(["ax", timeoutSec]);
+        nowMs += 2_000;
+        return null;
+      },
+      async readPopupCodeViaOcr(timeoutSec) {
+        calls.push(["ocr", timeoutSec]);
+        return { code: "654321", source: "vision" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { code: "654321", source: "vision" });
+  assert.deepEqual(calls, [
+    ["ax", 2],
+    ["ocr", 7],
+  ]);
+});
+
+test("slow OCR cancellation cannot publish a late verification code", async () => {
+  const controller = new AbortController();
+  let resolveSlowOcr;
+  let readerSignal;
+  let markOcrStarted;
+  const ocrStarted = new Promise((resolve) => {
+    markOcrStarted = resolve;
+  });
+  const codePromise = allowModule.readPopupCode(4, {
+    signal: controller.signal,
+    runtime: {
+      async readPopupCodeViaSwift() {
+        return null;
+      },
+      async readPopupCodeViaOcr(_timeoutSec, options) {
+        readerSignal = options.signal;
+        assert.notEqual(readerSignal, controller.signal);
+        markOcrStarted();
+        return new Promise((resolve) => {
+          resolveSlowOcr = resolve;
+        });
+      },
+    },
+  });
+
+  await ocrStarted;
+  controller.abort();
+  assert.equal(readerSignal?.aborted, true);
+  resolveSlowOcr({ code: "654321", source: "vision" });
+
+  assert.deepEqual(await codePromise, {
+    code: null,
+    source: "vision",
+    capability: "unavailable",
+  });
+});
+
+test("manual Allow reports a missing native Accessibility grant immediately", async () => {
+  const result = await waitForManualAllow({
+    timeoutMs: 30_000,
+    runtime: {
+      now: () => 0,
+      setTimer: () => 1,
+      clearTimer() {},
+      sleep: async () => {},
+      async probe2FAState() {
+        return { action: "accessibility_unavailable" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { clicked: false, reason: "accessibility_missing" });
 });
 
 test("popup code acquisition returns fixed OCR unavailability for status", async () => {
@@ -1317,8 +2010,34 @@ test("Swift center-crop OCR requires two independent matching captures", () => {
   assert.match(mainLoop, /guard capturedWindowIDs\.insert\(wid\)\.inserted else \{ continue \}/);
   assert.match(
     mainLoop,
+    /centerCandidateTracker\.retainOnly\(capturedWindowIDs\)[\s\S]*usleep\(350_000\)/
+  );
+  assert.match(
+    mainLoop,
     /if candidate\.requiresStability[\s\S]*observeCenterCandidate\([\s\S]*else \{ continue \}[\s\S]*emit\(Output/
   );
+});
+
+test("Swift OCR keeps raw recognition text out of its IPC contract", () => {
+  const output = popupOcrSwiftSource.slice(
+    popupOcrSwiftSource.indexOf("struct Output: Codable"),
+    popupOcrSwiftSource.indexOf("@_silgen_name")
+  );
+  const emitStart = popupOcrSwiftSource.indexOf("func emit");
+  const emitEnd = popupOcrSwiftSource.indexOf("\nvar timeoutSec", emitStart);
+  assert.ok(emitStart >= 0 && emitEnd > emitStart);
+  const emit = popupOcrSwiftSource.slice(emitStart, emitEnd);
+  const diagnosticLines = popupOcrSwiftSource
+    .split(/\r?\n/)
+    .filter((line) => /logStep\(/.test(line));
+
+  assert.match(output, /let code: String\?/);
+  assert.doesNotMatch(output, /\b(?:raw|ocrText|recognizedText|blob|lines):/i);
+  assert.match(emit, /JSONEncoder\(\)/);
+  assert.doesNotMatch(emit, /standardError|logStep/);
+  for (const line of diagnosticLines) {
+    assert.doesNotMatch(line, /\\\((?:candidate|code|text|blob|lines)/);
+  }
 });
 
 test("Swift center-crop OCR resets on empty or changed captures", () => {
@@ -1337,7 +2056,7 @@ test("Swift center-crop OCR resets on empty or changed captures", () => {
   );
   assert.match(
     mainLoop,
-    /guard let candidate = tryOcrOnImage\(cg\) else \{[\s\S]*reset\(windowID: wid\)[\s\S]*continue/
+    /guard let candidate = tryOcrOnImage\([\s\S]*requiresAppleAccountEvidence: target\.requiresAppleAccountEvidence[\s\S]*\) else \{[\s\S]*reset\(windowID: wid\)[\s\S]*continue/
   );
   assert.match(mainLoop, /retainOnly\(capturedWindowIDs\)/);
 });
@@ -1354,7 +2073,9 @@ test("Swift full-window formatted OCR remains a direct single-capture result", (
 });
 
 test("production Allow guidance requires Accessibility without System Events", () => {
-  assert.match(allowSource, /请确认终端已获辅助功能/);
+  assert.match(allowSource, /请手动点击「允许」/);
+  assert.match(allowSource, /原生 helper 条目为准/);
+  assert.doesNotMatch(allowSource, /终端已获辅助功能/);
   assert.doesNotMatch(allowSource, /System Events|辅助功能\s*\+\s*.*自动化/);
 });
 
@@ -1396,15 +2117,19 @@ test("AX popup helpers fail closed while OCR keeps its screen-recording fallback
   );
   assert.match(popupOcrSwiftSource, /func findScreenOnlyCodeDialogs\(\)/);
   assert.match(popupOcrSwiftSource, /CGWindowListCopyWindowInfo/);
-  assert.match(popupOcrSwiftSource, /candidateKind\(for: app\) == \.dedicated/);
+  assert.match(popupOcrSwiftSource, /case \.dedicated:/);
+  assert.match(popupOcrSwiftSource, /isSystemSettingsSharedHost\(app\)/);
   assert.doesNotMatch(
     popupOcrSwiftSource,
     /if preflightScreenCapture[\s\S]*guard AXIsProcessTrusted\(\) else/
   );
   assert.match(allowSource, /result\.action === "accessibility_unavailable"/);
   assert.match(sidecarSource, /action === "accessibility_unavailable"/);
-  assert.match(sidecarSource, /const screenOcrFallback = action === "accessibility_unavailable"/);
-  assert.match(sidecarSource, /if \(!activeAcquisition\) return;/);
+  assert.match(
+    sidecarSource,
+    /activeAcquisition != null[\s\S]*\["idle", "accessibility_unavailable", "probe_error", "unknown"\]\.includes\(action\)/
+  );
+  assert.match(sidecarSource, /status\("popup_scanning"/);
   assert.match(sidecarSource, /status\("popup_accessibility"/);
 });
 
@@ -1515,12 +2240,24 @@ test("OCR scans only trusted Apple authentication processes", () => {
     popupOcrSwiftSource,
     "func findScreenOnlyCodeDialogs"
   );
-  assert.match(screenOnlyFinder, /candidateKind\(for: app\) == \.dedicated/);
+  assert.match(screenOnlyFinder, /case \.dedicated:/);
+  assert.match(screenOnlyFinder, /isSystemSettingsSharedHost\(app\)/);
+  assert.match(screenOnlyFinder, /frontmostPID\.map \{ app\.processIdentifier == \$0 \} \?\? false/);
+  assert.match(screenOnlyFinder, /app\.isActive \|\| isFrontmost/);
   assert.match(screenOnlyFinder, /CGWindowListCopyWindowInfo/);
   assert.match(screenOnlyFinder, /kCGWindowOwnerPID/);
-  assert.match(screenOnlyFinder, /trustedPIDs\.contains/);
+  assert.match(screenOnlyFinder, /trustedPIDs\[pid_t\(ownerPIDNumber\.int32Value\)\]/);
   assert.match(screenOnlyFinder, /kCGWindowNumber/);
   assert.doesNotMatch(screenOnlyFinder, /kCGWindowName|localizedName/);
+
+  const sharedHostVision = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func hasSharedHostVisionEvidence"
+  );
+  const imageReader = sourceFunctionBody(popupOcrSwiftSource, "func tryOcrOnImage");
+  assert.match(sharedHostVision, /looksLikeCodeDialog\(evidence\).*hasExplicitAppleAccountEvidence\(evidence\)/s);
+  assert.match(imageReader, /requiresAppleAccountEvidence && !hasSharedHostVisionEvidence\(fullLines\)/);
+  assert.match(imageReader, /if fullLines\.isEmpty \{[\s\S]*ocrLines\(from: cg, level: \.fast\)/);
 });
 
 test("Swift diagnostics never log raw accessibility text", () => {

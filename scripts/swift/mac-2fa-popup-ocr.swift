@@ -88,12 +88,14 @@ func blobOf(_ root: AXUIElement, depth: Int = 0, maxDepth: Int = 14) -> String {
 func looksLikeCodeDialog(_ blob: String) -> Bool {
     if blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("在网页上输入") && blob.contains("验证码") { return true }
+    if blob.contains("输入此验证码") { return true }
     if blob.contains("验证码以登录") { return true }
     if blob.contains("在網頁上輸入此驗證碼") { return true }
     if blob.contains("在網頁上輸入") && blob.contains("驗證碼") { return true }
+    if blob.contains("輸入此驗證碼") { return true }
     if blob.contains("驗證碼以登入") { return true }
-    if blob.contains("Enter this verification code") { return true }
-    if blob.contains("正用于登录") && blob.contains("新设备") && (blob.contains("完成") || blob.contains("Done")) { return true }
+    let lower = blob.lowercased()
+    if lower.contains("enter this verification code on the web") { return true }
     return false
 }
 
@@ -108,6 +110,7 @@ let sharedHostExecutables: Set<String> = [
     "loginwindow",
     "SecurityAgent",
     "akd",
+    "System Settings",
 ]
 let dedicatedAuthBundleIDs: Set<String> = [
     "com.apple.FollowUpUI",
@@ -120,6 +123,8 @@ let sharedHostBundleIDs: Set<String> = [
     "com.apple.loginwindow",
     "com.apple.SecurityAgent",
     "com.apple.akd",
+    "com.apple.systempreferences",
+    "com.apple.SystemSettings",
 ]
 
 enum CandidateKind: Equatable {
@@ -148,6 +153,14 @@ func candidateKind(for app: NSRunningApplication) -> CandidateKind? {
         return .sharedHost
     }
     return nil
+}
+
+func isSystemSettingsSharedHost(_ app: NSRunningApplication) -> Bool {
+    guard candidateKind(for: app) == .sharedHost,
+          let executableURL = app.executableURL else { return false }
+    return executableURL.lastPathComponent == "System Settings" ||
+        app.bundleIdentifier == "com.apple.systempreferences" ||
+        app.bundleIdentifier == "com.apple.SystemSettings"
 }
 
 func hasExplicitAppleAccountEvidence(_ blob: String) -> Bool {
@@ -196,6 +209,7 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
 
 struct DialogTarget {
     let windowID: CGWindowID?
+    let requiresAppleAccountEvidence: Bool
 }
 
 enum OcrCandidateSource: Equatable {
@@ -315,7 +329,7 @@ func findCodeDialogs() -> [DialogTarget] {
                 near: frame
             ) ?? windowIDFor(win)
             guard let windowID else { continue }
-            out.append(DialogTarget(windowID: windowID))
+            out.append(DialogTarget(windowID: windowID, requiresAppleAccountEvidence: false))
         }
     }
     return out
@@ -346,13 +360,24 @@ func captureWindowByID(_ wid: CGWindowID) async -> CGImage? {
 }
 
 // Screen Recording can still inspect a window when Accessibility is denied to
-// this helper. Limit that route to dedicated Apple authentication processes,
-// enumerate only on-screen window IDs, and keep all pixels in memory.
+// this helper. Keep the fallback limited to dedicated Apple authentication
+// processes plus the System Settings Apple Account sheet, which must pass
+// independent in-memory OCR evidence before any code can be published.
 func findScreenOnlyCodeDialogs() -> [DialogTarget] {
-    let trustedPIDs = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
-        guard candidateKind(for: app) == .dedicated else { return nil }
-        return app.processIdentifier
-    })
+    var trustedPIDs: [pid_t: Bool] = [:]
+    let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    for app in NSWorkspace.shared.runningApplications {
+        guard let kind = candidateKind(for: app) else { continue }
+        switch kind {
+        case .dedicated:
+            trustedPIDs[app.processIdentifier] = false
+        case .sharedHost:
+            let isFrontmost = frontmostPID.map { app.processIdentifier == $0 } ?? false
+            if isSystemSettingsSharedHost(app) && (app.isActive || isFrontmost) {
+                trustedPIDs[app.processIdentifier] = true
+            }
+        }
+    }
     guard !trustedPIDs.isEmpty else { return [] }
 
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -362,7 +387,7 @@ func findScreenOnlyCodeDialogs() -> [DialogTarget] {
     for info in windowInfo {
         guard
             let ownerPIDNumber = info[kCGWindowOwnerPID as String] as? NSNumber,
-            trustedPIDs.contains(pid_t(ownerPIDNumber.int32Value)),
+            let requiresAppleAccountEvidence = trustedPIDs[pid_t(ownerPIDNumber.int32Value)],
             let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
             let bounds = info[kCGWindowBounds as String] as? NSDictionary,
             let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
@@ -371,7 +396,10 @@ func findScreenOnlyCodeDialogs() -> [DialogTarget] {
         else { continue }
         let windowID = CGWindowID(windowNumber.uint32Value)
         guard windowID != 0, windowIDs.insert(windowID).inserted else { continue }
-        out.append(DialogTarget(windowID: windowID))
+        out.append(DialogTarget(
+            windowID: windowID,
+            requiresAppleAccountEvidence: requiresAppleAccountEvidence
+        ))
     }
     return out
 }
@@ -436,16 +464,27 @@ func firstCode(in lines: [String], allowContiguous: Bool) -> String? {
     return nil
 }
 
-func tryOcrOnImage(_ cg: CGImage) -> OcrCandidate? {
-    let fullLines = ocrLines(from: cg, level: .accurate)
+func hasSharedHostVisionEvidence(_ lines: [String]) -> Bool {
+    var evidence = ""
+    for line in lines {
+        let remaining = 8_192 - evidence.count
+        guard remaining > 0 else { break }
+        if !evidence.isEmpty { evidence.append(" ") }
+        evidence.append(contentsOf: line.prefix(remaining))
+    }
+    return looksLikeCodeDialog(evidence) && hasExplicitAppleAccountEvidence(evidence)
+}
+
+func tryOcrOnImage(_ cg: CGImage, requiresAppleAccountEvidence: Bool) -> OcrCandidate? {
+    var fullLines = ocrLines(from: cg, level: .accurate)
+    if fullLines.isEmpty {
+        fullLines = ocrLines(from: cg, level: .fast)
+    }
+    if requiresAppleAccountEvidence && !hasSharedHostVisionEvidence(fullLines) {
+        return nil
+    }
     if let hit = firstCode(in: fullLines, allowContiguous: false) {
         return OcrCandidate(code: hit, source: .fullWindow)
-    }
-    if fullLines.isEmpty {
-        let fastLines = ocrLines(from: cg, level: .fast)
-        if let hit = firstCode(in: fastLines, allowContiguous: false) {
-            return OcrCandidate(code: hit, source: .fullWindow)
-        }
     }
     // 中心裁剪再试（大字号验证码常在中间）
     let w = CGFloat(cg.width)
@@ -533,7 +572,10 @@ while Date() < deadline {
             logStep("window capture failed")
             continue
         }
-        guard let candidate = tryOcrOnImage(cg) else {
+        guard let candidate = tryOcrOnImage(
+            cg,
+            requiresAppleAccountEvidence: target.requiresAppleAccountEvidence
+        ) else {
             centerCandidateTracker.reset(windowID: wid)
             continue
         }

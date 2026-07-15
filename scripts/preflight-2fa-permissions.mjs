@@ -25,29 +25,53 @@ async function main() {
   if (supervised) {
     console.log("[2FA] status:permission_preflight_start");
     const deadline = Date.now() + SUPERVISED_ACCESSIBILITY_WAIT_MS;
-    let granted = await isAccessibilityGranted().catch(() => false);
-    if (!granted) {
+    const capability = async () => {
+      try {
+        return (await isAccessibilityGranted({ compileIfNeeded: false }))
+          ? "available"
+          : "permission_missing";
+      } catch {
+        return "unavailable";
+      }
+    };
+    let state = await capability();
+    if (state === "unavailable") {
+      console.log("[2FA] status:native_helper_accessibility_probe_unavailable");
+      return;
+    }
+    if (state !== "available") {
       console.log("[2FA] status:permission_preflight_prompted");
       const promptResult = await triggerAccessibilityPrompt({
         waitTimeoutMs: SUPERVISED_ACCESSIBILITY_WAIT_MS,
+        compileIfNeeded: false,
       }).catch(() => null);
-      granted = promptResult?.capability === "available";
-      while (!granted && Date.now() < deadline) {
+      state = promptResult?.capability ?? "unavailable";
+      while (state === "permission_missing" && Date.now() < deadline) {
         await wait(SUPERVISED_ACCESSIBILITY_POLL_MS);
-        granted = await isAccessibilityGranted().catch(() => false);
+        state = await capability();
       }
     }
+    if (state === "unavailable") {
+      console.log("[2FA] status:native_helper_accessibility_probe_unavailable");
+      return;
+    }
     console.log(
-      `[2FA] status:${granted ? "permission_preflight_ready" : "permission_preflight_missing"}`
+      `[2FA] status:${state === "available" ? "permission_preflight_ready" : "permission_preflight_missing"}`
     );
     return;
   }
-  await run2FAPermissionPreflight({ quiet, timeoutMs: 120_000 });
+  await run2FAPermissionPreflight({
+    quiet,
+    timeoutMs: 120_000,
+    compileIfNeeded: false,
+  });
 }
 
 main().catch((e) => {
-  if (supervised && isAccessibilityDeniedError(e)) {
-    console.warn("[2FA] status:permission_preflight_missing");
+  if (supervised) {
+    console.warn(
+      `[2FA] status:${isAccessibilityDeniedError(e) ? "permission_preflight_missing" : "native_helper_accessibility_probe_unavailable"}`
+    );
     return;
   }
   console.error("[2FA 权限]", e.message || e);

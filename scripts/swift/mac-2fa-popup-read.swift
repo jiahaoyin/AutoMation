@@ -184,9 +184,9 @@ func clickDone(_ win: AXUIElement) -> Bool {
     ])
 }
 
-let priorityApps = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow"]
+let priorityApps = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow", "System Settings"]
 let dedicatedAuthExecutables: Set<String> = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent"]
-let sharedHostExecutables: Set<String> = ["UserNotificationCenter", "loginwindow", "SecurityAgent", "akd"]
+let sharedHostExecutables: Set<String> = ["UserNotificationCenter", "loginwindow", "SecurityAgent", "akd", "System Settings"]
 let dedicatedAuthBundleIDs: Set<String> = [
     "com.apple.FollowUpUI",
     "com.apple.CoreAuthUI",
@@ -198,9 +198,11 @@ let sharedHostBundleIDs: Set<String> = [
     "com.apple.loginwindow",
     "com.apple.SecurityAgent",
     "com.apple.akd",
+    "com.apple.systempreferences",
+    "com.apple.SystemSettings",
 ]
 
-enum CandidateKind {
+enum CandidateKind: Equatable {
     case dedicated
     case sharedHost
 }
@@ -224,6 +226,14 @@ func candidateKind(for app: NSRunningApplication) -> CandidateKind? {
         return .sharedHost
     }
     return nil
+}
+
+func isSystemSettingsSharedHost(_ app: NSRunningApplication) -> Bool {
+    guard candidateKind(for: app) == .sharedHost,
+          let executableURL = app.executableURL else { return false }
+    return executableURL.lastPathComponent == "System Settings" ||
+        app.bundleIdentifier == "com.apple.systempreferences" ||
+        app.bundleIdentifier == "com.apple.SystemSettings"
 }
 
 func hasExplicitAppleAccountEvidence(_ blob: String) -> Bool {
@@ -279,6 +289,7 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
 struct ScannedWindow {
     let appName: String
     let candidateKind: CandidateKind
+    let isSystemSettingsSharedHost: Bool
     let window: AXUIElement
     let scan: WindowScan
 }
@@ -308,12 +319,19 @@ func collectPriorityWindows() -> [ScannedWindow] {
     for app in apps {
         guard let kind = candidateKind(for: app) else { continue }
         let appName = app.localizedName ?? ""
+        let isSystemSettingsHost = isSystemSettingsSharedHost(app)
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         for win in windowsForApp(appEl) {
             let scan = scanWindow(win)
             let relevant = scan.hasAllow || scan.hasCodePrompt || scan.code != nil || looksLikeAllowDialog(scan.blob)
             if relevant || isPriorityApp(appName) {
-                out.append(ScannedWindow(appName: appName, candidateKind: kind, window: win, scan: scan))
+                out.append(ScannedWindow(
+                    appName: appName,
+                    candidateKind: kind,
+                    isSystemSettingsSharedHost: isSystemSettingsHost,
+                    window: win,
+                    scan: scan
+                ))
             }
         }
     }
@@ -357,7 +375,7 @@ func isActionableAllowWindow(_ item: ScannedWindow) -> Bool {
     case .dedicated:
         return true
     case .sharedHost:
-        return looksLikeAllowDialog(item.scan.blob)
+        return !item.isSystemSettingsSharedHost && looksLikeAllowDialog(item.scan.blob)
     }
 }
 

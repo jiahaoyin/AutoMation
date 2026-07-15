@@ -3552,6 +3552,38 @@ class SecurityCodeTests(unittest.TestCase):
 
         self.assertEqual(page.actions.calls, [])
 
+    def test_rejects_mixed_scope_six_targets_before_direct_input(self):
+        root_field = FakeElement(attrs={"autocomplete": "one-time-code"})
+        frame_fields = [
+            FakeElement(attrs={"autocomplete": "one-time-code"})
+            for _ in range(5)
+        ]
+        frame = FakePage(
+            {"css:input[autocomplete='one-time-code']": frame_fields},
+            state={"twofa": True, "trusted": False, "error": False},
+        )
+        page = FakePage(
+            {"css:input[autocomplete='one-time-code']": [root_field]},
+            frames=[frame],
+            state={"twofa": True, "trusted": False, "error": False},
+        )
+        frame.parent = page
+        mixed_fields = [(page, root_field), *[(frame, field) for field in frame_fields]]
+
+        self.assertEqual(account_flow.security_code_fields(page), [])
+        with self.assertRaisesRegex(RuntimeError, "six targets in one trusted Apple frame"):
+            fill_security_code(
+                page,
+                "123456",
+                FakeKeys,
+                pause=lambda *_: None,
+                fields=mixed_fields,
+            )
+
+        self.assertTrue(all(not field.inputs for _scope, field in mixed_fields))
+        self.assertEqual(page.actions.calls, [])
+        self.assertEqual(frame.actions.calls, [])
+
     def test_fills_single_contenteditable_target_through_trusted_actions(self):
         field = FakeElement(
             attrs={"contenteditable": "true", "aria-label": "Verification code"}
@@ -3628,7 +3660,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_element_bidi_retries_keyboard_when_value_is_unreadable(self):
+    def test_six_digit_empty_element_bidi_switches_once_to_owner_sequence(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3636,7 +3668,11 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
+        frame_actions = FakeActions(auto_advance_targets=fields)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
         iframe = FakeElement(attrs={"src": frame.state["href"]})
         page = FakePage(
             {"css:iframe": [iframe]},
@@ -3647,29 +3683,29 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[
-                result
-                for digit in "123456"
-                for result in ((False, None), (True, digit))
-            ],
+            side_effect=[(True, ""), *[(True, digit) for digit in "123456"]],
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
+            [[("1", True)], [], [], [], [], []],
         )
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
-            len([call for call in page.actions.calls if call[0] == "human_click"]),
-            6,
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
+            1,
         )
-        self.assertNotIn(
-            "element_bidi_unverified_continue",
-            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
         )
+        self.assertEqual(page.actions.calls, [])
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_verified", steps)
+        self.assertNotIn("sequence_failed", steps)
 
-    def test_six_digit_element_bidi_retries_keyboard_when_value_reads_empty(self):
+    def test_six_digit_mismatched_element_bidi_switches_once_to_owner_sequence(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3677,7 +3713,11 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
+        frame_actions = FakeActions(auto_advance_targets=fields)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
         iframe = FakeElement(attrs={"src": frame.state["href"]})
         page = FakePage(
             {"css:iframe": [iframe]},
@@ -3688,29 +3728,26 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[
-                result
-                for digit in "123456"
-                for result in ((True, ""), (True, digit))
-            ],
-        ), patch("apple_account_flow.emit") as emit_event:
+            side_effect=[(True, "9"), *[(True, digit) for digit in "123456"]],
+        ):
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
+            [[("1", True)], [], [], [], [], []],
         )
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
-            len([call for call in page.actions.calls if call[0] == "human_click"]),
-            6,
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
+            1,
         )
-        self.assertNotIn(
-            "element_bidi_unverified_continue",
-            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
         )
+        self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_fields_retry_through_the_owning_frame_as_one_sequence(self):
+    def test_six_digit_element_bidi_error_switches_to_owner_sequence(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3718,12 +3755,11 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        for field in fields:
-            def input_without_effect(value, clear=True, target=field):
-                target.inputs.append((value, clear))
-                return target
 
-            field.input = input_without_effect
+        def input_raises(*_args, **_kwargs):
+            raise RuntimeError("synthetic element input failure")
+
+        fields[0].input = input_raises
 
         frame_actions = FakeActions(auto_advance_targets=fields)
         frame = FakePage({"css:input[maxlength='1']": fields}, actions=frame_actions)
@@ -3738,13 +3774,17 @@ class SecurityCodeTests(unittest.TestCase):
         fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual([field.value for field in fields], list("123456"))
-        self.assertTrue(fields[0].inputs)
-        self.assertIn(
-            ("type", "123456", unittest.mock.ANY),
-            frame_actions.calls,
+        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
+        self.assertEqual(
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
+            1,
+        )
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
         )
 
-    def test_six_digit_fields_raise_when_element_bidi_and_keyboard_cannot_verify(self):
+    def test_six_digit_sequence_failure_stops_after_the_first_direct_cell(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3752,7 +3792,17 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
+
+        def input_without_effect(value, clear=True):
+            fields[0].inputs.append((value, clear))
+            return fields[0]
+
+        fields[0].input = input_without_effect
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
         iframe = FakeElement(attrs={"src": frame.state["href"]})
         page = FakePage(
             {"css:iframe": [iframe]},
@@ -3761,53 +3811,36 @@ class SecurityCodeTests(unittest.TestCase):
         )
         frame.parent = page
 
-        with patch(
-            "apple_account_flow.read_element_input_value",
-            return_value=(True, ""),
-        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
             RuntimeError,
-            "2FA digit input verification failed",
+            "2FA code sequence verification failed",
         ):
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertNotIn("verified", steps)
-        self.assertNotIn("element_bidi_unverified_continue", steps)
-        self.assertNotIn("unverified_continue", steps)
-
-    def test_six_digit_element_bidi_falls_back_on_readable_mismatch(self):
-        fields = [
-            FakeElement(
-                attrs={"maxlength": "1"},
-                location={"x": 20 + index * 45, "y": 30},
-            )
-            for index in range(6)
-        ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
-        iframe = FakeElement(
-            attrs={"src": frame.state["href"]},
-            location={"x": 100, "y": 200},
-        )
-        page = FakePage(
-            {"css:iframe": [iframe]},
-            frames=[frame],
-            actions=FakeActions(coordinate_target=fields),
-        )
-        frame.parent = page
-
-        with patch(
-            "apple_account_flow.read_element_input_value",
-            side_effect=[(True, "9"), *[(True, digit) for digit in "123456"]],
-        ):
-            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
-
-        self.assertEqual(fields[0].inputs, [("1", True)])
+        self.assertIn("sequence_failed", steps)
+        self.assertNotIn("sequence_verified", steps)
         self.assertEqual(
-            len([call for call in page.actions.calls if call[0] == "human_click"]),
+            [field.inputs for field in fields],
+            [[("1", True)], [], [], [], [], []],
+        )
+        self.assertEqual(
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
             1,
         )
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
+        )
 
-    def test_six_digit_fields_fall_back_to_keyboard_when_element_bidi_fails(self):
+    def test_six_digit_sequence_failure_does_not_emit_code_or_failure_details(self):
+        code = "123456"
+        secret = "synthetic-secret-token"
+        raw_dom = f"<input value='{code}' data-secret='{secret}'>"
+        url_query = (
+            "https://idmsa.apple.com/appleauth/auth/verify?"
+            f"otp={code}&token={secret}"
+        )
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3815,12 +3848,16 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        for field in fields:
-            def input_raises(*_args, **_kwargs):
-                raise RuntimeError("synthetic element input failure")
 
-            field.input = input_raises
-        frame = FakePage({"css:input[maxlength='1']": fields})
+        def input_raises(*_args, **_kwargs):
+            raise RuntimeError(f"synthetic direct input failure {raw_dom} {url_query}")
+
+        fields[0].input = input_raises
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
         iframe = FakeElement(
             attrs={"src": frame.state["href"]},
             location={"x": 100, "y": 200},
@@ -3832,46 +3869,26 @@ class SecurityCodeTests(unittest.TestCase):
         )
         frame.parent = page
 
-        fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA code sequence verification failed",
+        ) as failure:
+            fill_security_code(page, code, FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual([field.value for field in fields], list("123456"))
-        self.assertEqual(frame.actions.calls, [])
+        rendered_events = json.dumps(
+            [call.args[0] for call in emit_event.call_args_list]
+        )
+        for forbidden in (code, secret, raw_dom, url_query, "?otp="):
+            self.assertNotIn(forbidden, rendered_events)
+            self.assertNotIn(forbidden, str(failure.exception))
+        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
         self.assertEqual(
-            len([call for call in page.actions.calls if call[0] == "human_click"]),
-            6,
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
+            1,
         )
-
-    def test_six_digit_fields_fall_back_to_keyboard_for_generic_element_exception(self):
-        fields = [
-            FakeElement(
-                attrs={"maxlength": "1"},
-                location={"x": 20 + index * 45, "y": 30},
-            )
-            for index in range(6)
-        ]
-        for field in fields:
-            def input_raises(*_args, **_kwargs):
-                raise Exception("synthetic generic input failure")
-
-            field.input = input_raises
-        frame = FakePage({"css:input[maxlength='1']": fields})
-        iframe = FakeElement(
-            attrs={"src": frame.state["href"]},
-            location={"x": 100, "y": 200},
-        )
-        page = FakePage(
-            {"css:iframe": [iframe]},
-            frames=[frame],
-            actions=FakeActions(coordinate_target=fields),
-        )
-        frame.parent = page
-
-        fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
-
-        self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
-            len([call for call in page.actions.calls if call[0] == "human_click"]),
-            6,
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            [code],
         )
 
     def test_digit_element_bidi_rechecks_scope_after_pause_and_input(self):

@@ -26,6 +26,10 @@ const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
     "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
   settings_accessibility:
     "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
+  settings_retry:
+    "[2FA] 系统设置取码正在进行受限重试；其他可用取码路径仍会继续。",
+  settings_failed:
+    "[2FA] 系统设置取码未成功；其他可用取码路径仍会继续。",
   manual_allow:
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
   manual_code: "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
@@ -33,6 +37,8 @@ const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
   popup_accessibility:
     "[2FA] 原生验证码弹窗未获辅助功能授权；将尝试已授权的屏幕录制 OCR，系统设置与终端手输仍在继续。",
+  popup_scanning:
+    "[2FA] 网页已确认需要验证码，正在持续扫描受限 Apple 原生窗口。",
   popup_close_pending:
     "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
   timeout:
@@ -394,11 +400,13 @@ function reportTwoFactorStatus(event) {
         "settings_start",
         "settings_retry",
         "settings_accessibility",
+        "settings_failed",
         "manual_allow",
         "manual_code",
         "manual_unavailable",
         "ocr_permission_missing",
         "popup_accessibility",
+        "popup_scanning",
         "popup_close_pending",
         "timeout",
       ].includes(event.status)
@@ -462,7 +470,7 @@ export async function runAccountBrowserPhase(
 
   let axOk = false;
   try {
-    axOk = await checkAccessibility();
+    axOk = await checkAccessibility({ compileIfNeeded: false });
   } catch (error) {
     writeFlowAuditError(flowAudit, "account_browser", "accessibility_check_failed", error);
   }

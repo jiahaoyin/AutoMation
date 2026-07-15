@@ -21,6 +21,91 @@ const CLICK_ALLOW_BIN = resolveNativeHelperPath(
   path.resolve(__dirname, "../bin"),
   "mac-2fa-click-allow"
 );
+const HELPER_EXIT_GRACE_MS = 2_000;
+const AX_READ_TIMEOUT_SEC = 2;
+const OCR_PREFLIGHT_TIMEOUT_SEC = 2;
+const MIN_OCR_STABILITY_TIMEOUT_SEC = 4;
+const OCR_STABILITY_SCHEDULING_SLACK_SEC = 1;
+const MIN_POPUP_READ_TIMEOUT_SEC =
+  AX_READ_TIMEOUT_SEC + MIN_OCR_STABILITY_TIMEOUT_SEC + OCR_STABILITY_SCHEDULING_SLACK_SEC;
+const MAX_POPUP_READ_TIMEOUT_SEC = 12;
+
+function isAbortFailure(error, signal) {
+  return (
+    signal?.aborted === true ||
+    error?.name === "AbortError" ||
+    error?.code === "ABORT_ERR"
+  );
+}
+
+function unavailablePopupCode() {
+  return { code: null, source: "vision", capability: "unavailable" };
+}
+
+function rejectedPopupCode() {
+  return { code: null, rejected: true };
+}
+
+function popupReadBudget(timeoutSec, now, absoluteDeadline) {
+  const requested = Number(timeoutSec);
+  const requestedSeconds = Number.isFinite(requested)
+    ? Math.max(1, Math.ceil(requested))
+    : 10;
+  const requestedOcrTimeoutSec = Math.max(
+    MIN_OCR_STABILITY_TIMEOUT_SEC,
+    requestedSeconds - AX_READ_TIMEOUT_SEC - OCR_PREFLIGHT_TIMEOUT_SEC
+  );
+  const totalTimeoutSec = Math.min(
+    MAX_POPUP_READ_TIMEOUT_SEC,
+    Math.max(
+      MIN_POPUP_READ_TIMEOUT_SEC,
+      AX_READ_TIMEOUT_SEC +
+        OCR_PREFLIGHT_TIMEOUT_SEC +
+        requestedOcrTimeoutSec +
+        OCR_STABILITY_SCHEDULING_SLACK_SEC
+    )
+  );
+  const ocrTimeoutSec = Math.min(
+    requestedOcrTimeoutSec,
+    totalTimeoutSec -
+      AX_READ_TIMEOUT_SEC -
+      OCR_PREFLIGHT_TIMEOUT_SEC -
+      OCR_STABILITY_SCHEDULING_SLACK_SEC
+  );
+  const startedAt = now();
+  const requestedDeadline = startedAt + totalTimeoutSec * 1_000;
+  const deadline = Number.isFinite(absoluteDeadline)
+    ? Math.min(requestedDeadline, absoluteDeadline)
+    : requestedDeadline;
+  return {
+    deadline,
+    swiftTimeoutSec: AX_READ_TIMEOUT_SEC,
+    ocrTimeoutSec,
+    totalTimeoutSec,
+  };
+}
+
+function createDeadlineSignal(parentSignal, deadline, now, runtime = {}) {
+  const controller = new AbortController();
+  const setTimer = runtime.setTimer ?? setTimeout;
+  const clearTimer = runtime.clearTimer ?? clearTimeout;
+  let timer = null;
+  const abort = () => controller.abort();
+  const remainingMs = deadline - now();
+  if (parentSignal?.aborted || remainingMs <= 0) {
+    abort();
+  } else {
+    parentSignal?.addEventListener?.("abort", abort, { once: true });
+    timer = setTimer(abort, remainingMs);
+  }
+  return {
+    signal: controller.signal,
+    dispose() {
+      if (timer != null) clearTimer(timer);
+      parentSignal?.removeEventListener?.("abort", abort);
+    },
+  };
+}
 
 function needsRecompile(src, bin) {
   if (!fs.existsSync(src)) return true;
@@ -79,6 +164,9 @@ function compileSwift(src, bin, options = {}) {
 
 function ensureBin(src, bin, options = {}) {
   if ((options.platform ?? process.platform) !== "darwin") return false;
+  if (options.compileIfNeeded !== true) {
+    return !needsRecompile(src, bin) && binaryIsExecutable(bin, options);
+  }
   if (needsRecompile(src, bin)) return compileSwift(src, bin, options);
   return binaryIsExecutable(bin, options);
 }
@@ -102,7 +190,11 @@ function parseJson(stdout) {
 
 async function releaseLeftMouseButton(timeoutSec = 1, runtime = {}) {
   const ensureReleaseBin = runtime.ensureBin ?? ensureBin;
-  if (!ensureReleaseBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) return false;
+  if (
+    !ensureReleaseBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN, { compileIfNeeded: false })
+  ) {
+    return false;
+  }
   const runHelper = runtime.execFileAsync ?? execFileAsync;
   try {
     await runHelper(CLICK_ALLOW_BIN, ["--release-left-button"], {
@@ -119,7 +211,18 @@ async function releaseLeftMouseButton(timeoutSec = 1, runtime = {}) {
  * @returns {Promise<{ action: string, source?: string, code?: string }>}
  */
 export async function probe2FAState(timeoutSec = 2, options = {}) {
-  const result = await runPopupPhase("probe", timeoutSec, options);
+  if (options.signal?.aborted) return { action: "probe_error" };
+  let result;
+  try {
+    result = await runPopupPhase("probe", timeoutSec, {
+      ...options,
+      compileIfNeeded: false,
+    });
+  } catch (error) {
+    if (isAbortFailure(error, options.signal)) return { action: "probe_error" };
+    return { action: "probe_error" };
+  }
+  if (options.signal?.aborted) return { action: "probe_error" };
   if (result.action === "accessibility_unavailable") {
     return { action: "accessibility_unavailable" };
   }
@@ -132,21 +235,35 @@ export async function probe2FAState(timeoutSec = 2, options = {}) {
 }
 
 async function tryCgClickAllow(timeoutSec = 3, options = {}) {
-  if (!ensureBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) return { action: "none" };
+  if (options.signal?.aborted) return { action: "none", strategy: "cg_ax" };
+  const runtime = options.runtime ?? {};
+  const ensureHelper = runtime.ensureBin ?? ensureBin;
+  if (
+    !ensureHelper(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN, { compileIfNeeded: false })
+  ) {
+    return { action: "none", strategy: "cg_ax" };
+  }
+  const runHelper = runtime.execFileAsync ?? execFileAsync;
   try {
-    const execOptions = { timeout: (timeoutSec + 8) * 1000, maxBuffer: 128 * 1024 };
+    const boundedTimeoutSec = Math.max(1, Math.min(4, Math.ceil(Number(timeoutSec) || 1)));
+    const execOptions = {
+      timeout: boundedTimeoutSec * 1_000 + HELPER_EXIT_GRACE_MS,
+      maxBuffer: 128 * 1024,
+    };
     if (options.signal) execOptions.signal = options.signal;
-    const { stdout, stderr } = await execFileAsync(
+    const { stdout, stderr } = await runHelper(
       CLICK_ALLOW_BIN,
-      ["--timeout", String(timeoutSec)],
+      ["--timeout", String(boundedTimeoutSec)],
       execOptions
     );
+    if (options.signal?.aborted) return { action: "none", strategy: "cg_ax" };
     if (stderr?.trim()) console.log("[2FA] native Allow helper reported diagnostics");
     const parsed = parseJson(stdout);
     if (parsed?.action === "attempted_allow") {
       return { action: "attempted_allow", source: parsed.source, strategy: "cg_ax" };
     }
   } catch (err) {
+    if (isAbortFailure(err, options.signal)) return { action: "none", strategy: "cg_ax" };
     const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
     const parsed = stdout.trim() ? parseJson(stdout) : null;
     if (parsed?.action === "attempted_allow") {
@@ -161,7 +278,9 @@ function resolveAllowRuntime(overrides = {}) {
     strategies: overrides.strategies ?? [tryCgClickAllow],
     probe2FAState: overrides.probe2FAState ?? probe2FAState,
     releaseMouseButtons:
-      overrides.releaseMouseButtons ?? (() => releaseLeftMouseButton(1, overrides)),
+      overrides.releaseMouseButtons ??
+      ((releaseOptions = {}) =>
+        releaseLeftMouseButton(1, { ...overrides, ...releaseOptions })),
     sleep: overrides.sleep ?? sleep,
     now: overrides.now ?? Date.now,
     setTimer: overrides.setTimer ?? setTimeout,
@@ -169,32 +288,40 @@ function resolveAllowRuntime(overrides = {}) {
   };
 }
 
-async function probeWithinDeadline(runtime, deadline, timeoutSec) {
-  if (!Number.isFinite(deadline)) return runtime.probe2FAState(timeoutSec);
+async function probeWithinDeadline(runtime, deadline, timeoutSec, signal) {
+  if (signal?.aborted) return null;
+  if (!Number.isFinite(deadline)) return runtime.probe2FAState(timeoutSec, { signal });
   const remainingMs = deadline - runtime.now();
   if (remainingMs <= 0) return null;
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const timer = runtime.setTimer(() => {
+    const finish = (value, error) => {
+      if (settled) return;
       settled = true;
-      resolve(null);
+      runtime.clearTimer(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = runtime.setTimer(() => {
+      finish(null);
     }, remainingMs);
+    const onAbort = () => finish(null);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
 
     Promise.resolve()
-      .then(() => runtime.probe2FAState(timeoutSec))
+      .then(() => runtime.probe2FAState(timeoutSec, { signal }))
       .then(
         (state) => {
-          if (settled) return;
-          settled = true;
-          runtime.clearTimer(timer);
-          resolve(state);
+          finish(state);
         },
         (error) => {
-          if (settled) return;
-          settled = true;
-          runtime.clearTimer(timer);
-          reject(error);
+          if (isAbortFailure(error, signal)) {
+            finish(null);
+            return;
+          }
+          finish(null, error);
         }
       );
   });
@@ -207,10 +334,19 @@ export async function tryAllowOnce(timeoutSec = 4, options = {}) {
   const strategy = strategies[offset];
   let result;
   try {
-    result = await strategy(timeoutSec, { signal: options.signal });
+    if (!options.signal?.aborted) {
+      result = await strategy(timeoutSec, {
+        signal: options.signal,
+        runtime: options.runtime,
+        compileIfNeeded: false,
+      });
+    }
+  } catch (error) {
+    if (!isAbortFailure(error, options.signal)) throw error;
   } finally {
-    await runtime.releaseMouseButtons();
+    await runtime.releaseMouseButtons({ compileIfNeeded: false });
   }
+  if (options.signal?.aborted) result = null;
   return {
     attempted:
       result?.attempted === true || result?.action === "attempted_allow",
@@ -227,16 +363,20 @@ export async function waitForManualAllow(options = {}) {
   let sawAllowDialog = options.initialSawAllowDialog === true;
 
   while (runtime.now() < deadline) {
-    const state = await probeWithinDeadline(runtime, deadline, 2);
+    if (options.signal?.aborted) break;
+    const state = await probeWithinDeadline(runtime, deadline, 2, options.signal);
     if (!state) break;
     if (state.action === "has_allow_dialog") sawAllowDialog = true;
     if (state.action === "has_code_dialog" && sawAllowDialog) {
       return { clicked: true, source: state.source, strategy: "manual" };
     }
+    if (state.action === "accessibility_unavailable") {
+      return { clicked: false, reason: "accessibility_missing" };
+    }
     if (state.action === "has_allow_dialog") {
       if (!prompted) {
         console.log(
-          "[2FA] 检测到「允许」弹窗 — 请手动点击「允许」，脚本将自动继续（请确认终端已获辅助功能）"
+          "[2FA] 检测到「允许」弹窗 — 请手动点击「允许」，脚本将自动继续（辅助功能请以 macOS 弹窗或权限列表实际显示的原生 helper 条目为准）"
         );
         prompted = true;
       }
@@ -248,7 +388,24 @@ export async function waitForManualAllow(options = {}) {
 
 /** Read the popup code through the constrained native helper. */
 export async function readPopupCodeViaSwift(timeoutSec = 12, options = {}) {
-  const r = await runPopupPhase("read_code", timeoutSec, options);
+  if (options.signal?.aborted) {
+    return { code: null, source: "swift_ax", capability: "unavailable" };
+  }
+  let r;
+  try {
+    r = await runPopupPhase("read_code", timeoutSec, {
+      ...options,
+      compileIfNeeded: false,
+    });
+  } catch (error) {
+    if (isAbortFailure(error, options.signal)) {
+      return { code: null, source: "swift_ax", capability: "unavailable" };
+    }
+    return { code: null, source: "swift_ax", capability: "unavailable" };
+  }
+  if (options.signal?.aborted) {
+    return { code: null, source: "swift_ax", capability: "unavailable" };
+  }
   if (r.action === "accessibility_unavailable") {
     return { code: null, source: "swift_ax", capability: "accessibility_missing" };
   }
@@ -261,65 +418,105 @@ export async function readPopupCodeViaSwift(timeoutSec = 12, options = {}) {
 /**
  * Read from constrained native AX and window-targeted OCR helpers.
  * @param {number} [timeoutSec]
- * @param {{ rejectCodes?: Set<string>, runtime?: object }} [options]
+ * @param {{ rejectCodes?: Set<string>, runtime?: object, signal?: AbortSignal, now?: () => number, deadlineMs?: number }} [options]
  */
 export async function readPopupCode(timeoutSec = 10, options = {}) {
   const runtime = options.runtime ?? {};
   const readViaAx = runtime.readPopupCodeViaSwift ?? readPopupCodeViaSwift;
   const readViaOcr = runtime.readPopupCodeViaOcr ?? readPopupCodeViaOcr;
   const rejectCodes = options.rejectCodes;
-  const totalTimeout = Math.max(1, Number(timeoutSec) || 10);
-  const swiftTimeout = Math.min(2, totalTimeout);
-  const ocrTimeout = Math.max(1, totalTimeout - swiftTimeout);
+  if (options.signal?.aborted) return unavailablePopupCode();
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const budget = popupReadBudget(timeoutSec, now, options.deadlineMs);
+  const deadlineScope = createDeadlineSignal(options.signal, budget.deadline, now, runtime);
+  const signal = deadlineScope.signal;
+  if (signal.aborted) {
+    deadlineScope.dispose();
+    return unavailablePopupCode();
+  }
 
   const accept = (hit) => {
     if (typeof hit?.code !== "string" || !/^\d{6}$/.test(hit.code)) {
       return null;
     }
     if (rejectCodes?.has(hit.code)) {
-      console.log("[2FA] 跳过旧/无效验证码");
-      return null;
+      return rejectedPopupCode();
     }
     return hit;
   };
 
-  const swiftResult = await readViaAx(swiftTimeout, { signal: options.signal });
-  const swift = accept(swiftResult);
-  if (swift?.code) return swift;
-  if (swiftResult?.capability === "accessibility_missing") {
-    console.log("[2FA] Native AX reader unavailable; trying Vision OCR fallback");
-  } else {
-    console.log("[2FA] Native AX reader found no code; trying Vision OCR");
-  }
-  const ocrResult = await readViaOcr(ocrTimeout, {
-    signal: options.signal,
-    // Ask once at the real 2FA boundary. OCR remains optional, but a missing
-    // Screen Recording grant should surface a native macOS prompt instead of
-    // silently turning into an empty OCR result.
-    requestPermission: true,
-  });
-  const ocr = accept(ocrResult);
-  if (ocr?.code) {
-    console.log("[2FA] Vision OCR 已识别验证码");
-    return ocr;
-  }
-  if (
-    ocrResult?.capability === "permission_missing" ||
-    ocrResult?.capability === "unavailable"
-  ) {
+  try {
+    let swiftResult = null;
+    try {
+      swiftResult = await readViaAx(budget.swiftTimeoutSec, {
+        signal,
+        compileIfNeeded: false,
+      });
+    } catch (error) {
+      if (isAbortFailure(error, signal)) return unavailablePopupCode();
+    }
+    if (signal.aborted || now() >= budget.deadline) return unavailablePopupCode();
+    const swift = accept(swiftResult);
+    if (swift?.rejected || swift?.code) return swift;
+    if (swiftResult?.capability === "accessibility_missing") {
+      console.log("[2FA] Native AX reader unavailable; trying Vision OCR fallback");
+    } else {
+      console.log("[2FA] Native AX reader found no code; trying Vision OCR");
+    }
+    const remainingOcrMs = budget.deadline - now();
+    const remainingOcrReadMs =
+      remainingOcrMs -
+      OCR_PREFLIGHT_TIMEOUT_SEC * 1_000;
+    if (remainingOcrReadMs < MIN_OCR_STABILITY_TIMEOUT_SEC * 1_000) {
+      return unavailablePopupCode();
+    }
+    const ocrTimeoutSec = Math.min(
+      budget.ocrTimeoutSec,
+      Math.floor(remainingOcrReadMs / 1_000)
+    );
+    if (ocrTimeoutSec < MIN_OCR_STABILITY_TIMEOUT_SEC) return unavailablePopupCode();
+    let ocrResult = null;
+    try {
+      ocrResult = await readViaOcr(ocrTimeoutSec, {
+        signal,
+        now,
+        deadlineMs: budget.deadline,
+        compileIfNeeded: false,
+        // Ask once at the real 2FA boundary. OCR remains optional, but a missing
+        // Screen Recording grant should surface a native macOS prompt instead of
+        // silently turning into an empty OCR result.
+        requestPermission: true,
+      });
+    } catch (error) {
+      if (isAbortFailure(error, signal)) return unavailablePopupCode();
+    }
+    if (signal.aborted || now() >= budget.deadline) return unavailablePopupCode();
+    const ocr = accept(ocrResult);
+    if (ocr?.rejected) return ocr;
+    if (ocr?.code) {
+      console.log("[2FA] Vision OCR 已识别验证码");
+      return ocr;
+    }
+    if (
+      ocrResult?.capability === "permission_missing" ||
+      ocrResult?.capability === "unavailable"
+    ) {
+      return {
+        code: null,
+        source: "vision",
+        capability: ocrResult.capability,
+      };
+    }
     return {
       code: null,
-      source: "vision",
-      capability: ocrResult.capability,
+      source: ocrResult?.source ?? "vision",
+      capability:
+        ocrResult?.capability ??
+        (swiftResult?.capability === "accessibility_missing"
+          ? "accessibility_missing"
+          : "available"),
     };
+  } finally {
+    deadlineScope.dispose();
   }
-  return {
-    code: null,
-    source: ocrResult?.source ?? "vision",
-    capability:
-      ocrResult?.capability ??
-      (swiftResult?.capability === "accessibility_missing"
-        ? "accessibility_missing"
-        : "available"),
-  };
 }

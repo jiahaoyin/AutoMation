@@ -19,6 +19,7 @@ const PREEXISTING_ALLOW_CLEAR_IDLE_HITS = 3;
 const POPUP_DELIVERY_GRACE_MS = 800;
 const STATUS_NAMES = new Set([
   "settings_start",
+  "settings_failed",
   "settings_retry",
   "settings_accessibility",
   "manual_allow",
@@ -26,6 +27,7 @@ const STATUS_NAMES = new Set([
   "manual_unavailable",
   "ocr_permission_missing",
   "popup_accessibility",
+  "popup_scanning",
   "popup_close_pending",
   "timeout",
   "winner",
@@ -178,6 +180,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_winner_close_pending",
     "popup_code_buffered",
     "popup_code_read",
+    "popup_ocr_scan",
     "popup_provider_error",
     "prepare_2fa",
     "settings_provider_start",
@@ -414,7 +417,9 @@ export function createMac2FACollector(options = {}) {
   let manualUnavailableStatusSent = false;
   let ocrPermissionStatusSent = false;
   let popupAccessibilityStatusSent = false;
+  let popupScanningStatusSent = false;
   const popupCloseControllers = new Set();
+  const popupReadControllers = new Set();
   let timeoutStatusSent = false;
   const auditTimes = new Map();
   const onAudit = typeof options.onAudit === "function" ? options.onAudit : null;
@@ -591,15 +596,39 @@ export function createMac2FACollector(options = {}) {
     for (const controller of popupCloseControllers) controller.abort();
   };
 
+  const abortPopupReadTasks = () => {
+    for (const controller of popupReadControllers) controller.abort();
+  };
+
   const resetPendingPopupClose = () => {
     pendingPopupClose = null;
   };
 
-  const tryClosePendingPopup = async (candidate, generation) => {
-    const closeController = new AbortController();
-    popupCloseControllers.add(closeController);
-    const closeMayContinue = () => {
-      if (closeController.signal.aborted || disposed || generation !== popupGeneration) {
+  const reportPopupClosePending = (candidate) => {
+    if (candidate.closePendingReported) return;
+    candidate.closePendingReported = true;
+    audit(
+      {
+        phase: "popup_winner_close_pending",
+        reason: "close_pending",
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      },
+      { throttleKey: "popup-winner-close-pending" }
+    );
+    status("popup_close_pending", {
+      source: "popup",
+      remainingSec: remainingSeconds(),
+    });
+  };
+
+  const startPopupCloseCleanup = (candidate, generation) => {
+    const primaryController = new AbortController();
+    const fallbackController = new AbortController();
+    popupCloseControllers.add(primaryController);
+    popupCloseControllers.add(fallbackController);
+
+    const closeMayContinue = (controller) => {
+      if (controller.signal.aborted || disposed || generation !== popupGeneration) {
         return false;
       }
       const winnerSource =
@@ -607,108 +636,122 @@ export function createMac2FACollector(options = {}) {
       if (winnerSource) return winnerSource === "popup";
       return !activeWinnerSettled() || popupCandidate?.generation === generation;
     };
-    const closePopup = async () => {
-      let popupClosed = false;
+
+    const closePrimary = async () => {
       try {
-        if (!closeMayContinue()) return false;
-        popupClosed = await runtime.dismissCodePopupForWebFill(4, {
-          signal: closeController.signal,
+        if (!closeMayContinue(primaryController)) return false;
+        const popupClosed = await runtime.dismissCodePopupForWebFill(4, {
+          signal: primaryController.signal,
+          compileIfNeeded: false,
         });
-        if (!closeMayContinue()) return false;
+        return closeMayContinue(primaryController) && popupClosed;
       } catch {
-        if (disposed) return false;
-        audit({
-          phase: "popup_winner_close_failed",
-          reason: "primary_close_failed",
-          elapsedSincePrepareMs: elapsedSincePrepare(),
-        });
-      }
-      if (!popupClosed) {
-        try {
-          if (!closeMayContinue()) return false;
-          const fallback = await runtime.runPopupPhase("dismiss_stale", 2, {
-            signal: closeController.signal,
-          });
-          if (!closeMayContinue()) return false;
-          popupClosed = fallback?.action === "dismissed_stale";
+        if (!disposed && generation === popupGeneration) {
           audit({
-            phase: "popup_winner_close_fallback",
-            action: fallback?.action ?? "none",
+            phase: "popup_winner_close_failed",
+            reason: "primary_close_failed",
             elapsedSincePrepareMs: elapsedSincePrepare(),
           });
-        } catch {
-          if (disposed) return false;
+        }
+        return false;
+      }
+    };
+
+    const closeFallback = async () => {
+      try {
+        if (!closeMayContinue(fallbackController)) return false;
+        const fallback = await runtime.runPopupPhase("dismiss_stale", 2, {
+          signal: fallbackController.signal,
+          compileIfNeeded: false,
+        });
+        if (!closeMayContinue(fallbackController)) return false;
+        const popupClosed = fallback?.action === "dismissed_stale";
+        audit({
+          phase: "popup_winner_close_fallback",
+          action: fallback?.action ?? "none",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+        return popupClosed;
+      } catch {
+        if (!disposed && generation === popupGeneration) {
           audit({
             phase: "popup_winner_close_fallback_failed",
             reason: "fallback_close_failed",
             elapsedSincePrepareMs: elapsedSincePrepare(),
           });
         }
+        return false;
       }
-      return popupClosed;
     };
 
-    const closePromise = closePopup();
-    const trackedClosePromise = closePromise.finally(() => {
-      popupCloseControllers.delete(closeController);
-    });
-    const deliveryGrace = scheduleDelay(config.popupDeliveryGraceMs);
-    const closeResult = await Promise.race([
-      trackedClosePromise.then((popupClosed) => ({ kind: "close", popupClosed })),
-      deliveryGrace.promise.then((elapsed) => ({
-        kind: elapsed ? "grace" : "cancelled",
-        popupClosed: false,
-      })),
-    ]);
-    deliveryGrace.cancel();
-    if (closeResult.kind !== "close") closeController.abort();
-    if (
-      closeResult.kind === "cancelled" ||
-      disposed ||
-      generation !== popupGeneration
-    ) {
-      void trackedClosePromise.catch(() => {});
+    const primaryClose = closePrimary();
+    const closeGrace = scheduleDelay(config.popupDeliveryGraceMs);
+    const cleanup = (async () => {
+      const closeResult = await Promise.race([
+        primaryClose.then((popupClosed) => ({ kind: "close", popupClosed })),
+        closeGrace.promise.then((elapsed) => ({
+          kind: elapsed ? "grace" : "cancelled",
+          popupClosed: false,
+        })),
+      ]);
+      closeGrace.cancel();
+      if (closeResult.kind === "cancelled" || !closeMayContinue(fallbackController)) {
+        return;
+      }
+      if (closeResult.kind === "close" && closeResult.popupClosed) return;
+
+      if (closeResult.kind === "grace") {
+        // Do not let a hung primary close touch a later popup. The fallback has
+        // its own controller so it can still run after this bounded grace.
+        primaryController.abort();
+        reportPopupClosePending(candidate);
+      }
+
+      const fallbackClosed = await closeFallback();
+      if (!fallbackClosed && closeMayContinue(fallbackController)) {
+        reportPopupClosePending(candidate);
+      }
+    })();
+
+    void cleanup
+      .catch(() => {
+        /* Popup cleanup is best-effort and must never affect OTP delivery. */
+      })
+      .finally(() => {
+        closeGrace.cancel();
+        popupCloseControllers.delete(primaryController);
+        popupCloseControllers.delete(fallbackController);
+      });
+  };
+
+  const tryClosePendingPopup = (candidate, generation) => {
+    if (disposed || generation !== popupGeneration || activeWinnerSettled()) {
+      resetPendingPopupClose();
       return false;
     }
-    const popupClosed = closeResult.popupClosed;
 
-    if (!popupClosed) {
-      if (!candidate.closePendingReported) {
-        candidate.closePendingReported = true;
-        audit(
-          {
-            phase: "popup_winner_close_pending",
-            reason: "close_pending",
-            elapsedSincePrepareMs: elapsedSincePrepare(),
-          },
-          { throttleKey: "popup-winner-close-pending" }
-        );
-      }
-      status("popup_close_pending", {
-        source: "popup",
-        remainingSec: remainingSeconds(),
-      });
-    }
-
-    // The code was read from a verified Apple dialog. Closing that dialog helps
-    // the browser surface, but it must not withhold a valid code indefinitely.
+    // A verified popup candidate belongs to this generation immediately. Native
+    // dialog closing is only background cleanup, so it cannot consume the code.
+    resetPendingPopupClose();
+    popupCandidate = { ...candidate, generation };
     audit({
       phase: "popup_code_buffered",
       allowStrategy: candidate.allowStrategy,
       source: candidate.popupSource,
-      popupClosed,
+      popupClosed: false,
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
-    if (disposed || generation !== popupGeneration) return false;
-    resetPendingPopupClose();
-    popupCandidate = { ...candidate, generation };
     popupReady.resolve(popupCandidate);
+    startPopupCloseCleanup(popupCandidate, generation);
     return true;
   };
 
   const dismissRejectedPopup = async (code, signal) => {
     if (disposed || activeWinnerSettled()) return;
-    const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
+    const result = await runtime.runPopupPhase("dismiss_stale", 2, {
+      signal,
+      compileIfNeeded: false,
+    });
     if (disposed || activeWinnerSettled()) return;
     const dismissedCode = normalizeSixDigitCode(result?.code) || code;
     if (dismissedCode) rejectedCodes.add(dismissedCode);
@@ -735,53 +778,98 @@ export function createMac2FACollector(options = {}) {
     if (signal?.aborted || disposed || generation !== popupGeneration) return;
     if (!cleanupOnly && activeWinnerSettled()) return;
 
-    const screenOcrFallback = action === "accessibility_unavailable";
+    // The System Settings Apple Account sheet can be visible while AX reports
+    // an idle tree on macOS 15. Once the browser has explicitly requested a
+    // code, an idle/probe result must still reach the tightly scoped OCR path.
+    const screenOcrFallback =
+      activeAcquisition != null &&
+      ["idle", "accessibility_unavailable", "probe_error", "unknown"].includes(action);
     if (screenOcrFallback) {
-      if (!popupAccessibilityStatusSent) {
-        popupAccessibilityStatusSent = true;
-        status("popup_accessibility", {
+      if (!popupScanningStatusSent) {
+        popupScanningStatusSent = true;
+        status("popup_scanning", {
           source: "popup",
           remainingSec: remainingSeconds(),
         });
+        audit({
+          phase: "popup_ocr_scan",
+          source: "popup",
+          outcome: "prompting",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
       }
-      // AX cannot tell whether the dialog is current. Do not OCR before the
-      // browser asks for a code, so a stale system dialog cannot win this run.
-      if (!activeAcquisition) return;
+      if (!popupAccessibilityStatusSent) {
+        if (action === "accessibility_unavailable") {
+          popupAccessibilityStatusSent = true;
+          status("popup_accessibility", {
+            source: "popup",
+            remainingSec: remainingSeconds(),
+          });
+        }
+      }
     }
 
-    if (preexistingAllowGate && !screenOcrFallback) {
-      pendingAllowAttempt = null;
-      resetPendingPopupClose();
+    if (preexistingAllowGate) {
       if (action === "idle") {
         preexistingAllowIdleHits += 1;
         if (preexistingAllowIdleHits >= PREEXISTING_ALLOW_CLEAR_IDLE_HITS) {
           preexistingAllowGate = false;
           preexistingAllowIdleHits = 0;
         }
-        return;
+        // A real browser 2FA request makes the scoped OCR path safe even
+        // while an earlier Allow dialog still awaits its stable idle clear.
+        if (!activeAcquisition) {
+          pendingAllowAttempt = null;
+          resetPendingPopupClose();
+          return;
+        }
       }
-      preexistingAllowIdleHits = 0;
-      if (action !== "has_code_dialog") return;
+      else {
+        preexistingAllowIdleHits = 0;
+        if (!activeAcquisition) {
+          pendingAllowAttempt = null;
+          resetPendingPopupClose();
+          if (action !== "has_code_dialog") return;
 
-      const stateCode = normalizeSixDigitCode(state?.code);
-      if (stateCode) rejectedCodes.add(stateCode);
-      const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
-      if (signal?.aborted || disposed || generation !== popupGeneration) return;
-      const dismissedCode = normalizeSixDigitCode(result?.code);
-      if (dismissedCode) rejectedCodes.add(dismissedCode);
-      audit({
-        phase: "dismiss_rejected_popup",
-        action: result?.action ?? "none",
-        elapsedSincePrepareMs: elapsedSincePrepare(),
-      });
-      return;
+          const stateCode = normalizeSixDigitCode(state?.code);
+          if (stateCode) rejectedCodes.add(stateCode);
+          const result = await runtime.runPopupPhase("dismiss_stale", 2, {
+            signal,
+            compileIfNeeded: false,
+          });
+          if (signal?.aborted || disposed || generation !== popupGeneration) return;
+          const dismissedCode = normalizeSixDigitCode(result?.code);
+          if (dismissedCode) rejectedCodes.add(dismissedCode);
+          audit({
+            phase: "dismiss_rejected_popup",
+            action: result?.action ?? "none",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+          return;
+        }
+
+        // Never auto-click an Allow that pre-dates this browser request, but
+        // do not let that guard hide a fresh code dialog or OCR fallback.
+        if (action === "has_allow_dialog") {
+          pendingAllowAttempt = null;
+          resetPendingPopupClose();
+          if (!manualAllowStatusSent) {
+            manualAllowStatusSent = true;
+            status("manual_allow", { remainingSec: remainingSeconds() });
+          }
+          return;
+        }
+      }
     }
 
     if (cleanupOnly) {
       pendingAllowAttempt = null;
       if (action === "has_code_dialog") {
         if (disposed || generation !== popupGeneration) return;
-        const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
+        const result = await runtime.runPopupPhase("dismiss_stale", 2, {
+          signal,
+          compileIfNeeded: false,
+        });
         if (signal?.aborted || disposed || generation !== popupGeneration) return;
         audit({
           phase: "popup_cleanup_only",
@@ -841,6 +929,7 @@ export function createMac2FACollector(options = {}) {
             maxStrategies: 1,
             strategyOffset,
             signal,
+            compileIfNeeded: false,
           }
         );
         if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
@@ -918,12 +1007,18 @@ export function createMac2FACollector(options = {}) {
     }
 
     if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
+    const readerController = new AbortController();
+    const abortReader = () => readerController.abort();
+    signal?.addEventListener?.("abort", abortReader, { once: true });
+    popupReadControllers.add(readerController);
     let result;
     try {
       result = await runtime.readPopupCode(4, {
         preferOcr: true,
         rejectCodes: rejectedCodes,
-        signal,
+        signal: readerController.signal,
+        now: runtime.now,
+        deadlineMs: activeAcquisition?.deadline,
       });
     } catch (error) {
       diagnostic({ source: "popup", phase: "popup_code_read", error });
@@ -936,6 +1031,9 @@ export function createMac2FACollector(options = {}) {
       });
       resetPendingPopupClose();
       return;
+    } finally {
+      signal?.removeEventListener?.("abort", abortReader);
+      popupReadControllers.delete(readerController);
     }
     if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
       return;
@@ -954,7 +1052,8 @@ export function createMac2FACollector(options = {}) {
         remainingSec: remainingSeconds(),
       });
     }
-    const code = normalizeSixDigitCode(result?.code);
+    const readerRejected = result?.rejected === true;
+    const code = readerRejected ? null : normalizeSixDigitCode(result?.code);
     audit({
       phase: "popup_code_read",
       source: result?.source ?? "popup",
@@ -968,6 +1067,10 @@ export function createMac2FACollector(options = {}) {
             : "ax_ocr_no_code",
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
+    if (readerRejected) {
+      await dismissRejectedPopup(null, signal);
+      return;
+    }
     if (!code) {
       resetPendingPopupClose();
       return;
@@ -1020,7 +1123,9 @@ export function createMac2FACollector(options = {}) {
         throw new Error("macOS 2FA collection requires macOS");
       }
 
-      const stale = await runtime.dismissStale2FAPopups(6);
+      const stale = await runtime.dismissStale2FAPopups(6, {
+        compileIfNeeded: false,
+      });
       throwIfDisposedDuringPreparation();
       for (const value of stale?.codes ?? []) {
         const code = normalizeSixDigitCode(value);
@@ -1035,7 +1140,9 @@ export function createMac2FACollector(options = {}) {
       } else if (visible?.action === "has_code_dialog") {
         const visibleCode = normalizeSixDigitCode(visible.code);
         if (visibleCode) rejectedCodes.add(visibleCode);
-        const dismissed = await runtime.runPopupPhase("dismiss_stale", 2);
+        const dismissed = await runtime.runPopupPhase("dismiss_stale", 2, {
+          compileIfNeeded: false,
+        });
         throwIfDisposedDuringPreparation();
         const dismissedCode = normalizeSixDigitCode(dismissed?.code);
         if (dismissedCode) rejectedCodes.add(dismissedCode);
@@ -1180,22 +1287,24 @@ export function createMac2FACollector(options = {}) {
         elapsedSincePrepareMs: elapsedSincePrepare(),
       });
 
-      let request;
+      let request = null;
+      let outcome = null;
       try {
         request = runtime.start2FASettingsCodeRequest({
           timeoutMs: attemptTimeoutMs,
           reportDir,
+          runtime: { compileIfNeeded: false },
         });
       } catch (error) {
-        diagnostic({ source: "settings", phase: "settings_provider_start", error });
-        audit({
-          phase: "settings_provider_failed",
-          reason: "settings_start_failed",
-          elapsedSincePrepareMs: elapsedSincePrepare(),
-        });
+        outcome = {
+          kind: "failed",
+          error,
+          failureReason: isAccessibilityDeniedError(error)
+            ? "accessibility_denied"
+            : "settings_start_failed",
+        };
       }
 
-      let outcome = { kind: "failed" };
       if (request) {
         settingsRequest = request;
         const outcomeGate = createDeferred();
@@ -1231,35 +1340,44 @@ export function createMac2FACollector(options = {}) {
           outcome = { kind: "failed" };
         }
 
-        const failureReason =
-          outcome.kind === "failed"
-            ? settingsFailureReason(outcome.error)
-            : "settings_provider_failed";
-        const accessibilityDenied = failureReason === "accessibility_denied";
-        if (outcome.kind === "failed" && outcome.error) {
-          diagnostic({
-            source: "settings",
-            phase: "settings_provider_failed",
-            error: outcome.error,
-          });
-        }
-        audit({
-          phase:
-            outcome.kind === "cancelled"
-              ? "settings_provider_cancelled"
-              : "settings_provider_failed",
-          reason:
-            outcome.kind === "cancelled"
-              ? "cancelled"
-              : failureReason,
-          elapsedSincePrepareMs: elapsedSincePrepare(),
-        });
+      }
 
-        if (accessibilityDenied && !settingsAccessibilityAttempted) {
-          const recovery = await recoverSettingsAccessibility(acquisition, attempt);
-          if (recovery === "granted") continue;
-          return;
-        }
+      outcome ??= { kind: "failed" };
+      const failureReason =
+        outcome.kind === "failed"
+          ? outcome.failureReason ?? settingsFailureReason(outcome.error)
+          : "settings_provider_failed";
+      const accessibilityDenied = failureReason === "accessibility_denied";
+      if (outcome.kind === "failed" && outcome.error) {
+        diagnostic({
+          source: "settings",
+          phase: "settings_provider_failed",
+          error: outcome.error,
+        });
+      }
+      audit({
+        phase:
+          outcome.kind === "cancelled"
+            ? "settings_provider_cancelled"
+            : "settings_provider_failed",
+        reason:
+          outcome.kind === "cancelled"
+            ? "cancelled"
+            : failureReason,
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
+      if (outcome.kind === "failed" && !disposed && !acquisition.winner.settled) {
+        status("settings_failed", {
+          attempt,
+          source: "settings",
+          remainingSec: remainingSeconds(acquisition.deadline),
+        });
+      }
+
+      if (accessibilityDenied && !settingsAccessibilityAttempted) {
+        const recovery = await recoverSettingsAccessibility(acquisition, attempt);
+        if (recovery === "granted") continue;
+        return;
       }
 
       if (outcome.kind === "cancelled" || disposed || acquisition.winner.settled) return;
@@ -1459,6 +1577,7 @@ export function createMac2FACollector(options = {}) {
   const initializeGeneration = (generation, rejectPrevious) => {
     if (generation !== 2) return;
     abortPopupCloseTasks();
+    abortPopupReadTasks();
     if ((rejectPrevious || generation === 2) && lastReturnedCode) {
       rejectedCodes.add(lastReturnedCode);
     }
@@ -1507,8 +1626,30 @@ export function createMac2FACollector(options = {}) {
         ) {
           return false;
         }
+        if (runtime.now() >= acquisition.deadline) {
+          expireAcquisition();
+          return false;
+        }
         return winner.resolve(candidate);
       },
+    };
+    const expireAcquisition = () => {
+      if (
+        disposed ||
+        activeAcquisition !== acquisition ||
+        acquisition.winner.settled
+      ) {
+        return false;
+      }
+      cleanupOnly = true;
+      pendingAllowAttempt = null;
+      abortPopupReadTasks();
+      if (!timeoutStatusSent) {
+        timeoutStatusSent = true;
+        status("timeout", { remainingSec: 0 });
+      }
+      acquisition.winner.reject(new Error("macOS 2FA 验证码获取超时"));
+      return true;
     };
     activeAcquisition = acquisition;
     popupReady.promise.then((candidate) => acquisition.offer(candidate));
@@ -1517,12 +1658,7 @@ export function createMac2FACollector(options = {}) {
     const remainingMs = Math.max(0, acquisition.deadline - runtime.now());
     const deadlineDelay = scheduleDelay(remainingMs);
     deadlineDelay.promise.then((elapsed) => {
-      if (!elapsed || winner.settled) return;
-      if (!timeoutStatusSent) {
-        timeoutStatusSent = true;
-        status("timeout", { remainingSec: 0 });
-      }
-      winner.reject(new Error("macOS 2FA 验证码获取超时"));
+      if (elapsed) expireAcquisition();
     });
     settingsProviderPromise = startSettingsProvider(acquisition).catch(() => {
       audit({
@@ -1536,6 +1672,7 @@ export function createMac2FACollector(options = {}) {
     let candidate = null;
     try {
       candidate = await winner.promise;
+      abortPopupReadTasks();
       settledWinner = { generation, source: candidate.source };
       if (candidate.source !== "popup") {
         cleanupOnly = true;
@@ -1583,6 +1720,7 @@ export function createMac2FACollector(options = {}) {
     if (disposePromise) return disposePromise;
     disposed = true;
     abortPopupCloseTasks();
+    abortPopupReadTasks();
     popupWatcherController?.abort();
     manualAbortController?.abort();
     activeAcquisition?.winner.reject(new Error("2FA collector was disposed"));
@@ -1612,7 +1750,9 @@ export function createMac2FACollector(options = {}) {
         try {
           const state = await runtime.probe2FAState(2);
           if (state?.action === "has_code_dialog") {
-            const result = await runtime.runPopupPhase("dismiss_stale", 2);
+            const result = await runtime.runPopupPhase("dismiss_stale", 2, {
+              compileIfNeeded: false,
+            });
             audit({
               phase: "popup_dispose_cleanup",
               action: result?.action ?? "none",

@@ -115,6 +115,35 @@ export const SUPERVISED_TWO_FA_DETAILS = new Set([
   "automatic_code_unavailable",
 ]);
 
+// These values are deliberately independent from helper output. The bridge only
+// records them after observing fixed stdout/audit tokens or the fixed helper path.
+export const SUPERVISED_SETTINGS_PROVIDER_STATES = new Set([
+  "not_started",
+  "request_created",
+  "helper_spawned",
+  "failed",
+  "cancelled",
+  "winner",
+]);
+
+export const SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS = new Set([
+  "none",
+  "accessibility_denied",
+  "settings_timeout",
+  "settings_invalid_output",
+  "settings_invalid_code",
+  "settings_output_limit",
+  "settings_start_failed",
+  "settings_unavailable",
+  "settings_helper_exit",
+  "settings_two_factor_not_found",
+  "settings_alert_not_opened",
+  "settings_alert_not_found",
+  "settings_alert_cleanup_failed",
+  "settings_ui_unavailable",
+  "settings_provider_failed",
+]);
+
 export const SUPERVISED_STDOUT_STAGE_TOKENS = new Set([
   "launcher_entered",
   "launcher_bootstrap_started",
@@ -209,6 +238,9 @@ const ATTESTATION_OPTIONAL_KEYS = [
   "twoFaDetail",
   "productionStage",
   "nodeFailure",
+  "settingsProviderState",
+  "settingsProviderAttempt",
+  "settingsProviderFailureReason",
 ];
 const ATTESTATION_KEYS = new Set([
   ...ATTESTATION_REQUIRED_KEYS,
@@ -232,6 +264,10 @@ export function createSupervisedAttestation(values = {}) {
     twoFaDetail: values.twoFaDetail ?? "none",
     productionStage: values.productionStage ?? "not_started",
     nodeFailure: values.nodeFailure ?? "none",
+    settingsProviderState: values.settingsProviderState ?? "not_started",
+    settingsProviderAttempt: values.settingsProviderAttempt ?? 0,
+    settingsProviderFailureReason:
+      values.settingsProviderFailureReason ?? "none",
   };
 }
 
@@ -303,6 +339,60 @@ export function validateSupervisedAttestation(value, expected = {}) {
   }
   if (hasOwn(value, "nodeFailure") && !SUPERVISED_NODE_FAILURES.has(value.nodeFailure)) {
     errors.push("attestation node failure is invalid");
+  }
+  const settingsProviderKeys = [
+    "settingsProviderState",
+    "settingsProviderAttempt",
+    "settingsProviderFailureReason",
+  ];
+  const hasSettingsProviderFields = settingsProviderKeys.some((key) => hasOwn(value, key));
+  if (
+    hasSettingsProviderFields &&
+    settingsProviderKeys.some((key) => !hasOwn(value, key))
+  ) {
+    errors.push("attestation Settings provider fields are incomplete");
+  }
+  if (
+    hasOwn(value, "settingsProviderState") &&
+    !SUPERVISED_SETTINGS_PROVIDER_STATES.has(value.settingsProviderState)
+  ) {
+    errors.push("attestation Settings provider state is invalid");
+  }
+  if (
+    hasOwn(value, "settingsProviderAttempt") &&
+    (!Number.isInteger(value.settingsProviderAttempt) ||
+      value.settingsProviderAttempt < 0 ||
+      value.settingsProviderAttempt > 2)
+  ) {
+    errors.push("attestation Settings provider attempt is invalid");
+  }
+  if (
+    hasOwn(value, "settingsProviderFailureReason") &&
+    !SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS.has(
+      value.settingsProviderFailureReason
+    )
+  ) {
+    errors.push("attestation Settings provider failure reason is invalid");
+  }
+  if (
+    hasSettingsProviderFields &&
+    SUPERVISED_SETTINGS_PROVIDER_STATES.has(value.settingsProviderState) &&
+    Number.isInteger(value.settingsProviderAttempt) &&
+    SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS.has(
+      value.settingsProviderFailureReason
+    )
+  ) {
+    const state = value.settingsProviderState;
+    const attempt = value.settingsProviderAttempt;
+    const reason = value.settingsProviderFailureReason;
+    if (
+      (state === "not_started" && (attempt !== 0 || reason !== "none")) ||
+      (["request_created", "helper_spawned", "cancelled", "winner"].includes(state) &&
+        (attempt < 1 || reason !== "none")) ||
+      (state === "failed" && (attempt < 1 || reason === "none"))
+    ) {
+      errors.push("attestation Settings provider evidence is inconsistent");
+    }
   }
   const hasProductionDiagnostic =
     (hasOwn(value, "productionStage") && value.productionStage !== "not_started") ||

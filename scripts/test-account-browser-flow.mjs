@@ -38,7 +38,10 @@ function createRuntime(runBackend, options = {}) {
         warnings: options.environmentWarnings ?? [],
       };
     },
-    async isAccessibilityGranted() {
+    async isAccessibilityGranted(checkOptions) {
+      if (typeof options.isAccessibilityGranted === "function") {
+        return options.isAccessibilityGranted(checkOptions);
+      }
       return true;
     },
     createRuyiPageBackendRunner() {
@@ -406,6 +409,30 @@ async function runCollectorTimeoutIsAlways240SecondsTest() {
   }
 }
 
+async function runPreparedAccessibilityCheckDoesNotBlockBrowserTest() {
+  let checkOptions = null;
+  const unavailable = new Error("prepared helper unavailable");
+  unavailable.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
+  const harness = createRuntime(async () => successfulResult(), {
+    async isAccessibilityGranted(options) {
+      checkOptions = options;
+      throw unavailable;
+    },
+  });
+
+  const warnings = await captureConsole("warn", () =>
+    runAccountBrowserPhase(params, harness.runtime)
+  );
+
+  assert.deepEqual(checkOptions, { compileIfNeeded: false });
+  assert.equal(harness.collectorCount, 1);
+  assert.equal(
+    warnings.some((line) => line.includes("辅助功能未授权")),
+    true,
+    "an unavailable prepared helper must leave the 2FA collector available"
+  );
+}
+
 async function runFixedTwoFactorStatusPromptsTest() {
   const harness = createRuntime(async () => {
     harness.emitStatus({
@@ -428,6 +455,13 @@ async function runFixedTwoFactorStatusPromptsTest() {
       remainingSec: 190,
       secret: SECRET_FIXTURE,
     });
+    harness.emitStatus({
+      status: "settings_failed",
+      attempt: 1,
+      source: "settings",
+      remainingSec: 189,
+      reason: SECRET_FIXTURE,
+    });
     harness.emitStatus({ status: "manual_allow", remainingSec: 185 });
     harness.emitStatus({ status: "manual_code", source: "manual", remainingSec: 150 });
     harness.emitStatus({
@@ -441,6 +475,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
     harness.emitStatus({ status: "winner", source: "manual", remainingSec: 120 });
     harness.emitStatus({ status: "ocr_permission_missing", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "popup_accessibility", secret: SECRET_FIXTURE });
+    harness.emitStatus({ status: "popup_scanning", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "popup_close_pending", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "timeout", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "winner", source: SECRET_FIXTURE, remainingSec: 1 });
@@ -458,6 +493,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 正在尝试通过系统设置获取验证码（第 2/2 次）...",
     "[2FA] 系统设置取码失败，5 秒后进行第 2/2 次尝试...",
     "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
+    "[2FA] 系统设置取码未成功；其他可用取码路径仍会继续。",
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
     "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
     "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
@@ -466,6 +502,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 已使用终端手动输入的验证码。",
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
     "[2FA] 原生验证码弹窗未获辅助功能授权；将尝试已授权的屏幕录制 OCR，系统设置与终端手输仍在继续。",
+    "[2FA] 网页已确认需要验证码，正在持续扫描受限 Apple 原生窗口。",
     "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
   ]);
@@ -498,6 +535,51 @@ async function runSupervisedManualUnavailableStatusTest() {
     assert.deepEqual(logs.filter((line) => line.startsWith("[2FA]")), [
       "[2FA] status:manual_unavailable",
       "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
+    ]);
+    assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
+  } finally {
+    if (previous === undefined) delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+    else process.env.APPLE_AUTOMATION_SUPERVISED_GUI = previous;
+  }
+}
+
+async function runSupervisedSettingsStatusWhitelistTest() {
+  const previous = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+  try {
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
+    const harness = createRuntime(async () => {
+      harness.emitStatus({
+        status: "settings_accessibility",
+        source: "settings",
+        reason: SECRET_FIXTURE,
+      });
+      harness.emitStatus({
+        status: "settings_retry",
+        source: "settings",
+        secret: SECRET_FIXTURE,
+      });
+      harness.emitStatus({
+        status: "settings_failed",
+        source: "settings",
+        reason: SECRET_FIXTURE,
+      });
+      harness.emitStatus({ status: "popup_scanning", source: "popup", secret: SECRET_FIXTURE });
+      harness.emitStatus({ status: "winner", source: "popup", otp: SECRET_FIXTURE });
+      harness.emitStatus({ status: "winner", source: "settings", otp: SECRET_FIXTURE });
+      harness.emitStatus({ status: "winner", source: "manual", otp: SECRET_FIXTURE });
+      return successfulResult();
+    });
+    const logs = await captureConsole("log", () =>
+      runAccountBrowserPhase(params, harness.runtime)
+    );
+    assert.deepEqual(logs.filter((line) => line.startsWith("[2FA] status:")), [
+      "[2FA] status:settings_accessibility",
+      "[2FA] status:settings_retry",
+      "[2FA] status:settings_failed",
+      "[2FA] status:popup_scanning",
+      "[2FA] status:winner:popup",
+      "[2FA] status:winner:settings",
+      "[2FA] status:winner:manual",
     ]);
     assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
   } finally {
@@ -913,8 +995,10 @@ const focusedTests = {
   generations: runTwoGenerationForwardingTest,
   "flow-audit-forwarding": runFlowAuditForwardingTest,
   "password-bidi-progress": runPasswordBidiInputProgressTest,
+  "prepared-accessibility": runPreparedAccessibilityCheckDoesNotBlockBrowserTest,
   "status-prompts": runFixedTwoFactorStatusPromptsTest,
   "manual-unavailable-status": runSupervisedManualUnavailableStatusTest,
+  "settings-status": runSupervisedSettingsStatusWhitelistTest,
   "failure-stage": runFailureStageRetentionTest,
   "failure-envelope": () => {
     runFlowFailureEnvelopeTest();
@@ -936,8 +1020,10 @@ await runTwoGenerationForwardingTest();
 await runFlowAuditForwardingTest();
 await runPasswordBidiInputProgressTest();
 await runCollectorTimeoutIsAlways240SecondsTest();
+await runPreparedAccessibilityCheckDoesNotBlockBrowserTest();
 await runFixedTwoFactorStatusPromptsTest();
 await runSupervisedManualUnavailableStatusTest();
+await runSupervisedSettingsStatusWhitelistTest();
 await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();

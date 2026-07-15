@@ -25,6 +25,38 @@ const OCR_CAPABILITIES = new Set([
   "unavailable",
 ]);
 const defaultCapabilityCache = {};
+const HELPER_EXIT_GRACE_MS = 2_000;
+const MAX_OCR_TIMEOUT_SEC = 10;
+const MAX_PREFLIGHT_TIMEOUT_MS = 2_000;
+const PERMISSION_RECHECK_INTERVAL_MS = 2_000;
+
+function isAbortFailure(error, signal) {
+  return (
+    signal?.aborted === true ||
+    error?.name === "AbortError" ||
+    error?.code === "ABORT_ERR"
+  );
+}
+
+function boundedOcrTimeoutSec(timeoutSec) {
+  const value = Number(timeoutSec);
+  const requested = Number.isFinite(value) ? Math.ceil(value) : MAX_OCR_TIMEOUT_SEC;
+  return Math.min(MAX_OCR_TIMEOUT_SEC, Math.max(1, requested));
+}
+
+function remainingDeadlineMs(options = {}) {
+  const deadlineMs = Number(options.deadlineMs);
+  if (!Number.isFinite(deadlineMs)) return null;
+  const now = typeof options.now === "function" ? Number(options.now()) : Date.now();
+  const currentTimeMs = Number.isFinite(now) ? now : Date.now();
+  return Math.max(0, Math.floor(deadlineMs - currentTimeMs));
+}
+
+function boundedExecutionTimeout(timeoutMs, options = {}) {
+  const remainingMs = remainingDeadlineMs(options);
+  if (remainingMs == null) return timeoutMs;
+  return Math.max(0, Math.min(timeoutMs, remainingMs));
+}
 
 function needsRecompile(sourcePath, binaryPath) {
   if (!fs.existsSync(sourcePath)) return true;
@@ -97,9 +129,23 @@ export function is2FAOcrHelperAvailable(options = {}) {
   const binaryPath = options.binaryPath ?? OCR_BIN;
   if (platform !== "darwin") return false;
   if (needsRecompile(sourcePath, binaryPath)) {
+    // Runtime callers must only consume the helper prepared by install/startup.
+    // Only an explicit installation/preparation caller may compile synchronously.
+    if (options.compileIfNeeded !== true) return false;
     return compileOcrHelper(sourcePath, binaryPath, options);
   }
   return binaryIsExecutable(binaryPath, options);
+}
+
+function is2FAOcrHelperPrepared(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const sourcePath = options.sourcePath ?? OCR_SRC;
+  const binaryPath = options.binaryPath ?? OCR_BIN;
+  return (
+    platform === "darwin" &&
+    !needsRecompile(sourcePath, binaryPath) &&
+    binaryIsExecutable(binaryPath, options)
+  );
 }
 
 export function parseOcrResult(stdout) {
@@ -134,22 +180,62 @@ export function parseOcrCapability(stdout) {
 }
 
 export async function get2FAOcrCapability(options = {}) {
+  if (options.signal?.aborted) return "unavailable";
+  if (remainingDeadlineMs(options) === 0) return "unavailable";
   const capabilityCache = options.capabilityCache ?? defaultCapabilityCache;
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const currentTime = Number(now());
+  const currentTimeMs = Number.isFinite(currentTime) ? currentTime : Date.now();
+  const recheckAt = Number(capabilityCache.permissionRecheckAt);
   const requestPermission =
     options.requestPermission === true && capabilityCache.permissionPrompted !== true;
-  if (capabilityCache.capability === "permission_missing" && !requestPermission) {
+  if (options.requestPermission === true && capabilityCache.permissionPromptInFlight === true) {
     return "permission_missing";
   }
+  const retryPermissionPreflight =
+    capabilityCache.permissionPrompted === true &&
+    (capabilityCache.capability === "permission_missing" ||
+      capabilityCache.capability === "unavailable") &&
+    (!Number.isFinite(recheckAt) || currentTimeMs >= recheckAt);
+  if (
+    capabilityCache.capability === "permission_missing" &&
+    !requestPermission &&
+    !retryPermissionPreflight
+  ) {
+    return "permission_missing";
+  }
+  if (
+    capabilityCache.capability === "unavailable" &&
+    capabilityCache.permissionPrompted === true &&
+    !requestPermission &&
+    !retryPermissionPreflight
+  ) {
+    return "unavailable";
+  }
 
-  const isHelperAvailable =
-    options.isHelperAvailable ?? is2FAOcrHelperAvailable;
+  const isHelperAvailable = options.isHelperAvailable ?? is2FAOcrHelperPrepared;
   if (!isHelperAvailable(options)) return "unavailable";
+  if (options.signal?.aborted) return "unavailable";
+  if (remainingDeadlineMs(options) === 0) return "unavailable";
 
   const runHelper = options.execFileAsync ?? execFileAsync;
   const binaryPath = options.binaryPath ?? OCR_BIN;
   let capability = "unavailable";
+  if (retryPermissionPreflight) {
+    capabilityCache.permissionRecheckAt = currentTimeMs + PERMISSION_RECHECK_INTERVAL_MS;
+  }
+  let permissionPromptStarted = false;
   try {
-    const execOptions = { timeout: 5_000, maxBuffer: 64 * 1024 };
+    const timeout = boundedExecutionTimeout(MAX_PREFLIGHT_TIMEOUT_MS, options);
+    if (timeout <= 0) return "unavailable";
+    if (requestPermission) {
+      // A started native request can outlive its IPC response. Do not re-prompt
+      // during this process if the helper later exits or times out.
+      capabilityCache.permissionPrompted = true;
+      capabilityCache.permissionPromptInFlight = true;
+      permissionPromptStarted = true;
+    }
+    const execOptions = { timeout, maxBuffer: 64 * 1024 };
     if (options.signal) execOptions.signal = options.signal;
     const args = ["--preflight-screen-capture"];
     if (requestPermission) args.push("--prompt-screen-capture");
@@ -158,16 +244,30 @@ export async function get2FAOcrCapability(options = {}) {
       args,
       execOptions
     );
+    if (options.signal?.aborted) return "unavailable";
     capability = parseOcrCapability(stdout);
   } catch (err) {
+    if (isAbortFailure(err, options.signal)) return "unavailable";
     const stdout =
       err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
     if (stdout.trim()) capability = parseOcrCapability(stdout);
+  } finally {
+    if (permissionPromptStarted) {
+      delete capabilityCache.permissionPromptInFlight;
+    }
   }
 
-  if (capability === "permission_missing") {
+  if (
+    capability === "permission_missing" ||
+    (capability === "unavailable" && capabilityCache.permissionPrompted === true)
+  ) {
     capabilityCache.capability = capability;
-    if (requestPermission) capabilityCache.permissionPrompted = true;
+    if (capabilityCache.permissionPrompted === true) {
+      capabilityCache.permissionRecheckAt = currentTimeMs + PERMISSION_RECHECK_INTERVAL_MS;
+    }
+  } else if (capability === "available") {
+    delete capabilityCache.capability;
+    delete capabilityCache.permissionRecheckAt;
   }
   return capability;
 }
@@ -182,24 +282,41 @@ function unavailableOcrResult(capability) {
  * @returns {Promise<{ code: string, source: string }|null>}
  */
 export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
+  if (options.signal?.aborted) return unavailableOcrResult("unavailable");
   const capability = await get2FAOcrCapability(options);
+  if (options.signal?.aborted) return unavailableOcrResult("unavailable");
   if (capability !== "available") return unavailableOcrResult(capability);
+
+  const remainingMs = remainingDeadlineMs(options);
+  if (remainingMs === 0) return unavailableOcrResult("unavailable");
 
   const runHelper = options.execFileAsync ?? execFileAsync;
   const binaryPath = options.binaryPath ?? OCR_BIN;
-  const args = ["--timeout", String(timeoutSec)];
+  const boundedTimeoutSec = Math.min(
+    boundedOcrTimeoutSec(timeoutSec),
+    remainingMs == null ? MAX_OCR_TIMEOUT_SEC : Math.max(0, Math.floor(remainingMs / 1_000))
+  );
+  if (boundedTimeoutSec < 1) return unavailableOcrResult("unavailable");
+  const args = ["--timeout", String(boundedTimeoutSec)];
   try {
+    const timeout = boundedExecutionTimeout(
+      boundedTimeoutSec * 1_000 + HELPER_EXIT_GRACE_MS,
+      options
+    );
+    if (timeout <= 0) return unavailableOcrResult("unavailable");
     const execOptions = {
-      timeout: (timeoutSec + 15) * 1000,
+      timeout,
       maxBuffer: 256 * 1024,
     };
     if (options.signal) execOptions.signal = options.signal;
     const { stdout, stderr } = await runHelper(binaryPath, args, execOptions);
+    if (options.signal?.aborted) return unavailableOcrResult("unavailable");
     if (stderr?.trim()) {
       console.log("[2FA] Vision OCR helper reported diagnostics");
     }
     return parseOcrResult(stdout) ?? unavailableOcrResult("available");
   } catch (err) {
+    if (isAbortFailure(err, options.signal)) return unavailableOcrResult("unavailable");
     const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
     if (stdout.trim()) {
       return parseOcrResult(stdout) ?? unavailableOcrResult("available");

@@ -25,6 +25,7 @@ const AUTOMATION_URLS = [
   "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation",
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
 ];
+const NATIVE_HELPER_ACCESSIBILITY_CLIENT = "macOS 原生提示中列出的 2FA helper";
 
 function psField(pid, field) {
   const r = spawnSync("ps", ["-p", String(pid), "-o", `${field}=`], {
@@ -49,6 +50,10 @@ export function getAccessibilityHostApp(options = {}) {
   const supervised =
     options.supervised ?? env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
   const term = env.TERM_PROGRAM?.trim();
+
+  if (options.nativeHelper === true) {
+    return { name: NATIVE_HELPER_ACCESSIBILITY_CLIENT };
+  }
 
   if (!supervised && term === "Apple_Terminal") return { name: "Terminal" };
   if (!supervised && term === "iTerm.app") return { name: "iTerm" };
@@ -135,7 +140,11 @@ function resolveAccessibilityRuntime(options = {}) {
 export async function isAccessibilityGranted(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return true;
-  const result = await runtime.checkCapability({ signal: options.signal });
+  const result = await runtime.checkCapability({
+    signal: options.signal,
+    // Runtime permission checks must use the helper prepared by setup.
+    compileIfNeeded: false,
+  });
   if (result.capability === "unavailable") {
     const error = new Error("Accessibility capability probe is unavailable");
     error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
@@ -151,6 +160,8 @@ export async function triggerAccessibilityPrompt(options = {}) {
   const result = await runtime.promptPermission({
     signal: options.signal,
     waitTimeoutMs: options.waitTimeoutMs,
+    // The native prompt is still a runtime operation, never a build step.
+    compileIfNeeded: false,
   });
   if (result.capability === "unavailable") {
     const error = new Error("Accessibility permission prompt is unavailable");
@@ -328,9 +339,9 @@ export async function ensureAccessibility(options = {}) {
     return { granted: true, skipped: true };
   }
 
-  const host = getAccessibilityHostApp();
+  const host = getAccessibilityHostApp({ nativeHelper: true });
 
-  if (await isAccessibilityGranted({ runtime, signal })) {
+  if (await isAccessibilityGranted({ runtime, signal, compileIfNeeded: false })) {
     throwIfAccessibilityCancelled(signal);
     log(`✓ 辅助功能已授权（${host.name}）`, quiet);
     return { granted: true, host: host.name };
@@ -344,6 +355,7 @@ export async function ensureAccessibility(options = {}) {
   const promptResult = await triggerAccessibilityPrompt({
     runtime,
     signal,
+    compileIfNeeded: false,
     // Keep the same native helper alive while macOS displays the prompt. This
     // avoids a one-shot child disappearing before TCC records the decision.
     waitTimeoutMs: Math.min(timeoutMs, 30_000),
@@ -361,7 +373,7 @@ export async function ensureAccessibility(options = {}) {
   while (Date.now() < deadline) {
     await runtime.sleep(pollMs);
     throwIfAccessibilityCancelled(signal);
-    if (await isAccessibilityGranted({ runtime, signal })) {
+    if (await isAccessibilityGranted({ runtime, signal, compileIfNeeded: false })) {
       throwIfAccessibilityCancelled(signal);
       log(`✓ 辅助功能已授权（${host.name}）`, quiet);
       return { granted: true, host: host.name };
@@ -387,7 +399,7 @@ export async function withAccessibilityRetry(fn, options = {}) {
   const { maxAttempts = 3, label = "操作" } = options;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await ensureAccessibility({ quiet: false });
+    await ensureAccessibility({ quiet: false, compileIfNeeded: false });
     await sleep(500);
 
     try {
@@ -399,7 +411,11 @@ export async function withAccessibilityRetry(fn, options = {}) {
       console.warn(
         `[辅助功能] ${label} 失败（尝试 ${attempt}/${maxAttempts}），请在系统设置中勾选后脚本将自动重试…`
       );
-      await ensureAccessibility({ quiet: false, timeoutMs: 180_000 });
+      await ensureAccessibility({
+        quiet: false,
+        timeoutMs: 180_000,
+        compileIfNeeded: false,
+      });
       await sleep(1000);
     }
   }
@@ -419,12 +435,29 @@ export async function run2FAPermissionPreflight(options = {}) {
     return { ok: true, skipped: true };
   }
 
-  const host = getAccessibilityHostApp();
+  const host = getAccessibilityHostApp({ nativeHelper: true });
   if (!quiet) {
     console.log("==> 2FA 权限预检");
   }
 
-  await ensureAccessibility({ quiet, timeoutMs, pollMs, runtime });
+  try {
+    await ensureAccessibility({
+      quiet,
+      timeoutMs,
+      pollMs,
+      runtime,
+      compileIfNeeded: false,
+    });
+  } catch (error) {
+    if (error?.code === "2FA_ACCESSIBILITY_UNAVAILABLE") {
+      return {
+        ok: false,
+        host: host.name,
+        capability: "unavailable",
+      };
+    }
+    throw error;
+  }
 
   if (!quiet) {
     console.log(`==> 2FA 权限就绪（${host.name}：辅助功能）`);

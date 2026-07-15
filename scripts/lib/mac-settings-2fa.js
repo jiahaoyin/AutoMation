@@ -123,6 +123,17 @@ export function is2FASettingsHelperAvailable(options = {}) {
   return binaryIsExecutable(binaryPath, options);
 }
 
+function is2FASettingsHelperPrepared(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const sourcePath = options.sourcePath ?? SWIFT_SRC;
+  const binaryPath = options.binaryPath ?? BIN;
+  return (
+    platform === "darwin" &&
+    !swiftNeedsRecompile(sourcePath, binaryPath) &&
+    binaryIsExecutable(binaryPath, options)
+  );
+}
+
 function removeCancelFile(cancelFile) {
   try {
     if (fs.existsSync(cancelFile)) fs.unlinkSync(cancelFile);
@@ -150,6 +161,12 @@ function helperReasonError(reason) {
 
 function resolveHelperPath(runtime) {
   if (runtime.helperPath) return runtime.helperPath;
+  if (runtime.compileIfNeeded === false) {
+    if (!is2FASettingsHelperPrepared(runtime)) {
+      throw new Error("2FA settings helper is unavailable");
+    }
+    return BIN;
+  }
   if (!is2FASettingsHelperAvailable()) {
     const built = compile2FASettingsHelper({ quiet: true });
     if (!built.ok) {
@@ -165,7 +182,7 @@ function resolveHelperPath(runtime) {
  *   verbose?: boolean,
  *   reportDir?: string,
  *   cancelFile?: string,
- *   runtime?: { platform?: string, helperPath?: string, spawn?: typeof spawn }
+ *   runtime?: { platform?: string, helperPath?: string, spawn?: typeof spawn, compileIfNeeded?: boolean }
  * }} [opts]
  * @returns {{
  *   promise: Promise<{ code: string }>,

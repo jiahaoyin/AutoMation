@@ -11,6 +11,7 @@ import {
   isAccessibilityGranted,
   getAccessibilityHostApp,
   run2FAPermissionPreflight,
+  triggerAccessibilityPrompt,
 } from "./lib/accessibility.js";
 import {
   checkNativeAccessibilityCapability,
@@ -36,7 +37,7 @@ const preflightEntrySource = fs.readFileSync(
 
 assert.match(
   preflightEntrySource,
-  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight/
+  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityGranted\(\{\s*compileIfNeeded:\s*false\s*\}\)[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*compileIfNeeded:\s*false[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight\(\{[\s\S]*compileIfNeeded:\s*false/
 );
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 
@@ -74,11 +75,11 @@ assert.match(
 );
 assert.match(
   exportedFunctionSource(accessibilitySource, "isAccessibilityGranted"),
-  /runtime\.checkCapability\(\{\s*signal:\s*options\.signal\s*\}\)/
+  /runtime\.checkCapability\(\{\s*signal:\s*options\.signal,\s*\/\/ Runtime permission checks must use the helper prepared by setup\.\s*compileIfNeeded:\s*false,\s*\}\)/
 );
 assert.match(
   exportedFunctionSource(accessibilitySource, "triggerAccessibilityPrompt"),
-  /runtime\.promptPermission\(\{\s*signal:\s*options\.signal,\s*waitTimeoutMs:\s*options\.waitTimeoutMs,\s*\}\)/
+  /runtime\.promptPermission\(\{\s*signal:\s*options\.signal,\s*waitTimeoutMs:\s*options\.waitTimeoutMs,\s*\/\/ The native prompt is still a runtime operation, never a build step\.\s*compileIfNeeded:\s*false,\s*\}\)/
 );
 assert.doesNotMatch(
   accessibilitySource,
@@ -178,6 +179,38 @@ assert.deepEqual(prepareFailure, { capability: "unavailable" });
 assert.deepEqual(nativeCalls, []);
 assert.doesNotMatch(popupSource, /osascript|System Events/);
 
+const capabilityOptions = [];
+const promptOptions = [];
+assert.equal(
+  await isAccessibilityGranted({
+    runtime: {
+      platform: "darwin",
+      async checkCapability(options) {
+        capabilityOptions.push(options);
+        return { capability: "available" };
+      },
+    },
+  }),
+  true
+);
+assert.deepEqual(capabilityOptions, [{ signal: undefined, compileIfNeeded: false }]);
+assert.deepEqual(
+  await triggerAccessibilityPrompt({
+    waitTimeoutMs: 2_500,
+    runtime: {
+      platform: "darwin",
+      async promptPermission(options) {
+        promptOptions.push(options);
+        return { capability: "available" };
+      },
+    },
+  }),
+  { capability: "available" }
+);
+assert.deepEqual(promptOptions, [
+  { signal: undefined, waitTimeoutMs: 2_500, compileIfNeeded: false },
+]);
+
 await assert.rejects(
   isAccessibilityGranted({
     runtime: {
@@ -203,11 +236,13 @@ try {
     pollMs: 1,
     runtime: {
       platform: "darwin",
-      async checkCapability() {
+      async checkCapability(options) {
+        assert.equal(options.compileIfNeeded, false);
         preflightCalls.push("check");
         return { capability: capabilitySequence.shift() ?? "available" };
       },
-      async promptPermission() {
+      async promptPermission(options) {
+        assert.equal(options.compileIfNeeded, false);
         preflightCalls.push("prompt");
         return { capability: "permission_missing" };
       },
@@ -228,6 +263,22 @@ try {
 assert.equal(runtimePreflight.ok, true);
 assert.deepEqual(preflightCalls, ["check", "prompt", "sleep", "check"]);
 
+const unavailablePreflight = await run2FAPermissionPreflight({
+  quiet: true,
+  runtime: {
+    platform: "darwin",
+    async checkCapability(options) {
+      assert.equal(options.compileIfNeeded, false);
+      return { capability: "unavailable" };
+    },
+    async promptPermission() {
+      assert.fail("an unavailable prepared helper must not block on a prompt");
+    },
+  },
+});
+assert.equal(unavailablePreflight.ok, false);
+assert.equal(unavailablePreflight.capability, "unavailable");
+
 const cancellationController = new AbortController();
 const cancellationCalls = [];
 await assert.rejects(
@@ -238,13 +289,15 @@ await assert.rejects(
     signal: cancellationController.signal,
     runtime: {
       platform: "darwin",
-      async checkCapability({ signal }) {
+      async checkCapability({ signal, compileIfNeeded }) {
         assert.equal(signal, cancellationController.signal);
+        assert.equal(compileIfNeeded, false);
         cancellationCalls.push("check");
         return { capability: "permission_missing" };
       },
-      async promptPermission({ signal }) {
+      async promptPermission({ signal, compileIfNeeded }) {
         assert.equal(signal, cancellationController.signal);
+        assert.equal(compileIfNeeded, false);
         cancellationCalls.push("prompt");
         cancellationController.abort();
         return { capability: "permission_missing" };

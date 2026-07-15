@@ -1302,6 +1302,7 @@ def unique_scoped_elements(
 
 def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
     all_candidates: list[tuple[Any, Any]] = []
+    candidate_groups: list[list[tuple[Any, Any]]] = []
     grouped: list[tuple[Any, list[Any]]] = []
     group_indexes: dict[int, int] = {}
     for scope, root in current_element_search_roots(page):
@@ -1366,10 +1367,15 @@ def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
             )
 
         candidates = unique_elements(candidates)
-        all_candidates.extend((scope, field) for field in candidates)
+        scoped_candidates = [(scope, field) for field in candidates]
+        candidate_groups.append(scoped_candidates)
+        all_candidates.extend(scoped_candidates)
 
     all_candidates = unique_scoped_elements(all_candidates)
-    return all_candidates if len(all_candidates) in (1, 6) else []
+    six_digit_groups = [group for group in candidate_groups if len(group) == 6]
+    if len(six_digit_groups) == 1:
+        return six_digit_groups[0]
+    return all_candidates if len(all_candidates) == 1 else []
 
 
 def interactable_elements(root: Any, selector: str) -> list[Any]:
@@ -1461,6 +1467,14 @@ def fill_security_code(
         )
         return
 
+    sequence_scope = fields[0][0]
+    if any(scope is not sequence_scope for scope, _field in fields):
+        raise RuntimeError(
+            "2FA code input must resolve to six targets in one trusted Apple frame"
+        )
+    for _scope, field in fields:
+        require_otp_bidi_input_target(sequence_scope, field, "2FA digit")
+
     for (scope, field), digit in zip(fields, digits):
         try:
             input_otp_digit_with_element_bidi(
@@ -1471,23 +1485,17 @@ def fill_security_code(
             )
         except Exception:
             try:
-                input_and_verify(
-                    scope,
-                    field,
-                    digit,
-                    "2FA digit",
-                    keys,
-                    pause=pause,
-                    root_page=page,
-                )
-            except Exception:
-                if input_otp_digits_with_owner_actions(
+                sequenced = input_otp_digits_with_owner_actions(
                     fields,
                     digits,
                     pause=pause,
-                ):
-                    return
-                raise
+                )
+            except Exception:
+                sequenced = False
+            if sequenced:
+                return
+            emit_input_progress("2FA code", "sequence_failed", "owner")
+            raise RuntimeError("2FA code sequence verification failed")
         pause(80, 220)
 
 

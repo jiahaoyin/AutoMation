@@ -20,6 +20,8 @@ import {
   SUPERVISED_COMMAND_SHA256,
   SUPERVISED_PRODUCTION_ENV_KEYS,
   SUPERVISED_PRODUCTION_ENV_POLICY,
+  SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS,
+  SUPERVISED_SETTINGS_PROVIDER_STATES,
   SUPERVISED_SUCCESS_MARKER,
   createMacVerificationPermissionProfile,
   createSupervisedAttestation,
@@ -49,10 +51,15 @@ import {
   createProductionProtocolState,
   createSupervisorStatusProtocol,
   drainProductionStderr,
+  hasTrustedSettingsHelperProcess,
+  observeTrustedSettingsHelperSpawn,
   productionStdinForSupervisedInput,
   readBoundedRegularFile,
+  readSettingsProviderAudit,
   supervisedTtyCapability,
   supervisedTwoFaDetail,
+  supervisedTwoFaStatusMessage,
+  supervisedTwoFaWinnerMessage,
 } from "./supervised-terminal-bridge.mjs";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000;
@@ -159,6 +166,12 @@ assert.equal(
 assert.equal(productionProtocol.nodeFailure, "backend_exit");
 const accessibilityProtocol = createProductionProtocolState();
 assert.equal(
+  accessibilityProtocol.processStdoutLine("[2FA] status:native_helper_accessibility_missing"),
+  true
+);
+assert.equal(accessibilityProtocol.accessibilityPreflight, "missing");
+assert.equal(accessibilityProtocol.productionStage, "accessibility_missing");
+assert.equal(
   accessibilityProtocol.processStdoutLine("[2FA] status:permission_preflight_missing"),
   true
 );
@@ -172,9 +185,28 @@ assert.equal(
   "two_fa_code_pending",
   "a pending provider must expose active 2FA progress while retaining the fixed Accessibility result"
 );
+const nativeHelperReadyProtocol = createProductionProtocolState();
+assert.equal(
+  nativeHelperReadyProtocol.processStdoutLine("[2FA] status:native_helper_accessibility_granted"),
+  true
+);
+assert.equal(nativeHelperReadyProtocol.accessibilityPreflight, "ready");
+assert.equal(nativeHelperReadyProtocol.productionStage, "accessibility_ready");
+assert.equal(
+  nativeHelperReadyProtocol.processStdoutLine(
+    "[2FA] status:native_helper_accessibility_probe_unavailable"
+  ),
+  true
+);
+assert.equal(nativeHelperReadyProtocol.productionStage, "accessibility_preflight");
 const popupFallbackProtocol = createProductionProtocolState();
 assert.equal(
   popupFallbackProtocol.processStdoutLine("[2FA] status:popup_accessibility"),
+  true
+);
+assert.equal(popupFallbackProtocol.productionStage, "two_fa_code_pending");
+assert.equal(
+  popupFallbackProtocol.processStdoutLine("[2FA] status:popup_scanning"),
   true
 );
 assert.equal(popupFallbackProtocol.productionStage, "two_fa_code_pending");
@@ -183,6 +215,61 @@ assert.equal(
   true
 );
 assert.equal(popupFallbackProtocol.productionStage, "two_fa_code_pending");
+const winnerThenCleanupProtocol = createProductionProtocolState();
+assert.equal(
+  winnerThenCleanupProtocol.processStdoutLine("[2FA] status:winner:popup"),
+  true
+);
+assert.equal(winnerThenCleanupProtocol.productionStage, "two_fa_code_acquired");
+assert.equal(
+  winnerThenCleanupProtocol.processStdoutLine("[2FA] status:popup_close_pending"),
+  true
+);
+assert.equal(
+  winnerThenCleanupProtocol.productionStage,
+  "two_fa_code_acquired",
+  "background popup cleanup must not turn a delivered code back into pending acquisition"
+);
+const settingsFailedStatusProtocol = createProductionProtocolState();
+assert.equal(
+  settingsFailedStatusProtocol.processStdoutLine("[2FA] status:settings_failed"),
+  true
+);
+assert.equal(settingsFailedStatusProtocol.productionStage, "two_fa_code_pending");
+assert.equal(
+  supervisedTwoFaStatusMessage("settings_accessibility"),
+  "[mac:supervised] 系统设置取码需要辅助功能授权，正在请求 macOS 授权"
+);
+assert.equal(
+  supervisedTwoFaStatusMessage("settings_retry"),
+  "[mac:supervised] 系统设置取码正在进行受限重试；其他可用取码路径仍在继续"
+);
+assert.equal(
+  supervisedTwoFaStatusMessage("settings_failed"),
+  "[mac:supervised] 系统设置取码未成功；其他可用取码路径仍在继续"
+);
+assert.equal(
+  supervisedTwoFaStatusMessage("popup_close_pending"),
+  "[mac:supervised] 原生弹窗验证码已读取，正在后台清理弹窗并继续网页登录"
+);
+assert.equal(
+  supervisedTwoFaStatusMessage("popup_scanning"),
+  "[mac:supervised] 网页已请求验证码；正在对受限 Apple 原生窗口进行持续读码"
+);
+assert.equal(
+  supervisedTwoFaWinnerMessage("winner:popup"),
+  "[mac:supervised] 已从原生 Apple 验证码弹窗取得验证码，正在继续网页登录"
+);
+assert.equal(
+  supervisedTwoFaWinnerMessage("winner:settings"),
+  "[mac:supervised] 已通过系统设置取得验证码，正在继续网页登录"
+);
+assert.equal(
+  supervisedTwoFaWinnerMessage("winner:manual"),
+  "[mac:supervised] 已收到终端隐藏输入的验证码，正在继续网页登录"
+);
+assert.equal(supervisedTwoFaStatusMessage(RAW_SECRET_CANARY), null);
+assert.equal(supervisedTwoFaWinnerMessage(`winner:${RAW_SECRET_CANARY}`), null);
 const stageBeforeStderr = productionProtocol.productionStage;
 const nodeFailureBeforeStderr = productionProtocol.nodeFailure;
 assert.equal(
@@ -201,6 +288,238 @@ assert.equal(
 );
 assert.equal(productionProtocol.productionStage, stageBeforeStderr);
 assert.equal(productionProtocol.nodeFailure, nodeFailureBeforeStderr);
+
+const settingsHelperPath = path.join(
+  os.tmpdir(),
+  "supervised-settings-helper",
+  "mac-settings-2fa-code"
+);
+const settingsSpawnProtocol = createProductionProtocolState();
+assert.equal(
+  settingsSpawnProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(settingsSpawnProtocol.settingsProviderState, "request_created");
+assert.equal(settingsSpawnProtocol.settingsProviderAttempt, 1);
+assert.equal(settingsSpawnProtocol.settingsProviderFailureReason, "none");
+assert.equal(
+  hasTrustedSettingsHelperProcess(
+    { pid: 4100, pgid: 4100 },
+    settingsHelperPath,
+    {
+      listProcessGroupMembers: () => [4100, 4101],
+      inspectProcess: (pid) =>
+        pid === 4101
+          ? { pgid: 4100, executable: path.resolve(settingsHelperPath) }
+          : { pgid: 4100, executable: "/usr/bin/node" },
+    }
+  ),
+  true,
+  "only an exact helper executable in the production process group proves spawn"
+);
+assert.equal(
+  hasTrustedSettingsHelperProcess(
+    { pid: 4100, pgid: 4100 },
+    settingsHelperPath,
+    {
+      listProcessGroupMembers: () => [4101],
+      inspectProcess: () => ({ pgid: 9999, executable: path.resolve(settingsHelperPath) }),
+    }
+  ),
+  false,
+  "a helper-shaped process outside the trusted process group must not prove spawn"
+);
+assert.equal(settingsSpawnProtocol.observeSettingsHelperSpawned(), true);
+assert.equal(settingsSpawnProtocol.settingsProviderState, "helper_spawned");
+
+const delayedSettingsSpawnProtocol = createProductionProtocolState();
+assert.equal(
+  delayedSettingsSpawnProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+let delayedSettingsPolls = 0;
+const delayedSettingsIdentity = { pid: 4200, pgid: 4200 };
+const delayedSettingsHelperPid = 4201;
+const delayedSettingsHelperPath = path.resolve(settingsHelperPath);
+const delayedSettingsDependencies = {
+  listProcessGroupMembers(pgid) {
+    assert.equal(pgid, delayedSettingsIdentity.pgid);
+    delayedSettingsPolls += 1;
+    return delayedSettingsPolls === 1
+      ? [delayedSettingsIdentity.pid]
+      : [delayedSettingsIdentity.pid, delayedSettingsHelperPid];
+  },
+  inspectProcess(pid) {
+    assert.equal(pid, delayedSettingsHelperPid);
+    if (delayedSettingsPolls === 2) {
+      return { pgid: 9999, executable: delayedSettingsHelperPath };
+    }
+    if (delayedSettingsPolls === 3) {
+      return { pgid: delayedSettingsIdentity.pgid, executable: `${delayedSettingsHelperPath}.other` };
+    }
+    return {
+      pgid: delayedSettingsIdentity.pgid,
+      executable: delayedSettingsHelperPath,
+    };
+  },
+};
+assert.equal(
+  observeTrustedSettingsHelperSpawn(
+    delayedSettingsSpawnProtocol,
+    delayedSettingsIdentity,
+    delayedSettingsHelperPath,
+    delayedSettingsDependencies
+  ),
+  false,
+  "the first bounded poll must tolerate a helper that has not appeared yet"
+);
+assert.equal(delayedSettingsSpawnProtocol.settingsProviderState, "request_created");
+assert.equal(
+  observeTrustedSettingsHelperSpawn(
+    delayedSettingsSpawnProtocol,
+    delayedSettingsIdentity,
+    delayedSettingsHelperPath,
+    delayedSettingsDependencies
+  ),
+  false,
+  "a delayed helper in the wrong process group must be rejected"
+);
+assert.equal(
+  observeTrustedSettingsHelperSpawn(
+    delayedSettingsSpawnProtocol,
+    delayedSettingsIdentity,
+    delayedSettingsHelperPath,
+    delayedSettingsDependencies
+  ),
+  false,
+  "a delayed helper at a different executable path must be rejected"
+);
+assert.equal(
+  observeTrustedSettingsHelperSpawn(
+    delayedSettingsSpawnProtocol,
+    delayedSettingsIdentity,
+    delayedSettingsHelperPath,
+    delayedSettingsDependencies
+  ),
+  true,
+  "a later exact helper in the production process group must upgrade the evidence"
+);
+assert.equal(delayedSettingsPolls, 4);
+assert.equal(delayedSettingsSpawnProtocol.settingsProviderState, "helper_spawned");
+assert.equal(
+  observeTrustedSettingsHelperSpawn(
+    delayedSettingsSpawnProtocol,
+    delayedSettingsIdentity,
+    delayedSettingsHelperPath,
+    delayedSettingsDependencies
+  ),
+  false,
+  "terminal helper-spawn evidence must stop further process inspection"
+);
+assert.equal(delayedSettingsPolls, 4);
+
+const settingsFailedProtocol = createProductionProtocolState();
+assert.equal(
+  settingsFailedProtocol.processSettingsAuditEvent({
+    phase: "settings_provider_start",
+    attempt: 1,
+  }),
+  true
+);
+assert.equal(
+  settingsFailedProtocol.processSettingsAuditEvent({
+    phase: "settings_provider_failed",
+    attempt: 1,
+    reason: "settings_helper_exit",
+  }),
+  true
+);
+assert.equal(settingsFailedProtocol.settingsProviderState, "failed");
+assert.equal(settingsFailedProtocol.settingsProviderAttempt, 1);
+assert.equal(
+  settingsFailedProtocol.settingsProviderFailureReason,
+  "settings_helper_exit"
+);
+
+const settingsCancelledProtocol = createProductionProtocolState();
+assert.equal(
+  settingsCancelledProtocol.processSettingsAuditEvent({
+    phase: "settings_provider_start",
+    attempt: 1,
+  }),
+  true
+);
+assert.equal(
+  settingsCancelledProtocol.processSettingsAuditEvent({
+    phase: "settings_provider_cancelled",
+    attempt: 1,
+  }),
+  true
+);
+assert.equal(settingsCancelledProtocol.settingsProviderState, "cancelled");
+assert.equal(settingsCancelledProtocol.settingsProviderFailureReason, "none");
+
+const settingsWinnerProtocol = createProductionProtocolState();
+assert.equal(
+  settingsWinnerProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(
+  settingsWinnerProtocol.processStdoutLine("[2FA] status:winner:settings"),
+  true
+);
+assert.equal(settingsWinnerProtocol.settingsProviderState, "winner");
+assert.equal(settingsWinnerProtocol.settingsProviderAttempt, 1);
+assert.equal(settingsWinnerProtocol.settingsProviderFailureReason, "none");
+
+const settingsAttemptProtocol = createProductionProtocolState();
+assert.equal(
+  settingsAttemptProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(
+  settingsAttemptProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(
+  settingsAttemptProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(settingsAttemptProtocol.settingsProviderAttempt, 2);
+assert.equal(settingsAttemptProtocol.settingsProviderState, "request_created");
+
+const unknownSettingsProtocol = createProductionProtocolState();
+const unknownSettingsBefore = {
+  state: unknownSettingsProtocol.settingsProviderState,
+  attempt: unknownSettingsProtocol.settingsProviderAttempt,
+  reason: unknownSettingsProtocol.settingsProviderFailureReason,
+};
+assert.equal(
+  unknownSettingsProtocol.processStdoutLine("[2FA] status:settings_helper_spawned"),
+  false,
+  "an unapproved Settings stdout token must be rejected"
+);
+assert.equal(
+  unknownSettingsProtocol.processSettingsAuditEvent({
+    phase: "settings_provider_failed",
+    attempt: 1,
+    reason: "untrusted_reason",
+  }),
+  false,
+  "an unapproved Settings audit reason must be rejected"
+);
+assert.deepEqual(
+  {
+    state: unknownSettingsProtocol.settingsProviderState,
+    attempt: unknownSettingsProtocol.settingsProviderAttempt,
+    reason: unknownSettingsProtocol.settingsProviderFailureReason,
+  },
+  unknownSettingsBefore
+);
+assert.ok(SUPERVISED_SETTINGS_PROVIDER_STATES.has("helper_spawned"));
+assert.ok(
+  SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS.has("settings_helper_exit")
+);
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
   "utf8"
@@ -247,6 +566,62 @@ function removeTreeOneFileAtATime(directory) {
     else fs.unlinkSync(entryPath);
   }
   fs.rmdirSync(directory);
+}
+
+const settingsAuditRoot = fs.mkdtempSync(
+  path.join(os.tmpdir(), "supervised-settings-audit-")
+);
+try {
+  const settingsAuditDir = path.join(
+    settingsAuditRoot,
+    "apple-id-flow-2026-07-16T12-34-56-789Z"
+  );
+  fs.mkdirSync(settingsAuditDir);
+  fs.writeFileSync(
+    path.join(settingsAuditDir, "2fa-audit.jsonl"),
+    [
+      JSON.stringify({
+        ts: "2026-07-16T12:34:56.789Z",
+        phase: "settings_provider_start",
+        elapsedSincePrepareMs: 8000,
+      }),
+      JSON.stringify({
+        ts: "2026-07-16T12:34:56.790Z",
+        phase: "settings_provider_failed",
+        reason: RAW_SECRET_CANARY,
+        elapsedSincePrepareMs: 8001,
+        stderr: RAW_SECRET_CANARY,
+      }),
+      JSON.stringify({
+        ts: "2026-07-16T12:34:56.791Z",
+        phase: "settings_provider_failed",
+        reason: "settings_helper_exit",
+        elapsedSincePrepareMs: 8002,
+      }),
+      JSON.stringify({
+        ts: "2026-07-16T12:34:56.792Z",
+        phase: "settings_provider_untrusted",
+        rawAx: RAW_SECRET_CANARY,
+      }),
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  const settingsAuditEvents = readSettingsProviderAudit(settingsAuditRoot);
+  assert.deepEqual(settingsAuditEvents, [
+    { phase: "settings_provider_start", attempt: 1 },
+    {
+      phase: "settings_provider_failed",
+      attempt: 1,
+      reason: "settings_helper_exit",
+    },
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(settingsAuditEvents),
+    new RegExp(RAW_SECRET_CANARY),
+    "Settings evidence must not forward raw helper stderr, AX/OCR, OTP, or account material"
+  );
+} finally {
+  removeTreeOneFileAtATime(settingsAuditRoot);
 }
 
 async function waitUntil(predicate, timeoutMs, message) {
@@ -1855,6 +2230,22 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
+  /"settings_accessibility",\s*"settings_failed",\s*"manual_allow"/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /SUPERVISED_TWO_FA_WINNER_MESSAGES[\s\S]*winner:popup[\s\S]*winner:settings[\s\S]*winner:manual/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /const emitTwoFaWinner = \(status\) => \{[\s\S]*twoFaWinnerConfirmations >= 2[\s\S]*safeWrite/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /if \(supervisedTwoFaWinnerMessage\(status\)\) \{[\s\S]*emitTwoFaWinner\(status\)[\s\S]*supervisedTwoFaStatusMessage\(status\)/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
   /supervisedTwoFaDetail\(\{[\s\S]*failureClass,[\s\S]*ttyCapability,[\s\S]*manualPromptObserved/
 );
 assert.match(
@@ -1908,6 +2299,9 @@ assert.doesNotMatch(
 assert.match(supervisedTerminalBridgeSource, /2FA 自动取码处理中/);
 for (const token of [
   'const twoFaPrefix = "[2FA] status:"',
+  'status === "native_helper_accessibility_granted"',
+  'status === "native_helper_accessibility_missing"',
+  'status === "native_helper_accessibility_probe_unavailable"',
   'status === "permission_preflight_missing"',
   'productionStage = "two_fa_code_acquired"',
   'productionStage = "two_fa_code_unavailable"',
@@ -2422,6 +2816,9 @@ assert.equal(acceptedAttestation.ttyCapability, "unknown");
 assert.equal(acceptedAttestation.twoFaDetail, "none");
 assert.equal(acceptedAttestation.productionStage, "not_started");
 assert.equal(acceptedAttestation.nodeFailure, "none");
+assert.equal(acceptedAttestation.settingsProviderState, "not_started");
+assert.equal(acceptedAttestation.settingsProviderAttempt, 0);
+assert.equal(acceptedAttestation.settingsProviderFailureReason, "none");
 assert.match(SUPERVISED_COMMAND_SHA256, /^[0-9a-f]{64}$/);
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(acceptedAttestation), {
@@ -2441,6 +2838,9 @@ const detailedTwoFaAttestation = createSupervisedAttestation({
   failureClass: "TWO_FA_CODE_UNAVAILABLE",
   ttyCapability: "unavailable",
   twoFaDetail: "manual_tty_unavailable",
+  settingsProviderState: "failed",
+  settingsProviderAttempt: 1,
+  settingsProviderFailureReason: "settings_helper_exit",
 });
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(detailedTwoFaAttestation), {
@@ -2454,13 +2854,16 @@ delete legacyFailedAttestation.ttyCapability;
 delete legacyFailedAttestation.twoFaDetail;
 delete legacyFailedAttestation.productionStage;
 delete legacyFailedAttestation.nodeFailure;
+delete legacyFailedAttestation.settingsProviderState;
+delete legacyFailedAttestation.settingsProviderAttempt;
+delete legacyFailedAttestation.settingsProviderFailureReason;
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(legacyFailedAttestation), {
     nonce: SUPERVISED_TOKEN,
     expectedHead: EXPECTED_HEAD,
   }).errors,
   [],
-  "legacy failed attestations without TTY/detail fields must remain valid"
+  "legacy failed attestations without newer diagnostics must remain valid"
 );
 const invalidTwoFaDetailAttestation = {
   ...detailedTwoFaAttestation,
@@ -2512,6 +2915,40 @@ assert.ok(
     { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
   ).errors.some((error) => /node failure is invalid/i.test(error))
 );
+const invalidSettingsProviderStateAttestation = {
+  ...detailedTwoFaAttestation,
+  settingsProviderState: "untrusted_state",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(invalidSettingsProviderStateAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /Settings provider state is invalid/i.test(error))
+);
+const inconsistentSettingsProviderAttestation = {
+  ...detailedTwoFaAttestation,
+  settingsProviderState: "helper_spawned",
+  settingsProviderAttempt: 0,
+  settingsProviderFailureReason: "none",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(inconsistentSettingsProviderAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /Settings provider evidence is inconsistent/i.test(error))
+);
+const secretCanarySettingsAttestation = {
+  ...detailedTwoFaAttestation,
+  settingsProviderFailureReason: RAW_SECRET_CANARY,
+};
+const secretCanarySettingsErrors = parseSupervisedAttestation(
+  attestationArtifact(secretCanarySettingsAttestation),
+  { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+).errors;
+assert.ok(
+  secretCanarySettingsErrors.some((error) => /Settings provider failure reason is invalid/i.test(error))
+);
+assert.doesNotMatch(JSON.stringify(secretCanarySettingsErrors), new RegExp(RAW_SECRET_CANARY));
 
 function writeArtifacts(roundDir, overrides = {}) {
   fs.mkdirSync(roundDir, { recursive: true });

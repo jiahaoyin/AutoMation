@@ -27,6 +27,56 @@ const SAFE_PHASES = new Set([
   "dismiss_done",
   "probe",
 ]);
+const HELPER_EXIT_GRACE_MS = 2_000;
+const NATIVE_HELPER_ACCESSIBILITY_STATUSES = Object.freeze({
+  available: "native_helper_accessibility_granted",
+  permission_missing: "native_helper_accessibility_missing",
+  unavailable: "native_helper_accessibility_probe_unavailable",
+});
+
+function emptyPhaseResult() {
+  return { ok: false, action: "none", code: null, source: null };
+}
+
+function unavailableCapability() {
+  return { capability: "unavailable" };
+}
+
+function reportNativeHelperAccessibilityCapability(capability) {
+  if (process.env.APPLE_AUTOMATION_SUPERVISED_GUI !== "1") return;
+  const status = NATIVE_HELPER_ACCESSIBILITY_STATUSES[capability];
+  if (status) console.log(`[2FA] status:${status}`);
+}
+
+function finishNativeHelperAccessibilityCapability(result) {
+  reportNativeHelperAccessibilityCapability(result.capability);
+  return result;
+}
+
+function isAbortFailure(error, signal) {
+  return (
+    signal?.aborted === true ||
+    error?.name === "AbortError" ||
+    error?.code === "ABORT_ERR"
+  );
+}
+
+function waitForAbortableDelay(delayMs, signal) {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (elapsed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve(elapsed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), Math.max(0, delayMs));
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
 
 function needsRecompile(src, bin) {
   if (!fs.existsSync(src)) return true;
@@ -97,6 +147,9 @@ export function compile2FAPopupHelper(options = {}) {
 
 function ensureBin(src, bin, options = {}) {
   if ((options.platform ?? process.platform) !== "darwin") return false;
+  if (options.compileIfNeeded !== true) {
+    return !needsRecompile(src, bin) && binaryIsExecutable(bin, options);
+  }
   if (needsRecompile(src, bin)) return compileSwift(src, bin, options);
   return binaryIsExecutable(bin, options);
 }
@@ -138,15 +191,21 @@ function parseAccessibilityCapability(stdout) {
 
 async function runAccessibilityCapability(flag, options = {}) {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") return { capability: "unavailable" };
+  if (platform !== "darwin" || options.signal?.aborted) return unavailableCapability();
 
   const sourcePath = options.sourcePath ?? SWIFT_SRC;
   const binaryPath = options.binaryPath ?? SWIFT_BIN;
-  const ensureHelper = options.ensureHelper ?? (() => ensureBin(sourcePath, binaryPath, options));
+  const ensureHelper =
+    options.ensureHelper ??
+    (() => ensureBin(sourcePath, binaryPath, { ...options, compileIfNeeded: false }));
   try {
-    if (!ensureHelper()) return { capability: "unavailable" };
+    if (!ensureHelper() || options.signal?.aborted) {
+      return options.signal?.aborted
+        ? unavailableCapability()
+        : finishNativeHelperAccessibilityCapability(unavailableCapability());
+    }
   } catch {
-    return { capability: "unavailable" };
+    return finishNativeHelperAccessibilityCapability(unavailableCapability());
   }
 
   const runHelper = options.execFile ?? execFileAsync;
@@ -165,12 +224,14 @@ async function runAccessibilityCapability(flag, options = {}) {
     };
     if (options.signal) execOptions.signal = options.signal;
     const { stdout } = await runHelper(binaryPath, args, execOptions);
-    return parseAccessibilityCapability(stdout);
+    if (options.signal?.aborted) return unavailableCapability();
+    return finishNativeHelperAccessibilityCapability(parseAccessibilityCapability(stdout));
   } catch (error) {
+    if (isAbortFailure(error, options.signal)) return unavailableCapability();
     const parsed = parseAccessibilityCapability(error?.stdout);
-    return parsed.capability === "permission_missing"
-      ? parsed
-      : { capability: "unavailable" };
+    return finishNativeHelperAccessibilityCapability(
+      parsed.capability === "permission_missing" ? parsed : unavailableCapability()
+    );
   }
 }
 
@@ -183,22 +244,39 @@ export async function promptNativeAccessibilityPermission(options = {}) {
 }
 
 async function runSwiftPhase(phase, timeoutSec, options = {}) {
-  if (!ensureBin(SWIFT_SRC, SWIFT_BIN)) {
-    return { ok: false, action: "none", code: null, source: null };
-  }
+  if (options.signal?.aborted) return emptyPhaseResult();
+
+  const sourcePath = options.sourcePath ?? SWIFT_SRC;
+  const binaryPath = options.binaryPath ?? SWIFT_BIN;
+  const ensureHelper =
+    options.ensureHelper ??
+    (() => ensureBin(sourcePath, binaryPath, { ...options, compileIfNeeded: false }));
   try {
-    const execOptions = { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 };
+    if (!ensureHelper() || options.signal?.aborted) return emptyPhaseResult();
+  } catch {
+    return emptyPhaseResult();
+  }
+
+  const runHelper = options.execFile ?? execFileAsync;
+  try {
+    const boundedTimeoutSec = Math.max(1, Math.min(12, Math.ceil(Number(timeoutSec) || 1)));
+    const execOptions = {
+      timeout: boundedTimeoutSec * 1_000 + HELPER_EXIT_GRACE_MS,
+      maxBuffer: 256 * 1024,
+    };
     if (options.signal) execOptions.signal = options.signal;
-    const { stdout } = await execFileAsync(
-      SWIFT_BIN,
-      ["--phase", phase, "--timeout", String(timeoutSec)],
+    const { stdout } = await runHelper(
+      binaryPath,
+      ["--phase", phase, "--timeout", String(boundedTimeoutSec)],
       execOptions
     );
+    if (options.signal?.aborted) return emptyPhaseResult();
     return parsePhaseJson(stdout);
   } catch (err) {
+    if (isAbortFailure(err, options.signal)) return emptyPhaseResult();
     const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
     if (stdout.trim()) return parsePhaseJson(stdout);
-    return { ok: false, action: "none", code: null, source: null };
+    return emptyPhaseResult();
   }
 }
 
@@ -213,9 +291,11 @@ function logPhaseResult(phase, r) {
 }
 
 export async function runPopupPhase(phase, timeoutSec = 6, options = {}) {
-  if (process.platform !== "darwin") return { ok: false, action: "none", code: null, source: null };
+  if ((options.platform ?? process.platform) !== "darwin" || options.signal?.aborted) {
+    return emptyPhaseResult();
+  }
   if (!SAFE_PHASES.has(phase)) {
-    return { ok: false, action: "none", code: null, source: null };
+    return emptyPhaseResult();
   }
 
   const swift = await runSwiftPhase(phase, timeoutSec, options);
@@ -225,16 +305,18 @@ export async function runPopupPhase(phase, timeoutSec = 6, options = {}) {
   return swift;
 }
 
-export async function dismissStale2FAPopups(maxRounds = 6) {
+export async function dismissStale2FAPopups(maxRounds = 6, options = {}) {
   let dismissed = 0;
   /** @type {string[]} */
   const codes = [];
   for (let i = 0; i < maxRounds; i++) {
-    const r = await runPopupPhase("dismiss_stale", 2);
+    if (options.signal?.aborted) break;
+    const r = await runPopupPhase("dismiss_stale", 2, options);
+    if (options.signal?.aborted) break;
     if (r.action === "dismissed_stale") {
       dismissed += 1;
       if (r.code) codes.push(r.code);
-      await new Promise((res) => setTimeout(res, 500));
+      if (!(await waitForAbortableDelay(500, options.signal))) break;
     } else {
       break;
     }
@@ -244,17 +326,17 @@ export async function dismissStale2FAPopups(maxRounds = 6) {
 
 /** 读码后点「完成」关闭系统弹窗，避免遮挡 Firefox 输入 */
 export async function dismissCodePopupForWebFill(timeoutSec = 4, options = {}) {
-  if (process.platform !== "darwin") return false;
+  if ((options.platform ?? process.platform) !== "darwin" || options.signal?.aborted) return false;
   const r = await runPopupPhase("dismiss_done", timeoutSec, options);
+  if (options.signal?.aborted) return false;
   if (r.action === "dismissed_done") {
-    await new Promise((res) => setTimeout(res, 400));
-    return true;
+    return waitForAbortableDelay(400, options.signal);
   }
   return false;
 }
 
-export async function tryFetchMac2FAPopupAx(timeoutSec = 12) {
-  const r = await runPopupPhase("read_code", timeoutSec);
+export async function tryFetchMac2FAPopupAx(timeoutSec = 12, options = {}) {
+  const r = await runPopupPhase("read_code", timeoutSec, options);
   if (r.action === "accessibility_unavailable") {
     return { code: null, source: null, action: r.action, capability: "accessibility_missing" };
   }
