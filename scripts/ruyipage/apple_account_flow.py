@@ -1804,6 +1804,16 @@ def browser_flow(args: argparse.Namespace) -> int:
             }
         )
         return 0
+    except Exception:
+        if broker_mode and browser_startup_stage in BROWSER_STARTUP_STAGES:
+            emit(
+                {
+                    "event": "status",
+                    "status": "browser_failure",
+                    "failureStage": browser_startup_stage,
+                }
+            )
+        raise
     finally:
         had_error = sys.exc_info()[0] is not None
         try:

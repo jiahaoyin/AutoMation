@@ -1644,6 +1644,8 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(events))
 
     def test_authentication_failure_does_not_persist_a_failure_screenshot(self):
+        order = []
+
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
                 return lambda *_args, **_kwargs: None
@@ -1653,12 +1655,17 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 raise RuntimeError("authentication navigation failed")
 
             def quit(self):
+                order.append("quit")
                 return None
 
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
-            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+                "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "1",
+            },
             clear=False,
         ), patch(
             "apple_account_flow.import_ruyipage",
@@ -1668,12 +1675,29 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 FakeKeys,
             ),
         ), patch("apple_account_flow.take_screenshot") as take_screenshot, patch(
-            "apple_account_flow.emit"
-        ):
+            "apple_account_flow.emit",
+            side_effect=lambda event: order.append(("event", event)),
+        ) as emit_event:
             with self.assertRaisesRegex(RuntimeError, "authentication navigation failed"):
                 browser_flow(args)
 
         take_screenshot.assert_not_called()
+        self.assertIn(
+            {
+                "event": "status",
+                "status": "browser_failure",
+                "failureStage": "login_navigation",
+            },
+            [call.args[0] for call in emit_event.call_args_list],
+        )
+        failure_event_index = next(
+            index
+            for index, item in enumerate(order)
+            if isinstance(item, tuple)
+            and item[0] == "event"
+            and item[1].get("status") == "browser_failure"
+        )
+        self.assertLess(failure_event_index, order.index("quit"))
 
     def test_top_level_and_third_party_failures_use_one_fixed_safe_reason(self):
         run_cli = getattr(account_flow, "run_cli", None)

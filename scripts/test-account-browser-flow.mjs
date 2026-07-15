@@ -322,6 +322,23 @@ async function runReadyModeSanitizationTest() {
     await options.onEvent({ event: "ready", mode: "ruyipage-only" });
     await options.onEvent({ event: "ready", mode: "unexpected-mode" });
     await options.onEvent({ event: "ready" });
+    await options.onEvent({
+      event: "status",
+      status: "browser_failure",
+      failureStage: "email_wait",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "result",
+      success: false,
+      failureStage: "email_wait",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "browser_failure",
+      failureStage: SECRET_FIXTURE,
+    });
     return successfulResult();
   });
 
@@ -340,6 +357,11 @@ async function runReadyModeSanitizationTest() {
   );
   assert.ok(logs.includes("[ruyipage] status:runtime_resolving"));
   assert.ok(logs.includes("[ruyipage] status:backend_starting"));
+  assert.equal(
+    logs.filter((line) => line === "[ruyipage] status:failure:email_wait").length,
+    1
+  );
+  assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
 }
 
 async function runCleanupErrorSanitizationTest() {

@@ -238,6 +238,7 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
   });
   let result;
   let runError = null;
+  let reportedFailureStage = null;
   try {
     console.log("[ruyipage] status:runtime_resolving");
     const runner = createRunner();
@@ -254,11 +255,23 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
         ) {
           console.log(`[ruyipage] status:${event.status}`);
         } else if (
+          event.event === "status" &&
+          event.status === "browser_failure" &&
+          RUYIPAGE_FAILURE_STAGES.has(event.failureStage)
+        ) {
+          if (event.failureStage !== reportedFailureStage) {
+            reportedFailureStage = event.failureStage;
+            console.log(`[ruyipage] status:failure:${event.failureStage}`);
+          }
+        } else if (
           event.event === "result" &&
           event.success === false &&
           RUYIPAGE_FAILURE_STAGES.has(event.failureStage)
         ) {
-          console.log(`[ruyipage] status:failure:${event.failureStage}`);
+          if (event.failureStage !== reportedFailureStage) {
+            reportedFailureStage = event.failureStage;
+            console.log(`[ruyipage] status:failure:${event.failureStage}`);
+          }
         } else if (event.event === "warning") {
           console.warn("[ruyipage] backend warning");
         } else if (event.event === "prepare_2fa") {
