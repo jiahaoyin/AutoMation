@@ -1644,6 +1644,18 @@ assert.match(
   supervisedTerminalBridgeSource,
   /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*"\.\/run\.sh",\s*"--skip-mac",\s*\]/
 );
+const browserBrokerStartIndex = supervisedTerminalBridgeSource.indexOf(
+  "await startBroker(browserBroker, bridgeIdentity)"
+);
+const productionSpawnIndex = supervisedTerminalBridgeSource.indexOf(
+  "child = spawnProcess(",
+  browserBrokerStartIndex
+);
+assert.ok(
+  browserBrokerStartIndex >= 0 &&
+    productionSpawnIndex > browserBrokerStartIndex,
+  "the trusted browser broker and both FIFOs must be ready before production starts"
+);
 assert.match(supervisedTerminalBridgeSource, /runtime_resolving/);
 assert.match(supervisedTerminalBridgeSource, /backend_starting/);
 assert.match(supervisedTerminalBridgeSource, /BROWSER_RUNTIME_UNAVAILABLE/);
@@ -1670,7 +1682,7 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
-  /cleanupRecordedRuyiPageProcess\([\s\S]*context\.productionDir[\s\S]*apple_account_flow\.py"\),[\s\S]*context\.nonce/
+  /cleanupBrowserBroker\([\s\S]*cleanupRecorded\s*=\s*[\s\S]*cleanupRecordedRuyiPageProcess[\s\S]*broker\.paths\.statePath[\s\S]*broker\.paths\.scriptPath[\s\S]*broker\.context\.nonce/
 );
 assert.equal(
   (supervisedTerminalBridgeSource.match(/"\.\/run\.sh"/g) ?? []).length,
@@ -1727,6 +1739,11 @@ assert.match(
 );
 assert.match(
   supervisedRemoteScript,
+  /ruyi_state_file[\s\S]*elif \[\[ "\$lifecycle_status" == \(running\|accepted\) \|\| "\$ruyi_lifecycle_state" == \(preparing\|active\|cleanup_failed\) \]\][\s\S]*cleanup_failed=1/,
+  "an unfinished broker lifecycle without process identity must fail closed"
+);
+assert.match(
+  supervisedRemoteScript,
   /SUPERVISED_CLEANUP_RESULT="\$cleanup_failed"[\s\S]*SUPERVISED_CLEANUP_STATE=complete/
 );
 assert.match(
@@ -1743,7 +1760,7 @@ assert.match(
 );
 assert.match(
   supervisedRemoteScript,
-  /supervised-process-state-verifier\.mjs" ruyipage-lifecycle[\s\S]*ruyi_lifecycle_state" != "inactive"/
+  /supervised-process-state-verifier\.mjs" ruyipage-lifecycle[\s\S]*ruyi_lifecycle_state" != \(preparing\|active\|inactive\|cleanup_failed\)[\s\S]*ruyi_cleanup_identity_ok=0/
 );
 assert.doesNotMatch(supervisedRemoteScript, /-z "\$(?:\/bin\/)?ps .*command=/);
 assert.match(supervisedRemoteScript, /MODEL_TMP_OK=1/);
@@ -1792,7 +1809,7 @@ assert.match(
 );
 assert.match(
   ruyiPageRunnerSource,
-  /writeRuyiPageLifecycleState\(lifecycleStatePath, "preparing", processNonce\)[\s\S]*const child = spawn\(/
+  /writeRuyiPageLifecycleState\(lifecycleStatePath, "preparing", processNonce\)[\s\S]*const child = usesBrowserBroker[\s\S]*createBrowserBrokerChild[\s\S]*:\s*spawn\(/
 );
 assert.match(
   ruyiPageRunnerSource,
@@ -1838,7 +1855,7 @@ assert.match(
 );
 assert.match(
   ruyiPageRunnerSource,
-  /useProcessGroup: !usesOuterProcessSupervisor/
+  /useProcessGroup: !usesBrowserBroker && !usesOuterProcessSupervisor/
 );
 assert.match(
   ruyiPageRunnerSource,

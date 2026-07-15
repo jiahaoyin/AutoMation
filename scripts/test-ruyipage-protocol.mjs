@@ -1,13 +1,16 @@
 import { strict as assert } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import {
   buildRuyiPageProcessSupervisorScript,
+  createBrowserBrokerChild,
   createChildStopper,
   createRuyiPageBackendRunner,
   resolveBackendTimeouts,
@@ -336,6 +339,562 @@ async function assertSanitizedCallbackFailure(promise, expectedMessage) {
       assert.equal(exposed.includes(secret), false, `callback failure leaked ${secret}`);
     }
   }
+}
+
+function openBrokerStreams(eventsStream, commandsStream) {
+  queueMicrotask(() => {
+    eventsStream.emit("open", 101);
+    commandsStream.emit("open", 102);
+  });
+}
+
+function createMemoryBrokerChild({
+  eventsStream = new PassThrough(),
+  commandsStream = new PassThrough(),
+  connectTimeoutMs = 200,
+} = {}) {
+  const openedPaths = [];
+  const child = createBrowserBrokerChild({
+    commandsFifo: "/broker/commands.fifo",
+    eventsFifo: "/broker/events.fifo",
+    creds: FIXTURE_CREDS,
+    connectTimeoutMs,
+    fsApi: {
+      createReadStream(filePath) {
+        openedPaths.push(["read", filePath]);
+        return eventsStream;
+      },
+      createWriteStream(filePath) {
+        openedPaths.push(["write", filePath]);
+        return commandsStream;
+      },
+      fstat(_fd, callback) {
+        queueMicrotask(() => callback(null, { isFIFO: () => true }));
+      },
+    },
+  });
+  return { child, commandsStream, eventsStream, openedPaths };
+}
+
+async function captureBrokerTerminal(child, action) {
+  const errorOutcome = new Promise((resolve) => {
+    child.once("error", resolve);
+  });
+  const closeOutcome = new Promise((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  action();
+  const error = await withRejectGuard(
+    errorOutcome,
+    500,
+    "broker facade did not emit its fixed error"
+  );
+  const close = await withRejectGuard(
+    closeOutcome,
+    500,
+    "broker facade did not close after its fixed error"
+  );
+  return { error, close };
+}
+
+function assertBrokerErrorIsPrivate(error, expectedMessage) {
+  assert.equal(error?.message, expectedMessage);
+  const exposed = [String(error), String(error?.stack ?? ""), JSON.stringify(error)].join("\n");
+  for (const [label, secret] of Object.entries(SECRET_FIXTURES)) {
+    assert.equal(exposed.includes(secret), false, `broker failure leaked ${label}`);
+  }
+}
+
+function assertBrokerCredentialsFrame(frame) {
+  assert.deepEqual(Object.keys(frame ?? {}).sort(), ["appleId", "password", "type"]);
+  assert.equal(frame?.type, "credentials");
+  assert.equal(frame?.appleId === FIXTURE_CREDS.appleId, true, "broker Apple ID mismatch");
+  assert.equal(frame?.password === FIXTURE_CREDS.password, true, "broker password mismatch");
+}
+
+async function runBrowserBrokerFacadeSelfTest() {
+  const { child, commandsStream, eventsStream, openedPaths } =
+    createMemoryBrokerChild();
+  let commandsText = "";
+  let stdoutText = "";
+  let stderrText = "";
+  const terminalEvents = [];
+  commandsStream.on("data", (chunk) => {
+    commandsText += chunk.toString("utf8");
+  });
+  child.stdout.on("data", (chunk) => {
+    stdoutText += chunk.toString("utf8");
+  });
+  child.stderr.on("data", (chunk) => {
+    stderrText += chunk.toString("utf8");
+  });
+  child.once("exit", (code, signal) => terminalEvents.push(["exit", code, signal]));
+  const closed = new Promise((resolve) => {
+    child.once("close", (code, signal) => {
+      terminalEvents.push(["close", code, signal]);
+      resolve();
+    });
+  });
+
+  openBrokerStreams(eventsStream, commandsStream);
+  await child.connected;
+  eventsStream.write(`${JSON.stringify({ event: "ready", mode: "broker-self-test" })}\n`);
+  eventsStream.end(`${JSON.stringify({ event: "result", success: true })}\n`);
+  await withRejectGuard(closed, 500, "broker facade did not close after events FIFO EOF");
+
+  assert.deepEqual(openedPaths, [
+    ["read", "/broker/events.fifo"],
+    ["write", "/broker/commands.fifo"],
+  ]);
+  const initialCommands = commandsText
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.equal(initialCommands.length, 1, "credentials must be the first broker frame");
+  assertBrokerCredentialsFrame(initialCommands[0]);
+  assert.deepEqual(
+    stdoutText
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line)),
+    [
+      { event: "ready", mode: "broker-self-test" },
+      { event: "result", success: true },
+    ]
+  );
+  assert.equal(stderrText, "");
+  assert.deepEqual(terminalEvents, [
+    ["exit", 0, null],
+    ["close", 0, null],
+  ]);
+  assert.equal(child.kill("SIGKILL"), false, "closed broker facade must not signal anything");
+  await child.cleanup();
+}
+
+async function runBrowserBrokerRelaySelfTest() {
+  const relays = [];
+  const spawned = [];
+  const makeRelay = (kind) => {
+    const relay = new EventEmitter();
+    relay.stdin = kind === "commands" ? new PassThrough() : null;
+    relay.stdout = kind === "events" ? new PassThrough() : null;
+    relay.stderr = new PassThrough();
+    relay.killedWith = [];
+    relay.kill = (signal) => {
+      relay.killedWith.push(signal);
+      return true;
+    };
+    relay.unref = () => {};
+    relays.push(relay);
+    return relay;
+  };
+  const child = createBrowserBrokerChild({
+    commandsFifo: "/broker/commands.fifo",
+    eventsFifo: "/broker/events.fifo",
+    creds: FIXTURE_CREDS,
+    connectTimeoutMs: 200,
+    relayNode: "/runtime/node",
+    relayScript: "/repo/scripts/ruyipage-fifo-relay.mjs",
+    relayFsApi: {
+      lstatSync() {
+        return {
+          mode: 0o10600,
+          isFIFO: () => true,
+          isSymbolicLink: () => false,
+        };
+      },
+    },
+    spawnRelay(command, args) {
+      spawned.push([command, ...args]);
+      return makeRelay(args[1] === "write" ? "commands" : "events");
+    },
+  });
+  const [commandRelay, eventRelay] = relays;
+  let commandText = "";
+  let outputText = "";
+  commandRelay.stdin.on("data", (chunk) => {
+    commandText += chunk.toString("utf8");
+  });
+  child.stdout.on("data", (chunk) => {
+    outputText += chunk.toString("utf8");
+  });
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  await child.connected;
+  eventRelay.stdout.write(`${JSON.stringify({ event: "ready", mode: "relay" })}\n`);
+  eventRelay.stdout.end(`${JSON.stringify({ event: "result", success: true })}\n`);
+  queueMicrotask(() => eventRelay.emit("close", 0, null));
+  await withRejectGuard(closed, 500, "relay broker did not close");
+
+  assert.deepEqual(spawned, [
+    [
+      "/runtime/node",
+      "/repo/scripts/ruyipage-fifo-relay.mjs",
+      "write",
+      "/broker/commands.fifo",
+    ],
+    [
+      "/runtime/node",
+      "/repo/scripts/ruyipage-fifo-relay.mjs",
+      "read",
+      "/broker/events.fifo",
+    ],
+  ]);
+  assertBrokerCredentialsFrame(JSON.parse(commandText));
+  assert.deepEqual(
+    outputText.trim().split(/\r?\n/).map((line) => JSON.parse(line)),
+    [
+      { event: "ready", mode: "relay" },
+      { event: "result", success: true },
+    ]
+  );
+  assert.ok(
+    relays.every((relay) => relay.killedWith.includes("SIGTERM")),
+    "terminal relay cleanup must signal every potentially blocked helper"
+  );
+}
+
+async function runBrowserBrokerRelayTimeoutSelfTest() {
+  const relays = [];
+  const child = createBrowserBrokerChild({
+    commandsFifo: "/broker/commands.fifo",
+    eventsFifo: "/broker/events.fifo",
+    creds: FIXTURE_CREDS,
+    connectTimeoutMs: 20,
+    relayNode: "/runtime/node",
+    relayScript: "/repo/scripts/ruyipage-fifo-relay.mjs",
+    relayFsApi: {
+      lstatSync() {
+        return {
+          mode: 0o10600,
+          isFIFO: () => true,
+          isSymbolicLink: () => false,
+        };
+      },
+    },
+    spawnRelay(_command, args) {
+      const relay = new EventEmitter();
+      relay.stdin = args[1] === "write" ? new PassThrough() : null;
+      relay.stdout = args[1] === "read" ? new PassThrough() : null;
+      relay.stderr = new PassThrough();
+      relay.kill = (signal) => {
+        relay.signal = signal;
+        return true;
+      };
+      relay.unref = () => {};
+      relays.push(relay);
+      return relay;
+    },
+  });
+  const { error } = await captureBrokerTerminal(child, () => {});
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO open timed out");
+  assert.ok(
+    relays.every((relay) => relay.signal === "SIGTERM"),
+    "a stalled FIFO handshake must terminate both relay processes"
+  );
+}
+
+async function runBrowserBrokerImmediateEofSelfTest() {
+  const eventsStream = new PassThrough();
+  let credentialsFrame = null;
+  const commandsStream = new Writable({
+    write(chunk, _encoding, callback) {
+      credentialsFrame = JSON.parse(chunk.toString("utf8"));
+      eventsStream.end(`${JSON.stringify({ event: "result", success: true })}\n`);
+      setTimeout(callback, 30);
+    },
+  });
+  const { child } = createMemoryBrokerChild({ eventsStream, commandsStream });
+  let stdoutText = "";
+  child.stdout.on("data", (chunk) => {
+    stdoutText += chunk.toString("utf8");
+  });
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  openBrokerStreams(eventsStream, commandsStream);
+  await withRejectGuard(closed, 500, "broker lost immediate result before FIFO EOF");
+
+  assertBrokerCredentialsFrame(credentialsFrame);
+  assert.deepEqual(JSON.parse(stdoutText), { event: "result", success: true });
+}
+
+async function runBrowserBrokerCleanupSelfTest() {
+  const { child, commandsStream, eventsStream } = createMemoryBrokerChild();
+  openBrokerStreams(eventsStream, commandsStream);
+  await child.connected;
+  const terminalEvents = [];
+  child.once("exit", (code, signal) => terminalEvents.push(["exit", code, signal]));
+  child.once("close", (code, signal) => terminalEvents.push(["close", code, signal]));
+
+  await withRejectGuard(child.cleanup(), 100, "broker facade cleanup was not bounded");
+  assert.equal(child.pid, undefined);
+  assert.equal(child.killed, true);
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, "SIGTERM");
+  assert.deepEqual(terminalEvents, [
+    ["exit", null, "SIGTERM"],
+    ["close", null, "SIGTERM"],
+  ]);
+  assert.equal(child.kill("SIGKILL"), false);
+}
+
+async function runBrowserBrokerOpenFailureSelfTest() {
+  const { child, eventsStream } = createMemoryBrokerChild();
+  const { error, close } = await captureBrokerTerminal(child, () => {
+    eventsStream.emit("error", new Error(SECRET_CHILD_OUTPUT));
+  });
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO open failed");
+  assert.deepEqual(close, { code: 1, signal: null });
+  await assert.rejects(child.connected, /FIFO open failed/);
+}
+
+async function runBrowserBrokerRejectsNonFifoSelfTest() {
+  const eventsStream = new PassThrough();
+  const commandsStream = new PassThrough();
+  let commandsText = "";
+  commandsStream.on("data", (chunk) => {
+    commandsText += chunk.toString("utf8");
+  });
+  const child = createBrowserBrokerChild({
+    commandsFifo: "/broker/not-a-fifo",
+    eventsFifo: "/broker/events.fifo",
+    creds: FIXTURE_CREDS,
+    connectTimeoutMs: 200,
+    fsApi: {
+      createReadStream() {
+        return eventsStream;
+      },
+      createWriteStream() {
+        return commandsStream;
+      },
+      fstat(fd, callback) {
+        queueMicrotask(() => callback(null, { isFIFO: () => fd === 101 }));
+      },
+    },
+  });
+  const { error } = await captureBrokerTerminal(child, () => {
+    openBrokerStreams(eventsStream, commandsStream);
+  });
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO open failed");
+  assert.equal(commandsText.length, 0, "credentials must never be written to a non-FIFO fd");
+}
+
+async function runBrowserBrokerOpenTimeoutSelfTest() {
+  const { child } = createMemoryBrokerChild({ connectTimeoutMs: 20 });
+  const startedAt = Date.now();
+  const { error } = await captureBrokerTerminal(child, () => {});
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO open timed out");
+  assert.ok(Date.now() - startedAt < 300, "broker FIFO open timeout must remain bounded");
+}
+
+async function runBrowserBrokerWriteFailureSelfTest() {
+  const written = [];
+  const commandsStream = new Writable({
+    write(chunk, _encoding, callback) {
+      written.push(chunk.toString("utf8"));
+      callback(new Error(SECRET_CHILD_OUTPUT));
+    },
+  });
+  const { child, eventsStream } = createMemoryBrokerChild({ commandsStream });
+  const terminal = captureBrokerTerminal(child, () => {
+    openBrokerStreams(eventsStream, commandsStream);
+  });
+  const { error } = await terminal;
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO write failed");
+  assert.equal(written.length, 1);
+  assertBrokerCredentialsFrame(JSON.parse(written[0]));
+}
+
+async function runBrowserBrokerWriteTimeoutSelfTest() {
+  const commandsStream = new Writable({
+    write() {
+      // Deliberately leave the FIFO write callback pending.
+    },
+  });
+  const { child, eventsStream } = createMemoryBrokerChild({
+    commandsStream,
+    connectTimeoutMs: 20,
+  });
+  const terminal = captureBrokerTerminal(child, () => {
+    openBrokerStreams(eventsStream, commandsStream);
+  });
+  const { error } = await terminal;
+  assertBrokerErrorIsPrivate(error, "ruyipage browser broker FIFO write timed out");
+}
+
+async function runBrowserBrokerReadFailureSelfTest() {
+  const { child, commandsStream, eventsStream } = createMemoryBrokerChild();
+  openBrokerStreams(eventsStream, commandsStream);
+  await child.connected;
+  const { error } = await captureBrokerTerminal(child, () => {
+    eventsStream.emit("error", new Error(SECRET_CHILD_OUTPUT));
+  });
+  assertBrokerErrorIsPrivate(
+    error,
+    "ruyipage browser broker events FIFO read failed"
+  );
+}
+
+async function withBrowserBrokerEnvironment(operation) {
+  const overrides = {
+    APPLE_AUTOMATION_BROWSER_BROKER_MODE: "1",
+    APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO: "/broker/commands.fifo",
+    APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO: "/broker/events.fifo",
+  };
+  const previous = new Map();
+  for (const [name, value] of Object.entries(overrides)) {
+    previous.set(name, {
+      present: Object.prototype.hasOwnProperty.call(process.env, name),
+      value: process.env[name],
+    });
+    process.env[name] = value;
+  }
+  try {
+    return await operation();
+  } finally {
+    for (const [name, prior] of previous) {
+      if (prior.present) process.env[name] = prior.value;
+      else delete process.env[name];
+    }
+  }
+}
+
+async function runNodeRunnerBrowserBrokerSelfTest() {
+  const eventsStream = new PassThrough();
+  const commandsStream = new PassThrough();
+  const commands = [];
+  const events = [];
+  const openedPaths = [];
+  let commandBuffer = "";
+  commandsStream.on("data", (chunk) => {
+    commandBuffer += chunk.toString("utf8");
+    const lines = commandBuffer.split(/\r?\n/);
+    commandBuffer = lines.pop() ?? "";
+    for (const line of lines.filter(Boolean)) {
+      const command = JSON.parse(line);
+      commands.push(command);
+      if (commands.length === 1) {
+        eventsStream.write(`${JSON.stringify({ event: "ready", mode: "broker" })}\n`);
+        eventsStream.write(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      } else if (command.type === "2fa_prepared") {
+        eventsStream.write(`${JSON.stringify({ event: "need_2fa", generation: 1 })}\n`);
+      } else if (command.type === "2fa_code") {
+        eventsStream.end(
+          `${JSON.stringify({
+            event: "result",
+            success: command.code === SECRET_FIXTURES.verificationCode,
+            receivedGeneration: command.generation,
+          })}\n`
+        );
+      }
+    }
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      fsApi: {
+        createReadStream(filePath) {
+          openedPaths.push(["read", filePath]);
+          return eventsStream;
+        },
+        createWriteStream(filePath) {
+          openedPaths.push(["write", filePath]);
+          queueMicrotask(() => openBrokerStreams(eventsStream, commandsStream));
+          return commandsStream;
+        },
+        fstat(_fd, callback) {
+          queueMicrotask(() => callback(null, { isFIFO: () => true }));
+        },
+      },
+    },
+  });
+
+  const result = await withBrowserBrokerEnvironment(() =>
+    withRejectGuard(
+      runner.run({
+        creds: FIXTURE_CREDS,
+        reportDir: "data/reports/protocol-test",
+        onEvent(event) {
+          events.push(event);
+        },
+        async prepare2FA() {},
+        async get2FACode(request) {
+          assert.deepEqual(request, { generation: 1, rejectPrevious: false });
+          return SECRET_FIXTURES.verificationCode;
+        },
+      }),
+      1_000,
+      "runner hung on the browser broker transport"
+    )
+  );
+
+  assert.deepEqual(openedPaths, [
+    ["read", "/broker/events.fifo"],
+    ["write", "/broker/commands.fifo"],
+  ]);
+  assert.equal(commands.length, 3);
+  assertBrokerCredentialsFrame(commands[0]);
+  assert.deepEqual(commands[1], { type: "2fa_prepared" });
+  assert.deepEqual(Object.keys(commands[2] ?? {}).sort(), ["code", "generation", "type"]);
+  assert.equal(commands[2]?.type, "2fa_code");
+  assert.equal(commands[2]?.generation, 1);
+  assert.equal(
+    commands[2]?.code === SECRET_FIXTURES.verificationCode,
+    true,
+    "broker verification code mismatch"
+  );
+  assert.deepEqual(
+    events.map((event) => event.event),
+    ["ready", "prepare_2fa", "need_2fa", "result"]
+  );
+  assert.equal(result.success, true);
+  assert.equal(result.receivedGeneration, 1);
+  const publicOutput = JSON.stringify({ events, result });
+  for (const [label, secret] of Object.entries(SECRET_FIXTURES)) {
+    assert.equal(publicOutput.includes(secret), false, `broker public events leaked ${label}`);
+  }
+}
+
+async function runNodeRunnerBrowserBrokerEofSelfTest() {
+  const eventsStream = new PassThrough();
+  const commandsStream = new PassThrough();
+  commandsStream.once("data", () => eventsStream.end());
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      fsApi: {
+        createReadStream() {
+          return eventsStream;
+        },
+        createWriteStream() {
+          queueMicrotask(() => openBrokerStreams(eventsStream, commandsStream));
+          return commandsStream;
+        },
+        fstat(_fd, callback) {
+          queueMicrotask(() => callback(null, { isFIFO: () => true }));
+        },
+      },
+    },
+  });
+
+  await withBrowserBrokerEnvironment(() =>
+    assert.rejects(
+      runner.run({
+        creds: FIXTURE_CREDS,
+        reportDir: "data/reports/protocol-test",
+      }),
+      (error) => {
+        assert.equal(error.message, "ruyipage browser broker events FIFO closed");
+        return true;
+      }
+    )
+  );
 }
 
 function runBackendTimeoutConfigTest() {
@@ -1954,6 +2513,17 @@ assert.match(
 );
 
 const focusedTests = {
+  "broker-facade": runBrowserBrokerFacadeSelfTest,
+  "broker-immediate-eof": runBrowserBrokerImmediateEofSelfTest,
+  "broker-cleanup": runBrowserBrokerCleanupSelfTest,
+  "broker-open-failure": runBrowserBrokerOpenFailureSelfTest,
+  "broker-non-fifo": runBrowserBrokerRejectsNonFifoSelfTest,
+  "broker-open-timeout": runBrowserBrokerOpenTimeoutSelfTest,
+  "broker-write-failure": runBrowserBrokerWriteFailureSelfTest,
+  "broker-write-timeout": runBrowserBrokerWriteTimeoutSelfTest,
+  "broker-read-failure": runBrowserBrokerReadFailureSelfTest,
+  "broker-runner": runNodeRunnerBrowserBrokerSelfTest,
+  "broker-eof": runNodeRunnerBrowserBrokerEofSelfTest,
   "live-descendant": runChildStopperLiveDescendantSelfTest,
   "cleanup-timeout": runChildStopperCleanupDeadlineSelfTest,
   "identity-change": runChildStopperIdentityChangeSelfTest,
@@ -1986,6 +2556,19 @@ if (focusedTest) {
   process.exit(0);
 }
 
+await runBrowserBrokerFacadeSelfTest();
+await runBrowserBrokerRelaySelfTest();
+await runBrowserBrokerRelayTimeoutSelfTest();
+await runBrowserBrokerImmediateEofSelfTest();
+await runBrowserBrokerCleanupSelfTest();
+await runBrowserBrokerOpenFailureSelfTest();
+await runBrowserBrokerRejectsNonFifoSelfTest();
+await runBrowserBrokerOpenTimeoutSelfTest();
+await runBrowserBrokerWriteFailureSelfTest();
+await runBrowserBrokerWriteTimeoutSelfTest();
+await runBrowserBrokerReadFailureSelfTest();
+await runNodeRunnerBrowserBrokerSelfTest();
+await runNodeRunnerBrowserBrokerEofSelfTest();
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();

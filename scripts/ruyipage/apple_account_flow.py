@@ -9,6 +9,7 @@ remain inside ruyiPage.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import random
@@ -17,7 +18,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 from urllib.parse import urljoin, urlsplit
 
 
@@ -90,14 +91,20 @@ APPLE_AUTH_HOSTS = frozenset(
 SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
+BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
+BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
+BROKER_APPLE_ID_MAX_LENGTH = 320
+BROKER_PASSWORD_MAX_LENGTH = 1024
+BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
 
 
 def emit(event: dict[str, Any]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
-def read_command() -> dict[str, Any]:
-    line = sys.stdin.readline()
+def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
+    stream = input_stream if input_stream is not None else sys.stdin
+    line = stream.readline()
     if not line:
         raise RuntimeError("stdin closed before command")
     return json.loads(line)
@@ -1461,8 +1468,101 @@ def pop_browser_credentials() -> tuple[str, str]:
     return apple_id, password
 
 
+def browser_broker_mode_enabled() -> bool:
+    return os.environ.get(BROWSER_BROKER_MODE_ENV) == "1"
+
+
+def read_browser_broker_credentials(
+    input_stream: TextIO | None = None,
+) -> tuple[str, str]:
+    stream = input_stream if input_stream is not None else sys.stdin
+    try:
+        line = stream.readline(BROKER_CREDENTIAL_FRAME_MAX_CHARS + 1)
+    except (OSError, TypeError, UnicodeError, ValueError):
+        raise RuntimeError(BROWSER_BROKER_CREDENTIALS_ERROR) from None
+    if (
+        type(line) is not str
+        or not line
+        or len(line) > BROKER_CREDENTIAL_FRAME_MAX_CHARS
+    ):
+        raise RuntimeError(BROWSER_BROKER_CREDENTIALS_ERROR)
+
+    def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> Any:
+        raise ValueError("non-standard JSON constant")
+
+    try:
+        frame = json.loads(
+            line,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise RuntimeError(BROWSER_BROKER_CREDENTIALS_ERROR) from None
+
+    expected_fields = {"type", "appleId", "password"}
+    if type(frame) is not dict or set(frame) != expected_fields:
+        raise RuntimeError(BROWSER_BROKER_CREDENTIALS_ERROR)
+
+    apple_id = frame.get("appleId")
+    password = frame.get("password")
+    if (
+        frame.get("type") != "credentials"
+        or type(apple_id) is not str
+        or type(password) is not str
+        or not apple_id.strip()
+        or not password.strip()
+        or len(apple_id) > BROKER_APPLE_ID_MAX_LENGTH
+        or len(password) > BROKER_PASSWORD_MAX_LENGTH
+    ):
+        raise RuntimeError(BROWSER_BROKER_CREDENTIALS_ERROR)
+    return apple_id, password
+
+
+def load_browser_credentials(
+    input_stream: TextIO | None = None,
+) -> tuple[str, str]:
+    if not browser_broker_mode_enabled():
+        return pop_browser_credentials()
+
+    if os.environ.get("APPLE_ID") and os.environ.get("APPLE_PASSWORD"):
+        return pop_browser_credentials()
+
+    os.environ.pop("APPLE_ID", None)
+    os.environ.pop("APPLE_PASSWORD", None)
+    return read_browser_broker_credentials(input_stream)
+
+
+def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
+    if not browser_broker_mode_enabled() or sys.platform != "darwin":
+        return FirefoxPage(opts)
+
+    browser_module = importlib.import_module("ruyipage._base.browser")
+    runtime_subprocess = browser_module.subprocess
+    original_popen = runtime_subprocess.Popen
+
+    def inherit_broker_process_group(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("start_new_session") is True:
+            kwargs = dict(kwargs)
+            kwargs.pop("start_new_session")
+        return original_popen(*args, **kwargs)
+
+    runtime_subprocess.Popen = inherit_broker_process_group
+    try:
+        return FirefoxPage(opts)
+    finally:
+        runtime_subprocess.Popen = original_popen
+
+
 def browser_flow(args: argparse.Namespace) -> int:
-    apple_id, password = pop_browser_credentials()
+    apple_id, password = load_browser_credentials()
     sign_in_url = validate_apple_url(args.sign_in_url)
 
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
@@ -1486,7 +1586,7 @@ def browser_flow(args: argparse.Namespace) -> int:
     )
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
-    page = FirefoxPage(opts)
+    page = construct_firefox_page(FirefoxPage, opts)
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
         page.get(sign_in_url)

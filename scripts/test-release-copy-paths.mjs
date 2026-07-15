@@ -103,6 +103,7 @@ for (const rel of [
   "scripts/lib/firefox-runtime.js",
   "scripts/lib/ruyipage-runtime.js",
   "scripts/lib/ruyipage-backend-runner.js",
+  "scripts/ruyipage-fifo-relay.mjs",
   "scripts/ruyipage/apple_account_flow.py",
   "scripts/lib/2fa-audit.js",
   "scripts/lib/mac-2fa-allow.js",

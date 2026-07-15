@@ -17,6 +17,7 @@ import {
 } from "./lib/supervised-attestation.js";
 import {
   RUYIPAGE_LIFECYCLE_STATE_NAME,
+  RUYIPAGE_SUPERVISOR_COMMAND_ID,
   validateRuyiPageLifecycleState,
 } from "./lib/ruyipage-backend-runner.js";
 
@@ -25,6 +26,8 @@ const TERMINATE_GRACE_MS = 8_000;
 const KILL_GRACE_MS = 2_000;
 const TERMINAL_BRIDGE_COMMAND_ID = "supervised-terminal-bridge-v1";
 const PRODUCTION_SUPERVISOR_COMMAND_ID = "supervised-production-v1";
+const BROWSER_BROKER_COMMAND_ID = RUYIPAGE_SUPERVISOR_COMMAND_ID;
+const MACOS_DEFAULT_FIREFOX = "/Applications/Firefox.app/Contents/MacOS/firefox";
 const MAX_RAW_LOG_BYTES = 1024 * 1024;
 const MANUAL_CODE_PROMPT =
   "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
@@ -43,11 +46,193 @@ function pathIsWithin(parentPath, candidatePath) {
   );
 }
 
+function posixPathIsWithin(parentPath, candidatePath) {
+  const relative = path.posix.relative(parentPath, candidatePath);
+  return (
+    relative !== "" &&
+    !path.posix.isAbsolute(relative) &&
+    relative !== ".." &&
+    !relative.startsWith("../")
+  );
+}
+
+function requireAbsolutePosixPath(value, label) {
+  if (!value || !path.posix.isAbsolute(value) || /[\\\r\n\0]/.test(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return path.posix.resolve(value);
+}
+
 function requireAbsolutePath(value, label) {
   if (!value || !path.isAbsolute(value) || value.includes("\0")) {
     throw new Error(`${label} is invalid`);
   }
   return path.resolve(value);
+}
+
+function lstatIfPresent(fileSystem, targetPath) {
+  try {
+    return fileSystem.lstatSync(targetPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function permissionBits(stats) {
+  return Number(stats?.mode ?? 0) & 0o777;
+}
+
+function assertPrivateDirectory(fileSystem, directory, label) {
+  const stats = fileSystem.lstatSync(directory);
+  if (
+    !stats.isDirectory() ||
+    stats.isSymbolicLink() ||
+    permissionBits(stats) !== 0o700
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+}
+
+function assertPrivateFifo(fileSystem, fifoPath, label) {
+  const stats = fileSystem.lstatSync(fifoPath);
+  if (!stats.isFIFO() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
+    throw new Error(`${label} is invalid`);
+  }
+}
+
+function createPrivateDirectory(fileSystem, directory, label) {
+  if (lstatIfPresent(fileSystem, directory)) throw new Error(`${label} already exists`);
+  fileSystem.mkdirSync(directory, { recursive: false, mode: 0o700 });
+  fileSystem.chmodSync(directory, 0o700);
+  assertPrivateDirectory(fileSystem, directory, label);
+}
+
+function defaultCreateFifo(fifoPath) {
+  const result = spawnSync("/usr/bin/mkfifo", ["-m", "600", fifoPath], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024,
+  });
+  if (result.status !== 0) throw new Error("browser broker FIFO creation failed");
+}
+
+export function resolveBrowserBrokerPaths({ repo, productionDir }) {
+  const resolvedRepo = requireAbsolutePosixPath(repo, "repository");
+  const resolvedProductionDir = requireAbsolutePosixPath(
+    productionDir,
+    "production directory"
+  );
+  const brokerDir = path.posix.join(resolvedProductionDir, "browser-broker");
+  const reportDir = path.posix.join(brokerDir, "report");
+  const reportScreenshotsDir = path.posix.join(reportDir, "screenshots");
+  const commandsFifo = path.posix.join(brokerDir, "commands.fifo");
+  const eventsFifo = path.posix.join(brokerDir, "events.fifo");
+  const launchGatePath = path.posix.join(brokerDir, "broker.ready");
+  const reportRoot = path.posix.join(resolvedProductionDir, "reports");
+  const values = {
+    repo: resolvedRepo,
+    productionDir: resolvedProductionDir,
+    reportRoot,
+    brokerDir,
+    reportDir,
+    reportScreenshotsDir,
+    commandsFifo,
+    eventsFifo,
+    launchGatePath,
+    statePath: path.posix.join(reportRoot, ".ruyipage-process.json"),
+    lifecyclePath: path.posix.join(reportRoot, RUYIPAGE_LIFECYCLE_STATE_NAME),
+    pythonPath: path.posix.join(
+      resolvedRepo,
+      ".runtime",
+      "ruyipage-venv",
+      "bin",
+      "python"
+    ),
+    scriptPath: path.posix.join(
+      resolvedRepo,
+      "scripts",
+      "ruyipage",
+      "apple_account_flow.py"
+    ),
+    profileDir: path.posix.join(resolvedProductionDir, "firefox-profile"),
+    firefoxPath: MACOS_DEFAULT_FIREFOX,
+  };
+  validateBrowserBrokerPathScope(values);
+  return values;
+}
+
+export function validateBrowserBrokerPathScope(values) {
+  for (const [candidate, parent, label] of [
+    [values.brokerDir, values.productionDir, "browser broker directory"],
+    [values.reportDir, values.brokerDir, "browser broker report directory"],
+    [
+      values.reportScreenshotsDir,
+      values.reportDir,
+      "browser broker screenshots directory",
+    ],
+    [values.commandsFifo, values.brokerDir, "browser broker commands FIFO"],
+    [values.eventsFifo, values.brokerDir, "browser broker events FIFO"],
+    [values.launchGatePath, values.brokerDir, "browser broker launch gate"],
+    [values.statePath, values.reportRoot, "ruyipage process state"],
+    [values.lifecyclePath, values.reportRoot, "ruyipage lifecycle state"],
+    [values.pythonPath, values.repo, "ruyipage Python"],
+    [values.scriptPath, values.repo, "ruyipage script"],
+    [values.profileDir, values.productionDir, "Firefox profile"],
+  ]) {
+    if (!posixPathIsWithin(parent, candidate)) {
+      throw new Error(`${label} is out of scope`);
+    }
+  }
+  return true;
+}
+
+export function validateBrowserBrokerExecutable(paths, options = {}) {
+  const fileSystem = options.fs ?? fs;
+  if (!path.posix.isAbsolute(paths.pythonPath)) {
+    throw new Error("ruyipage Python is invalid");
+  }
+  const pythonStats = fileSystem.lstatSync(paths.pythonPath);
+  if (!pythonStats.isFile() && !pythonStats.isSymbolicLink()) {
+    throw new Error("ruyipage Python is invalid");
+  }
+  fileSystem.accessSync(paths.pythonPath, fs.constants.X_OK);
+  if (!path.posix.isAbsolute(paths.firefoxPath)) {
+    throw new Error("Firefox executable is invalid");
+  }
+  const firefoxStats = fileSystem.lstatSync(paths.firefoxPath);
+  if (!firefoxStats.isFile() || firefoxStats.isSymbolicLink()) {
+    throw new Error("Firefox executable is invalid");
+  }
+  fileSystem.accessSync(paths.firefoxPath, fs.constants.X_OK);
+  const scriptStats = fileSystem.lstatSync(paths.scriptPath);
+  if (!scriptStats.isFile() || scriptStats.isSymbolicLink()) {
+    throw new Error("ruyipage script is invalid");
+  }
+}
+
+export function prepareBrowserBrokerFilesystem(paths, options = {}) {
+  const fileSystem = options.fs ?? fs;
+  const createFifo = options.createFifo ?? defaultCreateFifo;
+  validateBrowserBrokerPathScope(paths);
+  assertPrivateDirectory(fileSystem, paths.profileDir, "Firefox profile directory");
+  for (const [directory, label] of [
+    [paths.brokerDir, "browser broker directory"],
+    [paths.reportDir, "browser broker report directory"],
+    [paths.reportScreenshotsDir, "browser broker screenshots directory"],
+  ]) {
+    createPrivateDirectory(fileSystem, directory, label);
+  }
+  for (const [fifoPath, label] of [
+    [paths.commandsFifo, "browser broker commands FIFO"],
+    [paths.eventsFifo, "browser broker events FIFO"],
+  ]) {
+    if (lstatIfPresent(fileSystem, fifoPath)) throw new Error(`${label} already exists`);
+    createFifo(fifoPath);
+    fileSystem.chmodSync(fifoPath, 0o600);
+    assertPrivateFifo(fileSystem, fifoPath, label);
+  }
+  assertPrivateDirectory(fileSystem, paths.brokerDir, "browser broker directory");
+  return paths;
 }
 
 export function readBoundedRegularFile(filePath, maxBytes = 4096) {
@@ -340,6 +525,58 @@ function atomicProductionProcessState(context, filePath, identity, state) {
   fs.renameSync(temporaryPath, filePath);
 }
 
+function atomicBrowserBrokerLifecycleState(context, filePath, state) {
+  if (!["preparing", "active", "inactive", "cleanup_failed"].includes(state)) {
+    throw new Error("browser broker lifecycle state is invalid");
+  }
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(
+    temporaryPath,
+    `${JSON.stringify({ version: 1, nonce: context.nonce, state })}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 }
+  );
+  fs.renameSync(temporaryPath, filePath);
+}
+
+function atomicBrowserBrokerProcessState(context, filePath, identity, state) {
+  if (
+    !identity ||
+    !Number.isInteger(identity.pid) ||
+    identity.pid <= 0 ||
+    identity.pgid !== identity.pid ||
+    typeof identity.startedAt !== "string" ||
+    !identity.startedAt ||
+    identity.startedAt.length > 64 ||
+    /[\r\n\0]/.test(identity.startedAt) ||
+    typeof identity.command !== "string" ||
+    !identity.command ||
+    identity.command.length > 16 * 1024 ||
+    /[\r\n\0]/.test(identity.command) ||
+    !["starting", "active", "inactive", "cleanup_failed"].includes(state)
+  ) {
+    throw new Error("browser broker process identity is invalid");
+  }
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  fs.writeFileSync(
+    temporaryPath,
+    `${JSON.stringify({
+      version: 1,
+      pid: identity.pid,
+      pgid: identity.pgid,
+      startedAt: identity.startedAt,
+      nonce: context.nonce,
+      commandId: BROWSER_BROKER_COMMAND_ID,
+      commandSha256: crypto
+        .createHash("sha256")
+        .update(identity.command, "utf8")
+        .digest("hex"),
+      state,
+    })}\n`,
+    { encoding: "utf8", flag: "wx", mode: 0o600 }
+  );
+  fs.renameSync(temporaryPath, filePath);
+}
+
 function writeProductionLaunchGate(filePath, pid, nonce) {
   const temporaryPath = `${filePath}.tmp-${process.pid}`;
   fs.writeFileSync(
@@ -539,6 +776,193 @@ export function buildProductionProcessSupervisorScript() {
     "/usr/bin/unlink \"$group_snapshot\" 2>/dev/null || cleanup_status=125",
     'if (( cleanup_status != 0 )); then supervisor_status "cleanup-failed" || exit 125; fi',
     "exit \"$production_status\"",
+  ].join("\n");
+}
+
+export function buildBrowserBrokerSupervisorScript() {
+  return [
+    "set -eu",
+    "umask 077",
+    "parent_pid=$1",
+    "parent_pgid=$2",
+    "parent_started_at=$3",
+    "parent_command=$4",
+    "launch_nonce=$5",
+    "launch_gate=$6",
+    "cancel_file=$7",
+    "outer_cancel_file=$8",
+    "deadline_ms=$9",
+    "commands_fifo=${10}",
+    "events_fifo=${11}",
+    "shift 11",
+    "interrupted_status=0",
+    "(( ${#launch_nonce} == 32 )) && [[ \"$launch_nonce\" != *[^0-9a-f]* ]] || exit 125",
+    "parent_is_current() {",
+    "  current_parent_pgid=$(/bin/ps -p \"$parent_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_started_at=$(/bin/ps -p \"$parent_pid\" -o lstart= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_command=$(/bin/ps -ww -p \"$parent_pid\" -o command= 2>/dev/null || true)",
+    "  [[ \"$current_parent_pgid\" == \"$parent_pgid\" && -n \"$parent_started_at\" && \"$current_started_at\" == \"$parent_started_at\" && -n \"$parent_command\" && \"$current_command\" == \"$parent_command\" ]]",
+    "}",
+    "runtime_is_allowed() {",
+    "  parent_is_current || return 125",
+    "  [[ ! -e \"$cancel_file\" && ! -e \"$outer_cancel_file\" ]] || return 130",
+    "  (( $(/bin/date +%s) * 1000 < deadline_ms )) || return 124",
+    "  (( interrupted_status == 0 )) || return \"$interrupted_status\"",
+    "  return 0",
+    "}",
+    "[[ -p \"$commands_fifo\" && ! -h \"$commands_fifo\" ]] || exit 125",
+    "[[ -p \"$events_fifo\" && ! -h \"$events_fifo\" ]] || exit 125",
+    "[[ \"$(/usr/bin/stat -f %Lp \"$commands_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
+    "[[ \"$(/usr/bin/stat -f %Lp \"$events_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
+    "expected_gate=\"{\\\"version\\\":1,\\\"nonce\\\":\\\"$launch_nonce\\\",\\\"pid\\\":$$}\"",
+    "while :; do",
+    "  if runtime_is_allowed; then :; else exit $?; fi",
+    "  gate_value=''",
+    "  if [[ -f \"$launch_gate\" && ! -h \"$launch_gate\" ]]; then gate_value=$(< \"$launch_gate\") || true; fi",
+    "  [[ \"$gate_value\" == \"$expected_gate\" ]] && break",
+    "  /bin/sleep 0.05",
+    "done",
+    "if runtime_is_allowed; then :; else exit $?; fi",
+    "group_snapshot=$(/usr/bin/mktemp \"${TMPDIR:-/tmp}/ruyipage-broker-members.XXXXXX\") || exit 125",
+    "snapshot_helper_pid=''",
+    "group_snapshot_failed=0",
+    "snapshot_group_members() {",
+    "  : >| \"$group_snapshot\" || return 1",
+    "  /bin/ps -ax -o pid= -o pgid= >| \"$group_snapshot\" 2>/dev/null &",
+    "  snapshot_helper_pid=$!",
+    "  wait \"$snapshot_helper_pid\"",
+    "}",
+    "group_has_members() {",
+    "  group_snapshot_failed=0",
+    "  if ! snapshot_group_members; then group_snapshot_failed=1; return 0; fi",
+    "  while read -r member_pid member_pgid; do",
+    "    [[ \"$member_pid\" == <-> && \"$member_pgid\" == \"$$\" ]] || continue",
+    "    [[ \"$member_pid\" == \"$$\" || \"$member_pid\" == \"$snapshot_helper_pid\" ]] && continue",
+    "    return 0",
+    "  done < \"$group_snapshot\"",
+    "  return 1",
+    "}",
+    "expected_backend_command=\"$*\"",
+    "backend_pid=''",
+    "backend_pgid=''",
+    "backend_started_at=''",
+    "backend_command=''",
+    "backend_is_running() {",
+    "  backend_state=$(/bin/ps -p \"$backend_pid\" -o state= 2>/dev/null | /usr/bin/xargs || true)",
+    "  [[ -n \"$backend_state\" && \"$backend_state\" != Z* ]]",
+    "}",
+    "direct_backend_is_current() {",
+    "  current_backend_ppid=$(/bin/ps -p \"$backend_pid\" -o ppid= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_backend_pgid=$(/bin/ps -p \"$backend_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
+    "  [[ \"$current_backend_ppid\" == \"$$\" && \"$current_backend_pgid\" == \"$$\" ]]",
+    "}",
+    "target_identity_is_current() {",
+    "  [[ -n \"$backend_pid\" && -n \"$backend_pgid\" && -n \"$backend_started_at\" && -n \"$backend_command\" ]] || return 1",
+    "  current_backend_pgid=$(/bin/ps -p \"$backend_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_backend_started_at=$(/bin/ps -p \"$backend_pid\" -o lstart= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_backend_command=$(/bin/ps -ww -p \"$backend_pid\" -o command= 2>/dev/null || true)",
+    "  [[ \"$current_backend_pgid\" == \"$backend_pgid\" && \"$current_backend_pgid\" == \"$$\" && \"$current_backend_started_at\" == \"$backend_started_at\" && \"$current_backend_command\" == \"$backend_command\" && \"$current_backend_command\" == \"$expected_backend_command\" ]]",
+    "}",
+    "wait_backend_bounded() {",
+    "  wait_attempt=0",
+    "  wait_limit=$1",
+    "  while backend_is_running && (( wait_attempt < wait_limit )); do /bin/sleep 0.1; wait_attempt=$((wait_attempt + 1)); done",
+    "  ! backend_is_running",
+    "}",
+    "terminate_backend_bounded() {",
+    "  backend_is_running || return 0",
+    "  direct_backend_is_current || return 1",
+    "  /bin/kill -TERM \"$backend_pid\" 2>/dev/null || true",
+    "  wait_backend_bounded 50 && return 0",
+    "  direct_backend_is_current || return 1",
+    "  /bin/kill -KILL \"$backend_pid\" 2>/dev/null || true",
+    "  wait_backend_bounded 20",
+    "}",
+    "signal_group_members() {",
+    "  signal_name=$1",
+    "  signal_failed=0",
+    "  snapshot_group_members || return 1",
+    "  while read -r member_pid member_pgid; do",
+    "    [[ \"$member_pid\" == <-> && \"$member_pgid\" == \"$$\" ]] || continue",
+    "    [[ \"$member_pid\" == \"$$\" || \"$member_pid\" == \"$snapshot_helper_pid\" ]] && continue",
+    "    current_pgid=$(/bin/ps -p \"$member_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
+    "    if [[ \"$current_pgid\" == \"$$\" ]]; then",
+    "      /bin/kill -\"$signal_name\" \"$member_pid\" 2>/dev/null || signal_failed=1",
+    "    elif /bin/kill -0 \"$member_pid\" 2>/dev/null; then",
+    "      signal_failed=1",
+    "    fi",
+    "  done < \"$group_snapshot\"",
+    "  (( signal_failed == 0 ))",
+    "}",
+    "cleanup_group_members() {",
+    "  group_has_members || return 0",
+    "  (( group_snapshot_failed == 0 )) || return 1",
+    "  signal_group_members TERM || return 1",
+    "  cleanup_attempt=0",
+    "  while group_has_members && (( cleanup_attempt < 50 )); do /bin/sleep 0.1; cleanup_attempt=$((cleanup_attempt + 1)); done",
+    "  group_has_members || return 0",
+    "  (( group_snapshot_failed == 0 )) || return 1",
+    "  signal_group_members KILL || return 1",
+    "  cleanup_attempt=0",
+    "  while group_has_members && (( cleanup_attempt < 20 )); do /bin/sleep 0.1; cleanup_attempt=$((cleanup_attempt + 1)); done",
+    "  if group_has_members; then return 1; fi",
+    "  (( group_snapshot_failed == 0 ))",
+    "}",
+    "shutdown_backend_and_descendants() {",
+    "  if ! terminate_backend_bounded; then",
+    "    signal_group_members TERM || true",
+    "    if ! wait_backend_bounded 50; then",
+    "      signal_group_members KILL || true",
+    "      wait_backend_bounded 20 || return 1",
+    "    fi",
+    "  fi",
+    "  if ! backend_is_running; then",
+    "    set +e",
+    "    wait \"$backend_pid\"",
+    "    set -e",
+    "  fi",
+    "  cleanup_group_members",
+    "}",
+    "trap 'interrupted_status=130' INT",
+    "trap 'interrupted_status=143' TERM",
+    "trap 'interrupted_status=129' HUP",
+    "\"$@\" < \"$commands_fifo\" > \"$events_fifo\" 2>/dev/null &",
+    "backend_pid=$!",
+    "identity_attempt=0",
+    "while /bin/kill -0 \"$backend_pid\" 2>/dev/null && (( identity_attempt < 1000 )); do",
+    "  current_backend_pgid=$(/bin/ps -p \"$backend_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_backend_started_at=$(/bin/ps -p \"$backend_pid\" -o lstart= 2>/dev/null | /usr/bin/xargs || true)",
+    "  current_backend_command=$(/bin/ps -ww -p \"$backend_pid\" -o command= 2>/dev/null || true)",
+    "  if [[ \"$current_backend_pgid\" == \"$$\" && -n \"$current_backend_started_at\" && \"$current_backend_command\" == \"$expected_backend_command\" ]]; then backend_pgid=$current_backend_pgid; backend_started_at=$current_backend_started_at; backend_command=$current_backend_command; break; fi",
+    "  /bin/sleep 0.01",
+    "  identity_attempt=$((identity_attempt + 1))",
+    "done",
+    "if [[ -z \"$backend_pgid\" ]] && backend_is_running; then",
+    "  shutdown_backend_and_descendants || true",
+    "  /usr/bin/unlink \"$group_snapshot\" 2>/dev/null || true",
+    "  exit 125",
+    "fi",
+    "runtime_status=0",
+    "while target_identity_is_current; do",
+    "  if runtime_is_allowed; then /bin/sleep 0.25; continue; else runtime_status=$?; fi",
+    "  shutdown_backend_and_descendants || runtime_status=125",
+    "  break",
+    "done",
+    "if backend_is_running; then runtime_status=125; shutdown_backend_and_descendants || runtime_status=125; fi",
+    "backend_status=125",
+    "if ! backend_is_running; then",
+    "  set +e",
+    "  wait \"$backend_pid\"",
+    "  backend_status=$?",
+    "  set -e",
+    "fi",
+    "[[ \"$runtime_status\" == (124|125|130) ]] && backend_status=$runtime_status",
+    "(( interrupted_status == 0 )) || backend_status=$interrupted_status",
+    "cleanup_status=0",
+    "cleanup_group_members || cleanup_status=125",
+    "/usr/bin/unlink \"$group_snapshot\" 2>/dev/null || cleanup_status=125",
+    "(( cleanup_status == 0 )) || exit 125",
+    "exit \"$backend_status\"",
   ].join("\n");
 }
 
@@ -817,10 +1241,274 @@ export function classifyProcessCleanup({
   return supervisorStatusOutcome === "cleanup_failed" ? "recovered" : "clean";
 }
 
-function productionEnvironment(context) {
-  const runtimeTmp = path.join(context.productionDir, "tmp");
-  const reportRoot = path.join(context.productionDir, "reports");
-  const profileDir = path.join(context.productionDir, "firefox-profile");
+export function buildBrowserBrokerEnvironment(context, paths) {
+  return {
+    HOME: context.home,
+    USER: context.user,
+    SHELL: "/bin/zsh",
+    LANG: "en_US.UTF-8",
+    LC_ALL: "en_US.UTF-8",
+    PATH: `${context.repo}/.runtime/ruyipage-venv/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    TMPDIR: path.posix.join(context.productionDir, "tmp"),
+    APPLE_AUTOMATION_REPORT_ROOT: paths.reportDir,
+    APPLE_AUTOMATION_BROWSER_BROKER_MODE: "1",
+    APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO: paths.commandsFifo,
+    APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO: paths.eventsFifo,
+    FIREFOX_PROFILE_DIR: paths.profileDir,
+    BROWSER_PROFILE_MODE: "persistent",
+    PYTHONDONTWRITEBYTECODE: "1",
+  };
+}
+
+export function browserBrokerIdentityMatches(identity, broker) {
+  return Boolean(
+    identity &&
+      Number.isInteger(identity.pid) &&
+      identity.pid > 0 &&
+      identity.pgid === identity.pid &&
+      typeof identity.command === "string" &&
+      identity.command.includes("ruyipage-supervisor") &&
+      identity.command.includes(broker.context.nonce) &&
+      identity.command.includes(broker.paths.scriptPath) &&
+      (!broker.identity || identity.command === broker.identity.command)
+  );
+}
+
+export function createBrowserBroker(context) {
+  return {
+    context,
+    paths: resolveBrowserBrokerPaths(context),
+    child: null,
+    identity: null,
+    filesystemTouched: false,
+    lifecycleStarted: false,
+  };
+}
+
+export async function startBrowserBroker(
+  broker,
+  bridgeIdentity,
+  options = {}
+) {
+  const validateExecutable =
+    options.validateExecutable ?? validateBrowserBrokerExecutable;
+  const prepareFilesystem =
+    options.prepareFilesystem ?? prepareBrowserBrokerFilesystem;
+  const spawnProcess = options.spawn ?? spawn;
+  const waitForIdentity = options.waitForIdentity ?? waitForFixedProcessIdentity;
+  const writeLifecycle =
+    options.writeLifecycle ?? atomicBrowserBrokerLifecycleState;
+  const writeProcessState =
+    options.writeProcessState ?? atomicBrowserBrokerProcessState;
+  const writeLaunchGate = options.writeLaunchGate ?? writeProductionLaunchGate;
+  validateExecutable(broker.paths);
+  broker.filesystemTouched = true;
+  prepareFilesystem(broker.paths);
+  writeLifecycle(
+    broker.context,
+    broker.paths.lifecyclePath,
+    "preparing"
+  );
+  broker.lifecycleStarted = true;
+  const supervisorScript = buildBrowserBrokerSupervisorScript();
+  const backendArgs = [
+    broker.paths.pythonPath,
+    broker.paths.scriptPath,
+    "--report-dir",
+    broker.paths.reportDir,
+    "--profile-dir",
+    broker.paths.profileDir,
+    "--firefox",
+    broker.paths.firefoxPath,
+  ];
+  broker.child = spawnProcess(
+    "/bin/zsh",
+    [
+      "-c",
+      supervisorScript,
+      "ruyipage-supervisor",
+      String(process.pid),
+      String(bridgeIdentity.pgid),
+      bridgeIdentity.startedAt,
+      bridgeIdentity.command,
+      broker.context.nonce,
+      broker.paths.launchGatePath,
+      broker.context.cancelPath,
+      broker.context.outerCancelPath,
+      String(broker.context.deadlineMs),
+      broker.paths.commandsFifo,
+      broker.paths.eventsFifo,
+      ...backendArgs,
+    ],
+    {
+      cwd: broker.context.repo,
+      detached: true,
+      env: buildBrowserBrokerEnvironment(broker.context, broker.paths),
+      stdio: "ignore",
+    }
+  );
+  if (!Number.isInteger(broker.child?.pid) || broker.child.pid <= 0) {
+    throw new Error("browser broker process did not start");
+  }
+  broker.identity = await waitForIdentity(
+    broker.child.pid,
+    (identity) => browserBrokerIdentityMatches(identity, broker)
+  );
+  if (!broker.identity) throw new Error("browser broker identity is unavailable");
+  writeProcessState(
+    broker.context,
+    broker.paths.statePath,
+    broker.identity,
+    "starting"
+  );
+  writeLaunchGate(
+    broker.paths.launchGatePath,
+    broker.child.pid,
+    broker.context.nonce
+  );
+  writeProcessState(
+    broker.context,
+    broker.paths.statePath,
+    broker.identity,
+    "active"
+  );
+  writeLifecycle(broker.context, broker.paths.lifecyclePath, "active");
+  broker.child.unref?.();
+  return broker;
+}
+
+function removeValidatedBrowserBrokerFifo(fileSystem, fifoPath, label) {
+  const stats = lstatIfPresent(fileSystem, fifoPath);
+  if (!stats) return true;
+  if (!stats.isFIFO() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
+    return false;
+  }
+  try {
+    fileSystem.unlinkSync(fifoPath);
+    return lstatIfPresent(fileSystem, fifoPath) === null;
+  } catch {
+    return false;
+  }
+}
+
+function removeValidatedBrowserBrokerGate(fileSystem, gatePath) {
+  const stats = lstatIfPresent(fileSystem, gatePath);
+  if (!stats) return true;
+  if (!stats.isFile() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
+    return false;
+  }
+  try {
+    fileSystem.unlinkSync(gatePath);
+    return lstatIfPresent(fileSystem, gatePath) === null;
+  } catch {
+    return false;
+  }
+}
+
+export async function cleanupBrowserBroker(broker, options = {}) {
+  if (!broker) return { ok: true, seen: false, cleanupEvidence: false };
+  const fileSystem = options.fs ?? fs;
+  const cleanupRecorded =
+    options.cleanupRecorded ?? cleanupRecordedRuyiPageProcess;
+  const groupExists = options.processGroupExists ?? processGroupExists;
+  const writeLifecycle =
+    options.writeLifecycle ?? atomicBrowserBrokerLifecycleState;
+  const writeProcessState =
+    options.writeProcessState ?? atomicBrowserBrokerProcessState;
+  let processCleanup = { ok: true, seen: false, cleanupEvidence: false };
+  if (broker.identity) {
+    processCleanup = await cleanupRecorded(
+      broker.paths.statePath,
+      broker.paths.scriptPath,
+      broker.context.nonce
+    );
+  } else if (Number.isInteger(broker.child?.pid) && groupExists(broker.child.pid)) {
+    processCleanup = { ok: false, seen: true, cleanupEvidence: false };
+  }
+
+  let stateOk = processCleanup.ok;
+  const finalState = stateOk ? "inactive" : "cleanup_failed";
+  if (broker.identity) {
+    try {
+      writeProcessState(
+        broker.context,
+        broker.paths.statePath,
+        broker.identity,
+        finalState
+      );
+    } catch {
+      stateOk = false;
+    }
+  }
+  if (broker.lifecycleStarted) {
+    try {
+      writeLifecycle(
+        broker.context,
+        broker.paths.lifecyclePath,
+        stateOk ? "inactive" : "cleanup_failed"
+      );
+    } catch {
+      stateOk = false;
+    }
+  }
+  if (!stateOk) {
+    return {
+      ok: false,
+      seen: processCleanup.seen || Boolean(broker.child),
+      cleanupEvidence: false,
+    };
+  }
+
+  let filesOk = true;
+  if (broker.filesystemTouched) {
+    for (const [fifoPath, label] of [
+      [broker.paths.commandsFifo, "browser broker commands FIFO"],
+      [broker.paths.eventsFifo, "browser broker events FIFO"],
+    ]) {
+      if (!removeValidatedBrowserBrokerFifo(fileSystem, fifoPath, label)) {
+        filesOk = false;
+      }
+    }
+    if (!removeValidatedBrowserBrokerGate(fileSystem, broker.paths.launchGatePath)) {
+      filesOk = false;
+    }
+  }
+  if (!filesOk) {
+    if (broker.identity) {
+      try {
+        writeProcessState(
+          broker.context,
+          broker.paths.statePath,
+          broker.identity,
+          "cleanup_failed"
+        );
+      } catch {
+        /* the failed cleanup result remains authoritative */
+      }
+    }
+    if (broker.lifecycleStarted) {
+      try {
+        writeLifecycle(
+          broker.context,
+          broker.paths.lifecyclePath,
+          "cleanup_failed"
+        );
+      } catch {
+        /* the failed cleanup result remains authoritative */
+      }
+    }
+  }
+  return {
+    ok: filesOk,
+    seen: processCleanup.seen || Boolean(broker.child),
+    cleanupEvidence: processCleanup.cleanupEvidence,
+  };
+}
+
+export function productionEnvironment(context, brokerPaths) {
+  const runtimeTmp = path.posix.join(context.productionDir, "tmp");
+  const reportRoot = path.posix.join(context.productionDir, "reports");
+  const profileDir = path.posix.join(context.productionDir, "firefox-profile");
   return {
     HOME: context.home,
     USER: context.user,
@@ -830,13 +1518,19 @@ function productionEnvironment(context) {
     PATH: `${context.repo}/.runtime/node/bin:${context.home}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     TMPDIR: runtimeTmp,
     APPLE_AUTOMATION_REPORT_ROOT: reportRoot,
-    APPLE_AUTOMATION_ACCEPTANCE_MARKER: path.join(reportRoot, ".account-home-confirmed"),
+    APPLE_AUTOMATION_ACCEPTANCE_MARKER: path.posix.join(
+      reportRoot,
+      ".account-home-confirmed"
+    ),
     APPLE_AUTOMATION_SUPERVISED_GUI: "1",
     APPLE_AUTOMATION_SUPERVISED_TOKEN: context.nonce,
-    APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE: path.join(
+    APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE: path.posix.join(
       reportRoot,
       ".ruyipage-process.json"
     ),
+    APPLE_AUTOMATION_BROWSER_BROKER_MODE: "1",
+    APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO: brokerPaths.commandsFifo,
+    APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO: brokerPaths.eventsFifo,
     APPLE_AUTOMATION_HELPER_DIR: context.helperDir,
     FIREFOX_PROFILE_DIR: profileDir,
     BROWSER_PROFILE_MODE: "persistent",
@@ -852,6 +1546,8 @@ export async function runSupervisedTerminalBridge(options = {}) {
   const wait = options.sleep ?? sleep;
   const git = options.fixedGit ?? fixedGit;
   const spawnProcess = options.spawn ?? spawn;
+  const startBroker = options.startBrowserBroker ?? startBrowserBroker;
+  const cleanupBroker = options.cleanupBrowserBroker ?? cleanupBrowserBroker;
   const output = options.stdout ?? process.stdout;
   const input = options.stdin ?? process.stdin;
   const maxRawLogBytes = options.maxRawLogBytes ?? MAX_RAW_LOG_BYTES;
@@ -861,6 +1557,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
   let productionIdentity = null;
   let productionStatePath = null;
   let productionLaunchGatePath = null;
+  let browserBroker = null;
   let cancellationRequested = false;
   const productionCommandMatches = (identity) =>
     identity.command.includes("supervised-production") &&
@@ -1125,7 +1822,8 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const onStderrChunk = createChunkHandler();
     emitStatus("starting", "[mac:supervised] 受监督 Apple Account 登录已启动");
 
-    const env = productionEnvironment(context);
+    browserBroker = createBrowserBroker(context);
+    const env = productionEnvironment(context, browserBroker.paths);
     for (const directory of [
       env.TMPDIR,
       env.APPLE_AUTOMATION_REPORT_ROOT,
@@ -1166,10 +1864,6 @@ export async function runSupervisedTerminalBridge(options = {}) {
       return 1;
     }
 
-    atomicAttestation(context, {
-      status: "running",
-      observedHeadBefore: headBefore,
-    });
     productionStatePath = path.join(context.controlDir, "supervised-production.json");
     productionLaunchGatePath = path.join(
       context.controlDir,
@@ -1224,6 +1918,20 @@ export async function runSupervisedTerminalBridge(options = {}) {
       });
       return 124;
     }
+    await startBroker(browserBroker, bridgeIdentity);
+    if (
+      cancellationRequested ||
+      cancellationIsPresent(context) ||
+      now() >= context.deadlineMs ||
+      git(context.repo, ["rev-parse", "HEAD"]) !== context.expectedHead ||
+      git(context.repo, ["status", "--porcelain=v1"]) !== ""
+    ) {
+      throw new Error("browser broker launch gate was cancelled");
+    }
+    atomicAttestation(context, {
+      status: "running",
+      observedHeadBefore: headBefore,
+    });
     child = spawnProcess(
       "/bin/zsh",
       [
@@ -1332,11 +2040,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     } finally {
       removeSingleFile(productionLaunchGatePath);
     }
-    const ruyiPageCleanup = await cleanupRecordedRuyiPageProcess(
-      env.APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE,
-      path.join(context.repo, "scripts", "ruyipage", "apple_account_flow.py"),
-      context.nonce
-    );
+    const ruyiPageCleanup = await cleanupBroker(browserBroker);
 
     const productionExit = Number.isInteger(outcome.value?.exitCode)
       ? outcome.value.exitCode
@@ -1477,11 +2181,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       }
     }
     if (productionLaunchGatePath) removeSingleFile(productionLaunchGatePath);
-    const ruyiPageCleanup = await cleanupRecordedRuyiPageProcess(
-      path.join(context.productionDir, "reports", ".ruyipage-process.json"),
-      path.join(context.repo, "scripts", "ruyipage", "apple_account_flow.py"),
-      context.nonce
-    );
+    const ruyiPageCleanup = await cleanupBroker(browserBroker);
     cleanupSucceeded = cleanupSucceeded && ruyiPageCleanup.ok;
     const headAfter = git(context.repo, ["rev-parse", "HEAD"]);
     try {

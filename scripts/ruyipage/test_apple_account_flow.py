@@ -3603,6 +3603,20 @@ class FrameLocationTests(unittest.TestCase):
 
 
 class CredentialBoundaryTests(unittest.TestCase):
+    def assert_broker_credentials_rejected(self, frame_text):
+        with patch.dict(
+            os.environ,
+            {account_flow.BROWSER_BROKER_MODE_ENV: "1"},
+            clear=True,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                account_flow.load_browser_credentials(io.StringIO(frame_text))
+
+        self.assertEqual(
+            str(raised.exception),
+            account_flow.BROWSER_BROKER_CREDENTIALS_ERROR,
+        )
+
     def test_test_module_is_importable_from_repository_root(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.assertIn(
@@ -3642,8 +3656,12 @@ class CredentialBoundaryTests(unittest.TestCase):
     def test_pops_credentials_from_environment_before_browser_launch(self):
         with patch.dict(
             os.environ,
-            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
-            clear=False,
+            {
+                account_flow.BROWSER_BROKER_MODE_ENV: "0",
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+            },
+            clear=True,
         ):
             apple_id, password = pop_browser_credentials()
 
@@ -3651,10 +3669,263 @@ class CredentialBoundaryTests(unittest.TestCase):
             self.assertNotIn("APPLE_ID", os.environ)
             self.assertNotIn("APPLE_PASSWORD", os.environ)
 
+    def test_broker_credentials_frame_is_consumed_once(self):
+        next_command = {"type": "2fa_prepared"}
+        stream = io.StringIO(
+            json.dumps(
+                {
+                    "type": "credentials",
+                    "appleId": "person@example.com",
+                    "password": "secret",
+                }
+            )
+            + "\n"
+            + json.dumps(next_command)
+            + "\n"
+        )
+
+        with patch.dict(
+            os.environ,
+            {account_flow.BROWSER_BROKER_MODE_ENV: "1"},
+            clear=True,
+        ):
+            credentials = account_flow.load_browser_credentials(stream)
+            remaining_command = account_flow.read_command(stream)
+
+        self.assertEqual(credentials, ("person@example.com", "secret"))
+        self.assertEqual(remaining_command, next_command)
+
+    def test_broker_credentials_reject_wrong_schema_and_types(self):
+        invalid_frames = (
+            "",
+            "not-json\n",
+            "[]\n",
+            json.dumps({"type": "credentials", "appleId": "person@example.com"}) + "\n",
+            json.dumps(
+                {
+                    "type": "wrong",
+                    "appleId": "person@example.com",
+                    "password": "secret",
+                }
+            )
+            + "\n",
+            json.dumps(
+                {"type": "credentials", "appleId": 7, "password": "secret"}
+            )
+            + "\n",
+            json.dumps(
+                {
+                    "type": "credentials",
+                    "appleId": "person@example.com",
+                    "password": False,
+                }
+            )
+            + "\n",
+            '{"type":"credentials","appleId":"first","appleId":"second","password":"secret"}\n',
+        )
+
+        for frame_text in invalid_frames:
+            with self.subTest(frame_text=frame_text[:40]):
+                self.assert_broker_credentials_rejected(frame_text)
+
+    def test_broker_credentials_reject_extra_fields(self):
+        self.assert_broker_credentials_rejected(
+            json.dumps(
+                {
+                    "type": "credentials",
+                    "appleId": "person@example.com",
+                    "password": "secret",
+                    "extra": "not-allowed",
+                }
+            )
+            + "\n"
+        )
+
+    def test_broker_credentials_reject_empty_and_overlong_values(self):
+        invalid_credentials = (
+            ("", "secret"),
+            ("   ", "secret"),
+            ("person@example.com", ""),
+            ("person@example.com", "\t"),
+            ("a" * (account_flow.BROKER_APPLE_ID_MAX_LENGTH + 1), "secret"),
+            (
+                "person@example.com",
+                "p" * (account_flow.BROKER_PASSWORD_MAX_LENGTH + 1),
+            ),
+        )
+
+        for apple_id, password in invalid_credentials:
+            with self.subTest(apple_id_length=len(apple_id), password_length=len(password)):
+                self.assert_broker_credentials_rejected(
+                    json.dumps(
+                        {
+                            "type": "credentials",
+                            "appleId": apple_id,
+                            "password": password,
+                        }
+                    )
+                    + "\n"
+                )
+
+    def test_broker_mode_uses_complete_environment_without_reading_stdin(self):
+        stream = io.StringIO("must remain unread")
+        with patch.dict(
+            os.environ,
+            {
+                account_flow.BROWSER_BROKER_MODE_ENV: "1",
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+            },
+            clear=True,
+        ):
+            credentials = account_flow.load_browser_credentials(stream)
+
+        self.assertEqual(credentials, ("person@example.com", "secret"))
+        self.assertEqual(stream.tell(), 0)
+
+    def test_broker_mode_replaces_partial_environment_from_the_first_frame(self):
+        stream = io.StringIO(
+            json.dumps(
+                {
+                    "type": "credentials",
+                    "appleId": "person@example.com",
+                    "password": "secret",
+                }
+            )
+            + "\n"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                account_flow.BROWSER_BROKER_MODE_ENV: "1",
+                "APPLE_ID": "incomplete-environment-value",
+            },
+            clear=True,
+        ):
+            credentials = account_flow.load_browser_credentials(stream)
+            self.assertNotIn("APPLE_ID", os.environ)
+            self.assertNotIn("APPLE_PASSWORD", os.environ)
+
+        self.assertEqual(credentials, ("person@example.com", "secret"))
+
+    def test_invalid_broker_frame_stops_before_ruyipage_import(self):
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {account_flow.BROWSER_BROKER_MODE_ENV: "1"},
+            clear=True,
+        ), patch("apple_account_flow.sys.stdin", io.StringIO("invalid\n")), patch(
+            "apple_account_flow.import_ruyipage"
+        ) as import_ruyipage:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                f"^{account_flow.BROWSER_BROKER_CREDENTIALS_ERROR}$",
+            ):
+                browser_flow(args)
+
+        import_ruyipage.assert_not_called()
+
     def test_command_line_apple_id_is_not_supported(self):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_args(["--apple-id", "person@example.com"])
+
+
+class BrowserBrokerLaunchTests(unittest.TestCase):
+    @staticmethod
+    def fake_browser_module(popen):
+        runtime_subprocess = type("FakeSubprocess", (), {})()
+        runtime_subprocess.Popen = popen
+        browser_module = type("FakeBrowserModule", (), {})()
+        browser_module.subprocess = runtime_subprocess
+        return browser_module, runtime_subprocess
+
+    def test_broker_mode_removes_new_session_only_during_macos_construction(self):
+        popen_calls = []
+
+        def original_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+            return object()
+
+        browser_module, runtime_subprocess = self.fake_browser_module(original_popen)
+        page = object()
+
+        def FirefoxPage(opts):
+            self.assertEqual(opts, "options")
+            self.assertIsNot(runtime_subprocess.Popen, original_popen)
+            runtime_subprocess.Popen(["firefox"], start_new_session=True)
+            return page
+
+        with patch.dict(
+            os.environ,
+            {account_flow.BROWSER_BROKER_MODE_ENV: "1"},
+            clear=True,
+        ), patch.object(sys, "platform", "darwin"), patch(
+            "apple_account_flow.importlib.import_module",
+            return_value=browser_module,
+        ) as import_module:
+            result = account_flow.construct_firefox_page(FirefoxPage, "options")
+
+        self.assertIs(result, page)
+        import_module.assert_called_once_with("ruyipage._base.browser")
+        self.assertNotIn("start_new_session", popen_calls[0][1])
+        self.assertIs(runtime_subprocess.Popen, original_popen)
+
+    def test_process_group_patch_is_disabled_outside_broker_macos(self):
+        for mode, platform in (("0", "darwin"), ("1", "win32")):
+            with self.subTest(mode=mode, platform=platform):
+                popen_calls = []
+
+                def original_popen(*args, **kwargs):
+                    popen_calls.append((args, kwargs))
+                    return object()
+
+                browser_module, runtime_subprocess = self.fake_browser_module(
+                    original_popen
+                )
+
+                def FirefoxPage(_opts):
+                    runtime_subprocess.Popen(
+                        ["firefox"],
+                        start_new_session=True,
+                    )
+                    return object()
+
+                with patch.dict(
+                    os.environ,
+                    {account_flow.BROWSER_BROKER_MODE_ENV: mode},
+                    clear=True,
+                ), patch.object(sys, "platform", platform), patch(
+                    "apple_account_flow.importlib.import_module"
+                ) as import_module:
+                    account_flow.construct_firefox_page(FirefoxPage, "options")
+
+                import_module.assert_not_called()
+                self.assertTrue(popen_calls[0][1]["start_new_session"])
+                self.assertIs(runtime_subprocess.Popen, original_popen)
+
+    def test_process_group_patch_is_restored_when_construction_fails(self):
+        def original_popen(*_args, **_kwargs):
+            raise OSError("launch failed")
+
+        browser_module, runtime_subprocess = self.fake_browser_module(original_popen)
+
+        def FailingFirefoxPage(_opts):
+            self.assertIsNot(runtime_subprocess.Popen, original_popen)
+            runtime_subprocess.Popen(["firefox"], start_new_session=True)
+
+        with patch.dict(
+            os.environ,
+            {account_flow.BROWSER_BROKER_MODE_ENV: "1"},
+            clear=True,
+        ), patch.object(sys, "platform", "darwin"), patch(
+            "apple_account_flow.importlib.import_module",
+            return_value=browser_module,
+        ):
+            with self.assertRaisesRegex(OSError, "launch failed"):
+                account_flow.construct_firefox_page(FailingFirefoxPage, "options")
+
+        self.assertIs(runtime_subprocess.Popen, original_popen)
 
 
 class PersonalInformationTests(unittest.TestCase):

@@ -50,6 +50,7 @@ export const COPY_PATHS = [
   "scripts/lib/credentials.js",
   "scripts/lib/prompt.js",
   "scripts/lib/ruyipage-backend-runner.js",
+  "scripts/ruyipage-fifo-relay.mjs",
   "scripts/lib/ruyipage-runtime.js",
   "scripts/lib/two-fa-sidecar.js",
   "scripts/lib/2fa-audit.js",

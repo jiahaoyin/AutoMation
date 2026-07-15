@@ -34,7 +34,7 @@
     "test:ruyipage-flow": "node scripts/test-ruyipage-flow.mjs",
     "test:python-bootstrap": "node scripts/test-python-bootstrap.mjs",
     "mac:codex": "node scripts/mac-codex-orchestrator.mjs",
-    "test:mac-codex": "node scripts/test-mac-codex-orchestrator.mjs",
+    "test:mac-codex": "node scripts/test-mac-codex-orchestrator.mjs && node scripts/test-supervised-browser-broker.mjs",
     "test:firefox-profile": "node scripts/test-firefox-profile-mode.mjs",
     "test:release-copy-paths": "node scripts/test-release-copy-paths.mjs"
   }
