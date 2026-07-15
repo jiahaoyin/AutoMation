@@ -231,6 +231,10 @@ def classify_strong_two_factor(
     )
 
 
+def should_resume_at_password(state: dict[str, Any]) -> bool:
+    return state.get("password") is True and state.get("email") is False
+
+
 def safe_elements(
     page: Any,
     selector: str,
@@ -1759,24 +1763,29 @@ def browser_flow(args: argparse.Namespace) -> int:
                 set_browser_startup_stage("twofa_prepare")
                 request_two_factor_preparation()
             else:
-                set_browser_startup_stage("email_wait")
-                email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
-                set_browser_startup_stage("email_input")
-                input_and_verify(
-                    email_scope,
-                    email,
-                    apple_id,
-                    "email",
-                    Keys,
-                    root_page=page,
-                )
-                set_browser_startup_stage("email_submit")
-                submit_element_with_enter(
-                    page,
-                    email_scope,
-                    email,
-                    Keys,
-                )
+                if not should_resume_at_password(initial_state):
+                    set_browser_startup_stage("email_wait")
+                    email_scope, email = wait_for_element(
+                        page,
+                        EMAIL_SELECTORS,
+                        timeout_s=45,
+                    )
+                    set_browser_startup_stage("email_input")
+                    input_and_verify(
+                        email_scope,
+                        email,
+                        apple_id,
+                        "email",
+                        Keys,
+                        root_page=page,
+                    )
+                    set_browser_startup_stage("email_submit")
+                    submit_element_with_enter(
+                        page,
+                        email_scope,
+                        email,
+                        Keys,
+                    )
 
                 set_browser_startup_stage("password_wait")
                 password_scope, password_field = wait_for_element(

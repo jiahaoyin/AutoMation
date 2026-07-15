@@ -1097,6 +1097,17 @@ class InputTests(unittest.TestCase):
 
 
 class BrowserFlowTests(unittest.TestCase):
+    def test_password_resume_requires_password_without_email(self):
+        cases = (
+            ({"password": True, "email": False}, True),
+            ({"password": True, "email": True}, False),
+            ({"password": True}, False),
+            ({"password": False, "email": False}, False),
+        )
+        for state, expected in cases:
+            with self.subTest(state=state):
+                self.assertIs(account_flow.should_resume_at_password(state), expected)
+
     def test_browser_flow_refocuses_password_after_remember_before_submit(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
         email = FakeElement()
@@ -1394,6 +1405,76 @@ class BrowserFlowTests(unittest.TestCase):
             [call.kwargs.get("otp_generation") for call in signed_in.call_args_list],
             [1, 2],
         )
+
+    def test_recovered_password_page_skips_email_and_resumes_login(self):
+        root = FakePage(state={"href": "https://account.apple.com/sign-in"})
+        root.get = lambda *_: None
+        root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        root.quit = lambda: None
+        password = FakeElement(attrs={"type": "password"})
+
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=[
+                {
+                    "trusted": False,
+                    "twofa": False,
+                    "password": True,
+                    "email": False,
+                    "error": False,
+                },
+                {"trusted": True, "error": False},
+            ],
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.wait_for_element",
+            return_value=(root, password),
+        ) as wait_for_element, patch(
+            "apple_account_flow.input_and_verify",
+        ) as input_and_verify, patch(
+            "apple_account_flow.ensure_remember_checked",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation",
+        ) as prepare_two_factor, patch(
+            "apple_account_flow.submit_element_with_enter",
+        ) as submit_password, patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value={"trusted": True},
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.collect_personal_info",
+            return_value={"fullName": "Person", "birthday": None},
+        ), patch(
+            "apple_account_flow.human_pause",
+            return_value=None,
+        ), patch("apple_account_flow.emit"):
+            self.assertEqual(browser_flow(args), 0)
+
+        wait_for_element.assert_called_once_with(
+            root,
+            account_flow.PASSWORD_SELECTORS,
+            timeout_s=45,
+        )
+        self.assertEqual(input_and_verify.call_args.args[3], "password")
+        prepare_two_factor.assert_called_once_with()
+        submit_password.assert_called_once()
 
     def test_recovered_two_factor_profile_skips_credentials_and_completes_two_generations(self):
         root = FakePage(
