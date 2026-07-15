@@ -135,7 +135,9 @@ export function parseOcrCapability(stdout) {
 
 export async function get2FAOcrCapability(options = {}) {
   const capabilityCache = options.capabilityCache ?? defaultCapabilityCache;
-  if (capabilityCache.capability === "permission_missing") {
+  const requestPermission =
+    options.requestPermission === true && capabilityCache.permissionPrompted !== true;
+  if (capabilityCache.capability === "permission_missing" && !requestPermission) {
     return "permission_missing";
   }
 
@@ -149,9 +151,11 @@ export async function get2FAOcrCapability(options = {}) {
   try {
     const execOptions = { timeout: 5_000, maxBuffer: 64 * 1024 };
     if (options.signal) execOptions.signal = options.signal;
+    const args = ["--preflight-screen-capture"];
+    if (requestPermission) args.push("--prompt-screen-capture");
     const { stdout } = await runHelper(
       binaryPath,
-      ["--preflight-screen-capture"],
+      args,
       execOptions
     );
     capability = parseOcrCapability(stdout);
@@ -163,6 +167,7 @@ export async function get2FAOcrCapability(options = {}) {
 
   if (capability === "permission_missing") {
     capabilityCache.capability = capability;
+    if (requestPermission) capabilityCache.permissionPrompted = true;
   }
   return capability;
 }

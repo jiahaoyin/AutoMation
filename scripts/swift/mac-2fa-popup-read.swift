@@ -406,14 +406,19 @@ func emitAction(_ action: String, source: String? = nil) -> Never {
     emit(Output(ok: action != "none", code: nil, action: action, message: "ok", source: source))
 }
 
-func emitAccessibilityCapability(prompt: Bool) -> Never {
-    let trusted: Bool
+func emitAccessibilityCapability(prompt: Bool, waitSeconds: Int = 0) -> Never {
+    var trusted: Bool
     if prompt {
         let options = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true,
         ] as CFDictionary
         trusted = AXIsProcessTrustedWithOptions(options)
     } else {
+        trusted = AXIsProcessTrusted()
+    }
+    let deadline = Date().addingTimeInterval(TimeInterval(max(0, min(waitSeconds, 30))))
+    while !trusted && Date() < deadline {
+        usleep(500_000)
         trusted = AXIsProcessTrusted()
     }
     let capability = trusted ? "available" : "permission_missing"
@@ -427,11 +432,15 @@ func emitAccessibilityCapability(prompt: Bool) -> Never {
 }
 
 let args = CommandLine.arguments
+var accessibilityWaitSeconds = 0
+if let waitIndex = args.firstIndex(of: "--wait-accessibility"), waitIndex + 1 < args.count {
+    accessibilityWaitSeconds = Int(args[waitIndex + 1]) ?? 0
+}
 if args.contains("--preflight-accessibility") {
     emitAccessibilityCapability(prompt: false)
 }
 if args.contains("--prompt-accessibility") {
-    emitAccessibilityCapability(prompt: true)
+    emitAccessibilityCapability(prompt: true, waitSeconds: accessibilityWaitSeconds)
 }
 
 // AX failures otherwise look exactly like an empty window list. Report a fixed

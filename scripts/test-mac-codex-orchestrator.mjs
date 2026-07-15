@@ -169,8 +169,8 @@ assert.equal(
 );
 assert.equal(
   accessibilityProtocol.productionStage,
-  "accessibility_missing",
-  "a pending provider must not overwrite the fixed Accessibility preflight result"
+  "two_fa_code_pending",
+  "a pending provider must expose active 2FA progress while retaining the fixed Accessibility result"
 );
 const popupFallbackProtocol = createProductionProtocolState();
 assert.equal(

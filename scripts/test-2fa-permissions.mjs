@@ -36,7 +36,7 @@ const preflightEntrySource = fs.readFileSync(
 
 assert.match(
   preflightEntrySource,
-  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight/
+  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight/
 );
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 
@@ -78,7 +78,7 @@ assert.match(
 );
 assert.match(
   exportedFunctionSource(accessibilitySource, "triggerAccessibilityPrompt"),
-  /runtime\.promptPermission\(\{\s*signal:\s*options\.signal\s*\}\)/
+  /runtime\.promptPermission\(\{\s*signal:\s*options\.signal,\s*waitTimeoutMs:\s*options\.waitTimeoutMs,\s*\}\)/
 );
 assert.doesNotMatch(
   accessibilitySource,
@@ -133,6 +133,20 @@ const prompted = await promptNativeAccessibilityPermission({
 });
 assert.deepEqual(prompted, { capability: "permission_missing" });
 assert.deepEqual(nativeCalls.shift(), ["--prompt-accessibility"]);
+
+const waitedPrompt = await promptNativeAccessibilityPermission({
+  platform: "darwin",
+  waitTimeoutMs: 2_500,
+  ensureHelper: () => true,
+  async execFile(_binary, args, options) {
+    nativeCalls.push([...args]);
+    nativeOptions.push(options);
+    return { stdout: JSON.stringify({ capability: "available" }) };
+  },
+});
+assert.deepEqual(waitedPrompt, { capability: "available" });
+assert.deepEqual(nativeCalls.shift(), ["--prompt-accessibility", "--wait-accessibility", "3"]);
+assert.equal(nativeOptions.shift().timeout, 15_000);
 
 const malformed = await checkNativeAccessibilityCapability({
   platform: "darwin",
@@ -277,6 +291,33 @@ assert.ok(capabilityStruct, "missing fixed Accessibility capability payload");
 assert.doesNotMatch(
   capabilityStruct,
   /\b(?:raw|message|source|code)\b/
+);
+
+assert.match(
+  popupSwiftSource,
+  /--wait-accessibility[\s\S]*emitAccessibilityCapability\(prompt: true, waitSeconds: accessibilityWaitSeconds\)/,
+  "the native prompt must keep the helper alive while TCC records the decision"
+);
+
+const supervisedHost = getAccessibilityHostApp({
+  supervised: true,
+  pid: 42,
+  psField(pid, field) {
+    const values = {
+      "42:comm": "node",
+      "42:command": "node scripts/apple-id-full-flow.mjs",
+      "42:ppid": "41",
+      "41:comm": "codex",
+      "41:command": "/Users/admin/.local/bin/codex sandbox",
+      "41:ppid": "1",
+    };
+    return values[`${pid}:${field}`] ?? "";
+  },
+});
+assert.deepEqual(
+  supervisedHost,
+  { name: "Codex" },
+  "a supervised sandbox must direct the user to Codex rather than inherited Terminal"
 );
 
 const host = getAccessibilityHostApp();

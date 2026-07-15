@@ -35,25 +35,42 @@ function psField(pid, field) {
 }
 
 /**
- * 推断需要在「辅助功能」中勾选的宿主 App（运行脚本的终端）
+ * 推断需要在「辅助功能」中勾选的宿主 App。
+ *
+ * A supervised production run is launched from Terminal but executes through
+ * the Codex sandbox. Treating its inherited TERM_PROGRAM as the TCC client
+ * sends the user to the wrong Privacy entry, so inspect the real parent chain
+ * before falling back to the terminal label.
  * @returns {{ name: string }}
  */
-export function getAccessibilityHostApp() {
-  const term = process.env.TERM_PROGRAM?.trim();
-  if (term === "Apple_Terminal") return { name: "Terminal" };
-  if (term === "iTerm.app") return { name: "iTerm" };
-  if (term && /vscode|Visual Studio Code/i.test(term)) {
+export function getAccessibilityHostApp(options = {}) {
+  const env = options.env ?? process.env;
+  const readPsField = options.psField ?? psField;
+  const supervised =
+    options.supervised ?? env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+  const term = env.TERM_PROGRAM?.trim();
+
+  if (!supervised && term === "Apple_Terminal") return { name: "Terminal" };
+  if (!supervised && term === "iTerm.app") return { name: "iTerm" };
+  if (!supervised && term && /vscode|Visual Studio Code/i.test(term)) {
     return { name: "Visual Studio Code" };
   }
-  if (term && /cursor/i.test(term)) return { name: "Cursor" };
-  if (process.env.CURSOR_TRACE_ID || process.env.CURSOR_SESSION) {
+  if (!supervised && term && /cursor/i.test(term)) return { name: "Cursor" };
+  if (!supervised && (env.CURSOR_TRACE_ID || env.CURSOR_SESSION)) {
     return { name: "Cursor" };
   }
 
-  let pid = process.pid;
+  let pid = options.pid ?? process.pid;
   for (let i = 0; i < 20; i++) {
-    const comm = psField(pid, "comm");
-    const args = psField(pid, "command") || comm;
+    const comm = readPsField(pid, "comm");
+    const args = readPsField(pid, "command") || comm;
+
+    if (
+      /(?:^|[\\/\s])codex(?:\s|$)/i.test(comm) ||
+      /(?:^|[\\/\s])codex(?:\s|$)/i.test(args)
+    ) {
+      return { name: "Codex" };
+    }
 
     if (/Terminal/i.test(comm) || /Terminal\.app/i.test(args)) {
       return { name: "Terminal" };
@@ -68,12 +85,12 @@ export function getAccessibilityHostApp() {
       return { name: "Visual Studio Code" };
     }
 
-    const ppid = parseInt(psField(pid, "ppid"), 10);
+    const ppid = parseInt(readPsField(pid, "ppid"), 10);
     if (!ppid || ppid <= 1) break;
     pid = ppid;
   }
 
-  return { name: "Terminal" };
+  return { name: supervised ? "Codex" : "Terminal" };
 }
 
 /** 是否为 macOS 自动化未授权错误（-1743 等） */
@@ -131,7 +148,10 @@ export async function isAccessibilityGranted(options = {}) {
 export async function triggerAccessibilityPrompt(options = {}) {
   const runtime = resolveAccessibilityRuntime(options);
   if (runtime.platform !== "darwin") return { capability: "available" };
-  const result = await runtime.promptPermission({ signal: options.signal });
+  const result = await runtime.promptPermission({
+    signal: options.signal,
+    waitTimeoutMs: options.waitTimeoutMs,
+  });
   if (result.capability === "unavailable") {
     const error = new Error("Accessibility permission prompt is unavailable");
     error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
@@ -320,14 +340,24 @@ export async function ensureAccessibility(options = {}) {
   log(">>> 辅助功能未授权，正在引导开启…", quiet);
   log(`    需要允许「${host.name}」控制此电脑（原生 AX 操作依赖此项）`, quiet);
 
-  await triggerAccessibilityPrompt({ runtime, signal });
+  const deadline = Date.now() + timeoutMs;
+  const promptResult = await triggerAccessibilityPrompt({
+    runtime,
+    signal,
+    // Keep the same native helper alive while macOS displays the prompt. This
+    // avoids a one-shot child disappearing before TCC records the decision.
+    waitTimeoutMs: Math.min(timeoutMs, 30_000),
+  });
   throwIfAccessibilityCancelled(signal);
+  if (promptResult.capability === "available") {
+    log(`✓ 辅助功能已授权（${host.name}）`, quiet);
+    return { granted: true, host: host.name };
+  }
   log(`    请按 macOS 原生提示授权「${host.name}」（等待授权中…）`, quiet);
   console.log(
     `    若未出现提示，请立即打开：系统设置 → 隐私与安全性 → 辅助功能，并勾选「${host.name}」`,
   );
 
-  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await runtime.sleep(pollMs);
     throwIfAccessibilityCancelled(signal);

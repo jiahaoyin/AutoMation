@@ -27,13 +27,13 @@ SHA-256 和 Python Software Foundation Developer ID 签名，再从 root 私有�
 - Node.js 18+（[nodejs.org](https://nodejs.org) 或 `install.sh` 下载官方包）
 - Python 3.10+（`install.sh` 自动检测；缺失时安装已验签的官方 Python 3.12.10）
 - Firefox（[mozilla.org/firefox](https://www.mozilla.org/firefox/)）
-- 终端「辅助功能」权限（`install.sh` 会引导）
+- 当前运行主体的「辅助功能」权限（`install.sh` 会引导；本地通常为 Terminal / iTerm，受监督验收为 Codex / 原生 helper）
 
 Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recording）
 权限，但这是**可选增强**。未授权不会导致 `install.sh` 失败；AX 弹窗读取、
-系统设置取码和隐藏终端手输仍可继续工作。需要启用 OCR 时，请在下次运行前打开
-「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」，勾选当前终端 App，按系统
-提示重新打开终端后再运行 `./run.sh`。
+系统设置取码和隐藏终端手输仍可继续工作。首次实际进入 2FA 且需要 OCR 回退时，
+项目会请求一次 macOS 原生授权；拒绝或未完成授权时会继续其他取码路线。若系统要求
+重启运行主体，请按提示重新打开当前终端或 Codex 后再运行 `./run.sh`。
 
 ## 命令
 
@@ -134,9 +134,9 @@ TCC 或 macOS 15 原生 UI 已验收。
 ## 权限分层
 
 - 浏览器 2FA 的「辅助功能」检查和提示由现有 `mac-2fa-popup-read.swift` 通过 `AXIsProcessTrusted()`、`AXIsProcessTrustedWithOptions(...)` 及 `--preflight-accessibility` / `--prompt-accessibility` 原生完成。旧 AppleScript 2FA/Accessibility 权限探针已移除。
-- `./run.sh --skip-mac` 只要求当前终端 App 获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；不要求 Terminal 控制 System Events 或“系统设置”。
+- `./run.sh --skip-mac` 只要求实际运行主体获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；本地通常是 Terminal / iTerm，受监督验收会明确提示 Codex / 原生 helper；不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有执行 macOS“系统设置登录 Apple Account”阶段时，才要求「自动化」中允许当前终端 App 控制“系统设置”。
-- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会请求权限，也不会阻断安装；AX、Settings 和隐藏终端手输仍可工作。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
+- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会阻断安装；首次实际 OCR 回退会请求一次原生屏幕录制授权，AX、Settings 和隐藏终端手输仍可工作。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
 - 权限变更后应按 macOS 提示退出并重新打开终端，再开始下一次运行。
 
 ## macOS 15 验收

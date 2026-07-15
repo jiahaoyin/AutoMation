@@ -206,7 +206,8 @@ function buildReadme(destRoot) {
 - **Node.js 18+**（[nodejs.org](https://nodejs.org) 官方安装包，或 \`./install.sh\` 自动下载官方二进制）
 - **Python**：\`./install.sh\` 会自动检测 Python 3.10+；缺失时请求管理员授权，核对 Python.org Python 3.12.10 universal2 PKG 的固定 SHA-256 与 Python Software Foundation Developer ID 签名，再把 ruyiPage 安装到项目内 \`.runtime/ruyipage-venv\`
 - **Firefox**（[mozilla.org/firefox](https://www.mozilla.org/firefox/) 手动安装）
-- **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时将打开系统设置并等待你勾选终端 App（如 Terminal / iTerm）
+- **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时会请求当前运行主体的系统授权（本地通常为 Terminal / iTerm；受监督验收会提示 Codex / 原生 helper）
+- **屏幕与系统音频录制**：Vision OCR 的可选增强；首次实际 2FA OCR 回退会请求一次原生授权，拒绝后仍继续 AX、系统设置与隐藏终端手输路线
 
 ## 快速开始
 
@@ -264,14 +265,14 @@ cd apple-id-automation-${VERSION}
 
 ## 故障排查
 
-- **辅助功能未授权**：运行 \`./install.sh\`，按提示在系统设置中勾选对应终端 App
+- **辅助功能未授权**：运行 \`./install.sh\`，按 macOS 原生提示允许实际运行主体；受监督验收不是只勾选 Terminal
 - **系统设置填表失败（macOS 15）**：确认已打开 Apple Account 页；辅助功能已授权 Terminal
 - **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`npm run dump:mac-ui\` 查看 AX 树（v1.0.22 修复 tell 上下文 + 自动化预检）
 - **调试 UI 结构**：\`osascript scripts/mac-settings-ui-dump.applescript\`（登录页打开后运行）
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
-- **2FA 超时**：确认 Mac 已登录同一 Apple ID，Terminal 已获辅助功能权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
+- **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
 - **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
 
 ## 安全

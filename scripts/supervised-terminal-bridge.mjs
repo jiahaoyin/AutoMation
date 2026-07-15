@@ -104,10 +104,7 @@ export function createProductionProtocolState() {
         return true;
       }
       if (TWO_FA_PENDING_STATUSES.has(status)) {
-        if (
-          productionStage !== "two_fa_code_acquired" &&
-          accessibilityPreflight !== "missing"
-        ) {
+        if (productionStage !== "two_fa_code_acquired") {
           productionStage = "two_fa_code_pending";
         }
         return true;
@@ -1972,7 +1969,6 @@ export function productionEnvironment(context, brokerPaths) {
     BROWSER_PROFILE_MODE: "persistent",
     SKIP_ENV_SETUP: "1",
     PYTHONDONTWRITEBYTECODE: "1",
-    TERM_PROGRAM: "Apple_Terminal",
   };
 }
 
@@ -2172,12 +2168,32 @@ export async function runSupervisedTerminalBridge(options = {}) {
         if (status === "permission_preflight_prompted") {
           emitStatus(
             "accessibility-prompted",
-            "[mac:supervised] 正在请求原生辅助功能授权；请按 macOS 提示允许当前 helper"
+            "[mac:supervised] 正在请求原生辅助功能授权；请按 macOS 提示允许 Codex / 原生 2FA helper"
           );
         } else if (status === "permission_preflight_missing") {
           emitStatus(
             "accessibility-missing",
-            "[mac:supervised] 原生 2FA helper 未获辅助功能授权；Terminal 已勾选时请同时允许系统新显示的 Codex/helper 项，流程将继续并保留手动验证码兜底"
+            "[mac:supervised] 原生 2FA helper 尚未获辅助功能授权；此受监督流程实际运行于 Codex，不是仅 Terminal，流程将继续尝试 OCR、系统设置与手动兜底"
+          );
+        } else if (status === "popup_accessibility") {
+          emitStatus(
+            "2fa-popup-ocr",
+            "[mac:supervised] 原生弹窗 AX 不可用，正在切换到屏幕录制 OCR 读码"
+          );
+        } else if (status === "ocr_permission_missing") {
+          emitStatus(
+            "2fa-ocr-permission",
+            "[mac:supervised] OCR 已请求屏幕录制授权；系统设置备用取码仍在继续"
+          );
+        } else if (status === "settings_start") {
+          emitStatus(
+            "2fa-settings",
+            "[mac:supervised] 正在通过系统设置备用路线获取验证码"
+          );
+        } else if (status === "manual_code") {
+          emitStatus(
+            "2fa-manual",
+            "[mac:supervised] 自动取码尚未完成，已启用终端隐藏输入兜底"
           );
         } else if (TWO_FA_PENDING_STATUSES.has(status)) {
           emitStatus("2fa-progress", "[mac:supervised] 2FA 自动取码处理中");

@@ -24,12 +24,14 @@ function wait(ms) {
 async function main() {
   if (supervised) {
     console.log("[2FA] status:permission_preflight_start");
+    const deadline = Date.now() + SUPERVISED_ACCESSIBILITY_WAIT_MS;
     let granted = await isAccessibilityGranted().catch(() => false);
     if (!granted) {
       console.log("[2FA] status:permission_preflight_prompted");
-      const promptResult = await triggerAccessibilityPrompt().catch(() => null);
+      const promptResult = await triggerAccessibilityPrompt({
+        waitTimeoutMs: SUPERVISED_ACCESSIBILITY_WAIT_MS,
+      }).catch(() => null);
       granted = promptResult?.capability === "available";
-      const deadline = Date.now() + SUPERVISED_ACCESSIBILITY_WAIT_MS;
       while (!granted && Date.now() < deadline) {
         await wait(SUPERVISED_ACCESSIBILITY_POLL_MS);
         granted = await isAccessibilityGranted().catch(() => false);

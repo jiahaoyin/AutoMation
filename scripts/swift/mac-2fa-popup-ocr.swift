@@ -32,8 +32,12 @@ func logStep(_ msg: String) {
     FileHandle.standardError.write("[2FA-ocr] \(msg)\n".data(using: .utf8)!)
 }
 
-func screenCaptureCapability() -> String {
-    CGPreflightScreenCaptureAccess() ? "available" : "permission_missing"
+func screenCaptureCapability(requestPermission: Bool = false) -> String {
+    if CGPreflightScreenCaptureAccess() { return "available" }
+    if requestPermission {
+        _ = CGRequestScreenCaptureAccess()
+    }
+    return CGPreflightScreenCaptureAccess() ? "available" : "permission_missing"
 }
 
 func axCopy<T>(_ element: AXUIElement, _ attr: String) -> T? {
@@ -473,10 +477,16 @@ func emit(_ output: Output) -> Never {
 
 var timeoutSec = 8
 var preflightScreenCapture = false
+var promptScreenCapture = false
 var i = 1
 while i < CommandLine.arguments.count {
     if CommandLine.arguments[i] == "--preflight-screen-capture" {
         preflightScreenCapture = true
+        i += 1
+        continue
+    }
+    if CommandLine.arguments[i] == "--prompt-screen-capture" {
+        promptScreenCapture = true
         i += 1
         continue
     }
@@ -494,7 +504,7 @@ if preflightScreenCapture {
         code: nil,
         source: nil,
         message: "preflight",
-        capability: screenCaptureCapability()
+        capability: screenCaptureCapability(requestPermission: promptScreenCapture)
     ))
 }
 

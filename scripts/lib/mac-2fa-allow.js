@@ -291,7 +291,13 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
   } else {
     console.log("[2FA] Native AX reader found no code; trying Vision OCR");
   }
-  const ocrResult = await readViaOcr(ocrTimeout, { signal: options.signal });
+  const ocrResult = await readViaOcr(ocrTimeout, {
+    signal: options.signal,
+    // Ask once at the real 2FA boundary. OCR remains optional, but a missing
+    // Screen Recording grant should surface a native macOS prompt instead of
+    // silently turning into an empty OCR result.
+    requestPermission: true,
+  });
   const ocr = accept(ocrResult);
   if (ocr?.code) {
     console.log("[2FA] Vision OCR 已识别验证码");

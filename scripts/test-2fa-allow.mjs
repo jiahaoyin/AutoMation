@@ -1022,6 +1022,29 @@ test("OCR screen-capture preflight exposes only fixed capability states", async 
   assert.deepEqual(calls, [["--preflight-screen-capture"]]);
 });
 
+test("OCR permission request adds the explicit native prompt flag once", async () => {
+  const calls = [];
+  const options = {
+    requestPermission: true,
+    capabilityCache: {},
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      calls.push([...args]);
+      return {
+        stdout:
+          '{"ok":true,"capability":"permission_missing","message":"preflight"}\n',
+        stderr: "",
+      };
+    },
+  };
+  const capability = await ocrModule.get2FAOcrCapability(options);
+  const repeatedCapability = await ocrModule.get2FAOcrCapability(options);
+
+  assert.equal(capability, "permission_missing");
+  assert.equal(repeatedCapability, "permission_missing");
+  assert.deepEqual(calls, [["--preflight-screen-capture", "--prompt-screen-capture"]]);
+});
+
 test("OCR permission denial is cached and never spawns capture attempts", async () => {
   const calls = [];
   const capabilityCache = {};
@@ -1147,8 +1170,8 @@ test("popup code acquisition falls back to OCR after an AX permission failure", 
         calls.push(["ax", timeoutSec]);
         return { code: null, source: "swift_ax", capability: "accessibility_missing" };
       },
-      async readPopupCodeViaOcr(timeoutSec) {
-        calls.push(["ocr", timeoutSec]);
+      async readPopupCodeViaOcr(timeoutSec, options) {
+        calls.push(["ocr", timeoutSec, options.requestPermission]);
         return { code: "654321", source: "vision" };
       },
     },
@@ -1157,7 +1180,7 @@ test("popup code acquisition falls back to OCR after an AX permission failure", 
   assert.deepEqual(result, { code: "654321", source: "vision" });
   assert.deepEqual(calls, [
     ["ax", 2],
-    ["ocr", 6],
+    ["ocr", 6, true],
   ]);
 });
 
@@ -1224,7 +1247,7 @@ test("popup code acquisition returns fixed OCR unavailability for status", async
   assert.deepEqual(result, unavailable);
 });
 
-test("Swift OCR preflight checks permission without requesting or capturing", () => {
+test("Swift OCR preflight remains capture-free and only requests permission through an explicit flag", () => {
   const capability = sourceFunctionBody(
     popupOcrSwiftSource,
     "func screenCaptureCapability"
@@ -1240,13 +1263,14 @@ test("Swift OCR preflight checks permission without requesting or capturing", ()
   assert.match(capability, /CGPreflightScreenCaptureAccess\(\)/);
   assert.match(capability, /"available"/);
   assert.match(capability, /"permission_missing"/);
-  assert.doesNotMatch(capability, /CGRequestScreenCaptureAccess|CGWindowListCreateImage/);
+  assert.match(capability, /if requestPermission[\s\S]*CGRequestScreenCaptureAccess\(\)/);
+  assert.doesNotMatch(capability, /CGWindowListCreateImage/);
   assert.ok(preflightFlag >= 0, "missing preflight command-line flag");
   assert.ok(
     preflightDispatch > preflightFlag && preflightDispatch < captureDeadline,
     "preflight must return before any capture polling"
   );
-  assert.doesNotMatch(popupOcrSwiftSource, /CGRequestScreenCaptureAccess/);
+  assert.match(popupOcrSwiftSource, /--prompt-screen-capture/);
 });
 
 test("Swift OCR accepts contiguous digits only from the verified center crop", () => {
@@ -1387,7 +1411,12 @@ test("AX popup helpers fail closed while OCR keeps its screen-recording fallback
 test("OCR path remains read-only, window-bound, memory-only, and secret-free", () => {
   assert.doesNotMatch(
     popupOcrSwiftSource,
-    /AXUIElementPerformAction|CGEvent|CGRequestScreenCaptureAccess|screencapture|NSTemporaryDirectory|FileManager\.default|\.png/
+    /AXUIElementPerformAction|CGEvent|screencapture|NSTemporaryDirectory|FileManager\.default|\.png/
+  );
+  assert.match(
+    sourceFunctionBody(popupOcrSwiftSource, "func screenCaptureCapability"),
+    /if requestPermission[\s\S]*CGRequestScreenCaptureAccess\(\)/,
+    "the only interactive OCR operation may request Screen Recording permission"
   );
   assert.doesNotMatch(ocrSource, /screenshot|raw\s*:|stderr\s*:/i);
   assert.doesNotMatch(allowSource, /OCR[^\n]*(?:code|raw).*\$\{/i);

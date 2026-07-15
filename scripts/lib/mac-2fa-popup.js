@@ -151,12 +151,20 @@ async function runAccessibilityCapability(flag, options = {}) {
 
   const runHelper = options.execFile ?? execFileAsync;
   try {
+    const waitTimeoutMs =
+      flag === "--prompt-accessibility"
+        ? Math.max(0, Math.min(30_000, Number(options.waitTimeoutMs) || 0))
+        : 0;
+    const args = [flag];
+    if (waitTimeoutMs > 0) {
+      args.push("--wait-accessibility", String(Math.ceil(waitTimeoutMs / 1000)));
+    }
     const execOptions = {
-      timeout: 15_000,
+      timeout: Math.max(15_000, waitTimeoutMs + 5_000),
       maxBuffer: 16 * 1024,
     };
     if (options.signal) execOptions.signal = options.signal;
-    const { stdout } = await runHelper(binaryPath, [flag], execOptions);
+    const { stdout } = await runHelper(binaryPath, args, execOptions);
     return parseAccessibilityCapability(stdout);
   } catch (error) {
     const parsed = parseAccessibilityCapability(error?.stdout);
