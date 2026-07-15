@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 RUYIPAGE_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if RUYIPAGE_SCRIPT_DIR not in sys.path:
@@ -798,6 +798,84 @@ class InputTests(unittest.TestCase):
             [],
         )
 
+    def test_password_retries_keyboard_when_owner_bidi_reads_empty(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        password = EmptyBidiPassword(attrs={"type": "password"})
+        actions = FakeActions()
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            actions=actions,
+        )
+
+        with patch("apple_account_flow.emit") as emit_event:
+            action_scope = input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(password.inputs, [("secret", True)])
+        self.assertEqual(password.value, "secret")
+        self.assertIn(("type", "secret", ANY), actions.calls)
+        self.assertIn(
+            "owner_bidi_value_empty",
+            [call.args[0]["step"] for call in emit_event.call_args_list],
+        )
+        self.assertIn(
+            "owner_bidi_keyboard_retry",
+            [call.args[0]["step"] for call in emit_event.call_args_list],
+        )
+
+    def test_password_empty_after_keyboard_retry_fails_before_2fa(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        password = EmptyBidiPassword(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            actions=FakeActions(apply_typed_text=False),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+    def test_password_empty_then_unreadable_retry_fails_before_2fa(self):
+        password = FakeElement(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            actions=FakeActions(),
+        )
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=[(True, ""), (False, None), (False, None)],
+        ), self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
     def test_password_bidi_input_failure_emits_only_a_fixed_failed_event(self):
         password = FakeElement(attrs={"type": "password"})
         page = FakePage({"css:input[type='password']": [password]})
@@ -1401,6 +1479,65 @@ class BrowserFlowTests(unittest.TestCase):
         for state, expected in cases:
             with self.subTest(state=state):
                 self.assertIs(account_flow.should_resume_at_password(state), expected)
+
+    def test_browser_flow_stops_before_2fa_when_password_input_fails(self):
+        root = FakePage(state={"href": "https://account.apple.com/sign-in"})
+        root.get = lambda *_: None
+        root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        root.quit = lambda: None
+        email = FakeElement()
+        password = FakeElement(attrs={"type": "password"})
+
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        def input_or_fail(_scope, _field, _value, label, _keys, **_kwargs):
+            if label == "password":
+                raise RuntimeError("password input verification failed")
+
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            return_value={"trusted": False},
+        ), patch(
+            "apple_account_flow.wait_for_element",
+            side_effect=[(root, email), (root, password)],
+        ), patch(
+            "apple_account_flow.input_and_verify",
+            side_effect=input_or_fail,
+        ), patch(
+            "apple_account_flow.submit_element_with_enter",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.ensure_remember_checked",
+            return_value=True,
+        ) as remember_account, patch(
+            "apple_account_flow.request_two_factor_preparation",
+            return_value=None,
+        ) as prepare_2fa, patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value={"trusted": True},
+        ) as wait_2fa, patch(
+            "apple_account_flow.human_pause",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.time.sleep",
+            return_value=None,
+        ), patch("apple_account_flow.emit"):
+            with self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+                browser_flow(args)
+
+        remember_account.assert_not_called()
+        prepare_2fa.assert_not_called()
+        wait_2fa.assert_not_called()
 
     def test_browser_flow_refocuses_password_after_remember_before_submit(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
