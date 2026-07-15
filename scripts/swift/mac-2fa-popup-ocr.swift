@@ -118,7 +118,7 @@ let sharedHostBundleIDs: Set<String> = [
     "com.apple.akd",
 ]
 
-enum CandidateKind {
+enum CandidateKind: Equatable {
     case dedicated
     case sharedHost
 }
@@ -288,6 +288,37 @@ func captureWindowByID(_ wid: CGWindowID) async -> CGImage? {
     }
 }
 
+// Screen Recording can still inspect a window when Accessibility is denied to
+// this helper. Limit that route to dedicated Apple authentication processes,
+// enumerate only on-screen window IDs, and keep all pixels in memory.
+func findScreenOnlyCodeDialogs() -> [DialogTarget] {
+    let trustedPIDs = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
+        guard candidateKind(for: app) == .dedicated else { return nil }
+        return app.processIdentifier
+    })
+    guard !trustedPIDs.isEmpty else { return [] }
+
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let windowInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+    var windowIDs = Set<CGWindowID>()
+    var out: [DialogTarget] = []
+    for info in windowInfo {
+        guard
+            let ownerPIDNumber = info[kCGWindowOwnerPID as String] as? NSNumber,
+            trustedPIDs.contains(pid_t(ownerPIDNumber.int32Value)),
+            let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
+            let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+            frame.width > 80,
+            frame.height > 60
+        else { continue }
+        let windowID = CGWindowID(windowNumber.uint32Value)
+        guard windowID != 0, windowIDs.insert(windowID).inserted else { continue }
+        out.append(DialogTarget(windowID: windowID))
+    }
+    return out
+}
+
 func captureDialog(_ target: DialogTarget) async -> CGImage? {
     guard let wid = target.windowID else { return nil }
     return await captureWindowByID(wid)
@@ -419,7 +450,13 @@ var capturePass = 0
 var centerCandidateTracker = CenterCandidateTracker()
 while Date() < deadline {
     capturePass += 1
-    let dialogs = findCodeDialogs()
+    let dialogs: [DialogTarget]
+    if AXIsProcessTrusted() {
+        let axDialogs = findCodeDialogs()
+        dialogs = axDialogs.isEmpty ? findScreenOnlyCodeDialogs() : axDialogs
+    } else {
+        dialogs = findScreenOnlyCodeDialogs()
+    }
     var capturedWindowIDs = Set<CGWindowID>()
     if dialogs.isEmpty {
         logStep("no code dialog found")

@@ -332,6 +332,17 @@ if releaseLeftButtonOnly {
     ))
 }
 
+guard AXIsProcessTrusted() else {
+    emit(Output(
+        ok: false,
+        action: "accessibility_unavailable",
+        source: nil,
+        message: "accessibility_unavailable",
+        x: nil,
+        y: nil
+    ))
+}
+
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 while Date() < deadline {
     var apps = NSWorkspace.shared.runningApplications

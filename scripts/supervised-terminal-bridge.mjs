@@ -51,11 +51,14 @@ const TWO_FA_PENDING_STATUSES = new Set([
   "manual_code",
   "manual_unavailable",
   "ocr_permission_missing",
+  "popup_accessibility",
+  "popup_close_pending",
 ]);
 
 export function createProductionProtocolState() {
   let productionStage = "not_started";
   let nodeFailure = "none";
+  let accessibilityPreflight = "unknown";
 
   const processStdoutLine = (line) => {
     if (typeof line !== "string") return false;
@@ -78,11 +81,17 @@ export function createProductionProtocolState() {
         productionStage = "accessibility_preflight";
         return true;
       }
+      if (status === "permission_preflight_prompted") {
+        productionStage = "accessibility_prompted";
+        return true;
+      }
       if (status === "permission_preflight_ready") {
+        accessibilityPreflight = "ready";
         productionStage = "accessibility_ready";
         return true;
       }
       if (status === "permission_preflight_missing") {
+        accessibilityPreflight = "missing";
         productionStage = "accessibility_missing";
         return true;
       }
@@ -95,7 +104,10 @@ export function createProductionProtocolState() {
         return true;
       }
       if (TWO_FA_PENDING_STATUSES.has(status)) {
-        if (productionStage !== "two_fa_code_acquired") {
+        if (
+          productionStage !== "two_fa_code_acquired" &&
+          accessibilityPreflight !== "missing"
+        ) {
           productionStage = "two_fa_code_pending";
         }
         return true;
@@ -144,6 +156,9 @@ export function createProductionProtocolState() {
     },
     get nodeFailure() {
       return nodeFailure;
+    },
+    get accessibilityPreflight() {
+      return accessibilityPreflight;
     },
   };
 }
@@ -2154,7 +2169,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
 
       if (line.startsWith("[2FA] status:")) {
         const status = line.slice("[2FA] status:".length);
-        if (status === "permission_preflight_missing") {
+        if (status === "permission_preflight_prompted") {
+          emitStatus(
+            "accessibility-prompted",
+            "[mac:supervised] 正在请求原生辅助功能授权；请按 macOS 提示允许当前 helper"
+          );
+        } else if (status === "permission_preflight_missing") {
           emitStatus(
             "accessibility-missing",
             "[mac:supervised] 原生 2FA helper 未获辅助功能授权；Terminal 已勾选时请同时允许系统新显示的 Codex/helper 项，流程将继续并保留手动验证码兜底"
@@ -2509,6 +2529,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
         ? "starting"
         : trustedProductionStage;
     const nodeFailure = productionProtocol.nodeFailure;
+    const accessibilityPreflight = productionProtocol.accessibilityPreflight;
     let failureClass = "NONE";
     if (processCleanupOutcome === "failed") {
       failureClass = "PROCESS_CLEANUP_FAILED";
@@ -2521,7 +2542,20 @@ export async function runSupervisedTerminalBridge(options = {}) {
     else if (headAfter !== context.expectedHead) failureClass = "HEAD_MISMATCH";
     else if (finalStatus !== "") failureClass = "GIT_DIRTY";
     else if (productionExit !== 0) {
-      if (
+      const accessibilityBlockedTwoFa =
+        accessibilityPreflight === "missing" &&
+        (
+          [
+            "two_fa_code_pending",
+            "two_fa_code_unavailable",
+            "browser_failure:twofa_page_wait",
+            "browser_failure:twofa_code_wait",
+          ].includes(productionStage) ||
+          ["two_fa_preparation", "two_fa_provider"].includes(nodeFailure)
+        );
+      if (accessibilityBlockedTwoFa) {
+        failureClass = "ACCESSIBILITY_PERMISSION_REQUIRED";
+      } else if (
         ["starting", "browser_backend_starting"].includes(productionStage) &&
         ["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"].includes(
           nodeFailure

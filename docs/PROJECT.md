@@ -43,8 +43,9 @@
 账号通过子进程环境变量传入 Python，不出现在进程命令行参数中。密码也只通过环境变量传递。
 密码提交前 Python 发出 `prepare_2fa`；Node 清理准备边界之前的旧窗并启动持续 watcher，回传 `2fa_prepared` 后 Python 才提交。页面确认 2FA 后，Node 从 popup、可取消的系统设置 helper 和按条件启用的隐藏终端手输中取首个合法六位码。
 
-popup 先尝试 AX 文本读取；只有 AX 没有合法码才启动 Vision OCR。OCR 只能捕获
-AX 已验证 Apple 系统窗口的 window ID：全窗仅接受 `NNN NNN`，中心裁剪连续六位
+popup 先尝试 AX 文本读取；只有 AX 没有合法码才启动 Vision OCR。AX 对当前 helper
+未授权时，OCR 仅在 `need_2fa` 后按 dedicated Apple authentication process 的 on-screen
+window ID 运行；其余情况仍只捕获 AX 已验证 Apple 系统窗口的 window ID。全窗仅接受 `NNN NNN`，中心裁剪连续六位
 必须在同一 window ID 的两次独立 capture 中一致后才发布。同一轮重复枚举不计作
 第二帧；空帧、不同码或窗口消失都会重置候选。OCR 不包含点击、全屏搜索或图片
 落盘。
@@ -90,7 +91,7 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 - 浏览器 Accessibility 使用 `mac-2fa-popup-read.swift` 的 `AXIsProcessTrusted()` / `AXIsProcessTrustedWithOptions(...)` 原生 preflight/prompt；旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 仍要求终端「辅助功能」，但不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有 macOS 系统设置登录阶段需要「自动化」权限，即允许当前终端 App 控制“系统设置”。
-- Vision OCR 使用「屏幕与系统音频录制」权限。未授权时固定降级为 `permission_missing`，AX、系统设置和隐藏手输仍工作。需要 OCR 时，应在下次运行前前往「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」勾选当前终端，并重新打开终端。
+- Vision OCR 使用「屏幕与系统音频录制」权限。未授权时固定降级为 `permission_missing`，AX、系统设置和隐藏手输仍工作。需要 OCR 时，应在下次运行前前往「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」勾选当前终端，并重新打开终端。受监督验收始终复用 `install.sh` 写入 `scripts/bin` 的稳定 native helper，避免每轮随机路径被 macOS 当作新的 TCC 客户端；拉取更新后先运行一次 `./install.sh`。
 
 切换账号时优先使用 `fresh`，避免身份和 Cookie 串用。
 
@@ -139,7 +140,7 @@ npm run test:account-browser-flow
 7. Settings 最多两次、每次不超过 60 秒且中间退避 5 秒；从第一次 acquisition 起 90 秒后的 TTY 手输不回显，240 秒后所有来源停止并完成 runner cleanup。
 8. Allow 自动最多两次；未确认后提示人工点击，监听和 Settings 不停止。
 9. 全窗 OCR 只接受 `NNN NNN`；中心连续六位需同一 window ID 两次独立捕获一致。Screen Recording 缺失时安装和 AX/Settings/手输路径不失败。
-10. 验证码只写入已识别的单框或六格控件，loser helper/弹窗随后关闭。
+10. 验证码只写入已识别的单框或六格控件。已验证的 popup 码不能因原生弹窗关闭失败而被扣留；关闭属于尽力清理并保留固定状态。
 11. 第一代只有在可信 Apple 页明确 OTP 错误/无效/过期时才可被第二代替换；旧码不再复用。captcha、锁定和未知错误停止。
 12. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
 13. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，姓名/生日结果与页面一致。

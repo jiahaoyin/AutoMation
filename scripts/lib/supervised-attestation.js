@@ -132,6 +132,7 @@ export const SUPERVISED_PRODUCTION_STAGES = new Set([
   "not_started",
   ...SUPERVISED_STDOUT_STAGE_TOKENS,
   "accessibility_preflight",
+  "accessibility_prompted",
   "accessibility_ready",
   "accessibility_missing",
   "two_fa_code_acquired",

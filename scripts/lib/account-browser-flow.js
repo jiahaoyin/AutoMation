@@ -31,6 +31,10 @@ const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
   manual_code: "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
   ocr_permission_missing:
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
+  popup_accessibility:
+    "[2FA] 原生验证码弹窗未获辅助功能授权；将尝试已授权的屏幕录制 OCR，系统设置与终端手输仍在继续。",
+  popup_close_pending:
+    "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
   timeout:
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
 });
@@ -394,6 +398,8 @@ function reportTwoFactorStatus(event) {
         "manual_code",
         "manual_unavailable",
         "ocr_permission_missing",
+        "popup_accessibility",
+        "popup_close_pending",
         "timeout",
       ].includes(event.status)
     ) {

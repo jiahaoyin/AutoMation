@@ -21,6 +21,7 @@ const OCR_BIN = resolveNativeHelperPath(
 const OCR_CAPABILITIES = new Set([
   "available",
   "permission_missing",
+  "accessibility_missing",
   "unavailable",
 ]);
 const defaultCapabilityCache = {};
@@ -105,6 +106,9 @@ export function parseOcrResult(stdout) {
   const line = String(stdout ?? "").trim().split(/\r?\n/).pop() || "";
   try {
     const parsed = JSON.parse(line);
+    if (parsed?.capability === "accessibility_missing") {
+      return { code: null, source: "vision", capability: "accessibility_missing" };
+    }
     if (parsed.ok !== true || typeof parsed.code !== "string") return null;
     if (!/^\d{6}$/.test(parsed.code)) return null;
     return {

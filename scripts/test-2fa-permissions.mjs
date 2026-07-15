@@ -36,7 +36,7 @@ const preflightEntrySource = fs.readFileSync(
 
 assert.match(
   preflightEntrySource,
-  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityGranted\(\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight/
+  /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight/
 );
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 

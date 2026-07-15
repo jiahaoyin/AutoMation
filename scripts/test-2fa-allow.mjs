@@ -867,14 +867,14 @@ test("zh-Hant code reading and completion cleanup share one state chain", () => 
     sidecarSource.indexOf("const tryClosePendingPopup"),
     sidecarSource.indexOf("const dismissRejectedPopup")
   );
-  const helperClose = closeHelper.indexOf("runtime.dismissCodePopupForWebFill(4)");
+  const helperClose = closeHelper.indexOf("runtime.dismissCodePopupForWebFill(4,");
   const helperBuffer = closeHelper.indexOf('phase: "popup_code_buffered"');
   assert.ok(
     sidecarRead >= 0 &&
       sidecarClose > sidecarRead &&
       helperClose >= 0 &&
       helperBuffer > helperClose,
-    "popup code must be read, closed, and only then buffered"
+    "popup code must be read, given a bounded close attempt, and only then buffered"
   );
 });
 
@@ -953,6 +953,12 @@ test("OCR accepts only an exact six-digit helper code", () => {
   assert.equal(ocrModule.parseOcrResult('{"ok":true,"code":"012 345"}'), null);
   assert.equal(ocrModule.parseOcrResult('{"ok":true,"code":"0123456"}'), null);
   assert.equal(ocrModule.parseOcrResult('{"ok":true,"raw":"012 345"}'), null);
+  assert.deepEqual(
+    ocrModule.parseOcrResult(
+      '{"ok":false,"capability":"accessibility_missing","message":"accessibility_unavailable"}'
+    ),
+    { code: null, source: "vision", capability: "accessibility_missing" }
+  );
   assert.doesNotMatch(ocrSource, /requireFormattedRaw|parsed\.raw/);
   assert.doesNotMatch(allowSource, /requireFormattedRaw/);
 });
@@ -1085,6 +1091,28 @@ test("popup code acquisition is AX-first even when legacy callers prefer OCR", a
 
   assert.deepEqual(result, { code: "123456", source: "swift_ax" });
   assert.deepEqual(calls, [["ax", 2]]);
+});
+
+test("popup code acquisition falls back to OCR after an AX permission failure", async () => {
+  const calls = [];
+  const result = await allowModule.readPopupCode(8, {
+    runtime: {
+      async readPopupCodeViaSwift(timeoutSec) {
+        calls.push(["ax", timeoutSec]);
+        return { code: null, source: "swift_ax", capability: "accessibility_missing" };
+      },
+      async readPopupCodeViaOcr(timeoutSec) {
+        calls.push(["ocr", timeoutSec]);
+        return { code: "654321", source: "vision" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { code: "654321", source: "vision" });
+  assert.deepEqual(calls, [
+    ["ax", 2],
+    ["ocr", 6],
+  ]);
 });
 
 test("popup code acquisition falls back to OCR only after AX has no legal code", async () => {
@@ -1266,6 +1294,29 @@ test("native Accessibility preflight is fixed and precedes popup enumeration", (
   );
 });
 
+test("AX popup helpers fail closed while OCR keeps its screen-recording fallback", () => {
+  assert.match(
+    popupReadSwiftSource,
+    /--prompt-accessibility[\s\S]*guard AXIsProcessTrusted\(\) else[\s\S]*action: "accessibility_unavailable"/
+  );
+  assert.match(
+    swiftSource,
+    /if releaseLeftButtonOnly[\s\S]*guard AXIsProcessTrusted\(\) else[\s\S]*action: "accessibility_unavailable"/
+  );
+  assert.match(popupOcrSwiftSource, /func findScreenOnlyCodeDialogs\(\)/);
+  assert.match(popupOcrSwiftSource, /CGWindowListCopyWindowInfo/);
+  assert.match(popupOcrSwiftSource, /candidateKind\(for: app\) == \.dedicated/);
+  assert.doesNotMatch(
+    popupOcrSwiftSource,
+    /if preflightScreenCapture[\s\S]*guard AXIsProcessTrusted\(\) else/
+  );
+  assert.match(allowSource, /result\.action === "accessibility_unavailable"/);
+  assert.match(sidecarSource, /action === "accessibility_unavailable"/);
+  assert.match(sidecarSource, /const screenOcrFallback = action === "accessibility_unavailable"/);
+  assert.match(sidecarSource, /if \(!activeAcquisition\) return;/);
+  assert.match(sidecarSource, /status\("popup_accessibility"/);
+});
+
 test("OCR path remains read-only, window-bound, memory-only, and secret-free", () => {
   assert.doesNotMatch(
     popupOcrSwiftSource,
@@ -1346,6 +1397,17 @@ test("OCR scans only trusted Apple authentication processes", () => {
     "window eligibility must precede window-ID access"
   );
   assert.doesNotMatch(finder, /localizedName.*(?:guard|if)/);
+
+  const screenOnlyFinder = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func findScreenOnlyCodeDialogs"
+  );
+  assert.match(screenOnlyFinder, /candidateKind\(for: app\) == \.dedicated/);
+  assert.match(screenOnlyFinder, /CGWindowListCopyWindowInfo/);
+  assert.match(screenOnlyFinder, /kCGWindowOwnerPID/);
+  assert.match(screenOnlyFinder, /trustedPIDs\.contains/);
+  assert.match(screenOnlyFinder, /kCGWindowNumber/);
+  assert.doesNotMatch(screenOnlyFinder, /kCGWindowName|localizedName/);
 });
 
 test("Swift diagnostics never log raw accessibility text", () => {

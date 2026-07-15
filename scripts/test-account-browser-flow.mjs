@@ -440,6 +440,8 @@ async function runFixedTwoFactorStatusPromptsTest() {
     harness.emitStatus({ status: "winner", source: "settings", remainingSec: 130 });
     harness.emitStatus({ status: "winner", source: "manual", remainingSec: 120 });
     harness.emitStatus({ status: "ocr_permission_missing", secret: SECRET_FIXTURE });
+    harness.emitStatus({ status: "popup_accessibility", secret: SECRET_FIXTURE });
+    harness.emitStatus({ status: "popup_close_pending", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "timeout", secret: SECRET_FIXTURE });
     harness.emitStatus({ status: "winner", source: SECRET_FIXTURE, remainingSec: 1 });
     harness.emitStatus({ status: SECRET_FIXTURE, source: "popup", remainingSec: 1 });
@@ -463,6 +465,8 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 已从系统设置取得验证码。",
     "[2FA] 已使用终端手动输入的验证码。",
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
+    "[2FA] 原生验证码弹窗未获辅助功能授权；将尝试已授权的屏幕录制 OCR，系统设置与终端手输仍在继续。",
+    "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
   ]);
   assert.deepEqual(

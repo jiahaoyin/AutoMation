@@ -434,6 +434,19 @@ if args.contains("--prompt-accessibility") {
     emitAccessibilityCapability(prompt: true)
 }
 
+// AX failures otherwise look exactly like an empty window list. Report a fixed
+// capability result so the collector can keep its fallback providers alive
+// without misclassifying a permission problem as an idle popup state.
+guard AXIsProcessTrusted() else {
+    emit(Output(
+        ok: false,
+        code: nil,
+        action: "accessibility_unavailable",
+        message: "accessibility_unavailable",
+        source: nil
+    ))
+}
+
 var timeoutSec = 8
 var phase = Phase.readCode
 var i = 1

@@ -120,6 +120,9 @@ async function releaseLeftMouseButton(timeoutSec = 1, runtime = {}) {
  */
 export async function probe2FAState(timeoutSec = 2) {
   const result = await runPopupPhase("probe", timeoutSec);
+  if (result.action === "accessibility_unavailable") {
+    return { action: "accessibility_unavailable" };
+  }
   if (!result.action || result.action === "none") return { action: "probe_error" };
   return {
     action: result.action,
@@ -244,6 +247,9 @@ export async function waitForManualAllow(options = {}) {
 /** Read the popup code through the constrained native helper. */
 export async function readPopupCodeViaSwift(timeoutSec = 12) {
   const r = await runPopupPhase("read_code", timeoutSec);
+  if (r.action === "accessibility_unavailable") {
+    return { code: null, source: "swift_ax", capability: "accessibility_missing" };
+  }
   if (r.code) {
     return { code: r.code, source: r.source ?? "swift_ax" };
   }
@@ -275,9 +281,14 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
     return hit;
   };
 
-  const swift = accept(await readViaAx(swiftTimeout));
+  const swiftResult = await readViaAx(swiftTimeout);
+  const swift = accept(swiftResult);
   if (swift?.code) return swift;
-  console.log("[2FA] Native AX reader found no code; trying Vision OCR");
+  if (swiftResult?.capability === "accessibility_missing") {
+    console.log("[2FA] Native AX reader unavailable; trying Vision OCR fallback");
+  } else {
+    console.log("[2FA] Native AX reader found no code; trying Vision OCR");
+  }
   const ocrResult = await readViaOcr(ocrTimeout);
   const ocr = accept(ocrResult);
   if (ocr?.code) {
@@ -297,6 +308,10 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
   return {
     code: null,
     source: ocrResult?.source ?? "vision",
-    capability: ocrResult?.capability ?? "available",
+    capability:
+      ocrResult?.capability ??
+      (swiftResult?.capability === "accessibility_missing"
+        ? "accessibility_missing"
+        : "available"),
   };
 }

@@ -174,15 +174,17 @@ export async function promptNativeAccessibilityPermission(options = {}) {
   return runAccessibilityCapability("--prompt-accessibility", options);
 }
 
-async function runSwiftPhase(phase, timeoutSec) {
+async function runSwiftPhase(phase, timeoutSec, options = {}) {
   if (!ensureBin(SWIFT_SRC, SWIFT_BIN)) {
     return { ok: false, action: "none", code: null, source: null };
   }
   try {
+    const execOptions = { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 };
+    if (options.signal) execOptions.signal = options.signal;
     const { stdout } = await execFileAsync(
       SWIFT_BIN,
       ["--phase", phase, "--timeout", String(timeoutSec)],
-      { timeout: (timeoutSec + 10) * 1000, maxBuffer: 256 * 1024 }
+      execOptions
     );
     return parsePhaseJson(stdout);
   } catch (err) {
@@ -202,13 +204,13 @@ function logPhaseResult(phase, r) {
   }
 }
 
-export async function runPopupPhase(phase, timeoutSec = 6) {
+export async function runPopupPhase(phase, timeoutSec = 6, options = {}) {
   if (process.platform !== "darwin") return { ok: false, action: "none", code: null, source: null };
   if (!SAFE_PHASES.has(phase)) {
     return { ok: false, action: "none", code: null, source: null };
   }
 
-  const swift = await runSwiftPhase(phase, timeoutSec);
+  const swift = await runSwiftPhase(phase, timeoutSec, options);
   if (swift.ok || swift.action !== "none") {
     logPhaseResult(phase, swift);
   }
@@ -233,9 +235,9 @@ export async function dismissStale2FAPopups(maxRounds = 6) {
 }
 
 /** 读码后点「完成」关闭系统弹窗，避免遮挡 Firefox 输入 */
-export async function dismissCodePopupForWebFill(timeoutSec = 4) {
+export async function dismissCodePopupForWebFill(timeoutSec = 4, options = {}) {
   if (process.platform !== "darwin") return false;
-  const r = await runPopupPhase("dismiss_done", timeoutSec);
+  const r = await runPopupPhase("dismiss_done", timeoutSec, options);
   if (r.action === "dismissed_done") {
     await new Promise((res) => setTimeout(res, 400));
     return true;
@@ -245,6 +247,9 @@ export async function dismissCodePopupForWebFill(timeoutSec = 4) {
 
 export async function tryFetchMac2FAPopupAx(timeoutSec = 12) {
   const r = await runPopupPhase("read_code", timeoutSec);
+  if (r.action === "accessibility_unavailable") {
+    return { code: null, source: null, action: r.action, capability: "accessibility_missing" };
+  }
   if (!r.code) return null;
   return { code: r.code, source: r.source, action: r.action };
 }

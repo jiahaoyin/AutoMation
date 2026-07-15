@@ -157,6 +157,32 @@ assert.equal(
   true
 );
 assert.equal(productionProtocol.nodeFailure, "backend_exit");
+const accessibilityProtocol = createProductionProtocolState();
+assert.equal(
+  accessibilityProtocol.processStdoutLine("[2FA] status:permission_preflight_missing"),
+  true
+);
+assert.equal(accessibilityProtocol.accessibilityPreflight, "missing");
+assert.equal(
+  accessibilityProtocol.processStdoutLine("[2FA] status:settings_start"),
+  true
+);
+assert.equal(
+  accessibilityProtocol.productionStage,
+  "accessibility_missing",
+  "a pending provider must not overwrite the fixed Accessibility preflight result"
+);
+const popupFallbackProtocol = createProductionProtocolState();
+assert.equal(
+  popupFallbackProtocol.processStdoutLine("[2FA] status:popup_accessibility"),
+  true
+);
+assert.equal(popupFallbackProtocol.productionStage, "two_fa_code_pending");
+assert.equal(
+  popupFallbackProtocol.processStdoutLine("[2FA] status:popup_close_pending"),
+  true
+);
+assert.equal(popupFallbackProtocol.productionStage, "two_fa_code_pending");
 const stageBeforeStderr = productionProtocol.productionStage;
 const nodeFailureBeforeStderr = productionProtocol.nodeFailure;
 assert.equal(
@@ -1440,7 +1466,7 @@ for (const requiredText of [
   `SUPERVISED_TOKEN='${SUPERVISED_TOKEN}'`,
   'SUPERVISED_CONTROL_DIR="$REMOTE_ROUND_DIR/supervised-control"',
   'SUPERVISED_PRODUCTION_DIR="$SUPERVISED_CONTROL_DIR/production"',
-  'SUPERVISED_HELPER_DIR="$SUPERVISED_CONTROL_DIR/helpers"',
+  'SUPERVISED_HELPER_DIR="$REMOTE_REPO/scripts/bin"',
   'SUPERVISED_TRIGGER="$RUN_TMP_DIR/supervised-trigger.json"',
   'SUPERVISED_CANCEL="$RUN_TMP_DIR/supervised-cancel.json"',
   'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
@@ -1469,28 +1495,25 @@ const supervisedHelperFailureIndex = supervisedRemoteScript.indexOf(
   'write_supervised_attestation failed 1 false HELPER_COMPILE_FAILED "$EXPECTED_HEAD"'
 );
 assert.ok(supervisedHelperFailureIndex > 0, "supervised helper hard-failure marker is required");
-for (const helper of ["mac-2fa-popup-read", "mac-2fa-click-allow"]) {
-  const helperCompileIndex = supervisedRemoteScript.indexOf(
-    `"$SUPERVISED_HELPER_DIR/${helper}" scripts/swift/${helper}.swift`
+for (const helper of [
+  "mac-2fa-popup-read",
+  "mac-2fa-click-allow",
+  "mac-settings-2fa-code",
+  "mac-2fa-popup-ocr",
+]) {
+  const helperCheckIndex = supervisedRemoteScript.indexOf(
+    `[[ ! -x "$SUPERVISED_HELPER_DIR/${helper}" ]]`
   );
   assert.ok(
-    helperCompileIndex > 0 && helperCompileIndex < supervisedHelperFailureIndex,
-    `${helper} must be compiled before the supervised hard-failure marker`
+    helperCheckIndex > 0 && helperCheckIndex < supervisedHelperFailureIndex,
+    `${helper} must be checked before the supervised hard-failure marker`
   );
 }
-for (const helper of ["mac-settings-2fa-code", "mac-2fa-popup-ocr"]) {
-  const helperCompileIndex = supervisedRemoteScript.indexOf(
-    `scripts/swift/${helper}.swift`
-  );
-  assert.ok(
-    helperCompileIndex > supervisedHelperFailureIndex,
-    `${helper} must be compiled only after the supervised hard-failure block`
-  );
-  assert.ok(
-    supervisedRemoteScript.includes(`"$SUPERVISED_HELPER_DIR/${helper}" || true`),
-    `${helper} must be best-effort in supervised setup`
-  );
-}
+assert.doesNotMatch(
+  supervisedRemoteScript,
+  /swiftc[\s\S]*SUPERVISED_HELPER_DIR|SUPERVISED_HELPER_DIR[\s\S]*scripts\/swift/
+);
+assert.doesNotMatch(supervisedRemoteScript, /SUPERVISED_CONTROL_DIR\/helpers/);
 for (const forbiddenText of [
   "supervised-terminal.status",
   "supervised-terminal.trigger",

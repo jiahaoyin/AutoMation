@@ -106,7 +106,7 @@ ruyiPage 填好密码和“记住账号”后，会先通过 JSONL 要求 Node �
 
 第一次 `getCode` acquisition 才启动取码竞速和共享 240 秒期限；如网页明确拒绝第一代验证码，第二代沿用同一期限，不会重新计时。来源按以下顺序加入：
 
-1. popup watcher 先用 AX 从已验证的 Apple 系统弹窗读取 `NNN NNN`。AX 没有合法验证码时，才对同一个可信 Apple window ID 做内存 Vision OCR。全窗只接受 `NNN NNN`；只有中心裁剪可接受连续六位，而且必须在同一 window ID 的两次独立捕获中保持一致。OCR 不点击、不做全屏搜索、不写临时 PNG。
+1. popup watcher 先用 AX 从已验证的 Apple 系统弹窗读取 `NNN NNN`。AX 没有合法验证码时，才对同一个可信 Apple window ID 做内存 Vision OCR；若该 helper 未获 AX 授权，则仅在 `need_2fa` 后按 dedicated Apple authentication process 的 on-screen window ID 启动同一 OCR 兜底。全窗只接受 `NNN NNN`；只有中心裁剪可接受连续六位，而且必须在同一 window ID 的两次独立捕获中保持一致。OCR 不点击、不做全屏搜索、不写临时 PNG。
 2. 系统设置只在 `getCode` 已活跃后启动，并以 `preparedAt + 8s` 为门槛；如果门槛已过就立即加入，否则等待到门槛。最多两次，每次最多 60 秒，两次之间退避 5 秒；popup watcher 同时继续。
 3. 从第一次 acquisition 起 90 秒后，如果 stdin/stdout 都是 TTY 且手输未被明确禁用，则显示固定提示并隐藏读取六位验证码。手输默认启用；只有 `BROWSER_2FA_MANUAL_FALLBACK=0` 才禁用，配置示例中的 `=1` 是显式启用写法。
 4. 首个合法来源获胜；其余来源被取消并执行有界弹窗清理。第一次 acquisition 起 240 秒到期后，runner 清理 helper 与进程组并整体失败。
@@ -114,6 +114,9 @@ ruyiPage 填好密码和“记住账号”后，会先通过 JSONL 要求 Node �
 Allow 自动动作最多尝试两次。两次都未确认时，终端只提示用户手动点击
 “允许”；popup 监听、系统设置和后续手输来源不会因此停止。自动尝试只有在后续
 原生状态确认 Allow 消失或验证码窗出现后才算成功。
+
+popup 读到并校验六位验证码后会立即交给网页流程；关闭原生验证码窗只是尽力清理，
+关闭失败会保留固定审计状态和终端提示，不能再阻塞验证码提交。
 
 最终发布合同最多允许两代验证码。generation 已从 ruyiPage 事件经 runner 和
 `account-browser-flow` 透传到 collector。只有可信 Apple 页面明确显示英文、简中或
@@ -133,7 +136,7 @@ TCC 或 macOS 15 原生 UI 已验收。
 - 浏览器 2FA 的「辅助功能」检查和提示由现有 `mac-2fa-popup-read.swift` 通过 `AXIsProcessTrusted()`、`AXIsProcessTrustedWithOptions(...)` 及 `--preflight-accessibility` / `--prompt-accessibility` 原生完成。旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 只要求当前终端 App 获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有执行 macOS“系统设置登录 Apple Account”阶段时，才要求「自动化」中允许当前终端 App 控制“系统设置”。
-- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会请求权限，也不会阻断安装；AX、Settings 和隐藏终端手输仍可工作。
+- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会请求权限，也不会阻断安装；AX、Settings 和隐藏终端手输仍可工作。受监督验收复用 `install.sh` 编译到 `scripts/bin` 的稳定 helper，避免每轮随机路径触发新的 TCC 身份；更新代码后先重新运行 `./install.sh`。
 - 权限变更后应按 macOS 提示退出并重新打开终端，再开始下一次运行。
 
 ## macOS 15 验收
