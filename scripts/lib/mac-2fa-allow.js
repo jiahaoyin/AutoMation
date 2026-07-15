@@ -118,8 +118,8 @@ async function releaseLeftMouseButton(timeoutSec = 1, runtime = {}) {
 /**
  * @returns {Promise<{ action: string, source?: string, code?: string }>}
  */
-export async function probe2FAState(timeoutSec = 2) {
-  const result = await runPopupPhase("probe", timeoutSec);
+export async function probe2FAState(timeoutSec = 2, options = {}) {
+  const result = await runPopupPhase("probe", timeoutSec, options);
   if (result.action === "accessibility_unavailable") {
     return { action: "accessibility_unavailable" };
   }
@@ -131,13 +131,15 @@ export async function probe2FAState(timeoutSec = 2) {
   };
 }
 
-async function tryCgClickAllow(timeoutSec = 3) {
+async function tryCgClickAllow(timeoutSec = 3, options = {}) {
   if (!ensureBin(CLICK_ALLOW_SRC, CLICK_ALLOW_BIN)) return { action: "none" };
   try {
+    const execOptions = { timeout: (timeoutSec + 8) * 1000, maxBuffer: 128 * 1024 };
+    if (options.signal) execOptions.signal = options.signal;
     const { stdout, stderr } = await execFileAsync(
       CLICK_ALLOW_BIN,
       ["--timeout", String(timeoutSec)],
-      { timeout: (timeoutSec + 8) * 1000, maxBuffer: 128 * 1024 }
+      execOptions
     );
     if (stderr?.trim()) console.log("[2FA] native Allow helper reported diagnostics");
     const parsed = parseJson(stdout);
@@ -205,7 +207,7 @@ export async function tryAllowOnce(timeoutSec = 4, options = {}) {
   const strategy = strategies[offset];
   let result;
   try {
-    result = await strategy(timeoutSec);
+    result = await strategy(timeoutSec, { signal: options.signal });
   } finally {
     await runtime.releaseMouseButtons();
   }
@@ -245,8 +247,8 @@ export async function waitForManualAllow(options = {}) {
 }
 
 /** Read the popup code through the constrained native helper. */
-export async function readPopupCodeViaSwift(timeoutSec = 12) {
-  const r = await runPopupPhase("read_code", timeoutSec);
+export async function readPopupCodeViaSwift(timeoutSec = 12, options = {}) {
+  const r = await runPopupPhase("read_code", timeoutSec, options);
   if (r.action === "accessibility_unavailable") {
     return { code: null, source: "swift_ax", capability: "accessibility_missing" };
   }
@@ -281,7 +283,7 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
     return hit;
   };
 
-  const swiftResult = await readViaAx(swiftTimeout);
+  const swiftResult = await readViaAx(swiftTimeout, { signal: options.signal });
   const swift = accept(swiftResult);
   if (swift?.code) return swift;
   if (swiftResult?.capability === "accessibility_missing") {
@@ -289,7 +291,7 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
   } else {
     console.log("[2FA] Native AX reader found no code; trying Vision OCR");
   }
-  const ocrResult = await readViaOcr(ocrTimeout);
+  const ocrResult = await readViaOcr(ocrTimeout, { signal: options.signal });
   const ocr = accept(ocrResult);
   if (ocr?.code) {
     console.log("[2FA] Vision OCR 已识别验证码");

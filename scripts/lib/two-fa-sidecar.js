@@ -376,6 +376,7 @@ export function createMac2FACollector(options = {}) {
   let disposed = false;
   let disposePromise = null;
   let popupWatcherPromise = null;
+  let popupWatcherController = null;
   let popupCandidate = null;
   let popupGeneration = 1;
   let cleanupOnly = false;
@@ -396,7 +397,7 @@ export function createMac2FACollector(options = {}) {
   let settingsAccessibilityController = null;
   let settingsAccessibilityOutcome = null;
   let activeAcquisition = null;
-  let winnerCleanupPromise = null;
+  const winnerCleanupPromises = new Map();
   let settledWinner = null;
   let manualAbortController = null;
   let manualCompletion = null;
@@ -705,9 +706,9 @@ export function createMac2FACollector(options = {}) {
     return true;
   };
 
-  const dismissRejectedPopup = async (code) => {
+  const dismissRejectedPopup = async (code, signal) => {
     if (disposed || activeWinnerSettled()) return;
-    const result = await runtime.runPopupPhase("dismiss_stale", 2);
+    const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
     if (disposed || activeWinnerSettled()) return;
     const dismissedCode = normalizeSixDigitCode(result?.code) || code;
     if (dismissedCode) rejectedCodes.add(dismissedCode);
@@ -719,18 +720,19 @@ export function createMac2FACollector(options = {}) {
     resetPendingPopupClose();
   };
 
-  const pollPopupOnce = async () => {
+  const pollPopupOnce = async (signal) => {
+    if (signal?.aborted) return;
     const generation = popupGeneration;
     let state;
     try {
-      state = await runtime.probe2FAState(2);
+      state = await runtime.probe2FAState(2, { signal });
     } catch {
       state = { action: "probe_error" };
     }
-    if (disposed || generation !== popupGeneration) return;
+    if (signal?.aborted || disposed || generation !== popupGeneration) return;
     if (!cleanupOnly && activeWinnerSettled()) return;
     const action = observeProbeState(state);
-    if (disposed || generation !== popupGeneration) return;
+    if (signal?.aborted || disposed || generation !== popupGeneration) return;
     if (!cleanupOnly && activeWinnerSettled()) return;
 
     const screenOcrFallback = action === "accessibility_unavailable";
@@ -763,8 +765,8 @@ export function createMac2FACollector(options = {}) {
 
       const stateCode = normalizeSixDigitCode(state?.code);
       if (stateCode) rejectedCodes.add(stateCode);
-      const result = await runtime.runPopupPhase("dismiss_stale", 2);
-      if (disposed || generation !== popupGeneration) return;
+      const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
+      if (signal?.aborted || disposed || generation !== popupGeneration) return;
       const dismissedCode = normalizeSixDigitCode(result?.code);
       if (dismissedCode) rejectedCodes.add(dismissedCode);
       audit({
@@ -779,8 +781,8 @@ export function createMac2FACollector(options = {}) {
       pendingAllowAttempt = null;
       if (action === "has_code_dialog") {
         if (disposed || generation !== popupGeneration) return;
-        const result = await runtime.runPopupPhase("dismiss_stale", 2);
-        if (disposed || generation !== popupGeneration) return;
+        const result = await runtime.runPopupPhase("dismiss_stale", 2, { signal });
+        if (signal?.aborted || disposed || generation !== popupGeneration) return;
         audit({
           phase: "popup_cleanup_only",
           action: result?.action ?? "none",
@@ -838,9 +840,12 @@ export function createMac2FACollector(options = {}) {
           {
             maxStrategies: 1,
             strategyOffset,
+            signal,
           }
         );
-        if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
+        if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
+          return;
+        }
       } catch {
         if (disposed) return;
         audit(
@@ -899,7 +904,7 @@ export function createMac2FACollector(options = {}) {
 
     const stateCode = normalizeSixDigitCode(state.code);
     if (stateCode && rejectedCodes.has(stateCode)) {
-      await dismissRejectedPopup(stateCode);
+      await dismissRejectedPopup(stateCode, signal);
       return;
     }
 
@@ -918,6 +923,7 @@ export function createMac2FACollector(options = {}) {
       result = await runtime.readPopupCode(4, {
         preferOcr: true,
         rejectCodes: rejectedCodes,
+        signal,
       });
     } catch (error) {
       diagnostic({ source: "popup", phase: "popup_code_read", error });
@@ -931,7 +937,9 @@ export function createMac2FACollector(options = {}) {
       resetPendingPopupClose();
       return;
     }
-    if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
+    if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
+      return;
+    }
     if (result?.capability === "accessibility_missing" && !popupAccessibilityStatusSent) {
       popupAccessibilityStatusSent = true;
       status("popup_accessibility", {
@@ -965,7 +973,7 @@ export function createMac2FACollector(options = {}) {
       return;
     }
     if (rejectedCodes.has(code)) {
-      await dismissRejectedPopup(code);
+      await dismissRejectedPopup(code, signal);
       return;
     }
 
@@ -980,10 +988,10 @@ export function createMac2FACollector(options = {}) {
     await tryClosePendingPopup(candidate, generation);
   };
 
-  const watchPopup = async () => {
-    while (!disposed) {
+  const watchPopup = async (signal) => {
+    while (!disposed && !signal?.aborted) {
       try {
-        await pollPopupOnce();
+        await pollPopupOnce(signal);
       } catch {
         if (!disposed) {
           audit(
@@ -996,9 +1004,9 @@ export function createMac2FACollector(options = {}) {
           );
         }
       }
-      if (disposed) break;
+      if (disposed || signal?.aborted) break;
       const delay = scheduleDelay(config.pollIntervalMs);
-      if (!(await delay.promise)) break;
+      if (!(await delay.promise) || signal?.aborted) break;
     }
   };
 
@@ -1042,7 +1050,8 @@ export function createMac2FACollector(options = {}) {
         rejectedStaleCodeCount: rejectedCodes.size,
         elapsedSincePrepareMs: 0,
       });
-      popupWatcherPromise = watchPopup();
+      popupWatcherController = new AbortController();
+      popupWatcherPromise = watchPopup(popupWatcherController.signal);
     })();
 
     return preparePromise;
@@ -1430,17 +1439,20 @@ export function createMac2FACollector(options = {}) {
     }
   };
 
-  const startWinnerCleanup = (winnerSource, reason) => {
-    if (winnerCleanupPromise) return winnerCleanupPromise;
+  const startWinnerCleanup = (generation, winnerSource, reason) => {
+    const existing = winnerCleanupPromises.get(generation);
+    if (existing) return existing;
     const cleanup = stopAcquisitionLosers(winnerSource, reason)
       .catch(() => {
         /* Provider cleanup is best-effort and must never delay code delivery. */
       });
     let trackedCleanup;
     trackedCleanup = cleanup.finally(() => {
-      if (winnerCleanupPromise === trackedCleanup) winnerCleanupPromise = null;
+      if (winnerCleanupPromises.get(generation) === trackedCleanup) {
+        winnerCleanupPromises.delete(generation);
+      }
     });
-    winnerCleanupPromise = trackedCleanup;
+    winnerCleanupPromises.set(generation, trackedCleanup);
     return trackedCleanup;
   };
 
@@ -1529,7 +1541,11 @@ export function createMac2FACollector(options = {}) {
         cleanupOnly = true;
         pendingAllowAttempt = null;
       }
-      void startWinnerCleanup(candidate.source, `${candidate.source}_won`);
+      void startWinnerCleanup(
+        acquisition.generation,
+        candidate.source,
+        `${candidate.source}_won`
+      );
 
       audit({
         phase: "2fa_winner",
@@ -1567,6 +1583,7 @@ export function createMac2FACollector(options = {}) {
     if (disposePromise) return disposePromise;
     disposed = true;
     abortPopupCloseTasks();
+    popupWatcherController?.abort();
     manualAbortController?.abort();
     activeAcquisition?.winner.reject(new Error("2FA collector was disposed"));
     cancelAllDelays();
@@ -1582,7 +1599,7 @@ export function createMac2FACollector(options = {}) {
       }
       await cancelSettingsProvider("collector_disposed");
       await abortManualProvider();
-      if (winnerCleanupPromise) await winnerCleanupPromise;
+      await Promise.all([...winnerCleanupPromises.values()]);
       if (settingsProviderPromise) {
         try {
           await settingsProviderPromise;

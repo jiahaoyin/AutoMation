@@ -351,7 +351,12 @@ class FakePage:
 
 
 class FakeActions:
-    def __init__(self, apply_typed_text=True, coordinate_target=None):
+    def __init__(
+        self,
+        apply_typed_text=True,
+        coordinate_target=None,
+        auto_advance_targets=None,
+    ):
         self.calls = []
         self.target = None
         self.pending_human_click = None
@@ -363,6 +368,7 @@ class FakeActions:
         self.coordinate_targets = (
             list(coordinate_target) if isinstance(coordinate_target, list) else None
         )
+        self.auto_advance_targets = list(auto_advance_targets or [])
 
     def combo(self, *keys):
         self.calls.append(("combo", keys))
@@ -406,7 +412,11 @@ class FakeActions:
             self.delete_selection = False
         if self.target is not None and self.pending_text is not None:
             if self.apply_typed_text:
-                self.target.value = self.pending_text
+                if self.auto_advance_targets:
+                    for field, digit in zip(self.auto_advance_targets, self.pending_text):
+                        field.value = digit
+                else:
+                    self.target.value = self.pending_text
             self.pending_text = None
         return self
 
@@ -3698,6 +3708,40 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertNotIn(
             "element_bidi_unverified_continue",
             [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+        )
+
+    def test_six_digit_fields_retry_through_the_owning_frame_as_one_sequence(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1"},
+                location={"x": 20 + index * 45, "y": 30},
+            )
+            for index in range(6)
+        ]
+        for field in fields:
+            def input_without_effect(value, clear=True, target=field):
+                target.inputs.append((value, clear))
+                return target
+
+            field.input = input_without_effect
+
+        frame_actions = FakeActions(auto_advance_targets=fields)
+        frame = FakePage({"css:input[maxlength='1']": fields}, actions=frame_actions)
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(apply_typed_text=False, coordinate_target=fields),
+        )
+        frame.parent = page
+
+        fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertTrue(fields[0].inputs)
+        self.assertIn(
+            ("type", "123456", unittest.mock.ANY),
+            frame_actions.calls,
         )
 
     def test_six_digit_fields_raise_when_element_bidi_and_keyboard_cannot_verify(self):

@@ -188,12 +188,13 @@ def sanitize_diagnostic_text(value: Any) -> str:
 
 
 def emit_input_progress(label: str, step: str, route: str | None = None) -> None:
+    normalized_label = label.strip().lower()
     field = {
         "email": "email",
         "password": "password",
-        "2FA code": "twofa_code",
-        "2FA digit": "twofa_digit",
-    }.get(label, "unknown")
+        "2fa code": "twofa_code",
+        "2fa digit": "twofa_digit",
+    }.get(normalized_label, "unknown")
     event = {
         "event": "status",
         "status": "input_progress",
@@ -703,6 +704,48 @@ def input_otp_digit_with_element_bidi(
         raise RuntimeError("2FA digit input verification failed")
     emit_input_progress("2FA digit", "verified", "owner")
     return scope
+
+
+def input_otp_digits_with_owner_actions(
+    fields: list[tuple[Any, Any]],
+    digits: str,
+    pause: Callable[[int, int], None] = human_pause,
+) -> bool:
+    """Retry a six-cell OTP through the owning ruyiPage frame context.
+
+    Apple advances focus between its six cells itself. A single trusted BiDi
+    action in that owning frame avoids sending keystrokes through the parent
+    iframe context after a direct cell input has demonstrably failed.
+    """
+    if len(fields) != 6 or len(digits) != 6:
+        return False
+    scope = fields[0][0]
+    if any(candidate_scope is not scope for candidate_scope, _field in fields):
+        return False
+    for _candidate_scope, field in fields:
+        require_otp_bidi_input_target(scope, field, "2FA digit")
+
+    try:
+        emit_input_progress("2FA code", "sequence_focus_started", "owner")
+        human_click(scope, fields[0][1], pause=pause)
+        pause(180, 480)
+        require_keyboard_target_ready(fields[0][1])
+        scope.actions.type(digits, interval=random.randint(55, 145)).perform()
+        validate_two_factor_scope(scope)
+        emit_input_progress("2FA code", "sequence_typed", "owner")
+        pause(280, 680)
+    except Exception:
+        return False
+
+    verified = True
+    for (_candidate_scope, field), digit in zip(fields, digits):
+        readable, actual = read_element_input_value(field)
+        if not readable or str(actual) != digit:
+            verified = False
+            break
+    if verified:
+        emit_input_progress("2FA code", "sequence_verified", "owner")
+    return verified
 
 
 def input_with_owner_bidi_fallback(
@@ -1427,15 +1470,24 @@ def fill_security_code(
                 pause=pause,
             )
         except Exception:
-            input_and_verify(
-                scope,
-                field,
-                digit,
-                "2FA digit",
-                keys,
-                pause=pause,
-                root_page=page,
-            )
+            try:
+                input_and_verify(
+                    scope,
+                    field,
+                    digit,
+                    "2FA digit",
+                    keys,
+                    pause=pause,
+                    root_page=page,
+                )
+            except Exception:
+                if input_otp_digits_with_owner_actions(
+                    fields,
+                    digits,
+                    pause=pause,
+                ):
+                    return
+                raise
         pause(80, 220)
 
 

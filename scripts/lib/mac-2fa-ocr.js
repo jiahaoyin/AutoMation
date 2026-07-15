@@ -147,10 +147,12 @@ export async function get2FAOcrCapability(options = {}) {
   const binaryPath = options.binaryPath ?? OCR_BIN;
   let capability = "unavailable";
   try {
+    const execOptions = { timeout: 5_000, maxBuffer: 64 * 1024 };
+    if (options.signal) execOptions.signal = options.signal;
     const { stdout } = await runHelper(
       binaryPath,
       ["--preflight-screen-capture"],
-      { timeout: 5_000, maxBuffer: 64 * 1024 }
+      execOptions
     );
     capability = parseOcrCapability(stdout);
   } catch (err) {
@@ -182,10 +184,12 @@ export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
   const binaryPath = options.binaryPath ?? OCR_BIN;
   const args = ["--timeout", String(timeoutSec)];
   try {
-    const { stdout, stderr } = await runHelper(binaryPath, args, {
+    const execOptions = {
       timeout: (timeoutSec + 15) * 1000,
       maxBuffer: 256 * 1024,
-    });
+    };
+    if (options.signal) execOptions.signal = options.signal;
+    const { stdout, stderr } = await runHelper(binaryPath, args, execOptions);
     if (stderr?.trim()) {
       console.log("[2FA] Vision OCR helper reported diagnostics");
     }

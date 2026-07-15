@@ -247,6 +247,7 @@ function createNativeHarness(
           result.reject(error);
         },
         cancel() {
+          request.cancelCalls += 1;
           if (settled) return false;
           stats.settingsCancels += 1;
           if (!settingsCancelSettles) return true;
@@ -263,6 +264,7 @@ function createNativeHarness(
           return true;
         },
       };
+      request.cancelCalls = 0;
       settingsRequests.push(request);
       return request;
     },
@@ -1091,9 +1093,17 @@ async function generationTwoDoesNotWaitForPreviousLoserCleanupTest() {
   assert.equal(await first, "111111");
 
   const second = collector.getCode({ generation: 2, rejectPrevious: true });
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 2, "generation 2 must own a fresh Settings request");
   native.setPopup("222222");
   await clock.advance(1);
   assert.equal(await second, "222222");
+  await clock.flush();
+  assert.equal(
+    native.settingsRequests[1].cancelCalls,
+    1,
+    "generation 2 winner must cancel its own Settings loser"
+  );
   const dispose = collector.dispose();
   await clock.advance(100);
   await dispose;
@@ -2195,9 +2205,9 @@ async function disposalStopsAllWorkTest() {
 
 async function disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest() {
   const clock = new ManualClock();
-  const watcherProbe = deferred();
   let probeCalls = 0;
   let allowAttempts = 0;
+  let watcherSignal = null;
   const collector = createMac2FACollector({
     pollIntervalMs: 10,
     runtime: {
@@ -2208,10 +2218,18 @@ async function disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest() {
       async dismissStale2FAPopups() {
         return { count: 0, codes: [] };
       },
-      async probe2FAState() {
+      async probe2FAState(_timeoutSec, options = {}) {
         probeCalls += 1;
         if (probeCalls === 1) return { action: "idle" };
-        if (probeCalls === 2) return watcherProbe.promise;
+        if (probeCalls === 2) {
+          watcherSignal = options.signal;
+          return new Promise((resolve) => {
+            if (watcherSignal?.aborted) resolve({ action: "idle" });
+            else watcherSignal?.addEventListener("abort", () => resolve({ action: "idle" }), {
+              once: true,
+            });
+          });
+        }
         return { action: "idle" };
       },
       async tryAllowOnce() {
@@ -2230,12 +2248,52 @@ async function disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest() {
     disposeSettled = true;
   });
   await clock.flush();
-  assert.equal(disposeSettled, false, "dispose must wait for the in-flight probe");
-
-  watcherProbe.resolve({ action: "has_allow_dialog" });
+  assert.equal(watcherSignal?.aborted, true, "dispose must abort the watcher probe");
   await disposePromise;
 
-  assert.equal(allowAttempts, 0, "a probe that returns after disposal must not click Allow");
+  assert.equal(disposeSettled, true, "an aborted watcher probe must not delay disposal");
+  assert.equal(allowAttempts, 0, "an aborted probe must not click Allow");
+  assert.equal(clock.timers.size, 0);
+}
+
+async function disposeAbortsInFlightWatcherAllowTest() {
+  const clock = new ManualClock();
+  let probeCalls = 0;
+  let allowSignal = null;
+  const collector = createMac2FACollector({
+    pollIntervalMs: 10,
+    settingsFallback: false,
+    manualFallback: false,
+    runtime: {
+      platform: "darwin",
+      now: clock.now,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+      async dismissStale2FAPopups() {
+        return { count: 0, codes: [] };
+      },
+      async probe2FAState() {
+        probeCalls += 1;
+        return probeCalls === 1 ? { action: "idle" } : { action: "has_allow_dialog" };
+      },
+      async tryAllowOnce(_timeoutSec, options = {}) {
+        allowSignal = options.signal;
+        return new Promise((resolve) => {
+          if (allowSignal?.aborted) resolve({ attempted: false });
+          else allowSignal?.addEventListener("abort", () => resolve({ attempted: false }), {
+            once: true,
+          });
+        });
+      },
+    },
+  });
+
+  await collector.prepare();
+  await clock.flush();
+  assert.ok(allowSignal, "watcher must start the Allow helper");
+
+  await collector.dispose();
+  assert.equal(allowSignal.aborted, true, "dispose must abort the Allow helper");
   assert.equal(clock.timers.size, 0);
 }
 
@@ -2353,6 +2411,7 @@ const focusedTests = {
   "generation-cleanup": generationTwoDoesNotWaitForPreviousLoserCleanupTest,
   "prepare-dispose": disposeWaitsForInProgressPreparationTest,
   "watcher-dispose": disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest,
+  "watcher-allow-dispose": disposeAbortsInFlightWatcherAllowTest,
   "settings-retry": settingsRetriesOnceAfterFiveSecondsTest,
   "settings-max": settingsNeverStartsThirdAttemptTest,
   "settings-cancel": cancelledSettingsDoesNotRetryTest,
@@ -2456,6 +2515,7 @@ if (focusedTest) {
   await popupWaitsAfterForceStopForBoundedCloseTest();
   await disposalStopsAllWorkTest();
   await disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest();
+  await disposeAbortsInFlightWatcherAllowTest();
   await disposeWaitsForInProgressPreparationTest();
   await disposalClosesVisiblePopupTest();
 

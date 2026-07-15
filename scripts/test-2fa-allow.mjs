@@ -351,6 +351,26 @@ test("tryAllowOnce does not rotate after a non-attempt", async () => {
   });
 });
 
+test("tryAllowOnce forwards cancellation to the selected native strategy", async () => {
+  const controller = new AbortController();
+  let receivedSignal = null;
+  const result = await tryAllowOnce(1, {
+    signal: controller.signal,
+    runtime: {
+      strategies: [
+        async (_timeoutSec, options) => {
+          receivedSignal = options.signal;
+          return { action: "attempted_allow", source: "FollowUpUI", strategy: "cg_ax" };
+        },
+      ],
+      async releaseMouseButtons() {},
+    },
+  });
+
+  assert.equal(receivedSignal, controller.signal);
+  assert.equal(result.attempted, true);
+});
+
 test("the default automatic path contains only constrained atomic Swift", () => {
   const runtimeBody = allowSource.slice(
     allowSource.indexOf("function resolveAllowRuntime"),
@@ -1073,6 +1093,32 @@ test("OCR permission availability preflights before one constrained read", async
   ]);
 });
 
+test("OCR helper forwards cancellation to both constrained subprocess calls", async () => {
+  const controller = new AbortController();
+  const signals = [];
+  const result = await ocrModule.readPopupCodeViaOcr(4, {
+    signal: controller.signal,
+    capabilityCache: {},
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args, options) {
+      signals.push(options.signal);
+      if (args[0] === "--preflight-screen-capture") {
+        return {
+          stdout: '{"ok":true,"capability":"available","message":"preflight"}\n',
+          stderr: "",
+        };
+      }
+      return {
+        stdout: '{"ok":true,"code":"012345","source":"vision","message":"ok"}\n',
+        stderr: "",
+      };
+    },
+  });
+
+  assert.deepEqual(result, { code: "012345", source: "vision" });
+  assert.deepEqual(signals, [controller.signal, controller.signal]);
+});
+
 test("popup code acquisition is AX-first even when legacy callers prefer OCR", async () => {
   const calls = [];
   const result = await allowModule.readPopupCode(8, {
@@ -1135,6 +1181,27 @@ test("popup code acquisition falls back to OCR only after AX has no legal code",
     ["ax", 2],
     ["ocr", 6],
   ]);
+});
+
+test("popup code readers forward cancellation to AX and OCR helpers", async () => {
+  const controller = new AbortController();
+  const signals = [];
+  const result = await allowModule.readPopupCode(8, {
+    signal: controller.signal,
+    runtime: {
+      async readPopupCodeViaSwift(_timeoutSec, options) {
+        signals.push(options.signal);
+        return null;
+      },
+      async readPopupCodeViaOcr(_timeoutSec, options) {
+        signals.push(options.signal);
+        return { code: "654321", source: "vision" };
+      },
+    },
+  });
+
+  assert.deepEqual(result, { code: "654321", source: "vision" });
+  assert.deepEqual(signals, [controller.signal, controller.signal]);
 });
 
 test("popup code acquisition returns fixed OCR unavailability for status", async () => {
@@ -1357,6 +1424,23 @@ test("OCR capture is window-id-only and stays in ScreenCaptureKit memory", () =>
     popupOcrSwiftSource,
     /\bProcess\s*\(|screencapture|waitUntilExit|NSTemporaryDirectory|FileManager\.default|\.png/
   );
+});
+
+test("Swift OCR maps a verified AX dialog to one matching on-screen window ID", () => {
+  const resolver = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func resolveOnScreenWindowID"
+  );
+  const finder = sourceFunctionBody(popupOcrSwiftSource, "func findCodeDialogs");
+
+  assert.match(resolver, /kCGWindowOwnerPID/);
+  assert.match(resolver, /optionOnScreenOnly/);
+  assert.match(resolver, /pid_t\(ownerPIDNumber\.int32Value\) == pid/);
+  assert.match(resolver, /axFrame\.intersection\(candidateFrame\)/);
+  assert.match(resolver, /geometrically indistinguishable/);
+  assert.match(finder, /resolveOnScreenWindowID\([\s\S]*\) \?\? windowIDFor\(win\)/);
+  assert.match(finder, /pid: app\.processIdentifier/);
+  assert.match(finder, /guard let windowID else \{ continue \}/);
 });
 
 test("native helpers accept only explicit read-only Apple system roots", () => {

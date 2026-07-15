@@ -245,6 +245,54 @@ func windowIDFor(_ element: AXUIElement) -> CGWindowID? {
     return nil
 }
 
+// Some system authentication sheets expose a complete AX tree but do not
+// bridge their AX window to a CGWindowID. Keep the OCR fallback window-bound:
+// resolve only an on-screen window from the same already-verified process
+// whose frame intersects the verified AX dialog frame.
+func resolveOnScreenWindowID(pid: pid_t, near axFrame: CGRect) -> CGWindowID? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let windowInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+    let axArea = max(1, axFrame.width * axFrame.height)
+    let axCenter = CGPoint(x: axFrame.midX, y: axFrame.midY)
+    var candidates: [(id: CGWindowID, score: CGFloat)] = []
+
+    for info in windowInfo {
+        guard
+            let ownerPIDNumber = info[kCGWindowOwnerPID as String] as? NSNumber,
+            pid_t(ownerPIDNumber.int32Value) == pid,
+            let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
+            let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            let candidateFrame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+            candidateFrame.width > 80,
+            candidateFrame.height > 60
+        else { continue }
+
+        let intersection = axFrame.intersection(candidateFrame)
+        let intersects = !intersection.isNull && !intersection.isEmpty
+        let candidateCenter = CGPoint(x: candidateFrame.midX, y: candidateFrame.midY)
+        let centerIsContained = candidateFrame.contains(axCenter) || axFrame.contains(candidateCenter)
+        guard intersects || centerIsContained else { continue }
+
+        let overlapPenalty = intersects ? 1 - (intersection.width * intersection.height / axArea) : 1
+        let sizePenalty = abs(candidateFrame.width - axFrame.width) / max(1, axFrame.width) +
+            abs(candidateFrame.height - axFrame.height) / max(1, axFrame.height)
+        let centerPenalty = hypot(candidateCenter.x - axCenter.x, candidateCenter.y - axCenter.y) /
+            max(1, max(axFrame.width, axFrame.height))
+        let windowID = CGWindowID(windowNumber.uint32Value)
+        guard windowID != 0 else { continue }
+        candidates.append((id: windowID, score: overlapPenalty + sizePenalty + centerPenalty))
+    }
+
+    candidates.sort { $0.score < $1.score }
+    guard let best = candidates.first else { return nil }
+    // If two windows are geometrically indistinguishable, do not guess which
+    // one to capture. The next polling pass can resolve a stable target.
+    if candidates.count > 1, abs(candidates[1].score - best.score) < 0.01 {
+        return nil
+    }
+    return best.id
+}
+
 func findCodeDialogs() -> [DialogTarget] {
     var out: [DialogTarget] = []
     for app in NSWorkspace.shared.runningApplications {
@@ -258,7 +306,12 @@ func findCodeDialogs() -> [DialogTarget] {
                 blob: blob,
                 hasCodePrompt: hasCodePrompt
             ), let frame = frameOf(win), frame.width > 80, frame.height > 60 else { continue }
-            out.append(DialogTarget(windowID: windowIDFor(win)))
+            let windowID = resolveOnScreenWindowID(
+                pid: app.processIdentifier,
+                near: frame
+            ) ?? windowIDFor(win)
+            guard let windowID else { continue }
+            out.append(DialogTarget(windowID: windowID))
         }
     }
     return out
