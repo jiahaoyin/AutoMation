@@ -856,7 +856,54 @@ class InputTests(unittest.TestCase):
                 pause=lambda *_: None,
             )
 
-    def test_password_empty_then_unreadable_retry_fails_before_2fa(self):
+    def test_password_keyboard_retry_failure_does_not_reuse_bidi(self):
+        class SecondBidiWouldMatchPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                if len(self.inputs) > 1:
+                    self.value = value
+                return self
+
+        password = SecondBidiWouldMatchPassword(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            actions=FakeActions(apply_typed_text=False),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(password.inputs, [("secret", True)])
+
+    def test_password_does_not_reuse_bidi_after_keyboard_focus_failure(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        password = EmptyBidiPassword(attrs={"type": "password"}, focused=False)
+        page = FakePage({"css:input[type='password']": [password]})
+
+        with self.assertRaisesRegex(RuntimeError, "focus was not confirmed"):
+            input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(password.inputs, [("secret", True)])
+
+    def test_password_unreadable_then_unreadable_retry_fails_before_2fa(self):
         password = FakeElement(attrs={"type": "password"})
         page = FakePage(
             {"css:input[type='password']": [password]},
@@ -865,7 +912,7 @@ class InputTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[(True, ""), (False, None), (False, None)],
+            side_effect=[(False, None), (False, None), (False, None)],
         ), self.assertRaisesRegex(RuntimeError, "password input verification failed"):
             input_and_verify(
                 page,
@@ -1130,14 +1177,14 @@ class InputTests(unittest.TestCase):
                 pause=lambda *_: None,
             )
 
-    def test_password_accepts_historical_unreadable_value_after_trusted_input(self):
+    def test_password_retries_keyboard_after_unreadable_trusted_input(self):
         password = FakeElement(attrs={"type": "password"})
         page = FakePage({"css:input[type='password']": [password]})
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            return_value=(False, None),
-        ):
+            side_effect=[(False, None), (True, "secret")],
+        ), patch("apple_account_flow.emit") as emit_event:
             action_scope = input_and_verify(
                 page,
                 password,
@@ -1150,6 +1197,11 @@ class InputTests(unittest.TestCase):
         self.assertIs(action_scope, page)
         self.assertEqual(password.value, "secret")
         self.assertEqual(password.inputs, [("secret", True)])
+        self.assertIn(("type", "secret", ANY), page.actions.calls)
+        self.assertIn(
+            "owner_bidi_keyboard_retry",
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+        )
 
     def test_password_value_never_falls_back_to_rendered_text(self):
         class PasswordElement(FakeElement):
@@ -4295,7 +4347,7 @@ class TrustBrowserTests(unittest.TestCase):
             return_value=False,
         ) as scan, patch("apple_account_flow.human_pause", lambda *_: None):
             with self.assertRaisesRegex(RuntimeError, "trust-browser prompt"):
-                wait_for_signed_in(page, timeout_s=0.01)
+                wait_for_signed_in(page, timeout_s=0.05)
 
         self.assertGreater(scan.call_count, 1)
 

@@ -592,12 +592,6 @@ def require_keyboard_target_ready(element: Any) -> None:
         raise RuntimeError(FOCUS_NOT_CONFIRMED_REASON)
 
 
-def require_password_compatibility_target(scope: Any, element: Any) -> None:
-    validate_apple_scope(scope)
-    require_keyboard_target_ready(element)
-    require_password_bidi_input_target(scope, element)
-
-
 def require_password_bidi_input_target(scope: Any, element: Any) -> None:
     """Validate the exact password target before a trusted element-input fallback."""
     validate_apple_scope(scope)
@@ -616,7 +610,6 @@ def input_password_with_owner_bidi_fallback(
     field: Any,
     value: str,
     pause: Callable[[int, int], None] = human_pause,
-    allow_unreadable_continue: bool = True,
 ) -> Any:
     """Use ruyiPage's trusted element input when Firefox cannot expose focus state."""
     require_password_bidi_input_target(scope, field)
@@ -636,14 +629,13 @@ def input_password_with_owner_bidi_fallback(
             raise RuntimeError("password input empty after trusted input")
         elif readable:
             raise RuntimeError("password input verification failed")
-        elif not allow_unreadable_continue:
-            raise RuntimeError("password input verification failed")
         else:
-            emit_input_progress("password", "password_compatibility_continue", "owner")
+            raise RuntimeError("password input unreadable after trusted input")
         return scope
     except Exception as exc:
         if str(exc) not in (
             "password input empty after trusted input",
+            "password input unreadable after trusted input",
             "password input verification failed",
         ):
             emit_input_progress("password", "failed")
@@ -719,7 +711,6 @@ def input_with_owner_bidi_fallback(
     value: str,
     label: str,
     pause: Callable[[int, int], None] = human_pause,
-    allow_password_unreadable_continue: bool = True,
 ) -> Any | None:
     if label == "password":
         return input_password_with_owner_bidi_fallback(
@@ -727,7 +718,6 @@ def input_with_owner_bidi_fallback(
             field,
             value,
             pause=pause,
-            allow_unreadable_continue=allow_password_unreadable_continue,
         )
     if label in ("2FA code", "2FA digit"):
         try:
@@ -863,7 +853,7 @@ def input_and_verify(
     root_page: Any | None = None,
 ) -> Any:
     root_page = root_page or scope
-    password_requires_readable_match = False
+    password_keyboard_retry_required = False
     if label == "password":
         try:
             return input_password_with_owner_bidi_fallback(
@@ -876,9 +866,12 @@ def input_and_verify(
             message = str(error)
             if message == "password input verification failed":
                 raise
-            if message != "password input empty after trusted input":
+            if message not in (
+                "password input empty after trusted input",
+                "password input unreadable after trusted input",
+            ):
                 raise
-            password_requires_readable_match = True
+            password_keyboard_retry_required = True
             emit_input_progress("password", "owner_bidi_keyboard_retry", "owner")
 
     two_factor_scope = label in ("2FA code", "2FA digit")
@@ -900,6 +893,8 @@ def input_and_verify(
         except RuntimeError as error:
             if str(error) != FOCUS_NOT_CONFIRMED_REASON:
                 raise
+            if label == "password" and password_keyboard_retry_required:
+                raise
             emit_input_progress(label, "owner_focus_unconfirmed", "owner")
             fallback = input_with_owner_bidi_fallback(
                 scope,
@@ -907,7 +902,6 @@ def input_and_verify(
                 value,
                 label,
                 pause=pause,
-                allow_password_unreadable_continue=not password_requires_readable_match,
             )
             if fallback is None:
                 raise
@@ -957,7 +951,9 @@ def input_and_verify(
                 or (readable and str(actual) != "")
             )
 
-        if action_scope is scope:
+        if action_scope is scope and not (
+            label == "password" and password_keyboard_retry_required
+        ):
             emit_input_progress(label, "element_fallback_started", route)
             pause(180, 420)
             require_keyboard_target_ready(field)
@@ -971,14 +967,6 @@ def input_and_verify(
             read_state = classify_input_read(readable, actual, value)
             emit_input_progress(label, f"element_value_{read_state}", route)
         if not readable:
-            if (
-                label == "password"
-                and not saw_readable_nonempty_mismatch
-                and not password_requires_readable_match
-            ):
-                require_password_compatibility_target(scope, field)
-                emit_input_progress(label, "password_compatibility_continue", route)
-                return action_scope
             raise RuntimeError(f"{label} input verification failed")
         if (
             label == "password"
@@ -992,6 +980,9 @@ def input_and_verify(
         return action_scope
     except RuntimeError as error:
         if str(error) == FOCUS_NOT_CONFIRMED_REASON:
+            if label == "password" and password_keyboard_retry_required:
+                emit_input_progress(label, "failed", route)
+                raise
             try:
                 emit_input_progress(label, "owner_focus_unconfirmed", "owner")
                 fallback = input_with_owner_bidi_fallback(
@@ -1000,7 +991,6 @@ def input_and_verify(
                     value,
                     label,
                     pause=pause,
-                    allow_password_unreadable_continue=not password_requires_readable_match,
                 )
                 if fallback is not None:
                     return fallback

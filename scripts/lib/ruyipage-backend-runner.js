@@ -1146,7 +1146,11 @@ async function runRuyiPageBackend({
         throw terminalError();
       }),
     ];
-    if (event.event !== "result") {
+    const terminalFailureEvent =
+      event?.event === "diagnostic" ||
+      (event?.event === "status" && event.status === "browser_failure") ||
+      event?.event === "result";
+    if (!terminalFailureEvent) {
       candidates.push(
         childOutcome.then((outcome) => {
           throw terminalError(outcome);

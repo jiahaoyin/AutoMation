@@ -78,6 +78,23 @@ if (process.argv.includes("--failed-result-exit-child")) {
   await new Promise(() => {});
 }
 
+if (process.argv.includes("--failed-result-after-failure-events-child")) {
+  const events = [
+    { event: "status", status: "browser_failure", failureStage: "password_input" },
+    {
+      event: "diagnostic",
+      failureStage: "password_input",
+      errorType: "RuntimeError",
+      message: "password input verification failed",
+    },
+    { event: "result", success: false, failureStage: "password_input" },
+  ];
+  process.stdout.write(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, () => {
+    process.exit(1);
+  });
+  await new Promise(() => {});
+}
+
 if (process.argv.includes("--exit-after-prepare-2fa-child")) {
   process.stdout.write(`${JSON.stringify({ event: "prepare_2fa" })}\n`, () => {
     process.exit(0);
@@ -1777,6 +1794,76 @@ async function runNodeRunnerDelayedResultOnEventSelfTest() {
   assert.equal(outcome.value.success, true);
 }
 
+async function runNodeRunnerTerminalFailureEventsAfterExitSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--failed-result-after-failure-events-child"],
+    timeoutMs: 10_000,
+    eventHandlerTimeoutMs: 500,
+  });
+  const events = [];
+  const releases = [];
+  const waitForHandlers = async (count) => {
+    const startedAt = Date.now();
+    while (releases.length < count) {
+      if (Date.now() - startedAt > 500) {
+        throw new Error(`terminal failure handler ${count} did not start`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+  let settled = false;
+
+  const runOutcome = runner
+    .run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      onEvent(event) {
+        events.push({
+          event: event.event,
+          status: event.status ?? null,
+          failureStage: event.failureStage ?? null,
+        });
+        return new Promise((resolve) => releases.push(resolve));
+      },
+    })
+    .then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error })
+    );
+  runOutcome.then(() => {
+    settled = true;
+  });
+
+  await waitForHandlers(1);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(
+    settled,
+    false,
+    "terminal failure events must remain drainable after child exit"
+  );
+  releases.shift()();
+  await waitForHandlers(1);
+  releases.shift()();
+  await waitForHandlers(1);
+  releases.shift()();
+
+  const outcome = await withRejectGuard(
+    runOutcome,
+    1_000,
+    "terminal failure events did not finish draining"
+  );
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.error?.message, "ruyipage backend failed");
+  assert.deepEqual(events, [
+    { event: "status", status: "browser_failure", failureStage: "password_input" },
+    { event: "diagnostic", status: null, failureStage: "password_input" },
+    { event: "result", status: null, failureStage: "password_input" },
+  ]);
+}
+
 async function runNodeRunnerPendingEventChildExitSelfTest() {
   const before = process.getActiveResourcesInfo().filter((type) => type === "Timeout").length;
   const runner = createRuyiPageBackendRunner({
@@ -2461,6 +2548,7 @@ runBackendTimeoutConfigTest();
 await runProtocolSelfTest();
 await runNodeRunnerSelfTest();
 await runNodeRunnerDelayedResultOnEventSelfTest();
+await runNodeRunnerTerminalFailureEventsAfterExitSelfTest();
 await runNodeRunnerPreparationFailureSelfTest();
 await runNodeRunner2FAFailureSelfTest();
 await runNodeRunnerImmediateExitDuring2FASelfTest();
