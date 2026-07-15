@@ -294,5 +294,9 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
       capability: ocrResult.capability,
     };
   }
-  return null;
+  return {
+    code: null,
+    source: ocrResult?.source ?? "vision",
+    capability: ocrResult?.capability ?? "available",
+  };
 }

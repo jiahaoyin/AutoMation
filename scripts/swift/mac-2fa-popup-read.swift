@@ -67,13 +67,25 @@ func axTexts(_ element: AXUIElement) -> [String] {
 
 func extractSixDigits(_ text: String) -> String? {
     let digits = text.filter(\.isNumber)
-    guard digits.count >= 6 else { return nil }
-    return String(digits.prefix(6))
+    guard digits.count == 6 else { return nil }
+    return String(digits)
 }
 
 func looksLikeCodeDisplay(_ text: String) -> Bool {
     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    return t.range(of: #"^\d{3}\s\d{3}$"#, options: .regularExpression) != nil
+    return t.range(
+        of: #"^(?:\d{3}[\s\u00A0\u2009]+\d{3}|\d{6})$"#,
+        options: .regularExpression
+    ) != nil
+}
+
+func formattedCodeInBlob(_ blob: String) -> String? {
+    let pattern = #"(?<![0-9])(?:[0-9]{3}[\s\u00A0\u2009]+[0-9]{3}|[0-9](?:[\s\u00A0\u2009]+[0-9]){5})(?![0-9])"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let ns = blob as NSString
+    let range = NSRange(location: 0, length: ns.length)
+    guard let match = regex.firstMatch(in: blob, range: range) else { return nil }
+    return ns.substring(with: match.range)
 }
 
 func hasCodeDisplayPrompt(_ blob: String) -> Bool {
@@ -131,6 +143,13 @@ func scanWindow(_ root: AXUIElement, maxDepth: Int = 14) -> WindowScan {
     var scan = WindowScan()
     walkCollect(root, depth: 0, maxDepth: maxDepth, result: &scan)
     scan.hasCodePrompt = hasCodeDisplayPrompt(scan.blob)
+    if scan.hasCodePrompt,
+       scan.code == nil,
+       let raw = formattedCodeInBlob(scan.blob),
+       let code = extractSixDigits(raw) {
+        scan.code = code
+        scan.codeRaw = raw
+    }
     return scan
 }
 

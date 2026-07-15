@@ -185,10 +185,12 @@ export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
     if (stderr?.trim()) {
       console.log("[2FA] Vision OCR helper reported diagnostics");
     }
-    return parseOcrResult(stdout);
+    return parseOcrResult(stdout) ?? unavailableOcrResult("available");
   } catch (err) {
     const stdout = err instanceof Error && "stdout" in err ? String(err.stdout || "") : "";
-    if (stdout.trim()) return parseOcrResult(stdout);
+    if (stdout.trim()) {
+      return parseOcrResult(stdout) ?? unavailableOcrResult("available");
+    }
   }
-  return null;
+  return unavailableOcrResult("unavailable");
 }

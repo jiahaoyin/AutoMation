@@ -116,6 +116,12 @@ let verificationAlertTitles = [
 ]
 
 let verificationAlertCloseButtons = ["好", "OK"]
+let verificationPromptFragments = [
+    "在网页上输入此验证码",
+    "输入此验证码以登录",
+    "Enter this verification code",
+    "verification code",
+]
 
 func normalizedAXText(_ text: String) -> String {
     text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -371,6 +377,12 @@ func findVerificationCodeAlertRoot(
     if !roots.contains(where: { $0 == appElement }) { roots.append(appElement) }
     for window in roots {
         guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
+        if let promptRoot = findVerificationCodePromptRoot(
+            window,
+            expectedPid: expectedPid
+        ) {
+            return promptRoot
+        }
         var queue: [AXUIElement] = [window]
         var visited = 0
         while !queue.isEmpty && visited < 1_500 {
@@ -418,6 +430,7 @@ func findSixDigitCodeInAlert(
     var queue: [AXUIElement] = [root]
     var visited = 0
     var candidates = Set<String>()
+    var allTexts: [String] = []
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
         visited += 1
@@ -427,10 +440,12 @@ func findSixDigitCodeInAlert(
             role == kAXGroupRole as String) {
             for text in axExactTexts(node) {
                 candidates.formUnion(sixDigitCodeCandidates(text))
+                allTexts.append(text)
             }
         }
         queue.append(contentsOf: axChildren(node))
     }
+    candidates.formUnion(sixDigitCodeCandidates(allTexts.joined(separator: " ")))
     guard isTrustedSystemSettingsProcess(expectedPid),
           candidates.count == 1 else { return nil }
     return candidates.first
@@ -446,6 +461,71 @@ func scanCodeFromAlertOnly(appElement: AXUIElement, expectedPid: pid_t) -> Strin
 
 func hasVerificationCodeAlert(appElement: AXUIElement, expectedPid: pid_t) -> Bool {
     findVerificationCodeAlertRoot(appElement: appElement, expectedPid: expectedPid) != nil
+}
+
+func hasVerificationCodePrompt(
+    _ root: AXUIElement,
+    expectedPid: pid_t,
+    maxNodes: Int = 800
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(root, pid: expectedPid) else { return false }
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        let text = axExactTexts(node).joined(separator: " ")
+        let lower = text.lowercased()
+        if verificationPromptFragments.contains(where: {
+            lower.contains($0.lowercased())
+        }) {
+            return true
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return false
+}
+
+func findVerificationCodePromptRoot(
+    _ root: AXUIElement,
+    expectedPid: pid_t
+) -> AXUIElement? {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(root, pid: expectedPid) else { return nil }
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var visited = 0
+    while !queue.isEmpty && visited < 900 {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        let role = axRole(node)
+        let isDialogRoot = role == kAXSheetRole as String ||
+            role == "AXDialog" ||
+            role == kAXWindowRole as String ||
+            role == kAXPopoverRole as String
+        if isDialogRoot,
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil,
+           hasVerificationCodePrompt(node, expectedPid: expectedPid, maxNodes: 500),
+           findExactButton(
+               in: node,
+               names: verificationAlertCloseButtons,
+               expectedPid: expectedPid,
+               maxNodes: 400
+           ) != nil {
+            return node
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return nil
 }
 
 func findGetCodeButton(

@@ -635,6 +635,69 @@ def input_password_with_owner_bidi_fallback(
     return scope
 
 
+def require_otp_bidi_input_target(scope: Any, element: Any, label: str) -> None:
+    """Validate an already-discovered OTP target before trusted element input."""
+    validate_apple_scope(scope)
+    if not element_is_interactable(element) or not element_is_editable_text_control(element):
+        raise RuntimeError("2FA input target is not interactable")
+    try:
+        maxlength = str(element.attr("maxlength") or "").strip()
+    except Exception:
+        maxlength = ""
+    if label == "2FA digit":
+        if maxlength != "1" and not element_has_otp_semantics(element):
+            raise RuntimeError("2FA digit target was not confirmed")
+    elif not element_has_otp_semantics(element):
+        raise RuntimeError("2FA input target was not confirmed")
+
+
+def input_otp_with_owner_bidi_fallback(
+    scope: Any,
+    field: Any,
+    value: str,
+    label: str,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    """Keep OTP entry in ruyiPage when Firefox loses observable focus after a click."""
+    require_otp_bidi_input_target(scope, field, label)
+    emit_input_progress(label, "owner_bidi_fallback_started", "owner")
+    pause(180, 420)
+    field.input(value, clear=True)
+    emit_input_progress(label, "owner_bidi_typed", "owner")
+    pause(280, 680)
+    readable, actual = read_element_input_value(field)
+    read_state = classify_input_read(readable, actual, value)
+    emit_input_progress(label, f"owner_bidi_value_{read_state}", "owner")
+    if not readable or str(actual) != value:
+        raise RuntimeError(f"{label} input verification failed")
+    emit_input_progress(label, "verified", "owner")
+    return scope
+
+
+def input_with_owner_bidi_fallback(
+    scope: Any,
+    field: Any,
+    value: str,
+    label: str,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any | None:
+    if label == "password":
+        return input_password_with_owner_bidi_fallback(scope, field, value, pause=pause)
+    if label in ("2FA code", "2FA digit"):
+        try:
+            require_otp_bidi_input_target(scope, field, label)
+        except RuntimeError:
+            return None
+        return input_otp_with_owner_bidi_fallback(
+            scope,
+            field,
+            value,
+            label,
+            pause=pause,
+        )
+    return None
+
+
 def element_uses_rendered_text(element: Any) -> bool:
     try:
         input_type = str(element.attr("type") or "").strip().lower()
@@ -744,15 +807,19 @@ def input_and_verify(
         try:
             action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
         except RuntimeError as error:
-            if label != "password" or str(error) != FOCUS_NOT_CONFIRMED_REASON:
+            if str(error) != FOCUS_NOT_CONFIRMED_REASON:
                 raise
             emit_input_progress(label, "owner_focus_unconfirmed", "owner")
-            return input_password_with_owner_bidi_fallback(
+            fallback = input_with_owner_bidi_fallback(
                 scope,
                 field,
                 value,
+                label,
                 pause=pause,
             )
+            if fallback is None:
+                raise
+            return fallback
         route = "root" if action_scope is root_page else "owner"
         emit_input_progress(label, "focus_confirmed", route)
         action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
@@ -828,6 +895,24 @@ def input_and_verify(
             raise RuntimeError(f"{label} input verification failed")
         emit_input_progress(label, "verified", route)
         return action_scope
+    except RuntimeError as error:
+        if str(error) == FOCUS_NOT_CONFIRMED_REASON:
+            try:
+                emit_input_progress(label, "owner_focus_unconfirmed", "owner")
+                fallback = input_with_owner_bidi_fallback(
+                    scope,
+                    field,
+                    value,
+                    label,
+                    pause=pause,
+                )
+                if fallback is not None:
+                    return fallback
+            except Exception:
+                emit_input_progress(label, "failed", route)
+                raise
+        emit_input_progress(label, "failed", route)
+        raise
     except Exception:
         emit_input_progress(label, "failed", route)
         raise

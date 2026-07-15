@@ -344,6 +344,18 @@ export async function runAccountBrowserPhase(
     onAudit(entry) {
       writeFlowAudit(flowAudit, "two_factor", "audit", entry);
     },
+    onDiagnostic(entry) {
+      writeFlowAuditError(
+        flowAudit,
+        "two_factor",
+        "native_provider_diagnostic",
+        entry?.error,
+        {
+          source: entry?.source,
+          phase: entry?.phase,
+        }
+      );
+    },
   });
   let result;
   let runError = null;

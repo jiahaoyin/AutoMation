@@ -136,6 +136,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_winner_close_fallback_failed",
     "popup_winner_close_pending",
     "popup_code_buffered",
+    "popup_code_read",
     "popup_provider_error",
     "prepare_2fa",
     "settings_provider_start",
@@ -175,6 +176,8 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "primary_close_failed",
     "fallback_close_failed",
     "probe_or_provider_failed",
+    "ax_ocr_no_code",
+    "ocr_permission_missing",
     "settings_start_failed",
     "accessibility_denied",
     "accessibility_unavailable",
@@ -218,6 +221,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "code_visible_late",
   ]),
   outcome: new Set(["candidate_ready", "prompting", "granted", "unavailable"]),
+  capability: new Set(["available", "permission_missing", "unavailable"]),
 });
 const AUDIT_STRING_KEYS = new Set(Object.keys(AUDIT_LABELS_BY_KEY));
 const AUDIT_BOOLEAN_KEYS = new Set([
@@ -276,6 +280,7 @@ function normalizeProbeAction(action) {
  * @param {{
  *   auditThrottleMs?: number,
  *   onAudit?: (entry: object) => void,
+ *   onDiagnostic?: (entry: { source: string, phase: string, error: unknown }) => void,
  *   onStatus?: (status: object) => void,
  *   manualCodeProvider?: typeof promptForHidden2FACode,
  *   isTTY?: boolean,
@@ -345,6 +350,8 @@ export function createMac2FACollector(options = {}) {
   let timeoutStatusSent = false;
   const auditTimes = new Map();
   const onAudit = typeof options.onAudit === "function" ? options.onAudit : null;
+  const onDiagnostic =
+    typeof options.onDiagnostic === "function" ? options.onDiagnostic : null;
   const onStatus = typeof options.onStatus === "function" ? options.onStatus : null;
 
   const elapsedSincePrepare = () => Math.max(0, runtime.now() - preparedAt);
@@ -371,6 +378,14 @@ export function createMac2FACollector(options = {}) {
     } catch {
       console.warn("[2FA] 写入审计记录失败");
       return false;
+    }
+  };
+
+  const diagnostic = (entry) => {
+    try {
+      onDiagnostic?.(entry);
+    } catch {
+      /* Diagnostics must not disrupt collection or winner selection. */
     }
   };
 
@@ -694,10 +709,24 @@ export function createMac2FACollector(options = {}) {
     }
 
     if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
-    const result = await runtime.readPopupCode(4, {
-      preferOcr: true,
-      rejectCodes: rejectedCodes,
-    });
+    let result;
+    try {
+      result = await runtime.readPopupCode(4, {
+        preferOcr: true,
+        rejectCodes: rejectedCodes,
+      });
+    } catch (error) {
+      diagnostic({ source: "popup", phase: "popup_code_read", error });
+      audit({
+        phase: "popup_code_read",
+        source: "popup",
+        outcome: "unavailable",
+        reason: "probe_or_provider_failed",
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
+      resetStablePopup();
+      return;
+    }
     if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
     if (result?.capability === "permission_missing" && !ocrPermissionStatusSent) {
       ocrPermissionStatusSent = true;
@@ -707,6 +736,17 @@ export function createMac2FACollector(options = {}) {
       });
     }
     const code = normalizeSixDigitCode(result?.code);
+    audit({
+      phase: "popup_code_read",
+      source: result?.source ?? "popup",
+      outcome: code ? "candidate_ready" : "unavailable",
+      capability: result?.capability ?? "available",
+      reason:
+        result?.capability === "permission_missing"
+          ? "ocr_permission_missing"
+          : "ax_ocr_no_code",
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
     if (!code) {
       resetStablePopup();
       return;
@@ -974,7 +1014,8 @@ export function createMac2FACollector(options = {}) {
           timeoutMs: attemptTimeoutMs,
           reportDir,
         });
-      } catch {
+      } catch (error) {
+        diagnostic({ source: "settings", phase: "settings_provider_start", error });
         audit({
           phase: "settings_provider_failed",
           reason: "settings_start_failed",
@@ -1020,6 +1061,13 @@ export function createMac2FACollector(options = {}) {
 
         const accessibilityDenied =
           outcome.kind === "failed" && isAccessibilityDeniedError(outcome.error);
+        if (outcome.kind === "failed" && outcome.error) {
+          diagnostic({
+            source: "settings",
+            phase: "settings_provider_failed",
+            error: outcome.error,
+          });
+        }
         audit({
           phase:
             outcome.kind === "cancelled"

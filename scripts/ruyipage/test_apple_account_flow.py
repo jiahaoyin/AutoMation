@@ -774,6 +774,56 @@ class InputTests(unittest.TestCase):
             ["submit_owner_focus_unconfirmed", "submit_owner_enter_sent"],
         )
 
+    def test_otp_digit_uses_owner_bidi_input_after_focus_is_lost(self):
+        field = FakeElement(
+            attrs={
+                "type": "text",
+                "inputmode": "numeric",
+                "maxlength": "1",
+                "autocomplete": "one-time-code",
+            }
+        )
+
+        class LoseFocusAfterClearActions(FakeActions):
+            def __init__(self):
+                super().__init__()
+                self.perform_count = 0
+
+            def perform(self):
+                result = super().perform()
+                self.perform_count += 1
+                if self.perform_count == 2:
+                    field.focused = False
+                return result
+
+        page = FakePage({"css:input": [field]}, actions=LoseFocusAfterClearActions())
+
+        with patch("apple_account_flow.emit") as emit_event:
+            action_scope = input_and_verify(
+                page,
+                field,
+                "7",
+                "2FA digit",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(field.inputs, [("7", True)])
+        self.assertEqual(
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+            [
+                "focus_started",
+                "focus_confirmed",
+                "keyboard_cleared",
+                "owner_focus_unconfirmed",
+                "owner_bidi_fallback_started",
+                "owner_bidi_typed",
+                "owner_bidi_value_matched",
+                "verified",
+            ],
+        )
+
     def test_frame_input_does_not_fall_back_after_the_target_becomes_disabled(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         iframe = FakeElement(attrs={"src": auth_url})

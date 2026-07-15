@@ -68,6 +68,9 @@ function createRuntime(runBackend, options = {}) {
     emitStatus(payload) {
       collectorOptions?.onStatus?.(payload);
     },
+    emitDiagnostic(payload) {
+      collectorOptions?.onDiagnostic?.(payload);
+    },
     get collectorCount() {
       return collectorCount;
     },
@@ -150,6 +153,11 @@ async function runFlowAuditForwardingTest() {
     },
   };
   const harness = createRuntime(async (options) => {
+    harness.emitDiagnostic({
+      source: "settings",
+      phase: "settings_provider_failed",
+      error: new Error("synthetic native settings failure"),
+    });
     await options.onEvent?.({
       event: "status",
       status: "input_progress",
@@ -187,6 +195,15 @@ async function runFlowAuditForwardingTest() {
         entry.source === "ruyipage" &&
         entry.event === "diagnostic" &&
         entry.details.failureStage === "password_input"
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "two_factor" &&
+        entry.event === "native_provider_diagnostic" &&
+        entry.details.source === "settings" &&
+        entry.error?.message === "synthetic native settings failure"
     )
   );
 }
