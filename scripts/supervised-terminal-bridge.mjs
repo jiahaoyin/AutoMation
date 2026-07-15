@@ -1976,6 +1976,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let manualPromptVisible = false;
     let manualPromptCount = 0;
     let productionStage = "starting";
+    let browserNodeFailure = null;
     const supervisorStatusProtocol = createSupervisorStatusProtocol();
     const emittedStatuses = new Set();
     const successMarkerBytes = Buffer.from(SUPERVISED_SUCCESS_MARKER, "utf8");
@@ -2091,6 +2092,36 @@ export async function runSupervisedTerminalBridge(options = {}) {
           ].includes(failureStage)
         ) {
           productionStage = `browser_failure:${failureStage}`;
+        }
+        return;
+      }
+      if (line.startsWith("[ruyipage] status:node-failure:")) {
+        const failureCode = line.slice(
+          "[ruyipage] status:node-failure:".length
+        );
+        if (
+          [
+            "account_home_unconfirmed",
+            "backend_cleanup",
+            "backend_exit",
+            "backend_failed",
+            "backend_interrupted",
+            "backend_stdin",
+            "backend_timeout",
+            "broker_connect",
+            "broker_connect_timeout",
+            "broker_eof",
+            "broker_io",
+            "collector_cleanup",
+            "event_handler",
+            "event_handler_timeout",
+            "process_state",
+            "two_fa_preparation",
+            "two_fa_provider",
+            "unknown",
+          ].includes(failureCode)
+        ) {
+          browserNodeFailure = failureCode;
         }
         return;
       }
@@ -2440,7 +2471,25 @@ export async function runSupervisedTerminalBridge(options = {}) {
     else if (headAfter !== context.expectedHead) failureClass = "HEAD_MISMATCH";
     else if (finalStatus !== "") failureClass = "GIT_DIRTY";
     else if (productionExit !== 0) {
-      if (productionStage === "two_fa_code_acquired") {
+      if (
+        ["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"].includes(
+          browserNodeFailure
+        )
+      ) {
+        failureClass = "BROWSER_BROKER_TRANSPORT_FAILED";
+      } else if (
+        ["two_fa_preparation", "two_fa_provider"].includes(browserNodeFailure)
+      ) {
+        failureClass = "TWO_FA_CODE_UNAVAILABLE";
+      } else if (browserNodeFailure === "account_home_unconfirmed") {
+        failureClass = "ACCOUNT_INFORMATION_FAILED";
+      } else if (
+        ["backend_cleanup", "collector_cleanup", "event_handler", "event_handler_timeout", "process_state"].includes(
+          browserNodeFailure
+        )
+      ) {
+        failureClass = "INTERNAL_ERROR";
+      } else if (productionStage === "two_fa_code_acquired") {
         failureClass = "TWO_FA_LOGIN_FAILED";
       } else if (
         ["two_fa_code_pending", "two_fa_code_unavailable"].includes(productionStage)

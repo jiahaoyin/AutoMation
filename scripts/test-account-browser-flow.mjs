@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
+import {
+  classifyBrowserRunFailure,
+  readBrowserFailureCode,
+  runAccountBrowserPhase,
+} from "./lib/account-browser-flow.js";
 import {
   loadEnvFile,
   maskAppleId,
@@ -217,12 +221,42 @@ async function runFailureDisposalTest() {
     throw new Error("backend failed");
   });
 
-  await assert.rejects(
-    runAccountBrowserPhase(params, harness.runtime),
-    /backend failed/
-  );
+  const logs = await captureConsole("log", async () => {
+    await assert.rejects(
+      runAccountBrowserPhase(params, harness.runtime),
+      (error) => {
+        assert.match(error.message, /backend failed/);
+        assert.equal(readBrowserFailureCode(error), "unknown");
+        return true;
+      }
+    );
+  });
+  assert.ok(logs.includes("[ruyipage] status:node-failure:unknown"));
   assert.deepEqual(harness.calls, ["prepare", "dispose"]);
   assert.equal(harness.collectorCount, 1);
+}
+
+function runBrowserFailureClassificationTest() {
+  const cases = [
+    ["ruyipage browser broker socket closed", "broker_eof"],
+    ["ruyipage browser broker socket connection failed", "broker_connect"],
+    [
+      "ruyipage browser broker socket connection timed out",
+      "broker_connect_timeout",
+    ],
+    ["ruyipage browser broker socket I/O failed", "broker_io"],
+    ["ruyipage backend failed", "backend_failed"],
+    ["ruyipage backend exited 1", "backend_exit"],
+    ["ruyipage backend timed out after 720000ms", "backend_timeout"],
+    ["ruyipage 2FA preparation failed", "two_fa_preparation"],
+    ["ruyipage 2FA code provider failed", "two_fa_provider"],
+    [SECRET_FIXTURE, "unknown"],
+  ];
+  for (const [message, expected] of cases) {
+    assert.equal(classifyBrowserRunFailure(new Error(message)), expected);
+  }
+  assert.equal(classifyBrowserRunFailure(SECRET_FIXTURE), "unknown");
+  assert.equal(readBrowserFailureCode({ browserFailureCode: SECRET_FIXTURE }), "unknown");
 }
 
 async function runMissingAccountHomeConfirmationTest() {
@@ -401,6 +435,7 @@ function runFullFlowSourceContractTest() {
   assert.match(source, /appleId:\s*maskAppleId\(creds\.appleId\)/);
   assert.doesNotMatch(source, /creds\.appleId\.replace\(/);
   assert.match(source, /report\.error\s*=\s*"Apple ID flow failed"/);
+  assert.match(source, /failureCode:\s*readBrowserFailureCode\(e\)/);
   assert.doesNotMatch(source, /e\.message|String\(e\)/);
   assert.match(source, /process\.exitCode\s*=\s*1/);
   assert.doesNotMatch(source, /process\.exit\(1\)/);
@@ -503,6 +538,7 @@ await runEnvironmentWarningSanitizationTest();
 await runReadyModeSanitizationTest();
 await runCleanupErrorSanitizationTest();
 runAppleIdMaskingTest();
+runBrowserFailureClassificationTest();
 runEnvDataParsingTest();
 runFullFlowSourceContractTest();
 runSupervisedCredentialConfirmationTest();

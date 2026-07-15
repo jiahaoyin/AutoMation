@@ -12,7 +12,10 @@
  *   node scripts/apple-id-full-flow.mjs --skip-browser # 仅 Mac 设置阶段
  */
 
-import { runAccountBrowserPhase } from "./lib/account-browser-flow.js";
+import {
+  readBrowserFailureCode,
+  runAccountBrowserPhase,
+} from "./lib/account-browser-flow.js";
 import { confirmOrPromptAppleCredentials, maskAppleId } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
 import {
@@ -76,6 +79,7 @@ async function main() {
         report.phases.accountBrowser = {
           success: false,
           error: "Account browser phase failed",
+          failureCode: readBrowserFailureCode(e),
         };
         throw e;
       }

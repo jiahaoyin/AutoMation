@@ -68,6 +68,89 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "signed_in",
   "account_information",
 ]);
+const BROWSER_RUN_FAILURE_CODES = new Set([
+  "account_home_unconfirmed",
+  "backend_cleanup",
+  "backend_exit",
+  "backend_failed",
+  "backend_interrupted",
+  "backend_stdin",
+  "backend_timeout",
+  "broker_connect",
+  "broker_connect_timeout",
+  "broker_eof",
+  "broker_io",
+  "collector_cleanup",
+  "event_handler",
+  "event_handler_timeout",
+  "process_state",
+  "two_fa_preparation",
+  "two_fa_provider",
+  "unknown",
+]);
+
+export function classifyBrowserRunFailure(error) {
+  const message = error instanceof Error ? error.message : "";
+  const exact = new Map([
+    ["ruyipage browser broker socket closed", "broker_eof"],
+    ["ruyipage browser broker socket connection failed", "broker_connect"],
+    [
+      "ruyipage browser broker socket connection timed out",
+      "broker_connect_timeout",
+    ],
+    ["ruyipage browser broker socket I/O failed", "broker_io"],
+    ["ruyipage backend failed", "backend_failed"],
+    ["ruyipage backend stdin failed", "backend_stdin"],
+    ["ruyipage backend cleanup failed", "backend_cleanup"],
+    ["ruyipage backend interrupted", "backend_interrupted"],
+    ["ruyipage process state initialization failed", "process_state"],
+    ["ruyipage event handler failed", "event_handler"],
+    ["ruyipage 2FA preparation failed", "two_fa_preparation"],
+    ["ruyipage 2FA code provider failed", "two_fa_provider"],
+    [
+      "ruyipage backend did not confirm the authenticated Apple account home",
+      "account_home_unconfirmed",
+    ],
+  ]).get(message);
+  if (exact) return exact;
+  if (/^ruyipage backend exited (?:unknown|\d+)$/.test(message)) {
+    return "backend_exit";
+  }
+  if (/^ruyipage backend timed out after \d+ms$/.test(message)) {
+    return "backend_timeout";
+  }
+  if (
+    /^ruyipage onEvent handler timed out for [a-z0-9_]+ after \d+ms$/.test(
+      message
+    )
+  ) {
+    return "event_handler_timeout";
+  }
+  return "unknown";
+}
+
+export function readBrowserFailureCode(error) {
+  const code = error?.browserFailureCode;
+  return BROWSER_RUN_FAILURE_CODES.has(code) ? code : "unknown";
+}
+
+function annotateBrowserRunFailure(error, override = null) {
+  const code = BROWSER_RUN_FAILURE_CODES.has(override)
+    ? override
+    : classifyBrowserRunFailure(error);
+  if (error && (typeof error === "object" || typeof error === "function")) {
+    try {
+      Object.defineProperty(error, "browserFailureCode", {
+        configurable: true,
+        value: code,
+      });
+    } catch {
+      /* The fixed status line remains sufficient for non-extensible errors. */
+    }
+  }
+  console.log(`[ruyipage] status:node-failure:${code}`);
+  return error;
+}
 
 function sanitizeReadyMode(mode) {
   const normalized = typeof mode === "string" ? mode.trim() : "";
@@ -193,12 +276,12 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
     });
   } catch (error) {
     runError = error;
-    throw error;
+    throw annotateBrowserRunFailure(error);
   } finally {
     try {
       await collector.dispose();
     } catch (error) {
-      if (!runError) throw error;
+      if (!runError) throw annotateBrowserRunFailure(error, "collector_cleanup");
       console.warn("[2FA] collector cleanup failed");
     }
   }
@@ -208,7 +291,9 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
     result.browserLogin.backend !== "ruyipage" ||
     result.browserLogin.accountHomeConfirmed !== true
   ) {
-    throw new Error("ruyipage backend did not confirm the authenticated Apple account home");
+    throw annotateBrowserRunFailure(
+      new Error("ruyipage backend did not confirm the authenticated Apple account home")
+    );
   }
 
   return {
