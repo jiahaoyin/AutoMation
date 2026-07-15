@@ -1659,7 +1659,14 @@ assert.ok(
 assert.match(supervisedTerminalBridgeSource, /runtime_resolving/);
 assert.match(supervisedTerminalBridgeSource, /backend_starting/);
 assert.match(supervisedTerminalBridgeSource, /BROWSER_RUNTIME_UNAVAILABLE/);
-assert.match(supervisedTerminalBridgeSource, /BROWSER_BACKEND_START_FAILED/);
+for (const failureClass of [
+  "BROWSER_BROKER_LAUNCH_FAILED",
+  "BROWSER_BROKER_TRANSPORT_FAILED",
+  "BROWSER_PROCESS_UNRESPONSIVE",
+  "BROWSER_LAUNCH_FAILED",
+]) {
+  assert.match(supervisedTerminalBridgeSource, new RegExp(failureClass));
+}
 assert.match(
   supervisedTerminalBridgeSource,
   /child = spawnProcess\(\s*"\/bin\/zsh",\s*\[\s*"-c",\s*supervisorScript,[\s\S]*?productionLaunchGatePath,[\s\S]*?context\.codexBin,[\s\S]*?\.\.\.productionArgs/

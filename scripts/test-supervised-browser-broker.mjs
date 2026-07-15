@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 
 import {
   SUPERVISED_PRODUCTION_ENV_KEYS,
@@ -231,7 +232,10 @@ assert.equal(
 const wrapper = buildBrowserBrokerSupervisorScript();
 assert.match(wrapper, /^set -eu\numask 077/m);
 assert.match(wrapper, /ruyipage-broker-members/);
-assert.match(wrapper, /"\$@" < "\$commands_fifo" > "\$events_fifo" 2>\/dev\/null &/);
+assert.match(
+  wrapper,
+  /"\$@" 3>&- < "\$commands_fifo" > "\$events_fifo" 2>\/dev\/null &/
+);
 assert.match(wrapper, /target_identity_is_current[\s\S]*\/bin\/kill -TERM/);
 assert.match(
   wrapper,
@@ -262,6 +266,7 @@ assert.doesNotMatch(wrapper, /\bexec\b/);
 const broker = createBrowserBroker(context);
 const startOrder = [];
 let spawnCall = null;
+const brokerStatusStream = new PassThrough();
 const expectedIdentity = {
   pid: 4321,
   pgid: 4321,
@@ -286,7 +291,11 @@ await startBrowserBroker(
     spawn(command, args, options) {
       startOrder.push("spawn-broker");
       spawnCall = { command, args, options };
-      return { pid: 4321, unref: () => startOrder.push("unref") };
+      return {
+        pid: 4321,
+        stdio: [null, null, null, brokerStatusStream],
+        unref: () => startOrder.push("unref"),
+      };
     },
     async waitForIdentity(pid, predicate) {
       startOrder.push("wait-identity");
@@ -321,7 +330,7 @@ assert.deepEqual(startOrder, [
 ]);
 assert.equal(spawnCall.command, "/bin/zsh");
 assert.equal(spawnCall.options.detached, true);
-assert.equal(spawnCall.options.stdio, "ignore");
+assert.deepEqual(spawnCall.options.stdio, ["ignore", "ignore", "ignore", "pipe"]);
 assert.equal(spawnCall.options.env.APPLE_ID, undefined);
 assert.equal(spawnCall.options.env.APPLE_PASSWORD, undefined);
 for (const value of [
@@ -338,6 +347,9 @@ for (const value of [
   assert.ok(spawnCall.args.includes(value), `broker launch must include ${value}`);
 }
 assert.equal(browserBrokerIdentityMatches(expectedIdentity, broker), true);
+brokerStatusStream.write("supervisor-ready\ngate-open\ntarget-launch\n");
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(broker.stage, "target-launch");
 assert.equal(
   browserBrokerIdentityMatches(
     { ...expectedIdentity, command: expectedIdentity.command.replace(NONCE, "f".repeat(32)) },

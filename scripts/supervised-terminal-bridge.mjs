@@ -796,6 +796,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "events_fifo=${11}",
     "shift 11",
     "interrupted_status=0",
+    'broker_status() { print -r -- "$1" >&3; }',
     "(( ${#launch_nonce} == 32 )) && [[ \"$launch_nonce\" != *[^0-9a-f]* ]] || exit 125",
     "parent_is_current() {",
     "  current_parent_pgid=$(/bin/ps -p \"$parent_pid\" -o pgid= 2>/dev/null | /usr/bin/xargs || true)",
@@ -814,6 +815,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "[[ -p \"$events_fifo\" && ! -h \"$events_fifo\" ]] || exit 125",
     "[[ \"$(/usr/bin/stat -f %Lp \"$commands_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
     "[[ \"$(/usr/bin/stat -f %Lp \"$events_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
+    'broker_status "supervisor-ready" || exit 125',
     "expected_gate=\"{\\\"version\\\":1,\\\"nonce\\\":\\\"$launch_nonce\\\",\\\"pid\\\":$$}\"",
     "while :; do",
     "  if runtime_is_allowed; then :; else exit $?; fi",
@@ -823,6 +825,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "  /bin/sleep 0.05",
     "done",
     "if runtime_is_allowed; then :; else exit $?; fi",
+    'broker_status "gate-open" || exit 125',
     "group_snapshot=$(/usr/bin/mktemp \"${TMPDIR:-/tmp}/ruyipage-broker-members.XXXXXX\") || exit 125",
     "snapshot_helper_pid=''",
     "group_snapshot_failed=0",
@@ -926,7 +929,8 @@ export function buildBrowserBrokerSupervisorScript() {
     "trap 'interrupted_status=130' INT",
     "trap 'interrupted_status=143' TERM",
     "trap 'interrupted_status=129' HUP",
-    "\"$@\" < \"$commands_fifo\" > \"$events_fifo\" 2>/dev/null &",
+    'broker_status "target-launch" || exit 125',
+    "\"$@\" 3>&- < \"$commands_fifo\" > \"$events_fifo\" 2>/dev/null &",
     "backend_pid=$!",
     "identity_attempt=0",
     "while /bin/kill -0 \"$backend_pid\" 2>/dev/null && (( identity_attempt < 1000 )); do",
@@ -938,10 +942,12 @@ export function buildBrowserBrokerSupervisorScript() {
     "  identity_attempt=$((identity_attempt + 1))",
     "done",
     "if [[ -z \"$backend_pgid\" ]] && backend_is_running; then",
+    '  broker_status "target-identity-failed" || true',
     "  shutdown_backend_and_descendants || true",
     "  /usr/bin/unlink \"$group_snapshot\" 2>/dev/null || true",
     "  exit 125",
     "fi",
+    'broker_status "target-identity-ready" || exit 125',
     "runtime_status=0",
     "while target_identity_is_current; do",
     "  if runtime_is_allowed; then /bin/sleep 0.25; continue; else runtime_status=$?; fi",
@@ -956,6 +962,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "  backend_status=$?",
     "  set -e",
     "fi",
+    'broker_status "target-exit" || true',
     "[[ \"$runtime_status\" == (124|125|130) ]] && backend_status=$runtime_status",
     "(( interrupted_status == 0 )) || backend_status=$interrupted_status",
     "cleanup_status=0",
@@ -1274,6 +1281,48 @@ export function browserBrokerIdentityMatches(identity, broker) {
   );
 }
 
+export function attachBrowserBrokerStatusStream(broker, stream) {
+  if (!stream || typeof stream.on !== "function") {
+    throw new Error("browser broker status stream is unavailable");
+  }
+  const allowed = new Set([
+    "supervisor-ready",
+    "gate-open",
+    "target-launch",
+    "target-identity-ready",
+    "target-identity-failed",
+    "target-exit",
+  ]);
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+  let bytes = 0;
+  const accept = (line) => {
+    if (!allowed.has(line)) {
+      broker.stage = "status-invalid";
+      return;
+    }
+    broker.stage = line;
+  };
+  stream.on("data", (chunk) => {
+    if (broker.stage === "status-invalid") return;
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 512) {
+      broker.stage = "status-invalid";
+      return;
+    }
+    buffer += decoder.write(Buffer.from(chunk));
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) accept(line);
+  });
+  stream.once("end", () => {
+    buffer += decoder.end();
+    if (buffer.length > 0) accept(buffer);
+    buffer = "";
+  });
+  return broker;
+}
+
 export function createBrowserBroker(context) {
   return {
     context,
@@ -1282,6 +1331,7 @@ export function createBrowserBroker(context) {
     identity: null,
     filesystemTouched: false,
     lifecycleStarted: false,
+    stage: "created",
   };
 }
 
@@ -1344,12 +1394,14 @@ export async function startBrowserBroker(
       cwd: broker.context.repo,
       detached: true,
       env: buildBrowserBrokerEnvironment(broker.context, broker.paths),
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "ignore", "pipe"],
     }
   );
   if (!Number.isInteger(broker.child?.pid) || broker.child.pid <= 0) {
     throw new Error("browser broker process did not start");
   }
+  broker.stage = "spawned";
+  attachBrowserBrokerStatusStream(broker, broker.child.stdio?.[3]);
   broker.identity = await waitForIdentity(
     broker.child.pid,
     (identity) => browserBrokerIdentityMatches(identity, broker)
@@ -1762,6 +1814,21 @@ export async function runSupervisedTerminalBridge(options = {}) {
         emitStatus("backend-starting", "[mac:supervised] ruyiPage backend starting");
         return;
       }
+      if (line === "[ruyipage] status:broker_credentials_received") {
+        productionStage = "browser_credentials_received";
+        emitStatus("broker-connected", "[mac:supervised] ruyiPage broker connected");
+        return;
+      }
+      if (line === "[ruyipage] status:browser_runtime_imported") {
+        productionStage = "browser_runtime_imported";
+        emitStatus("runtime-imported", "[mac:supervised] ruyiPage runtime imported");
+        return;
+      }
+      if (line === "[ruyipage] status:browser_constructing") {
+        productionStage = "browser_constructing";
+        emitStatus("browser-constructing", "[mac:supervised] Firefox launch requested by ruyiPage");
+        return;
+      }
       if (line === SUPERVISED_SUCCESS_MARKER) {
         emitStatus("success", SUPERVISED_SUCCESS_MARKER);
       } else if (line.startsWith("[Firefox]")) {
@@ -2122,8 +2189,26 @@ export async function runSupervisedTerminalBridge(options = {}) {
         failureClass = "ACCESSIBILITY_PERMISSION_REQUIRED";
       } else if (productionStage === "browser_runtime_resolving") {
         failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
+      } else if (productionStage === "browser_credentials_received") {
+        failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
+      } else if (
+        ["browser_runtime_imported", "browser_constructing"].includes(
+          productionStage
+        )
+      ) {
+        failureClass = "BROWSER_LAUNCH_FAILED";
       } else if (productionStage === "browser_backend_starting") {
-        failureClass = "BROWSER_BACKEND_START_FAILED";
+        if (
+          ["target-identity-ready", "target-exit"].includes(
+            browserBroker?.stage
+          )
+        ) {
+          failureClass = "BROWSER_PROCESS_UNRESPONSIVE";
+        } else if (browserBroker?.stage === "target-launch") {
+          failureClass = "BROWSER_BROKER_TRANSPORT_FAILED";
+        } else {
+          failureClass = "BROWSER_BROKER_LAUNCH_FAILED";
+        }
       } else {
         failureClass = "PRODUCTION_EXIT_NONZERO";
       }

@@ -1349,7 +1349,14 @@ async function runRuyiPageBackend({
   const callOnEvent = async (event) => {
     if (typeof onEvent !== "function") return;
 
-    const safeEventNames = new Set(["ready", "prepare_2fa", "need_2fa", "warning", "result"]);
+    const safeEventNames = new Set([
+      "ready",
+      "status",
+      "prepare_2fa",
+      "need_2fa",
+      "warning",
+      "result",
+    ]);
     const eventName = safeEventNames.has(event?.event) ? event.event : "unknown";
     let handlerTimer;
     const handlerOutcome = callExternal(

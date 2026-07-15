@@ -37,6 +37,11 @@ const TWO_FACTOR_WINNER_MESSAGES = Object.freeze({
   manual: "[2FA] 已使用终端手动输入的验证码。",
 });
 const SUPERVISED_TWO_FACTOR_STATUS_PREFIX = "[2FA] status:";
+const RUYIPAGE_STARTUP_STATUSES = new Set([
+  "broker_credentials_received",
+  "browser_runtime_imported",
+  "browser_constructing",
+]);
 
 function sanitizeReadyMode(mode) {
   const normalized = typeof mode === "string" ? mode.trim() : "";
@@ -134,6 +139,11 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
       onEvent(event) {
         if (event.event === "ready") {
           console.log(`[ruyipage] 浏览器已就绪 (${sanitizeReadyMode(event.mode)})`);
+        } else if (
+          event.event === "status" &&
+          RUYIPAGE_STARTUP_STATUSES.has(event.status)
+        ) {
+          console.log(`[ruyipage] status:${event.status}`);
         } else if (event.event === "warning") {
           console.warn("[ruyipage] backend warning");
         } else if (event.event === "prepare_2fa") {

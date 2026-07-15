@@ -1563,9 +1563,14 @@ def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
 
 def browser_flow(args: argparse.Namespace) -> int:
     apple_id, password = load_browser_credentials()
+    broker_mode = browser_broker_mode_enabled()
+    if broker_mode:
+        emit({"event": "status", "status": "broker_credentials_received"})
     sign_in_url = validate_apple_url(args.sign_in_url)
 
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
+    if broker_mode:
+        emit({"event": "status", "status": "browser_runtime_imported"})
     opts = FirefoxOptions()
     if args.firefox:
         opts.set_browser_path(args.firefox)
@@ -1586,6 +1591,8 @@ def browser_flow(args: argparse.Namespace) -> int:
     )
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
+    if broker_mode:
+        emit({"event": "status", "status": "browser_constructing"})
     page = construct_firefox_page(FirefoxPage, opts)
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
