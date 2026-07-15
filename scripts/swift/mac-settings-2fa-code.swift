@@ -121,6 +121,7 @@ let exactTextAttributes = [
 
 let verificationAlertTitles = [
     "Apple 账户验证码",
+    "Apple 帐户验证码",
     "Apple 帳戶驗證碼",
     "Apple 帳號驗證碼",
     "Apple Account Verification Code",
@@ -131,6 +132,8 @@ let verificationAlertCloseButtons = ["好", "OK", "Done", "完成"]
 let verificationPromptFragments = [
     "在网页上输入此验证码",
     "输入此验证码以登录",
+    "Apple 账户验证码",
+    "Apple 帐户验证码",
     "Enter this verification code",
     "verification code",
 ]

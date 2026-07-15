@@ -2011,6 +2011,10 @@ function runTraditionalChineseStateContractTest() {
     source,
     /let verificationAlertTitles\s*=\s*\[[\s\S]*"Apple 帳戶驗證碼"[\s\S]*\]/
   );
+  assert.match(
+    source,
+    /let verificationAlertTitles\s*=\s*\[[\s\S]*"Apple 帐户验证码"[\s\S]*\]/
+  );
 
   const scanAlert = functionBody("scanCodeFromAlertOnly");
   assert.match(
