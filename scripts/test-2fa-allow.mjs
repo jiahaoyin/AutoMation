@@ -860,12 +860,20 @@ test("zh-Hant code reading and completion cleanup share one state chain", () => 
 
   const sidecarRead = sidecarSource.indexOf("runtime.readPopupCode(4");
   const sidecarClose = sidecarSource.indexOf(
-    "runtime.dismissCodePopupForWebFill(4)",
+    "await tryClosePendingPopup(candidate, generation)",
     sidecarRead
   );
-  const sidecarBuffer = sidecarSource.indexOf("popupCandidate =", sidecarClose);
+  const closeHelper = sidecarSource.slice(
+    sidecarSource.indexOf("const tryClosePendingPopup"),
+    sidecarSource.indexOf("const dismissRejectedPopup")
+  );
+  const helperClose = closeHelper.indexOf("runtime.dismissCodePopupForWebFill(4)");
+  const helperBuffer = closeHelper.indexOf('phase: "popup_code_buffered"');
   assert.ok(
-    sidecarRead >= 0 && sidecarClose > sidecarRead && sidecarBuffer > sidecarClose,
+    sidecarRead >= 0 &&
+      sidecarClose > sidecarRead &&
+      helperClose >= 0 &&
+      helperBuffer > helperClose,
     "popup code must be read, closed, and only then buffered"
   );
 });
@@ -927,6 +935,13 @@ test("popup and OCR helpers expose only fixed diagnostics", () => {
   assert.doesNotMatch(popupSource, /raw:\s*r\.raw|raw:\s*parsed\.raw/);
   assert.doesNotMatch(ocrSource, /return\s*\{\s*code,\s*raw/);
   assert.doesNotMatch(popupOcrSwiftSource, /let raw: String\?/);
+});
+
+test("popup reads are reported as candidates until the sidecar buffers a winner", () => {
+  assert.match(popupSource, /已读取候选验证码，等待关闭验证码窗/);
+  assert.doesNotMatch(popupSource, /console\.log\("\[2FA\] 已读取验证码"\)/);
+  assert.match(sidecarSource, /phase: "popup_code_buffered"/);
+  assert.match(sidecarSource, /status\("winner"/);
 });
 
 test("OCR accepts only an exact six-digit helper code", () => {

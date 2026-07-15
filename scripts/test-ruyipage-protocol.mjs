@@ -70,6 +70,14 @@ if (process.argv.includes("--unsafe-result-error-child")) {
   await new Promise(() => {});
 }
 
+if (process.argv.includes("--failed-result-exit-child")) {
+  process.stdout.write(
+    `${JSON.stringify({ event: "result", success: false, failureStage: "twofa_input" })}\n`,
+    () => process.exit(1)
+  );
+  await new Promise(() => {});
+}
+
 if (process.argv.includes("--exit-after-prepare-2fa-child")) {
   process.stdout.write(`${JSON.stringify({ event: "prepare_2fa" })}\n`, () => {
     process.exit(0);
@@ -1932,6 +1940,11 @@ async function runNodeRunnerSanitizedChildFailureSelfTest() {
     {
       scenario: "failed_result_error",
       arg: "--unsafe-result-error-child",
+      expectedMessage: "ruyipage backend failed",
+    },
+    {
+      scenario: "failed_result_nonzero",
+      arg: "--failed-result-exit-child",
       expectedMessage: "ruyipage backend failed",
     },
   ];

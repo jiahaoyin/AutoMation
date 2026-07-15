@@ -1325,10 +1325,10 @@ async function runRuyiPageBackend({
   if (processingError) throw processingError;
   if (outcome.error) throw outcome.error;
 
-  if (exitCode !== 0) {
-    throw new Error(`ruyipage backend exited ${exitCode}`);
-  }
   if (!finalResult) {
+    if (exitCode !== 0) {
+      throw new Error(`ruyipage backend exited ${exitCode}`);
+    }
     throw new Error(
       usesBrowserBroker
         ? BROWSER_BROKER_ERRORS.eof
@@ -1337,6 +1337,9 @@ async function runRuyiPageBackend({
   }
   if (finalResult.success !== true) {
     throw new Error("ruyipage backend failed");
+  }
+  if (exitCode !== 0) {
+    throw new Error(`ruyipage backend exited ${exitCode}`);
   }
   return finalResult;
 }

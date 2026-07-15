@@ -198,7 +198,7 @@ function logPhaseResult(phase, r) {
   } else if (r.action === "dismissed_done") {
     console.log("[2FA] 已点击「完成」关闭验证码窗，便于填入网页");
   } else if (r.action === "read_code" && r.code) {
-    console.log("[2FA] 已读取验证码");
+    console.log("[2FA] 已读取候选验证码，等待关闭验证码窗");
   }
 }
 

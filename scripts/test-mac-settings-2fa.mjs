@@ -858,18 +858,24 @@ async function runHelperFailureSanitizationTest() {
     });
     harness.child.stdout.emit(
       "data",
-      Buffer.from(JSON.stringify({ ok: false, message: SECRET_TEXT }) + "\n")
+      Buffer.from(
+        JSON.stringify({
+          ok: false,
+          reason: "two_factor_not_found",
+          message: SECRET_TEXT,
+        }) + "\n"
+      )
     );
     harness.child.stderr.emit("data", Buffer.from(SECRET_TEXT));
     harness.child.emit("close", 7, null);
 
     const error = await rejectionOf(request.promise);
     assertSafeError(error);
-    assert.equal(error.code, "2FA_SETTINGS_HELPER_EXIT");
+    assert.equal(error.code, "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND");
     assert.equal(error.hasHelperStderr, true);
     assert.equal(error.hasHelperMessage, true);
-    assert.match(error.message, /helper failed/i);
-    assert.match(error.message, /exit 7/i);
+    assert.match(error.message, /could not find Two-Factor Authentication/i);
+    assert.doesNotMatch(error.message, /exit 7|helper failed/i);
   } finally {
     harness.cleanup();
   }
@@ -886,7 +892,11 @@ async function runAccessibilityFailureClassificationTest() {
     harness.child.stdout.emit(
       "data",
       Buffer.from(
-        JSON.stringify({ ok: false, message: "Accessibility permission unavailable" }) +
+        JSON.stringify({
+          ok: false,
+          reason: "accessibility_unavailable",
+          message: SECRET_TEXT,
+        }) +
           "\n"
       )
     );
@@ -897,6 +907,64 @@ async function runAccessibilityFailureClassificationTest() {
     assert.equal(error.code, "2FA_SETTINGS_ACCESSIBILITY_DENIED");
     assert.match(error.message, /requires Accessibility permission/);
     assert.equal(isAccessibilityDeniedError(error), true);
+  } finally {
+    harness.cleanup();
+  }
+}
+
+async function runFixedHelperReasonMappingTest() {
+  const cases = [
+    ["two_factor_not_found", "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND"],
+    ["verification_alert_not_opened", "2FA_SETTINGS_ALERT_NOT_OPENED"],
+    ["verification_alert_not_found", "2FA_SETTINGS_ALERT_NOT_FOUND"],
+    ["verification_alert_cleanup_failed", "2FA_SETTINGS_ALERT_CLEANUP_FAILED"],
+    ["settings_unavailable", "2FA_SETTINGS_UI_UNAVAILABLE"],
+  ];
+  for (const [reason, expectedCode] of cases) {
+    const harness = createHarness();
+    try {
+      const request = start2FASettingsCodeRequest({
+        reportDir: harness.reportDir,
+        runtime: harness.runtime,
+        verbose: false,
+      });
+      harness.child.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({ ok: false, reason, message: SECRET_TEXT }) + "\n"
+        )
+      );
+      harness.child.emit("close", 1, null);
+
+      const error = await rejectionOf(request.promise);
+      assertSafeError(error);
+      assert.equal(error.code, expectedCode, `${reason} must have a fixed error code`);
+      assertNoSecrets(error.message);
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({ ok: false, reason: SECRET_TEXT, message: SECRET_TEXT }) +
+          "\n"
+      )
+    );
+    harness.child.emit("close", 9, null);
+
+    const error = await rejectionOf(request.promise);
+    assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_HELPER_EXIT");
+    assertNoSecrets(error.message);
   } finally {
     harness.cleanup();
   }
@@ -1461,18 +1529,36 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(sheetRoots, /collectWindows\(/);
 
   const navigationClick = functionBody("clickNamed");
+  const navigationAncestor = functionBody("nearestNavigationPressableAncestor");
   assert.match(navigationClick, /expectedPid/);
   assert.match(navigationClick, /hasExactName\(node,\s*names:\s*names\)/);
-  assert.match(navigationClick, /kAXHiddenAttribute/);
-  assert.match(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}==\s*true/);
-  assert.doesNotMatch(navigationClick, /kAXEnabledAttribute[\s\S]{0,100}!=\s*false/);
-  assert.match(navigationClick, /supportsPressAction\(node\)/);
+  assert.match(navigationClick, /nearestNavigationPressableAncestor\(/);
+  assert.match(navigationAncestor, /axParent\(candidate\)/);
+  assert.match(navigationAncestor, /kAXHiddenAttribute/);
+  assert.match(navigationAncestor, /kAXEnabledAttribute[\s\S]{0,100}==\s*true/);
+  assert.doesNotMatch(navigationAncestor, /kAXEnabledAttribute[\s\S]{0,100}!=\s*false/);
+  assert.match(navigationAncestor, /supportsPressAction\(candidate\)/);
   assert.ok(
-    (navigationClick.match(/settingsActionScopeAllowsElement\(/g) ?? []).length >= 2,
-    "window scope must be revalidated during discovery and immediately before navigation press"
+    (navigationAncestor.match(/settingsActionScopeAllowsElement\(/g) ?? []).length >= 1 &&
+      (navigationClick.match(/settingsActionScopeAllowsElement\(/g) ?? []).length >= 1,
+    "window scope must be revalidated during ancestor discovery and immediately before navigation press"
   );
   assert.match(navigationClick, /matches\.count\s*==\s*1/);
   assert.doesNotMatch(navigationClick, /blob\.contains|blob\s*=|names\.contains/);
+
+  const navigationWait = functionBody("waitForTwoFactorNavigationTarget");
+  const getCodeWait = functionBody("waitForGetCodeButton");
+  assert.match(navigationWait, /findGetCodeButton\(/);
+  assert.match(navigationWait, /hasNavigableNamedElement\(/);
+  assert.match(navigationWait, /cappedAt:\s*100/);
+  assert.match(getCodeWait, /findGetCodeButton\(/);
+  assert.match(getCodeWait, /cappedAt:\s*100/);
+  assert.doesNotMatch(getCodeWait, /hasNavigableNamedElement\(/);
+
+  assert.match(source, /enum OutputReason: String/);
+  assert.match(source, /case twoFactorNotFound = "two_factor_not_found"/);
+  assert.match(source, /case accessibilityUnavailable = "accessibility_unavailable"/);
+  assert.match(source, /case settingsUnavailable = "settings_unavailable"/);
 
   const windowlessStatus = functionBody("windowlessAppleIDSettingsStatus");
   assert.match(windowlessStatus, /isTrustedAppleIDSettingsExtension\(owner\)/);
@@ -1834,7 +1920,9 @@ function runVerificationCodeHardeningSourceContractTest() {
     "observed verification alerts must be confirmed gone before close returns true"
   );
 
-  const successStart = source.lastIndexOf('logStep(7, "verification code detected")');
+  const successStart = source.lastIndexOf(
+    'logStep(7, "verification code candidate detected")'
+  );
   const successEnd = source.lastIndexOf("emit(Output(ok: true");
   const successPath = source.slice(successStart, successEnd);
   assert.match(
@@ -1842,6 +1930,12 @@ function runVerificationCodeHardeningSourceContractTest() {
     /(?:guard|if)[\s\S]{0,500}closeVerificationCodeAlert/,
     "the success path must require a true alert-close result"
   );
+  assert.match(
+    source.slice(successStart),
+    /guard closed else[\s\S]{0,280}logStep\(8, "verification code retrieval completed"\)[\s\S]{0,180}emit\(Output\(ok: true/,
+    "completion must only be logged after alert cleanup succeeds and immediately before success JSON"
+  );
+  assert.doesNotMatch(successPath, /verification code detected/);
 
   const ownerRecoveryStart = source.indexOf("for uiOwnerAttempt in 1...2");
   const ownerRecoveryEnd = source.lastIndexOf(
@@ -1988,6 +2082,7 @@ await runSuccessTest();
 await runSensitiveOutputSanitizationTest();
 await runHelperFailureSanitizationTest();
 await runAccessibilityFailureClassificationTest();
+await runFixedHelperReasonMappingTest();
 await runChildErrorSanitizationTest();
 await runCancelTest();
 runMissingSourceRejectsOldBinaryTest();

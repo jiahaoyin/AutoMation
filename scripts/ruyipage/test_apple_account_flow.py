@@ -1838,6 +1838,54 @@ class BrowserFlowTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_browser_flow_does_not_submit_when_twofa_input_cannot_be_verified(self):
+        root = FakePage(state={"href": "https://account.apple.com/sign-in"})
+        root.get = lambda *_: None
+        root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        root.quit = lambda: None
+
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
+        ), patch(
+            "apple_account_flow.detect_login_state", return_value={"trusted": False}
+        ), patch(
+            "apple_account_flow.wait_for_element",
+            side_effect=[(root, FakeElement()), (root, FakeElement())],
+        ), patch("apple_account_flow.input_and_verify"), patch(
+            "apple_account_flow.submit_element_with_enter"
+        ), patch("apple_account_flow.ensure_remember_checked", return_value=True), patch(
+            "apple_account_flow.request_two_factor_preparation"
+        ), patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value={"trusted": False, "twofa": True},
+        ), patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_code", "generation": 1, "code": "123456"},
+        ), patch(
+            "apple_account_flow.wait_for_otp_target",
+            return_value=[(root, FakeElement())],
+        ), patch(
+            "apple_account_flow.fill_security_code",
+            side_effect=RuntimeError("2FA digit input verification failed"),
+        ), patch("apple_account_flow.click_two_factor_submit") as submit_two_factor, patch(
+            "apple_account_flow.human_pause", return_value=None
+        ), patch("apple_account_flow.emit"):
+            with self.assertRaisesRegex(RuntimeError, "2FA digit input verification failed"):
+                browser_flow(args)
+
+        self.assertEqual(account_flow.browser_startup_stage, "twofa_input")
+        submit_two_factor.assert_not_called()
+
     def test_recovered_password_page_skips_email_and_resumes_login(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
         root.get = lambda *_: None
@@ -3518,7 +3566,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_element_bidi_continues_when_value_is_unreadable(self):
+    def test_six_digit_element_bidi_retries_keyboard_when_value_is_unreadable(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3528,12 +3576,20 @@ class SecurityCodeTests(unittest.TestCase):
         ]
         frame = FakePage({"css:input[maxlength='1']": fields})
         iframe = FakeElement(attrs={"src": frame.state["href"]})
-        page = FakePage({"css:iframe": [iframe]}, frames=[frame])
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
         frame.parent = page
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            return_value=(False, None),
+            side_effect=[
+                result
+                for digit in "123456"
+                for result in ((False, None), (True, digit))
+            ],
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
@@ -3541,13 +3597,17 @@ class SecurityCodeTests(unittest.TestCase):
             [field.inputs for field in fields],
             [[(digit, True)] for digit in "123456"],
         )
-        self.assertEqual(page.actions.calls, [])
-        self.assertIn(
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual(
+            len([call for call in page.actions.calls if call[0] == "human_click"]),
+            6,
+        )
+        self.assertNotIn(
             "element_bidi_unverified_continue",
             [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
         )
 
-    def test_six_digit_element_bidi_continues_when_value_reads_empty(self):
+    def test_six_digit_element_bidi_retries_keyboard_when_value_reads_empty(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3557,20 +3617,67 @@ class SecurityCodeTests(unittest.TestCase):
         ]
         frame = FakePage({"css:input[maxlength='1']": fields})
         iframe = FakeElement(attrs={"src": frame.state["href"]})
-        page = FakePage({"css:iframe": [iframe]}, frames=[frame])
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
         frame.parent = page
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            return_value=(True, ""),
-        ):
+            side_effect=[
+                result
+                for digit in "123456"
+                for result in ((True, ""), (True, digit))
+            ],
+        ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
             [[(digit, True)] for digit in "123456"],
         )
-        self.assertEqual(page.actions.calls, [])
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual(
+            len([call for call in page.actions.calls if call[0] == "human_click"]),
+            6,
+        )
+        self.assertNotIn(
+            "element_bidi_unverified_continue",
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+        )
+
+    def test_six_digit_fields_raise_when_element_bidi_and_keyboard_cannot_verify(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1"},
+                location={"x": 20 + index * 45, "y": 30},
+            )
+            for index in range(6)
+        ]
+        frame = FakePage({"css:input[maxlength='1']": fields})
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
+        frame.parent = page
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            return_value=(True, ""),
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA digit input verification failed",
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertNotIn("verified", steps)
+        self.assertNotIn("element_bidi_unverified_continue", steps)
+        self.assertNotIn("unverified_continue", steps)
 
     def test_six_digit_element_bidi_falls_back_on_readable_mismatch(self):
         fields = [

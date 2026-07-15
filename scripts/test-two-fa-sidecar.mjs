@@ -963,26 +963,64 @@ async function popupCodeFallsBackToGenericDialogCleanupTest() {
 }
 
 async function popupCodeIsNotPublishedUntilCleanupSucceedsTest() {
-  const { clock, native, collector } = createHarness({
+  const { clock, native, collector, audits } = createHarness({
     popupPrimaryCloseSucceeds: false,
     popupFallbackCloseFailures: 1,
   });
   await collector.prepare();
   native.setPopup("676767");
-  await clock.advance(20);
 
   let returned = false;
   const codePromise = collector.getCode().then((code) => {
     returned = true;
     return code;
   });
+  await clock.advance(10);
   await clock.flush();
   assert.equal(returned, false);
+  assert.ok(
+    audits.some(
+      (entry) =>
+        entry.phase === "popup_winner_close_pending" && entry.reason === "close_pending"
+    ),
+    "a failed close must enter the fixed pending state before delivery"
+  );
 
   await clock.advance(10);
   assert.equal(await codePromise, "676767");
   assert.equal(native.stats.cleanupDismissals, 1);
   await collector.dispose();
+}
+
+async function popupCodeStopsAfterBoundedCloseFailuresTest() {
+  const { clock, native, collector, audits } = createHarness({
+    popupPrimaryCloseSucceeds: false,
+    popupFallbackCloseFailures: 2,
+    settingsFallback: false,
+    manualFallback: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  native.setPopup("787878");
+
+  await clock.advance(40);
+  assert.equal(native.stats.popupReads.length, 1, "close retries must reuse one candidate");
+  assert.equal(native.stats.popupWinnerClosures, 0);
+  assert.equal(native.stats.cleanupDismissals, 0);
+  assert.equal(
+    audits.filter((entry) => entry.phase === "popup_winner_close_pending").length,
+    1,
+    "bounded close failure must produce one fixed pending state"
+  );
+  assert.equal(
+    audits.some((entry) => entry.phase === "2fa_winner"),
+    false,
+    "a code with a still-visible popup must never win"
+  );
+  assert.equal(JSON.stringify(audits).includes("787878"), false, "audit leaked OTP");
+
+  await collector.dispose();
+  await assert.rejects(codePromise, /disposed/i);
 }
 
 async function settingsGracePeriodTest() {
@@ -1045,6 +1083,32 @@ async function settingsRetriesOnceAfterFiveSecondsTest() {
     true
   );
   await collector.dispose();
+}
+
+async function settingsFixedFailureReasonIsPreservedTest() {
+  const { clock, native, collector, audits } = createHarness({
+    settingsFallbackAfterMs: 0,
+    manualFallback: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  await clock.advance(0);
+
+  const error = new Error("private settings failure 123456");
+  error.code = "2FA_SETTINGS_ALERT_NOT_OPENED";
+  native.settingsRequests[0].reject(error);
+  await clock.flush();
+
+  assert.equal(
+    audits.some(
+      ({ phase, reason }) =>
+        phase === "settings_provider_failed" && reason === "settings_alert_not_opened"
+    ),
+    true
+  );
+  assert.equal(JSON.stringify(audits).includes("123456"), false);
+  await collector.dispose();
+  await assert.rejects(codePromise, /disposed/i);
 }
 
 async function settingsNeverStartsThirdAttemptTest() {
@@ -1895,7 +1959,7 @@ async function popupForcesUnresponsiveSettingsCleanupTest() {
   assert.equal(native.stats.settingsCancels, 1);
   assert.equal(returned, false);
 
-  await clock.advance(49);
+  await clock.advance(39);
   assert.equal(native.stats.settingsForceStops, 0);
   assert.equal(returned, false);
   await clock.advance(1);
@@ -1923,7 +1987,7 @@ async function popupWaitsAfterForceStopForBoundedCloseTest() {
   await clock.advance(50);
   assert.equal(native.stats.settingsForceStops, 1);
   assert.equal(returned, false);
-  await clock.advance(49);
+  await clock.advance(39);
   assert.equal(returned, false);
   await clock.advance(1);
   assert.equal(await codePromise, "232323");
@@ -2098,6 +2162,7 @@ const focusedTests = {
   "timeout-status": sharedDeadlineEmitsTimeoutBeforeRejectingTest,
   "winner-status": winnerUsesStatusWithoutDynamicConsoleTest,
   "late-need": lateNeedStartsSettingsImmediatelyTest,
+  "popup-close-pending": popupCodeStopsAfterBoundedCloseFailuresTest,
   "prepare-dispose": disposeWaitsForInProgressPreparationTest,
   "watcher-dispose": disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest,
   "settings-retry": settingsRetriesOnceAfterFiveSecondsTest,
@@ -2157,8 +2222,10 @@ if (focusedTest) {
   await popupCodeWaitsForDialogCleanupTest();
   await popupCodeFallsBackToGenericDialogCleanupTest();
   await popupCodeIsNotPublishedUntilCleanupSucceedsTest();
+  await popupCodeStopsAfterBoundedCloseFailuresTest();
   await settingsGracePeriodTest();
   await settingsRetriesOnceAfterFiveSecondsTest();
+  await settingsFixedFailureReasonIsPreservedTest();
   await settingsNeverStartsThirdAttemptTest();
   await cancelledSettingsDoesNotRetryTest();
   await settingsAccessibilityRecoveryRestartsImmediatelyTest();

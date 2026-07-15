@@ -707,10 +707,7 @@ def input_otp_digit_with_element_bidi(
     readable, actual = read_element_input_value(field)
     read_state = classify_input_read(readable, actual, value)
     emit_input_progress("2FA digit", f"element_bidi_value_{read_state}", "owner")
-    if not readable or str(actual) == "":
-        emit_input_progress("2FA digit", "element_bidi_unverified_continue", "owner")
-        return scope
-    if str(actual) != value:
+    if not readable or str(actual) != value:
         raise RuntimeError("2FA digit input verification failed")
     emit_input_progress("2FA digit", "verified", "owner")
     return scope
@@ -974,9 +971,6 @@ def input_and_verify(
             read_state = classify_input_read(readable, actual, value)
             emit_input_progress(label, f"element_value_{read_state}", route)
         if not readable:
-            if label == "2FA digit" and not saw_readable_nonempty_mismatch:
-                emit_input_progress(label, "unverified_continue", route)
-                return action_scope
             if (
                 label == "password"
                 and not saw_readable_nonempty_mismatch
@@ -986,13 +980,6 @@ def input_and_verify(
                 emit_input_progress(label, "password_compatibility_continue", route)
                 return action_scope
             raise RuntimeError(f"{label} input verification failed")
-        if (
-            label == "2FA digit"
-            and str(actual) == ""
-            and not saw_readable_nonempty_mismatch
-        ):
-            emit_input_progress(label, "unverified_continue", route)
-            return action_scope
         if (
             label == "password"
             and str(actual) == ""

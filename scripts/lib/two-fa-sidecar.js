@@ -16,6 +16,7 @@ const SETTINGS_RETRY_DELAY_MS = 5_000;
 const MANUAL_FALLBACK_AFTER_MS = 90_000;
 const MIN_MANUAL_INPUT_WINDOW_MS = 90_000;
 const PREEXISTING_ALLOW_CLEAR_IDLE_HITS = 3;
+const MAX_POPUP_CLOSE_ATTEMPTS = 2;
 const STATUS_NAMES = new Set([
   "settings_start",
   "settings_retry",
@@ -122,6 +123,16 @@ function settingsFailureReason(error) {
       return "settings_unavailable";
     case "2FA_SETTINGS_HELPER_EXIT":
       return "settings_helper_exit";
+    case "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND":
+      return "settings_two_factor_not_found";
+    case "2FA_SETTINGS_ALERT_NOT_OPENED":
+      return "settings_alert_not_opened";
+    case "2FA_SETTINGS_ALERT_NOT_FOUND":
+      return "settings_alert_not_found";
+    case "2FA_SETTINGS_ALERT_CLEANUP_FAILED":
+      return "settings_alert_cleanup_failed";
+    case "2FA_SETTINGS_UI_UNAVAILABLE":
+      return "settings_ui_unavailable";
     default:
       return "settings_provider_failed";
   }
@@ -200,6 +211,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "action_not_attempted",
     "primary_close_failed",
     "fallback_close_failed",
+    "close_pending",
     "probe_or_provider_failed",
     "ax_ocr_no_code",
     "ocr_permission_missing",
@@ -210,6 +222,11 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "settings_output_limit",
     "settings_unavailable",
     "settings_helper_exit",
+    "settings_two_factor_not_found",
+    "settings_alert_not_opened",
+    "settings_alert_not_found",
+    "settings_alert_cleanup_failed",
+    "settings_ui_unavailable",
     "accessibility_denied",
     "accessibility_unavailable",
     "cancelled",
@@ -348,8 +365,7 @@ export function createMac2FACollector(options = {}) {
   let popupCandidate = null;
   let popupGeneration = 1;
   let cleanupOnly = false;
-  let lastStableCode = null;
-  let stableHits = 0;
+  let pendingPopupClose = null;
   let allowStrategy = "none";
   let allowAttempt = 0;
   let preexistingAllowGate = false;
@@ -552,9 +568,74 @@ export function createMac2FACollector(options = {}) {
     for (const delay of [...delays]) delay.cancel();
   };
 
-  const resetStablePopup = () => {
-    lastStableCode = null;
-    stableHits = 0;
+  const resetPendingPopupClose = () => {
+    pendingPopupClose = null;
+  };
+
+  const tryClosePendingPopup = async (candidate, generation) => {
+    if (candidate.closeAttempts >= MAX_POPUP_CLOSE_ATTEMPTS) return false;
+
+    candidate.closeAttempts += 1;
+    let popupClosed = false;
+    try {
+      if (disposed || generation !== popupGeneration || activeWinnerSettled()) return false;
+      popupClosed = await runtime.dismissCodePopupForWebFill(4);
+      if (disposed || generation !== popupGeneration || activeWinnerSettled()) return false;
+    } catch {
+      if (disposed) return false;
+      audit({
+        phase: "popup_winner_close_failed",
+        reason: "primary_close_failed",
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
+    }
+    if (!popupClosed) {
+      try {
+        if (disposed || generation !== popupGeneration || activeWinnerSettled()) return false;
+        const fallback = await runtime.runPopupPhase("dismiss_stale", 2);
+        if (disposed || generation !== popupGeneration || activeWinnerSettled()) return false;
+        popupClosed = fallback?.action === "dismissed_stale";
+        audit({
+          phase: "popup_winner_close_fallback",
+          action: fallback?.action ?? "none",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+      } catch {
+        if (disposed) return false;
+        audit({
+          phase: "popup_winner_close_fallback_failed",
+          reason: "fallback_close_failed",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+      }
+    }
+    if (!popupClosed) {
+      if (!candidate.closePendingReported) {
+        candidate.closePendingReported = true;
+        audit(
+          {
+            phase: "popup_winner_close_pending",
+            reason: "close_pending",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          },
+          { throttleKey: "popup-winner-close-pending" }
+        );
+      }
+      return false;
+    }
+
+    audit({
+      phase: "popup_code_buffered",
+      allowStrategy: candidate.allowStrategy,
+      source: candidate.popupSource,
+      popupClosed,
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+    if (generation !== popupGeneration) return false;
+    resetPendingPopupClose();
+    popupCandidate = { ...candidate, generation };
+    popupReady.resolve(popupCandidate);
+    return true;
   };
 
   const dismissRejectedPopup = async (code) => {
@@ -568,7 +649,7 @@ export function createMac2FACollector(options = {}) {
       action: result?.action ?? "none",
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
-    resetStablePopup();
+    resetPendingPopupClose();
   };
 
   const pollPopupOnce = async () => {
@@ -587,7 +668,7 @@ export function createMac2FACollector(options = {}) {
 
     if (preexistingAllowGate) {
       pendingAllowAttempt = null;
-      resetStablePopup();
+      resetPendingPopupClose();
       if (action === "idle") {
         preexistingAllowIdleHits += 1;
         if (preexistingAllowIdleHits >= PREEXISTING_ALLOW_CLEAR_IDLE_HITS) {
@@ -653,7 +734,7 @@ export function createMac2FACollector(options = {}) {
           manualAllowStatusSent = true;
           status("manual_allow", { remainingSec: remainingSeconds() });
         }
-        resetStablePopup();
+        resetPendingPopupClose();
         return;
       }
       const strategyOffset = allowAttempt;
@@ -693,7 +774,7 @@ export function createMac2FACollector(options = {}) {
           },
           { throttleKey: `allow-result:native_rotation:strategy_error` }
         );
-        resetStablePopup();
+        resetPendingPopupClose();
         return;
       }
 
@@ -726,12 +807,12 @@ export function createMac2FACollector(options = {}) {
           { throttleKey: `allow-result:${strategy}:action_not_attempted` }
         );
       }
-      resetStablePopup();
+      resetPendingPopupClose();
       return;
     }
 
     if (action !== "has_code_dialog") {
-      resetStablePopup();
+      resetPendingPopupClose();
       return;
     }
 
@@ -739,6 +820,15 @@ export function createMac2FACollector(options = {}) {
     if (stateCode && rejectedCodes.has(stateCode)) {
       await dismissRejectedPopup(stateCode);
       return;
+    }
+
+    if (pendingPopupClose) {
+      if (stateCode && stateCode !== pendingPopupClose.code) {
+        resetPendingPopupClose();
+      } else {
+        await tryClosePendingPopup(pendingPopupClose, generation);
+        return;
+      }
     }
 
     if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
@@ -757,7 +847,7 @@ export function createMac2FACollector(options = {}) {
         reason: "probe_or_provider_failed",
         elapsedSincePrepareMs: elapsedSincePrepare(),
       });
-      resetStablePopup();
+      resetPendingPopupClose();
       return;
     }
     if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
@@ -781,7 +871,7 @@ export function createMac2FACollector(options = {}) {
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
     if (!code) {
-      resetStablePopup();
+      resetPendingPopupClose();
       return;
     }
     if (rejectedCodes.has(code)) {
@@ -789,68 +879,16 @@ export function createMac2FACollector(options = {}) {
       return;
     }
 
-    if (code === lastStableCode) stableHits += 1;
-    else {
-      lastStableCode = code;
-      stableHits = 1;
-    }
-
-    if (stableHits < 2) return;
     const candidate = {
       source: "popup",
       code,
       allowStrategy,
+      popupSource: result?.source ?? "popup",
+      closeAttempts: 0,
+      closePendingReported: false,
     };
-    let popupClosed = false;
-    try {
-      if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
-      popupClosed = await runtime.dismissCodePopupForWebFill(4);
-      if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
-    } catch {
-      if (disposed) return;
-      audit({
-        phase: "popup_winner_close_failed",
-        reason: "primary_close_failed",
-        elapsedSincePrepareMs: elapsedSincePrepare(),
-      });
-    }
-    if (!popupClosed) {
-      try {
-        if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
-        const fallback = await runtime.runPopupPhase("dismiss_stale", 2);
-        if (disposed || generation !== popupGeneration || activeWinnerSettled()) return;
-        popupClosed = fallback?.action === "dismissed_stale";
-        audit({
-          phase: "popup_winner_close_fallback",
-          action: fallback?.action ?? "none",
-          elapsedSincePrepareMs: elapsedSincePrepare(),
-        });
-      } catch {
-        if (disposed) return;
-        audit({
-          phase: "popup_winner_close_fallback_failed",
-          reason: "fallback_close_failed",
-          elapsedSincePrepareMs: elapsedSincePrepare(),
-        });
-      }
-    }
-    if (!popupClosed) {
-      audit({
-        phase: "popup_winner_close_pending",
-        elapsedSincePrepareMs: elapsedSincePrepare(),
-      });
-      return;
-    }
-    audit({
-      phase: "popup_code_buffered",
-      allowStrategy,
-      source: result?.source ?? "popup",
-      popupClosed,
-      elapsedSincePrepareMs: elapsedSincePrepare(),
-    });
-    if (generation !== popupGeneration) return;
-    popupCandidate = { ...candidate, generation };
-    popupReady.resolve(popupCandidate);
+    pendingPopupClose = candidate;
+    await tryClosePendingPopup(candidate, generation);
   };
 
   const watchPopup = async () => {
@@ -1294,7 +1332,7 @@ export function createMac2FACollector(options = {}) {
     popupReady = createDeferred();
     cleanupOnly = false;
     pendingAllowAttempt = null;
-    resetStablePopup();
+    resetPendingPopupClose();
   };
 
   const acquireCode = async ({ generation, rejectPrevious }) => {

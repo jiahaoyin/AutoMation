@@ -18,6 +18,33 @@ const BIN = resolveNativeHelperPath(
   "mac-settings-2fa-code"
 );
 const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
+const HELPER_FAILURES = Object.freeze({
+  cancelled: ["2FA_SETTINGS_CANCELLED", "2FA settings request was cancelled"],
+  accessibility_unavailable: [
+    "2FA_SETTINGS_ACCESSIBILITY_DENIED",
+    "2FA settings helper requires Accessibility permission",
+  ],
+  two_factor_not_found: [
+    "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND",
+    "2FA settings helper could not find Two-Factor Authentication",
+  ],
+  verification_alert_not_opened: [
+    "2FA_SETTINGS_ALERT_NOT_OPENED",
+    "2FA settings helper did not open the verification code alert",
+  ],
+  verification_alert_not_found: [
+    "2FA_SETTINGS_ALERT_NOT_FOUND",
+    "2FA settings helper did not find the verification code alert",
+  ],
+  verification_alert_cleanup_failed: [
+    "2FA_SETTINGS_ALERT_CLEANUP_FAILED",
+    "2FA settings helper could not close the verification code alert",
+  ],
+  settings_unavailable: [
+    "2FA_SETTINGS_UI_UNAVAILABLE",
+    "2FA settings helper could not access Apple Account settings",
+  ],
+});
 
 function swiftNeedsRecompile(sourcePath = SWIFT_SRC, binaryPath = BIN) {
   if (!fs.existsSync(sourcePath)) return true;
@@ -114,6 +141,11 @@ function codedSettingsError(message, code) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function helperReasonError(reason) {
+  const fixed = HELPER_FAILURES[reason];
+  return fixed ? codedSettingsError(fixed[1], fixed[0]) : null;
 }
 
 function resolveHelperPath(runtime) {
@@ -301,14 +333,15 @@ export function start2FASettingsCodeRequest(opts = {}) {
       parsed = null;
     }
 
-    if (cancelRequested || (parsedOutput && parsed?.message === "cancelled")) {
+    const helperReason =
+      parsedOutput && typeof parsed?.reason === "string" ? parsed.reason : null;
+    if (cancelRequested || helperReason === "cancelled") {
       finish(cancelledError());
       return;
     }
-    if (parsedOutput && parsed?.message === "Accessibility permission unavailable") {
-      const error = new Error("2FA settings helper requires Accessibility permission");
-      error.code = "2FA_SETTINGS_ACCESSIBILITY_DENIED";
-      finish(annotateHelperError(error, parsed));
+    const reasonError = helperReasonError(helperReason);
+    if (reasonError) {
+      finish(annotateHelperError(reasonError, parsed));
       return;
     }
     const suffix =

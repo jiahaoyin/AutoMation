@@ -10,6 +10,18 @@ struct Output: Codable {
     let ok: Bool
     let code: String?
     let message: String
+    let reason: String?
+}
+
+enum OutputReason: String {
+    case ok
+    case cancelled
+    case accessibilityUnavailable = "accessibility_unavailable"
+    case twoFactorNotFound = "two_factor_not_found"
+    case verificationAlertNotOpened = "verification_alert_not_opened"
+    case verificationAlertNotFound = "verification_alert_not_found"
+    case verificationAlertCleanupFailed = "verification_alert_cleanup_failed"
+    case settingsUnavailable = "settings_unavailable"
 }
 
 let settingsBundleIds: Set<String> = ["com.apple.systempreferences", "com.apple.SystemSettings"]
@@ -1095,18 +1107,13 @@ func clickNamed(
         seen.append(node)
         visited += 1
         if hasExactName(node, names: names),
-           elementBelongsToProcess(node, pid: expectedPid),
-           axBool(node, kAXHiddenAttribute as String) != true,
-           axBool(node, kAXEnabledAttribute as String) == true,
-           supportsPressAction(node),
-           axFrame(node) != nil,
-           settingsActionScopeAllowsElement(
-               node,
+           let pressableAncestor = nearestNavigationPressableAncestor(
+               from: node,
                appElement: root,
                expectedPid: expectedPid
            ),
-           !matches.contains(where: { $0 == node }) {
-            matches.append(node)
+           !matches.contains(where: { $0 == pressableAncestor }) {
+            matches.append(pressableAncestor)
         }
         queue.append(contentsOf: axSheets(node))
         queue.append(contentsOf: axChildren(node))
@@ -1128,6 +1135,139 @@ func clickNamed(
         expectedPid: expectedPid,
         deadline: deadline
     )
+}
+
+func nearestNavigationPressableAncestor(
+    from element: AXUIElement,
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    maxDepth: Int = 12
+) -> AXUIElement? {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(element, pid: expectedPid) else { return nil }
+    var current: AXUIElement? = element
+    for _ in 0..<maxDepth {
+        guard let candidate = current,
+              elementBelongsToProcess(candidate, pid: expectedPid) else { return nil }
+        if axBool(candidate, kAXHiddenAttribute as String) != true,
+           axBool(candidate, kAXEnabledAttribute as String) == true,
+           supportsPressAction(candidate),
+           axFrame(candidate) != nil,
+           settingsActionScopeAllowsElement(
+               candidate,
+               appElement: appElement,
+               expectedPid: expectedPid
+           ) {
+            return isTrustedSystemSettingsProcess(expectedPid) ? candidate : nil
+        }
+        current = axParent(candidate)
+    }
+    return nil
+}
+
+enum NavigationTargetReadiness {
+    case getCodeReady
+    case twoFactorReady
+    case ownerLost
+    case timedOut
+}
+
+func hasNavigableNamedElement(
+    in root: AXUIElement,
+    names: [String],
+    expectedPid: pid_t,
+    maxNodes: Int = 2_000
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        if hasExactName(node, names: names),
+           nearestNavigationPressableAncestor(
+               from: node,
+               appElement: root,
+               expectedPid: expectedPid
+           ) != nil {
+            return isTrustedSystemSettingsProcess(expectedPid)
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return false
+}
+
+func waitForTwoFactorNavigationTarget(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date
+) -> NavigationTargetReadiness {
+    repeat {
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else {
+            return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+        }
+        if findGetCodeButton(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            twoFactorNames: twoFactor,
+            buttonNames: getCodeBtn
+        ) != nil {
+            return .getCodeReady
+        }
+        if hasNavigableNamedElement(
+            in: appElement,
+            names: twoFactor,
+            expectedPid: expectedPid
+        ) {
+            return .twoFactorReady
+        }
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 100)
+        guard pauseMs > 0 else { return .timedOut }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
+    } while true
+}
+
+func waitForGetCodeButton(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date
+) -> NavigationTargetReadiness {
+    repeat {
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else {
+            return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+        }
+        if findGetCodeButton(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            twoFactorNames: twoFactor,
+            buttonNames: getCodeBtn
+        ) != nil {
+            return .getCodeReady
+        }
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 100)
+        guard pauseMs > 0 else { return .timedOut }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
+    } while true
 }
 
 func collectWindows(appElement: AXUIElement, expectedPid: pid_t) -> [AXUIElement] {
@@ -1481,7 +1621,7 @@ func stopIfCancelled(appElement: AXUIElement? = nil, expectedPid: pid_t? = nil) 
             waitForAlertMs: verificationCodeRequested ? 3_000 : 0
         )
     }
-    emit(Output(ok: false, code: nil, message: "cancelled"))
+    emit(Output(ok: false, code: nil, message: "cancelled", reason: OutputReason.cancelled.rawValue))
 }
 
 func cancellablePause(
@@ -1681,13 +1821,20 @@ func prepareVerificationCodeAlert(
             expectedPid: expectedPid,
             deadline: deadline
         ) {
-            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 1_200)
-            guard pauseMs > 0 else { return .timedOut }
-            cancellablePause(
-                UInt32(pauseMs * 1_000),
+            switch waitForTwoFactorNavigationTarget(
                 appElement: appElement,
-                expectedPid: expectedPid
-            )
+                expectedPid: expectedPid,
+                deadline: deadline
+            ) {
+            case .getCodeReady:
+                logStep(4, "Two-Factor Authentication already open")
+            case .twoFactorReady:
+                break
+            case .ownerLost:
+                return .ownerLost
+            case .timedOut:
+                return .timedOut
+            }
         }
         guard actionMayProceed(
             deadline: deadline,
@@ -1732,18 +1879,11 @@ func prepareVerificationCodeAlert(
                     return .twoFactorNotFound
                 }
             }
-            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 1_200)
-            guard pauseMs > 0 else { return .timedOut }
-            cancellablePause(
-                UInt32(pauseMs * 1_000),
+            guard waitForGetCodeButton(
                 appElement: appElement,
-                expectedPid: expectedPid
-            )
-            guard actionMayProceed(
-                deadline: deadline,
-                appElement: appElement,
-                expectedPid: expectedPid
-            ) else {
+                expectedPid: expectedPid,
+                deadline: deadline
+            ) == .getCodeReady else {
                 return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
             }
         }
@@ -1799,7 +1939,7 @@ while i < args.count {
 stopIfCancelled()
 guard AXIsProcessTrusted() else {
     logStep(0, "Accessibility permission unavailable")
-    emit(Output(ok: false, code: nil, message: "Accessibility permission unavailable"))
+    emit(Output(ok: false, code: nil, message: "Accessibility permission unavailable", reason: OutputReason.accessibilityUnavailable.rawValue))
 }
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 
@@ -1887,7 +2027,7 @@ for uiOwnerAttempt in 1...2 {
         continue
     case .twoFactorNotFound:
         if uiOwnerAttempt < 2 { continue }
-        emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found"))
+        emit(Output(ok: false, code: nil, message: "Two-Factor Authentication not found", reason: OutputReason.twoFactorNotFound.rawValue))
     case .alertNotOpened:
         _ = closeVerificationCodeAlert(
             appElement: appElement,
@@ -1895,7 +2035,7 @@ for uiOwnerAttempt in 1...2 {
             waitForAlertMs: 1_000
         )
         guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
-        emit(Output(ok: false, code: nil, message: "verification code alert was not opened"))
+        emit(Output(ok: false, code: nil, message: "verification code alert was not opened", reason: OutputReason.verificationAlertNotOpened.rawValue))
     case .ready:
         break
     }
@@ -1944,10 +2084,10 @@ for uiOwnerAttempt in 1...2 {
             waitForAlertMs: 1_000
         )
         guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
-        emit(Output(ok: false, code: nil, message: "verification code alert not found"))
+        emit(Output(ok: false, code: nil, message: "verification code alert not found", reason: OutputReason.verificationAlertNotFound.rawValue))
     }
 
-    logStep(7, "verification code detected")
+    logStep(7, "verification code candidate detected")
     stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
     let closed = closeVerificationCodeAlert(
         appElement: appElement,
@@ -1956,10 +2096,11 @@ for uiOwnerAttempt in 1...2 {
     )
     guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
     guard closed else {
-        emit(Output(ok: false, code: nil, message: "verification code alert cleanup failed"))
+        emit(Output(ok: false, code: nil, message: "verification code alert cleanup failed", reason: OutputReason.verificationAlertCleanupFailed.rawValue))
     }
     stopIfCancelled(appElement: appElement, expectedPid: settingsPid)
-    emit(Output(ok: true, code: finalCode, message: "ok"))
+    logStep(8, "verification code retrieval completed")
+    emit(Output(ok: true, code: finalCode, message: "ok", reason: OutputReason.ok.rawValue))
 }
 
-emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable"))
+emit(Output(ok: false, code: nil, message: "Apple Account settings UI unavailable", reason: OutputReason.settingsUnavailable.rawValue))
