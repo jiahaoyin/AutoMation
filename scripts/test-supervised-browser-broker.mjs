@@ -605,8 +605,8 @@ const bridgeSource = fs.readFileSync(
 );
 assert.match(
   bridgeSource,
-  /!productionStage\.startsWith\("browser_failure:"\)[\s\S]*\["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"\]\.includes/,
-  "an explicit page failure stage must take precedence over a later broker EOF"
+  /\["starting", "browser_backend_starting"\]\.includes\(productionStage\)[\s\S]*\["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"\]\.includes/,
+  "broker EOF is authoritative only before browser startup produces a stronger stage"
 );
 
 console.log("supervised browser broker contract: ok");

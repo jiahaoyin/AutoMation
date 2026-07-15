@@ -2472,7 +2472,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     else if (finalStatus !== "") failureClass = "GIT_DIRTY";
     else if (productionExit !== 0) {
       if (
-        !productionStage.startsWith("browser_failure:") &&
+        ["starting", "browser_backend_starting"].includes(productionStage) &&
         ["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"].includes(
           browserNodeFailure
         )
