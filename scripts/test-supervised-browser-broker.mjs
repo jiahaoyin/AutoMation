@@ -114,6 +114,8 @@ assert.throws(
 const executableFs = createFakeFileSystem(
   new Map([
     [paths.pythonPath, { type: "symlink", mode: 0o777 }],
+    [paths.relayNodePath, { type: "file", mode: 0o755 }],
+    [paths.relayScriptPath, { type: "file", mode: 0o644 }],
     [paths.firefoxPath, { type: "file", mode: 0o755 }],
     [paths.scriptPath, { type: "file", mode: 0o644 }],
   ])
@@ -121,11 +123,13 @@ const executableFs = createFakeFileSystem(
 validateBrowserBrokerExecutable(paths, { fs: executableFs });
 assert.deepEqual(
   executableFs.calls.filter(([operation]) => operation === "access").map((call) => call[1]),
-  [paths.pythonPath, paths.firefoxPath]
+  [paths.pythonPath, paths.relayNodePath, paths.firefoxPath]
 );
 const symlinkFirefoxFs = createFakeFileSystem(
   new Map([
     [paths.pythonPath, { type: "file", mode: 0o755 }],
+    [paths.relayNodePath, { type: "file", mode: 0o755 }],
+    [paths.relayScriptPath, { type: "file", mode: 0o644 }],
     [paths.firefoxPath, { type: "symlink", mode: 0o777 }],
     [paths.scriptPath, { type: "file", mode: 0o644 }],
   ])
@@ -234,7 +238,12 @@ assert.match(wrapper, /^set -eu\numask 077/m);
 assert.match(wrapper, /ruyipage-broker-members/);
 assert.match(
   wrapper,
-  /"\$@" 3>&- < "\$commands_fifo" > "\$events_fifo" 2>\/dev\/null &/
+  /"\$@" 3>&- < <\("\$relay_node" "\$relay_script" read "\$commands_fifo" 3>&-\) > >\("\$relay_node" "\$relay_script" write "\$events_fifo" 3>&-\) 2>\/dev\/null &/
+);
+assert.doesNotMatch(
+  wrapper,
+  /"\$@"[^\n]*< "\$commands_fifo"[^\n]*> "\$events_fifo"/,
+  "the supervisor leader must never block while opening a FIFO"
 );
 assert.match(wrapper, /target_identity_is_current[\s\S]*\/bin\/kill -TERM/);
 assert.match(
@@ -337,6 +346,8 @@ for (const value of [
   "ruyipage-supervisor",
   NONCE,
   paths.scriptPath,
+  paths.relayNodePath,
+  paths.relayScriptPath,
   "--report-dir",
   paths.reportDir,
   "--profile-dir",

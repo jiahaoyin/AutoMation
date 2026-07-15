@@ -148,6 +148,18 @@ export function resolveBrowserBrokerPaths({ repo, productionDir }) {
       "bin",
       "python"
     ),
+    relayNodePath: path.posix.join(
+      resolvedRepo,
+      ".runtime",
+      "node",
+      "bin",
+      "node"
+    ),
+    relayScriptPath: path.posix.join(
+      resolvedRepo,
+      "scripts",
+      "ruyipage-fifo-relay.mjs"
+    ),
     scriptPath: path.posix.join(
       resolvedRepo,
       "scripts",
@@ -176,6 +188,8 @@ export function validateBrowserBrokerPathScope(values) {
     [values.statePath, values.reportRoot, "ruyipage process state"],
     [values.lifecyclePath, values.reportRoot, "ruyipage lifecycle state"],
     [values.pythonPath, values.repo, "ruyipage Python"],
+    [values.relayNodePath, values.repo, "FIFO relay Node"],
+    [values.relayScriptPath, values.repo, "FIFO relay script"],
     [values.scriptPath, values.repo, "ruyipage script"],
     [values.profileDir, values.productionDir, "Firefox profile"],
   ]) {
@@ -196,6 +210,15 @@ export function validateBrowserBrokerExecutable(paths, options = {}) {
     throw new Error("ruyipage Python is invalid");
   }
   fileSystem.accessSync(paths.pythonPath, fs.constants.X_OK);
+  const relayNodeStats = fileSystem.lstatSync(paths.relayNodePath);
+  if (!relayNodeStats.isFile() && !relayNodeStats.isSymbolicLink()) {
+    throw new Error("FIFO relay Node is invalid");
+  }
+  fileSystem.accessSync(paths.relayNodePath, fs.constants.X_OK);
+  const relayScriptStats = fileSystem.lstatSync(paths.relayScriptPath);
+  if (!relayScriptStats.isFile() || relayScriptStats.isSymbolicLink()) {
+    throw new Error("FIFO relay script is invalid");
+  }
   if (!path.posix.isAbsolute(paths.firefoxPath)) {
     throw new Error("Firefox executable is invalid");
   }
@@ -794,7 +817,9 @@ export function buildBrowserBrokerSupervisorScript() {
     "deadline_ms=$9",
     "commands_fifo=${10}",
     "events_fifo=${11}",
-    "shift 11",
+    "relay_node=${12}",
+    "relay_script=${13}",
+    "shift 13",
     "interrupted_status=0",
     'broker_status() { print -r -- "$1" >&3; }',
     "(( ${#launch_nonce} == 32 )) && [[ \"$launch_nonce\" != *[^0-9a-f]* ]] || exit 125",
@@ -815,6 +840,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "[[ -p \"$events_fifo\" && ! -h \"$events_fifo\" ]] || exit 125",
     "[[ \"$(/usr/bin/stat -f %Lp \"$commands_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
     "[[ \"$(/usr/bin/stat -f %Lp \"$events_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
+    "[[ -x \"$relay_node\" && -f \"$relay_script\" && ! -h \"$relay_script\" ]] || exit 125",
     'broker_status "supervisor-ready" || exit 125',
     "expected_gate=\"{\\\"version\\\":1,\\\"nonce\\\":\\\"$launch_nonce\\\",\\\"pid\\\":$$}\"",
     "while :; do",
@@ -930,7 +956,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "trap 'interrupted_status=143' TERM",
     "trap 'interrupted_status=129' HUP",
     'broker_status "target-launch" || exit 125',
-    "\"$@\" 3>&- < \"$commands_fifo\" > \"$events_fifo\" 2>/dev/null &",
+    "\"$@\" 3>&- < <(\"$relay_node\" \"$relay_script\" read \"$commands_fifo\" 3>&-) > >(\"$relay_node\" \"$relay_script\" write \"$events_fifo\" 3>&-) 2>/dev/null &",
     "backend_pid=$!",
     "identity_attempt=0",
     "while /bin/kill -0 \"$backend_pid\" 2>/dev/null && (( identity_attempt < 1000 )); do",
@@ -1388,6 +1414,8 @@ export async function startBrowserBroker(
       String(broker.context.deadlineMs),
       broker.paths.commandsFifo,
       broker.paths.eventsFifo,
+      broker.paths.relayNodePath,
+      broker.paths.relayScriptPath,
       ...backendArgs,
     ],
     {
