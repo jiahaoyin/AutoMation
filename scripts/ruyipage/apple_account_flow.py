@@ -91,6 +91,16 @@ APPLE_AUTH_HOSTS = frozenset(
 SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
+BROWSER_STARTUP_STAGES = {
+    "not_started",
+    "credentials_received",
+    "url_validated",
+    "runtime_importing",
+    "runtime_imported",
+    "browser_constructing",
+    "browser_ready",
+}
+browser_startup_stage = "not_started"
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROKER_APPLE_ID_MAX_LENGTH = 320
@@ -1562,14 +1572,23 @@ def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
 
 
 def browser_flow(args: argparse.Namespace) -> int:
+    global browser_startup_stage
+    browser_startup_stage = "not_started"
     apple_id, password = load_browser_credentials()
     broker_mode = browser_broker_mode_enabled()
     if broker_mode:
+        browser_startup_stage = "credentials_received"
         emit({"event": "status", "status": "broker_credentials_received"})
     sign_in_url = validate_apple_url(args.sign_in_url)
+    if broker_mode:
+        browser_startup_stage = "url_validated"
+        emit({"event": "status", "status": "browser_url_validated"})
 
+    if broker_mode:
+        browser_startup_stage = "runtime_importing"
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
     if broker_mode:
+        browser_startup_stage = "runtime_imported"
         emit({"event": "status", "status": "browser_runtime_imported"})
     opts = FirefoxOptions()
     if args.firefox:
@@ -1592,8 +1611,11 @@ def browser_flow(args: argparse.Namespace) -> int:
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     if broker_mode:
+        browser_startup_stage = "browser_constructing"
         emit({"event": "status", "status": "browser_constructing"})
     page = construct_firefox_page(FirefoxPage, opts)
+    if broker_mode:
+        browser_startup_stage = "browser_ready"
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
         page.get(sign_in_url)
@@ -1795,13 +1817,14 @@ def run_cli(argv: list[str]) -> int:
     try:
         return main(argv)
     except Exception:
-        emit(
-            {
-                "event": "result",
-                "success": False,
-                "error": TOP_LEVEL_FAILURE_REASON,
-            }
-        )
+        result = {
+            "event": "result",
+            "success": False,
+            "error": TOP_LEVEL_FAILURE_REASON,
+        }
+        if browser_broker_mode_enabled() and browser_startup_stage in BROWSER_STARTUP_STAGES:
+            result["failureStage"] = browser_startup_stage
+        emit(result)
         print(TOP_LEVEL_FAILURE_REASON, file=sys.stderr, flush=True)
         return 1
 

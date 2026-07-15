@@ -1847,6 +1847,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
         emitStatus("broker-connected", "[mac:supervised] ruyiPage broker connected");
         return;
       }
+      if (line === "[ruyipage] status:browser_url_validated") {
+        productionStage = "browser_url_validated";
+        return;
+      }
       if (line === "[ruyipage] status:browser_runtime_imported") {
         productionStage = "browser_runtime_imported";
         emitStatus("runtime-imported", "[mac:supervised] ruyiPage runtime imported");
@@ -1855,6 +1859,23 @@ export async function runSupervisedTerminalBridge(options = {}) {
       if (line === "[ruyipage] status:browser_constructing") {
         productionStage = "browser_constructing";
         emitStatus("browser-constructing", "[mac:supervised] Firefox launch requested by ruyiPage");
+        return;
+      }
+      if (line.startsWith("[ruyipage] status:failure:")) {
+        const failureStage = line.slice("[ruyipage] status:failure:".length);
+        if (
+          [
+            "not_started",
+            "credentials_received",
+            "url_validated",
+            "runtime_importing",
+            "runtime_imported",
+            "browser_constructing",
+            "browser_ready",
+          ].includes(failureStage)
+        ) {
+          productionStage = `browser_failure:${failureStage}`;
+        }
         return;
       }
       if (line === SUPERVISED_SUCCESS_MARKER) {
@@ -2217,6 +2238,25 @@ export async function runSupervisedTerminalBridge(options = {}) {
         failureClass = "ACCESSIBILITY_PERMISSION_REQUIRED";
       } else if (productionStage === "browser_runtime_resolving") {
         failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
+      } else if (productionStage === "browser_failure:credentials_received") {
+        failureClass = "BROWSER_URL_VALIDATION_FAILED";
+      } else if (
+        [
+          "browser_failure:url_validated",
+          "browser_failure:runtime_importing",
+        ].includes(productionStage)
+      ) {
+        failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
+      } else if (
+        [
+          "browser_failure:runtime_imported",
+          "browser_failure:browser_constructing",
+          "browser_failure:browser_ready",
+        ].includes(productionStage)
+      ) {
+        failureClass = "BROWSER_LAUNCH_FAILED";
+      } else if (productionStage === "browser_failure:not_started") {
+        failureClass = "BROWSER_BROKER_TRANSPORT_FAILED";
       } else if (productionStage === "browser_credentials_received") {
         failureClass = "BROWSER_RUNTIME_UNAVAILABLE";
       } else if (

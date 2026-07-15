@@ -39,8 +39,18 @@ const TWO_FACTOR_WINNER_MESSAGES = Object.freeze({
 const SUPERVISED_TWO_FACTOR_STATUS_PREFIX = "[2FA] status:";
 const RUYIPAGE_STARTUP_STATUSES = new Set([
   "broker_credentials_received",
+  "browser_url_validated",
   "browser_runtime_imported",
   "browser_constructing",
+]);
+const RUYIPAGE_FAILURE_STAGES = new Set([
+  "not_started",
+  "credentials_received",
+  "url_validated",
+  "runtime_importing",
+  "runtime_imported",
+  "browser_constructing",
+  "browser_ready",
 ]);
 
 function sanitizeReadyMode(mode) {
@@ -144,6 +154,12 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
           RUYIPAGE_STARTUP_STATUSES.has(event.status)
         ) {
           console.log(`[ruyipage] status:${event.status}`);
+        } else if (
+          event.event === "result" &&
+          event.success === false &&
+          RUYIPAGE_FAILURE_STAGES.has(event.failureStage)
+        ) {
+          console.log(`[ruyipage] status:failure:${event.failureStage}`);
         } else if (event.event === "warning") {
           console.warn("[ruyipage] backend warning");
         } else if (event.event === "prepare_2fa") {
