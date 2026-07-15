@@ -12,8 +12,12 @@
  *   node scripts/apple-id-full-flow.mjs --skip-browser # 仅 Mac 设置阶段
  */
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
   readBrowserFailureCode,
+  readBrowserFailureStage,
   runAccountBrowserPhase,
 } from "./lib/account-browser-flow.js";
 import { confirmOrPromptAppleCredentials, maskAppleId } from "./lib/credentials.js";
@@ -29,54 +33,99 @@ import { createFlowAudit } from "./lib/flow-audit.js";
 const skipMac = process.argv.includes("--skip-mac");
 const skipBrowser = process.argv.includes("--skip-browser");
 const skipSetup = process.argv.includes("--skip-setup");
+const FAILURE_TOKEN_RE = /^[a-z0-9_]{1,96}$/;
 
-async function main() {
+function failureToken(value) {
+  return typeof value === "string" && FAILURE_TOKEN_RE.test(value) ? value : "unknown";
+}
+
+export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = new Date()) {
+  return {
+    failureStage: failureToken(failureStage),
+    failureCode: failureToken(failureCode),
+    failedAt: failedAt.toISOString(),
+    auditFile: "flow-audit.jsonl",
+  };
+}
+
+export async function main() {
+  console.log("[apple-automation] stage:flow_main_started");
   console.log("═══════════════════════════════════════════");
   console.log(" Apple ID 流程：Mac 系统设置 → Firefox account");
   console.log("═══════════════════════════════════════════\n");
 
-  if (!skipSetup) {
-    await ensureEnvironment({
-      quiet: false,
-      skipFirefox: skipBrowser,
-      skipRuyiPage: skipBrowser,
-      skipAutomation: skipMac,
-    });
-    console.log("");
-  }
-
-  const creds = await confirmOrPromptAppleCredentials();
   const reportDir = createReportDir("apple-id-flow");
   const flowAudit = createFlowAudit(reportDir, {
-    secrets: [creds.appleId, creds.password],
     onWriteFailure() {
       console.warn("[报告] 统一诊断日志写入失败");
     },
   });
   console.log(`[报告] 统一诊断日志: ${flowAudit.path}`);
-  flowAudit.write("flow", "started", {
-    skipMac,
-    skipBrowser,
-    skipSetup,
-  });
   const report = {
     runAt: new Date().toISOString(),
-    appleId: maskAppleId(creds.appleId),
     phases: {},
   };
   let reportFile = null;
+  let creds = null;
+  let failureStage = "unknown";
+  let failureCode = "unknown";
 
   try {
+    flowAudit.write("flow", "started", {
+      skipMac,
+      skipBrowser,
+      skipSetup,
+    });
+
+    if (!skipSetup) {
+      failureStage = "environment_setup";
+      failureCode = "environment_setup_failed";
+      try {
+        await ensureEnvironment({
+          quiet: false,
+          skipFirefox: skipBrowser,
+          skipRuyiPage: skipBrowser,
+          skipAutomation: skipMac,
+        });
+      } catch (error) {
+        flowAudit.write("flow", "environment_setup_failed", {
+          failureStage,
+          failureCode,
+        });
+        throw error;
+      }
+      console.log("");
+    }
+
+    failureStage = "credential_resolution";
+    failureCode = "credential_resolution_failed";
+    try {
+      creds = await confirmOrPromptAppleCredentials();
+    } catch (error) {
+      flowAudit.write("flow", "credential_resolution_failed", {
+        failureStage,
+        failureCode,
+      });
+      throw error;
+    }
+    flowAudit.addSecrets([creds.appleId, creds.password]);
+    console.log("[apple-automation] stage:credentials_ready");
+    report.appleId = maskAppleId(creds.appleId);
+
     if (!skipMac) {
+      failureStage = "mac_settings";
+      failureCode = "mac_settings_failed";
       try {
         flowAudit.write("mac_settings", "started");
         report.phases.macSettings = await runMacSettingsLoginPhase(creds);
         flowAudit.write("mac_settings", "completed", { success: true });
       } catch (e) {
-        flowAudit.writeError("mac_settings", "failed", e);
+        flowAudit.write("mac_settings", "failed", { failureStage, failureCode });
         report.phases.macSettings = {
           success: false,
           error: "Mac Settings phase failed",
+          failureStage,
+          failureCode,
         };
         throw e;
       }
@@ -87,6 +136,8 @@ async function main() {
     }
 
     if (!skipBrowser) {
+      failureStage = "unknown";
+      failureCode = "account_browser_failed";
       try {
         flowAudit.write("account_browser", "started");
         report.phases.accountBrowser = await runAccountBrowserPhase({
@@ -96,13 +147,17 @@ async function main() {
         });
         flowAudit.write("account_browser", "completed", { success: true });
       } catch (e) {
-        flowAudit.writeError("account_browser", "failed", e, {
-          failureCode: readBrowserFailureCode(e),
+        failureStage = readBrowserFailureStage(e);
+        failureCode = readBrowserFailureCode(e);
+        flowAudit.write("account_browser", "failed", {
+          failureStage,
+          failureCode,
         });
         report.phases.accountBrowser = {
           success: false,
           error: "Account browser phase failed",
-          failureCode: readBrowserFailureCode(e),
+          failureStage,
+          failureCode,
         };
         throw e;
       }
@@ -112,6 +167,8 @@ async function main() {
       flowAudit.write("account_browser", "skipped");
     }
 
+    failureStage = "report_write";
+    failureCode = "report_write_failed";
     reportFile = writeReport(reportDir, report);
     flowAudit.write("flow", "report_written", { file: "report.json" });
     if (report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true) {
@@ -121,10 +178,18 @@ async function main() {
     flowAudit.write("flow", "completed", { success: true });
   } catch (e) {
     report.error = "Apple ID flow failed";
+    report.failure = createFlowFailureEnvelope(failureStage, failureCode);
     reportFile = writeReport(reportDir, report);
-    flowAudit.writeError("flow", "failed", e, {
+    flowAudit.write("flow", "failed", {
+      failureStage: report.failure.failureStage,
+      failureCode: report.failure.failureCode,
       reportFile: "report.json",
     });
+    console.error(`[apple-automation] failure_stage:${report.failure.failureStage}`);
+    console.error(`[apple-automation] failure_code:${report.failure.failureCode}`);
+    console.error(`[apple-automation] failed_at:${report.failure.failedAt}`);
+    console.error(`[apple-automation] report_path:${reportFile}`);
+    console.error(`[apple-automation] audit_path:${flowAudit.path}`);
     console.error(`\n[报告] 失败报告已保存: ${reportFile}`);
     console.error(`[报告] 统一诊断日志: ${flowAudit.path}`);
     throw e;
@@ -140,7 +205,12 @@ async function main() {
   console.log("═══════════════════════════════════════════\n");
 }
 
-main().catch(() => {
-  console.error("\n[failed] Apple ID flow failed");
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+) {
+  main().catch(() => {
+    console.error("\n[failed] Apple ID flow failed");
+    process.exitCode = 1;
+  });
+}

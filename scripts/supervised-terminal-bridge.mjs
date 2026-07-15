@@ -11,8 +11,11 @@ import { fileURLToPath } from "node:url";
 import {
   SUPERVISED_ACCEPTANCE_VALUE,
   SUPERVISED_COMMAND_ID,
+  SUPERVISED_NODE_FAILURES,
   SUPERVISED_PRODUCTION_ENV_POLICY,
+  SUPERVISED_PRODUCTION_STAGES,
   SUPERVISED_SUCCESS_MARKER,
+  SUPERVISED_STDOUT_STAGE_TOKENS,
   createSupervisedProductionPermissionProfile,
   createSupervisedAttestation,
 } from "./lib/supervised-attestation.js";
@@ -35,6 +38,119 @@ const BROWSER_BROKER_CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RAW_LOG_BYTES = 1024 * 1024;
 const MANUAL_CODE_PROMPT =
   "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
+const RUYIPAGE_FAILURE_STAGES = new Set(
+  [...SUPERVISED_PRODUCTION_STAGES]
+    .filter((stage) => stage.startsWith("browser_failure:"))
+    .map((stage) => stage.slice("browser_failure:".length))
+);
+const TWO_FA_PENDING_STATUSES = new Set([
+  "settings_start",
+  "settings_retry",
+  "settings_accessibility",
+  "manual_allow",
+  "manual_code",
+  "manual_unavailable",
+  "ocr_permission_missing",
+]);
+
+export function createProductionProtocolState() {
+  let productionStage = "not_started";
+  let nodeFailure = "none";
+
+  const processStdoutLine = (line) => {
+    if (typeof line !== "string") return false;
+    if (line === SUPERVISED_SUCCESS_MARKER) return true;
+
+    const stagePrefix = "[apple-automation] stage:";
+    if (line.startsWith(stagePrefix)) {
+      const stage = line.slice(stagePrefix.length);
+      if (SUPERVISED_STDOUT_STAGE_TOKENS.has(stage)) {
+        productionStage = stage;
+        return true;
+      }
+      return false;
+    }
+
+    const twoFaPrefix = "[2FA] status:";
+    if (line.startsWith(twoFaPrefix)) {
+      const status = line.slice(twoFaPrefix.length);
+      if (status === "permission_preflight_start") {
+        productionStage = "accessibility_preflight";
+        return true;
+      }
+      if (status === "permission_preflight_ready") {
+        productionStage = "accessibility_ready";
+        return true;
+      }
+      if (status === "permission_preflight_missing") {
+        productionStage = "accessibility_missing";
+        return true;
+      }
+      if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
+        productionStage = "two_fa_code_acquired";
+        return true;
+      }
+      if (status === "timeout") {
+        productionStage = "two_fa_code_unavailable";
+        return true;
+      }
+      if (TWO_FA_PENDING_STATUSES.has(status)) {
+        if (productionStage !== "two_fa_code_acquired") {
+          productionStage = "two_fa_code_pending";
+        }
+        return true;
+      }
+      return false;
+    }
+
+    const ruyiStatusPrefix = "[ruyipage] status:";
+    if (line.startsWith(ruyiStatusPrefix)) {
+      const status = line.slice(ruyiStatusPrefix.length);
+      const fixedStages = new Map([
+        ["runtime_resolving", "browser_runtime_resolving"],
+        ["backend_starting", "browser_backend_starting"],
+        ["broker_credentials_received", "browser_credentials_received"],
+        ["browser_url_validated", "browser_url_validated"],
+        ["browser_runtime_imported", "browser_runtime_imported"],
+        ["browser_constructing", "browser_constructing"],
+      ]);
+      if (fixedStages.has(status)) {
+        productionStage = fixedStages.get(status);
+        return true;
+      }
+      if (status.startsWith("failure:")) {
+        const failureStage = status.slice("failure:".length);
+        if (RUYIPAGE_FAILURE_STAGES.has(failureStage)) {
+          productionStage = `browser_failure:${failureStage}`;
+          return true;
+        }
+        return false;
+      }
+      if (status.startsWith("node-failure:")) {
+        const failure = status.slice("node-failure:".length);
+        if (failure !== "none" && SUPERVISED_NODE_FAILURES.has(failure)) {
+          nodeFailure = failure;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  return {
+    processStdoutLine,
+    get productionStage() {
+      return productionStage;
+    },
+    get nodeFailure() {
+      return nodeFailure;
+    },
+  };
+}
+
+export function drainProductionStderr(chunk) {
+  return Buffer.from(chunk).length;
+}
 
 export function supervisedTtyCapability(input) {
   return input?.isTTY === true && typeof input.setRawMode === "function"
@@ -1865,6 +1981,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
   let productionStatePath = null;
   let productionLaunchGatePath = null;
   let browserBroker = null;
+  let productionProtocol = null;
   let cancellationRequested = false;
   const productionCommandMatches = (identity) =>
     identity.command.includes("supervised-production") &&
@@ -1997,17 +2114,14 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let rawBytes = 0;
     let logLimitExceeded = false;
     let outputForwardingFailed = false;
-    let markerTail = Buffer.alloc(0);
     let promptTail = Buffer.alloc(0);
     let markerConfirmedInOutput = false;
     let manualPromptVisible = false;
     let manualPromptObserved = false;
     let manualPromptCount = 0;
-    let productionStage = "starting";
-    let browserNodeFailure = null;
+    productionProtocol = createProductionProtocolState();
     const supervisorStatusProtocol = createSupervisorStatusProtocol();
     const emittedStatuses = new Set();
-    const successMarkerBytes = Buffer.from(SUPERVISED_SUCCESS_MARKER, "utf8");
     const manualPromptBytes = Buffer.from(MANUAL_CODE_PROMPT, "utf8");
     const safeWrite = (value) => {
       if (outputForwardingFailed) return;
@@ -2023,173 +2137,55 @@ export async function runSupervisedTerminalBridge(options = {}) {
       safeWrite(`${value}\n`);
     };
     const processSafeLine = (line) => {
-      if (line.startsWith("[2FA] status:")) {
-        const status = line.slice("[2FA] status:".length);
-        if (status === "permission_preflight_start") {
-          productionStage = "accessibility_preflight";
-        } else if (status === "permission_preflight_ready") {
-          productionStage = "accessibility_ready";
-        } else if (status === "permission_preflight_missing") {
-          productionStage = "accessibility_missing";
-          emitStatus(
-            "accessibility-missing",
-            "[mac:supervised] 原生 2FA helper 未获辅助功能授权；Terminal 已勾选时请同时允许系统新显示的 Codex/helper 项，流程将继续并保留手动验证码兜底"
-          );
-        } else if (["winner:popup", "winner:settings", "winner:manual"].includes(status)) {
-          productionStage = "two_fa_code_acquired";
-        } else if (status === "timeout") {
-          productionStage = "two_fa_code_unavailable";
-        } else if (
-          [
-            "settings_start",
-            "settings_retry",
-            "settings_accessibility",
-            "manual_allow",
-            "manual_code",
-            "manual_unavailable",
-            "ocr_permission_missing",
-          ].includes(status) &&
-          productionStage !== "two_fa_code_acquired"
-        ) {
-          productionStage = "two_fa_code_pending";
-        }
-        return;
-      }
-      if (line.includes(MANUAL_CODE_PROMPT)) {
+      if (line === MANUAL_CODE_PROMPT) {
         if (manualPromptVisible) {
           safeWrite("\n");
           manualPromptVisible = false;
         }
         return;
       }
-      if (line === "[ruyipage] status:runtime_resolving") {
-        productionStage = "browser_runtime_resolving";
-        emitStatus("runtime-resolving", "[mac:supervised] ruyiPage runtime resolving");
-        return;
-      }
-      if (line === "[ruyipage] status:backend_starting") {
-        productionStage = "browser_backend_starting";
-        emitStatus("backend-starting", "[mac:supervised] ruyiPage backend starting");
-        return;
-      }
-      if (line === "[ruyipage] status:broker_credentials_received") {
-        productionStage = "browser_credentials_received";
-        emitStatus("broker-connected", "[mac:supervised] ruyiPage broker connected");
-        return;
-      }
-      if (line === "[ruyipage] status:browser_url_validated") {
-        productionStage = "browser_url_validated";
-        return;
-      }
-      if (line === "[ruyipage] status:browser_runtime_imported") {
-        productionStage = "browser_runtime_imported";
-        emitStatus("runtime-imported", "[mac:supervised] ruyiPage runtime imported");
-        return;
-      }
-      if (line === "[ruyipage] status:browser_constructing") {
-        productionStage = "browser_constructing";
-        emitStatus("browser-constructing", "[mac:supervised] Firefox launch requested by ruyiPage");
-        return;
-      }
-      if (line.startsWith("[ruyipage] status:failure:")) {
-        const failureStage = line.slice("[ruyipage] status:failure:".length);
-        if (
-          [
-            "not_started",
-            "credentials_received",
-            "url_validated",
-            "runtime_importing",
-            "runtime_imported",
-            "browser_constructing",
-            "browser_ready",
-            "login_navigation",
-            "login_page_loaded",
-            "login_state_detected",
-            "email_wait",
-            "email_input",
-            "email_submit",
-            "password_wait",
-            "password_input",
-            "remember_account",
-            "twofa_prepare",
-            "password_submit",
-            "twofa_page_wait",
-            "twofa_code_wait",
-            "twofa_input",
-            "signed_in",
-            "account_information",
-          ].includes(failureStage)
-        ) {
-          productionStage = `browser_failure:${failureStage}`;
-        }
-        return;
-      }
-      if (line.startsWith("[ruyipage] status:node-failure:")) {
-        const failureCode = line.slice(
-          "[ruyipage] status:node-failure:".length
-        );
-        if (
-          [
-            "account_home_unconfirmed",
-            "backend_cleanup",
-            "backend_exit",
-            "backend_failed",
-            "backend_interrupted",
-            "backend_stdin",
-            "backend_timeout",
-            "broker_connect",
-            "broker_connect_timeout",
-            "broker_eof",
-            "broker_io",
-            "collector_cleanup",
-            "event_handler",
-            "event_handler_timeout",
-            "process_state",
-            "two_fa_preparation",
-            "two_fa_provider",
-            "unknown",
-          ].includes(failureCode)
-        ) {
-          browserNodeFailure = failureCode;
-        }
-        return;
-      }
       if (line === SUPERVISED_SUCCESS_MARKER) {
+        markerConfirmedInOutput = true;
+        productionProtocol.processStdoutLine(line);
         emitStatus("success", SUPERVISED_SUCCESS_MARKER);
-      } else if (line.startsWith("[Firefox]")) {
-        productionStage = "browser_started";
-        emitStatus("browser", "[mac:supervised] ruyiPage 浏览器流程已启动");
-      } else if (line.startsWith("[ruyipage] 浏览器已就绪")) {
-        productionStage = "browser_ready";
-        emitStatus("browser-ready", "[mac:supervised] ruyiPage 浏览器已就绪");
-      } else if (line.startsWith("[ruyipage] 密码提交前")) {
-        productionStage = "two_fa_page_pending";
-        emitStatus("2fa-prepare", "[mac:supervised] 正在准备 2FA 自动取码");
-      } else if (line.startsWith("[ruyipage] 页面已确认进入 2FA")) {
-        productionStage = "two_fa_code_pending";
-        emitStatus("2fa-page", "[mac:supervised] 网页已进入 2FA 验证");
-      } else if (line.startsWith("[2FA]")) {
-        emitStatus("2fa-progress", "[mac:supervised] 2FA 自动取码处理中");
-      } else if (line.includes("Apple ID flow failed")) {
-        emitStatus("production-failed", "[mac:supervised] Apple Account 登录流程失败");
+        return;
+      }
+      if (!productionProtocol.processStdoutLine(line)) return;
+
+      if (line.startsWith("[2FA] status:")) {
+        const status = line.slice("[2FA] status:".length);
+        if (status === "permission_preflight_missing") {
+          emitStatus(
+            "accessibility-missing",
+            "[mac:supervised] 原生 2FA helper 未获辅助功能授权；Terminal 已勾选时请同时允许系统新显示的 Codex/helper 项，流程将继续并保留手动验证码兜底"
+          );
+        } else if (TWO_FA_PENDING_STATUSES.has(status)) {
+          emitStatus("2fa-progress", "[mac:supervised] 2FA 自动取码处理中");
+        }
+        return;
+      }
+      if (line === "[ruyipage] status:runtime_resolving") {
+        emitStatus("runtime-resolving", "[mac:supervised] ruyiPage runtime resolving");
+      } else if (line === "[ruyipage] status:backend_starting") {
+        emitStatus("backend-starting", "[mac:supervised] ruyiPage backend starting");
+      } else if (line === "[ruyipage] status:broker_credentials_received") {
+        emitStatus("broker-connected", "[mac:supervised] ruyiPage broker connected");
+      } else if (line === "[ruyipage] status:browser_runtime_imported") {
+        emitStatus("runtime-imported", "[mac:supervised] ruyiPage runtime imported");
+      } else if (line === "[ruyipage] status:browser_constructing") {
+        emitStatus("browser-constructing", "[mac:supervised] Firefox launch requested by ruyiPage");
       }
     };
-    const createChunkHandler = ({ inspectPrompt = false, inspectMarker = false } = {}) => {
+    const createStdoutChunkHandler = ({ inspectPrompt = false } = {}) => {
       const decoder = new StringDecoder("utf8");
       let lineBuffer = "";
-      return (chunk) => {
+      let finished = false;
+      const handle = (chunk) => {
         const buffer = Buffer.from(chunk);
         rawBytes += buffer.length;
         if (rawBytes > maxRawLogBytes) {
           logLimitExceeded = true;
           return;
-        }
-        if (inspectMarker && !markerConfirmedInOutput) {
-          const combined = Buffer.concat([markerTail, buffer]);
-          markerConfirmedInOutput = combined.includes(successMarkerBytes);
-          markerTail = combined.subarray(
-            Math.max(0, combined.length - successMarkerBytes.length + 1)
-          );
         }
         if (inspectPrompt && manualPromptCount < 2 && !manualPromptVisible) {
           const combined = Buffer.concat([promptTail, buffer]);
@@ -2210,9 +2206,20 @@ export async function runSupervisedTerminalBridge(options = {}) {
         lineBuffer = lines.pop() ?? "";
         for (const line of lines) processSafeLine(line);
       };
+      handle.finish = () => {
+        if (finished || logLimitExceeded) return;
+        finished = true;
+        lineBuffer += decoder.end();
+        if (lineBuffer.length > 0) processSafeLine(lineBuffer);
+        lineBuffer = "";
+      };
+      return handle;
     };
-    const onStdoutChunk = createChunkHandler({ inspectPrompt: true, inspectMarker: true });
-    const onStderrChunk = createChunkHandler();
+    const onStdoutChunk = createStdoutChunkHandler({ inspectPrompt: true });
+    const onStderrChunk = (chunk) => {
+      rawBytes += drainProductionStderr(chunk);
+      if (rawBytes > maxRawLogBytes) logLimitExceeded = true;
+    };
     emitStatus("starting", "[mac:supervised] 受监督 Apple Account 登录已启动");
 
     browserBroker = createBrowserBroker(context);
@@ -2401,6 +2408,8 @@ export async function runSupervisedTerminalBridge(options = {}) {
     );
     child.stdout.on("data", onStdoutChunk);
     child.stderr.on("data", onStderrChunk);
+    child.stdout.once("end", onStdoutChunk.finish);
+    child.stdout.once("close", onStdoutChunk.finish);
 
     while (
       !outcome.settled &&
@@ -2494,6 +2503,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
       manualPromptVisible = false;
     }
 
+    const trustedProductionStage = productionProtocol.productionStage;
+    const productionStage =
+      trustedProductionStage === "not_started"
+        ? "starting"
+        : trustedProductionStage;
+    const nodeFailure = productionProtocol.nodeFailure;
     let failureClass = "NONE";
     if (processCleanupOutcome === "failed") {
       failureClass = "PROCESS_CLEANUP_FAILED";
@@ -2509,19 +2524,19 @@ export async function runSupervisedTerminalBridge(options = {}) {
       if (
         ["starting", "browser_backend_starting"].includes(productionStage) &&
         ["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"].includes(
-          browserNodeFailure
+          nodeFailure
         )
       ) {
         failureClass = "BROWSER_BROKER_TRANSPORT_FAILED";
       } else if (
-        ["two_fa_preparation", "two_fa_provider"].includes(browserNodeFailure)
+        ["two_fa_preparation", "two_fa_provider"].includes(nodeFailure)
       ) {
         failureClass = "TWO_FA_CODE_UNAVAILABLE";
-      } else if (browserNodeFailure === "account_home_unconfirmed") {
+      } else if (nodeFailure === "account_home_unconfirmed") {
         failureClass = "ACCOUNT_INFORMATION_FAILED";
       } else if (
         ["backend_cleanup", "collector_cleanup", "event_handler", "event_handler_timeout", "process_state"].includes(
-          browserNodeFailure
+          nodeFailure
         )
       ) {
         failureClass = "INTERNAL_ERROR";
@@ -2531,8 +2546,6 @@ export async function runSupervisedTerminalBridge(options = {}) {
         ["two_fa_code_pending", "two_fa_code_unavailable"].includes(productionStage)
       ) {
         failureClass = "TWO_FA_CODE_UNAVAILABLE";
-      } else if (productionStage === "two_fa_page_pending") {
-        failureClass = "TWO_FA_PAGE_FAILED";
       } else if (
         ["accessibility_preflight", "accessibility_missing"].includes(productionStage)
       ) {
@@ -2621,6 +2634,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
 
     const accepted = failureClass === "NONE";
     const cancelled = failureClass === "CANCELLED";
+    const attestationProductionStage = cancelled
+      ? "not_started"
+      : trustedProductionStage;
+    const attestationNodeFailure = cancelled ? "none" : nodeFailure;
     const twoFaDetail = supervisedTwoFaDetail({
       failureClass,
       ttyCapability,
@@ -2639,6 +2656,8 @@ export async function runSupervisedTerminalBridge(options = {}) {
       markerConfirmed,
       failureClass,
       twoFaDetail,
+      productionStage: attestationProductionStage,
+      nodeFailure: attestationNodeFailure,
       observedHeadBefore: headBefore,
       observedHeadAfter: headAfter,
     });

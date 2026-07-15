@@ -5,20 +5,37 @@ const MAX_TEXT_CHARS = 128 * 1024;
 const MAX_ARRAY_ITEMS = 200;
 const MAX_OBJECT_KEYS = 200;
 const MAX_OBJECT_DEPTH = 6;
-const MAX_ERROR_CAUSES = 4;
-const MAX_AGGREGATE_ERRORS = 8;
 const SAFE_TOKEN_RE = /^[a-z0-9_.-]+$/;
+const SAFE_KEY_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,96}$/;
+const SAFE_ERROR_CODE_RE = /^[a-z0-9_.-]+$/;
+const SAFE_REDACTED_TEXT_FIELDS = new Set();
+const SAFE_ERROR_TYPES = new Set([
+  "error",
+  "typeerror",
+  "rangeerror",
+  "syntaxerror",
+  "aggregateerror",
+  "aborterror",
+  "unknown",
+]);
 const SENSITIVE_FIELDS = new Set([
   "appleid",
   "authorization",
   "axdump",
   "axtext",
+  "cause",
   "code",
   "cookie",
   "cookies",
+  "diagnosticmessage",
+  "diagnostictraceback",
   "email",
+  "helpermessage",
+  "helperstderr",
+  "helperstdout",
   "html",
   "image",
+  "message",
   "ocrtext",
   "otp",
   "pagesource",
@@ -31,7 +48,9 @@ const SENSITIVE_FIELDS = new Set([
   "secret",
   "secrets",
   "setcookie",
+  "stack",
   "token",
+  "traceback",
   "twofactorcode",
   "verificationcode",
 ]);
@@ -52,6 +71,8 @@ function isSensitiveField(value) {
   return (
     normalized.includes("accessibilitytree") ||
     normalized.includes("rawaccessibility") ||
+    normalized.includes("rawax") ||
+    normalized.includes("ocr") ||
     normalized.includes("rawocr") ||
     normalized.includes("screenshot")
   );
@@ -91,9 +112,102 @@ export function redactFlowAuditText(value, secrets = []) {
     /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
     "[REDACTED_EMAIL]"
   );
+  text = text.replace(/\b\d(?:[\s-]+\d){5}\b/g, "[REDACTED_OTP]");
   text = text.replace(/\b\d{3}[\s-]+\d{3}\b/g, "[REDACTED_OTP]");
   text = text.replace(/\b\d{6}\b/g, "[REDACTED_OTP]");
+  text = text.replace(
+    /((?:https?:\/\/[^\s"'<>?#]+|\/[A-Za-z0-9._~%-]+(?:\/[A-Za-z0-9._~%-]+)*)\?)[^\s"'<>]*/gi,
+    "$1[REDACTED_QUERY]"
+  );
+  text = text.replace(
+    /%3[fF][^\s"'<>]*(?:token|secret|password|code)[^\s"'<>]*/gi,
+    "%3F[REDACTED_QUERY]"
+  );
+  text = text.replace(
+    /\b(?:password|passwd|secret|token|otp|code|verificationcode|twofactorcode)\s*[:=]\s*[^\s"'<>]+/gi,
+    "[REDACTED_SECRET_ASSIGNMENT]"
+  );
+  text = text.replace(/\b[A-Za-z]:\\[^\s"'<>]+/g, "[REDACTED_PATH]");
+  text = text.replace(
+    /(?:^|[\s"'(])\/(?:Users|tmp|private|var|Volumes|home|data|Library|System|Applications|opt)\/[^\s"'<>]+/g,
+    (match) => `${match[0].trim() === "" ? match[0] : ""}[REDACTED_PATH]`
+  );
+  text = text.replace(
+    /\b[^\s"'<>]*(?:screenshot|screenshots|\.png|\.jpe?g|\.webp|\.tiff?|\.gif)[^\s"'<>]*/gi,
+    "[REDACTED_SCREENSHOT]"
+  );
+  if (
+    /\b(?:raw\s*(?:ax|ocr)|rawax|rawocr|axdump|ocrtext|accessibility\s*tree|rawaccessibility|vision\s*ocr)\b/i.test(
+      text
+    )
+  ) {
+    text = "[REDACTED_RAW_DIAGNOSTIC]";
+  }
   return truncateText(text);
+}
+
+function isSensitiveAuditText(value, secrets = []) {
+  const text = String(value);
+  if (
+    /\b\d(?:[\s-]+\d){5}\b/.test(text) ||
+    /\b\d{3}[\s-]+\d{3}\b/.test(text) ||
+    /\b\d{6}\b/.test(text)
+  ) {
+    return true;
+  }
+  return secrets.some((secret) => {
+    const normalizedSecret = String(secret);
+    return normalizedSecret && text.includes(normalizedSecret);
+  });
+}
+
+function safeAuditToken(value, secrets = []) {
+  if (typeof value !== "string") return "unknown";
+  const token = value.trim();
+  if (
+    token !== token.toLowerCase() ||
+    !SAFE_TOKEN_RE.test(token) ||
+    token.length > 96 ||
+    isSensitiveField(token) ||
+    isSensitiveAuditText(token, secrets)
+  ) {
+    return "unknown";
+  }
+  return token;
+}
+
+function safeAuditKey(value, secrets = []) {
+  const key = typeof value === "string" ? value : "";
+  return SAFE_KEY_RE.test(key) &&
+    !isSensitiveField(key) &&
+    !isSensitiveAuditText(key, secrets)
+    ? key
+    : "unknown";
+}
+
+function safeErrorType(value) {
+  const type = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SAFE_ERROR_TYPES.has(type) ? type : "unknown";
+}
+
+function safeErrorCode(value, secrets = []) {
+  if (typeof value !== "string" && typeof value !== "number") return "unknown";
+  const rawCode = String(value).trim();
+  const code = rawCode.toLowerCase();
+  if (
+    !SAFE_ERROR_CODE_RE.test(code) ||
+    code.length > 96 ||
+    isSensitiveField(code) ||
+    isSensitiveAuditText(rawCode, secrets)
+  ) {
+    return "unknown";
+  }
+  return code;
+}
+
+function safeRedactedAuditText(value, secrets = []) {
+  if (typeof value !== "string") return undefined;
+  return redactFlowAuditText(value, secrets);
 }
 
 function readDataProperty(value, key) {
@@ -121,32 +235,32 @@ function sanitizeValue(value, secrets, depth = 0, seen = new WeakSet()) {
   if (value == null || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value === "bigint") return `${value}n`;
-  if (typeof value === "string") return redactFlowAuditText(value, secrets);
+  if (typeof value === "string") return safeAuditToken(value, secrets);
   if (typeof value !== "object" && typeof value !== "function") {
-    return redactFlowAuditText(String(value), secrets);
+    return "unknown";
   }
   if (value instanceof Error) {
-    return serializeFlowAuditError(value, secrets, 0, seen);
+    return serializeFlowAuditError(value, secrets);
   }
-  if (seen.has(value)) return "[CIRCULAR]";
-  if (depth >= MAX_OBJECT_DEPTH) return "[MAX_DEPTH]";
+  if (seen.has(value)) return "circular";
+  if (depth >= MAX_OBJECT_DEPTH) return "max_depth";
   seen.add(value);
 
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) {
     const byteLength = Number(value.byteLength ?? value.length ?? 0);
     return {
-      type: value.constructor?.name ?? "Binary",
+      type: "binary",
       byteLength: Number.isFinite(byteLength) ? byteLength : 0,
     };
   }
   if (value instanceof ArrayBuffer) {
-    return { type: "ArrayBuffer", byteLength: value.byteLength };
+    return { type: "arraybuffer", byteLength: value.byteLength };
   }
   if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+    return "date";
   }
   if (value instanceof Map || value instanceof Set) {
-    return { type: value.constructor.name, size: value.size };
+    return { type: value instanceof Map ? "map" : "set", size: value.size };
   }
   if (Array.isArray(value)) {
     const result = [];
@@ -154,7 +268,7 @@ function sanitizeValue(value, secrets, depth = 0, seen = new WeakSet()) {
       const item = readDataProperty(value, String(index));
       result.push(sanitizeValue(item, secrets, depth + 1, seen));
     }
-    if (value.length > MAX_ARRAY_ITEMS) result.push("[TRUNCATED_ITEMS]");
+    if (value.length > MAX_ARRAY_ITEMS) result.push("truncated_items");
     return result;
   }
 
@@ -163,20 +277,30 @@ function sanitizeValue(value, secrets, depth = 0, seen = new WeakSet()) {
   try {
     descriptors = Object.getOwnPropertyDescriptors(value);
   } catch {
-    return "[UNREADABLE_OBJECT]";
+    return "unreadable_object";
   }
   const entries = Object.entries(descriptors).slice(0, MAX_OBJECT_KEYS);
+  let redactedKeyCount = 0;
   for (const [key, descriptor] of entries) {
-    const safeKey = redactFlowAuditText(key, secrets);
+    let safeKey = safeAuditKey(key, secrets);
+    if (safeKey === "unknown" && key !== "unknown") {
+      redactedKeyCount += 1;
+      safeKey = `redacted_key_${redactedKeyCount}`;
+    }
     if (isSensitiveField(key)) {
       result[safeKey] = "[REDACTED_FIELD]";
     } else if (Object.hasOwn(descriptor, "value")) {
-      result[safeKey] = sanitizeValue(
-        descriptor.value,
-        secrets,
-        depth + 1,
-        seen
-      );
+      if (SAFE_REDACTED_TEXT_FIELDS.has(normalizeFieldName(key))) {
+        const textValue = safeRedactedAuditText(descriptor.value, secrets);
+        result[safeKey] = textValue === undefined ? "unknown" : textValue;
+      } else {
+        result[safeKey] = sanitizeValue(
+          descriptor.value,
+          secrets,
+          depth + 1,
+          seen
+        );
+      }
     } else {
       result[safeKey] = "[ACCESSOR_OMITTED]";
     }
@@ -184,63 +308,24 @@ function sanitizeValue(value, secrets, depth = 0, seen = new WeakSet()) {
   if (Object.keys(descriptors).length > MAX_OBJECT_KEYS) {
     result.__truncatedKeys = true;
   }
+  if (redactedKeyCount > 0) result.redactedKeyCount = redactedKeyCount;
   return result;
 }
 
-export function serializeFlowAuditError(
-  error,
-  secrets = [],
-  depth = 0,
-  seen = new WeakSet()
-) {
-  if (depth >= MAX_ERROR_CAUSES) {
-    return { name: "Error", message: "[MAX_CAUSE_DEPTH]" };
-  }
+export function serializeFlowAuditError(error, secrets = []) {
   const normalized =
     error && (typeof error === "object" || typeof error === "function")
       ? error
       : new Error(String(error));
-  if (seen.has(normalized)) {
-    return { name: "Error", message: "[CIRCULAR_CAUSE]" };
-  }
-  seen.add(normalized);
-  const message = safeErrorProperty(normalized, "message", undefined);
-  let fallbackMessage = "Error";
-  if (message === undefined) {
-    try {
-      fallbackMessage = Object.prototype.toString.call(normalized);
-    } catch {
-      fallbackMessage = "Error";
-    }
-  }
-
   const result = {
-    name: redactFlowAuditText(
-      safeErrorProperty(normalized, "name", "Error"),
-      secrets
-    ),
-    message: redactFlowAuditText(
-      message === undefined ? fallbackMessage : message,
-      secrets
-    ),
+    errorType: safeErrorType(safeErrorProperty(normalized, "name", "Error")),
+    errorCode: safeErrorCode(safeErrorProperty(normalized, "code", undefined), secrets),
+    hasStack: typeof safeErrorProperty(normalized, "stack", undefined) === "string",
+    hasCause: safeErrorProperty(normalized, "cause", undefined) !== undefined,
   };
-  const code = safeErrorProperty(normalized, "code", undefined);
-  if (typeof code === "string" || typeof code === "number") {
-    result.errorCode = redactFlowAuditText(code, secrets);
-  }
-  const stack = safeErrorProperty(normalized, "stack", undefined);
-  if (typeof stack === "string") {
-    result.stack = redactFlowAuditText(stack, secrets);
-  }
-  const cause = safeErrorProperty(normalized, "cause", undefined);
-  if (cause !== undefined) {
-    result.cause = serializeFlowAuditError(cause, secrets, depth + 1, seen);
-  }
   const aggregateErrors = readDataProperty(normalized, "errors");
   if (Array.isArray(aggregateErrors)) {
-    result.errors = aggregateErrors
-      .slice(0, MAX_AGGREGATE_ERRORS)
-      .map((item) => serializeFlowAuditError(item, secrets, depth + 1, seen));
+    result.hasAggregateErrors = true;
   }
   return result;
 }

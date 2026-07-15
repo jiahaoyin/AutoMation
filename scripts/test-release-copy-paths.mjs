@@ -304,6 +304,72 @@ const generatedRunSh = renderRunSh();
 assert.match(generatedRunSh, /--skip-browser/);
 assert.match(generatedRunSh, /--skip-mac/);
 assert.match(generatedRunSh, /--skip-firefox --skip-ruyipage/);
+const launcherAuditStages = [
+  "launcher_entered",
+  "launcher_bootstrap_started",
+  "launcher_bootstrap_ready",
+  "launcher_env_setup_started",
+  "launcher_env_setup_skipped",
+  "launcher_env_setup_ready",
+  "launcher_preflight_started",
+  "launcher_preflight_skipped",
+  "launcher_preflight_ready",
+  "flow_main_started",
+  "credentials_ready",
+  "apple_flow_exec",
+  "failure",
+];
+assert.match(
+  generatedRunSh,
+  /launcher_report_root="\$\{APPLE_AUTOMATION_REPORT_ROOT:-data\/reports\}"/,
+  "release run.sh must default launcher audit storage to data/reports"
+);
+assert.match(
+  generatedRunSh,
+  /mktemp -d "\$launcher_report_root\/\.launcher-audit\.XXXXXX"/,
+  "release run.sh must isolate each launcher audit in a unique directory"
+);
+assert.match(generatedRunSh, /launcher-audit\.jsonl/);
+assert.match(generatedRunSh, /umask 077/);
+assert.match(generatedRunSh, /\/bin\/chmod 600 "\$launcher_audit_path"/);
+assert.match(
+  generatedRunSh,
+  /\{"timestamp":"%s","stage":"%s","exitCode":%d\}/,
+  "launcher audit records must contain only timestamp, stage, and exitCode"
+);
+assert.match(
+  generatedRunSh,
+  /printf '\[apple-automation\] stage:%s\\n' "\$1"/,
+  "launcher progress must use the fixed stdout format"
+);
+for (const stage of launcherAuditStages) {
+  assert.match(
+    generatedRunSh,
+    new RegExp(`\\b${stage}\\b`),
+    `release run.sh is missing the fixed launcher stage ${stage}`
+  );
+}
+assert.match(
+  generatedRunSh,
+  /launcher_audit_record failure "\$exit_code" \|\| true/,
+  "launcher failures must be recorded with the process exit code"
+);
+assert.doesNotMatch(generatedRunSh, /\btee\b/, "launcher must not tee raw process output");
+assert.doesNotMatch(
+  generatedRunSh,
+  /node scripts\/(?:setup-environment|preflight-2fa-permissions|apple-id-full-flow)\.mjs[^\n]*(?:\||>|2>&1|1>)/,
+  "launcher must not capture or redirect Node process output"
+);
+assert.doesNotMatch(
+  generatedRunSh,
+  /(?:^|[;\n])\s*exec\s+node\s+scripts\/apple-id-full-flow\.mjs/m,
+  "launcher must leave Node exit handling to the EXIT trap"
+);
+assert.match(
+  generatedRunSh,
+  /\nnode scripts\/apple-id-full-flow\.mjs --skip-setup "\$@"/,
+  "launcher must preserve the Apple flow arguments without exec"
+);
 assert.match(
   generatedRunSh,
   /if \[\[ "\$\{skip_mac\}" == "1" \]\]; then[\s\S]*setup_args\+=\(--skip-automation\)[\s\S]*fi/,
@@ -325,6 +391,21 @@ assert.equal(
   rootRunSh.replaceAll("\r\n", "\n"),
   generatedRunSh.replaceAll("\r\n", "\n"),
   "repository and release run.sh routing must stay identical"
+);
+const launcherAuditPathPrint = rootRunSh.indexOf(
+  "printf '%s\\n' \"$launcher_audit_path\""
+);
+const bootstrapSource = rootRunSh.indexOf(
+  'source "$(dirname "$0")/scripts/bootstrap-macos.sh"'
+);
+assert.ok(
+  launcherAuditPathPrint >= 0 && launcherAuditPathPrint < bootstrapSource,
+  "launcher audit path must be printed before bootstrap source execution"
+);
+assert.doesNotMatch(
+  rootRunSh.slice(0, launcherAuditPathPrint),
+  /(?:^|\n)\s*(?:echo|printf)\b/,
+  "launcher audit path must be the first terminal output"
 );
 assert.match(rootRunSh, /--skip-browser/);
 assert.match(rootRunSh, /--skip-mac/);

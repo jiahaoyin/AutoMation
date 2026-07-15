@@ -6,8 +6,10 @@ import path from "node:path";
 import {
   classifyBrowserRunFailure,
   readBrowserFailureCode,
+  readBrowserFailureStage,
   runAccountBrowserPhase,
 } from "./lib/account-browser-flow.js";
+import { createFlowFailureEnvelope } from "./apple-id-full-flow.mjs";
 import {
   loadEnvFile,
   maskAppleId,
@@ -146,7 +148,7 @@ async function runFlowAuditForwardingTest() {
       entries.push({ source, event, details });
     },
     writeError(source, event, error, details = {}) {
-      entries.push({ source, event, details, error });
+      entries.push({ source, event, details, hasError: Boolean(error) });
     },
     addSecrets(values) {
       secrets.push(...values);
@@ -186,7 +188,10 @@ async function runFlowAuditForwardingTest() {
       (entry) =>
         entry.source === "ruyipage" &&
         entry.event === "status" &&
-        entry.details.step === "owner_fallback_started"
+        entry.details.status === "input_progress" &&
+        entry.details.field === "password" &&
+        entry.details.step === "owner_fallback_started" &&
+        entry.details.route === "owner"
     )
   );
   assert.ok(
@@ -194,7 +199,16 @@ async function runFlowAuditForwardingTest() {
       (entry) =>
         entry.source === "ruyipage" &&
         entry.event === "diagnostic" &&
-        entry.details.failureStage === "password_input"
+        entry.details.failureStage === "password_input" &&
+        entry.details.errorType === "backend_diagnostic" &&
+        entry.details.diagnosticErrorType === "runtimeerror" &&
+        entry.details.diagnosticMessageClass === "backend_exception" &&
+        entry.details.hasDiagnosticMessage === true &&
+        entry.details.hasTraceback === true &&
+        !("message" in entry.details) &&
+        !("traceback" in entry.details) &&
+        !("diagnosticMessage" in entry.details) &&
+        !("diagnosticTraceback" in entry.details)
     )
   );
   assert.ok(
@@ -203,9 +217,175 @@ async function runFlowAuditForwardingTest() {
         entry.source === "two_factor" &&
         entry.event === "native_provider_diagnostic" &&
         entry.details.source === "settings" &&
-        entry.error?.message === "synthetic native settings failure"
+        entry.details.phase === "settings_provider_failed" &&
+        entry.details.helperFailureCode === "unknown" &&
+        entry.details.hasHelperStderr === false &&
+        entry.hasError === true
     )
   );
+}
+
+async function runPasswordBidiInputProgressTest() {
+  const entries = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+    addSecrets() {},
+  };
+  const tokens = [
+    "password_bidi_input_started",
+    "password_bidi_input_sent",
+    "password_input_verified",
+    "password_input_failed",
+  ];
+  const unsafeDetails = {
+    message: SECRET_FIXTURE,
+    password: SECRET_FIXTURE,
+    otp: "123456",
+    traceback: SECRET_FIXTURE,
+  };
+  const harness = createRuntime(async (options) => {
+    for (const event of [
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_fallback_started",
+        route: "owner",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_typed",
+        route: "owner",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "verified",
+        route: "owner",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "failed",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "email",
+        step: "owner_bidi_fallback_started",
+        route: "owner",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_unknown",
+        route: "owner",
+        ...unsafeDetails,
+      },
+      {
+        event: "status",
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_typed",
+        route: "owner?token=secret",
+        ...unsafeDetails,
+      },
+    ]) {
+      await options.onEvent(event);
+    }
+    return successfulResult();
+  });
+
+  const logs = await captureConsole("log", () =>
+    runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
+  );
+  const statusEntries = entries.filter(
+    (entry) => entry.source === "ruyipage" && entry.event === "status"
+  );
+  assert.deepEqual(
+    statusEntries
+      .filter((entry) => entry.details.status === "input_progress")
+      .map((entry) => entry.details),
+    [
+      {
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_fallback_started",
+        route: "owner",
+        inputProgress: "password_bidi_input_started",
+      },
+      {
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_typed",
+        route: "owner",
+        inputProgress: "password_bidi_input_sent",
+      },
+      {
+        status: "input_progress",
+        field: "password",
+        step: "verified",
+        route: "owner",
+        inputProgress: "password_input_verified",
+      },
+      {
+        status: "input_progress",
+        field: "password",
+        step: "failed",
+        route: "none",
+        inputProgress: "password_input_failed",
+      },
+      {
+        status: "input_progress",
+        field: "email",
+        step: "owner_bidi_fallback_started",
+        route: "owner",
+      },
+      {
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_unknown",
+        route: "owner",
+      },
+      {
+        status: "input_progress",
+        field: "password",
+        step: "owner_bidi_typed",
+        route: "none",
+      },
+    ]
+  );
+  assert.deepEqual(
+    statusEntries
+      .filter((entry) => entry.details.status === "unknown")
+      .map((entry) => entry.details),
+    []
+  );
+  for (const token of tokens) {
+    assert.equal(logs.filter((line) => line === `[ruyipage] status:${token}`).length, 1);
+  }
+  assert.ok(logs.includes("[ruyipage] status:input:email:owner_bidi_fallback_started:owner"));
+  assert.ok(logs.includes("[ruyipage] status:input:password:owner_bidi_unknown:owner"));
+  assert.ok(logs.includes("[ruyipage] status:input:password:owner_bidi_typed:none"));
+  assert.equal(logs.join(" ").includes(SECRET_FIXTURE), false);
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+  assert.equal(JSON.stringify(entries).includes("123456"), false);
+  assert.equal(JSON.stringify(entries).includes("owner?token=secret"), false);
 }
 
 async function runCollectorTimeoutIsAlways240SecondsTest() {
@@ -364,6 +544,74 @@ function runBrowserFailureClassificationTest() {
   }
   assert.equal(classifyBrowserRunFailure(SECRET_FIXTURE), "unknown");
   assert.equal(readBrowserFailureCode({ browserFailureCode: SECRET_FIXTURE }), "unknown");
+  assert.equal(readBrowserFailureStage({ browserFailureStage: SECRET_FIXTURE }), "unknown");
+}
+
+async function runFailureStageRetentionTest() {
+  const entries = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+    addSecrets() {},
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "browser_failure",
+      failureStage: "password_input",
+    });
+    await options.onEvent({
+      event: "result",
+      success: false,
+      failureStage: SECRET_FIXTURE,
+    });
+    throw new Error("ruyipage backend failed");
+  });
+
+  await assert.rejects(
+    runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime),
+    (error) => {
+      assert.equal(readBrowserFailureCode(error), "backend_failed");
+      assert.equal(readBrowserFailureStage(error), "password_input");
+      return true;
+    }
+  );
+  const resultEvent = entries.find(
+    (entry) => entry.source === "ruyipage" && entry.event === "result"
+  );
+  const runnerFailure = entries.find(
+    (entry) => entry.source === "account_browser" && entry.event === "runner_failed"
+  );
+  assert.equal(resultEvent?.details.failureStage, "unknown");
+  assert.equal(runnerFailure?.details.failureStage, "password_input");
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+}
+
+function runFlowFailureEnvelopeTest() {
+  const failedAt = new Date("2030-01-02T03:04:05.678Z");
+  assert.deepEqual(
+    createFlowFailureEnvelope(
+      "credential_resolution",
+      "credential_resolution_failed",
+      failedAt
+    ),
+    {
+      failureStage: "credential_resolution",
+      failureCode: "credential_resolution_failed",
+      failedAt: "2030-01-02T03:04:05.678Z",
+      auditFile: "flow-audit.jsonl",
+    }
+  );
+  assert.deepEqual(createFlowFailureEnvelope(SECRET_FIXTURE, SECRET_FIXTURE, failedAt), {
+    failureStage: "unknown",
+    failureCode: "unknown",
+    failedAt: "2030-01-02T03:04:05.678Z",
+    auditFile: "flow-audit.jsonl",
+  });
 }
 
 async function runMissingAccountHomeConfirmationTest() {
@@ -561,10 +809,12 @@ function runFullFlowSourceContractTest() {
     source,
     /import\s+\{\s*confirmOrPromptAppleCredentials,\s*maskAppleId\s*\}\s+from\s+"\.\/lib\/credentials\.js";/
   );
-  assert.match(source, /appleId:\s*maskAppleId\(creds\.appleId\)/);
+  assert.match(source, /report\.appleId\s*=\s*maskAppleId\(creds\.appleId\)/);
   assert.doesNotMatch(source, /creds\.appleId\.replace\(/);
   assert.match(source, /report\.error\s*=\s*"Apple ID flow failed"/);
-  assert.match(source, /failureCode:\s*readBrowserFailureCode\(e\)/);
+  assert.match(source, /readBrowserFailureStage/);
+  assert.match(source, /failureCode\s*=\s*readBrowserFailureCode\(e\)/);
+  assert.match(source, /failureStage\s*=\s*readBrowserFailureStage\(e\)/);
   assert.doesNotMatch(source, /e\.message|String\(e\)/);
   assert.match(source, /process\.exitCode\s*=\s*1/);
   assert.doesNotMatch(source, /process\.exit\(1\)/);
@@ -573,6 +823,19 @@ function runFullFlowSourceContractTest() {
     /report\.phases\.accountBrowser\?\.browserLogin\?\.accountHomeConfirmed\s*===\s*true/
   );
   assert.match(source, /REAL_ACCOUNT_HOME_CONFIRMED/);
+  assert.match(source, /\[apple-automation\] stage:flow_main_started/);
+  assert.match(source, /\[apple-automation\] stage:credentials_ready/);
+  assert.match(source, /flowAudit\.addSecrets\(\[creds\.appleId, creds\.password\]\)/);
+  assert.match(source, /auditFile:\s*"flow-audit\.jsonl"/);
+  assert.match(source, /flowAudit\.write\("flow", "credential_resolution_failed", \{/);
+  assert.ok(
+    source.indexOf('const reportDir = createReportDir("apple-id-flow")') <
+      source.indexOf("await ensureEnvironment")
+  );
+  assert.ok(
+    source.indexOf('const reportDir = createReportDir("apple-id-flow")') <
+      source.indexOf("await confirmOrPromptAppleCredentials")
+  );
 }
 
 function runSupervisedCredentialConfirmationTest() {
@@ -644,8 +907,15 @@ const focusedTests = {
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
   "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
   generations: runTwoGenerationForwardingTest,
+  "flow-audit-forwarding": runFlowAuditForwardingTest,
+  "password-bidi-progress": runPasswordBidiInputProgressTest,
   "status-prompts": runFixedTwoFactorStatusPromptsTest,
   "manual-unavailable-status": runSupervisedManualUnavailableStatusTest,
+  "failure-stage": runFailureStageRetentionTest,
+  "failure-envelope": () => {
+    runFlowFailureEnvelopeTest();
+    runFullFlowSourceContractTest();
+  },
 };
 
 const focusedTest = process.env.ACCOUNT_BROWSER_FLOW_FOCUSED_TEST;
@@ -660,6 +930,7 @@ if (focusedTest) {
 await runTwoFactorLifecycleTest();
 await runTwoGenerationForwardingTest();
 await runFlowAuditForwardingTest();
+await runPasswordBidiInputProgressTest();
 await runCollectorTimeoutIsAlways240SecondsTest();
 await runFixedTwoFactorStatusPromptsTest();
 await runSupervisedManualUnavailableStatusTest();
@@ -670,8 +941,10 @@ await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
 await runReadyModeSanitizationTest();
 await runCleanupErrorSanitizationTest();
+await runFailureStageRetentionTest();
 runAppleIdMaskingTest();
 runBrowserFailureClassificationTest();
+runFlowFailureEnvelopeTest();
 runEnvDataParsingTest();
 runFullFlowSourceContractTest();
 runSupervisedCredentialConfirmationTest();

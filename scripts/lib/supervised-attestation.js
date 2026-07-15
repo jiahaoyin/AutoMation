@@ -115,6 +115,81 @@ export const SUPERVISED_TWO_FA_DETAILS = new Set([
   "automatic_code_unavailable",
 ]);
 
+export const SUPERVISED_STDOUT_STAGE_TOKENS = new Set([
+  "launcher_entered",
+  "launcher_bootstrap_started",
+  "launcher_bootstrap_ready",
+  "launcher_env_setup_started",
+  "launcher_env_setup_ready",
+  "launcher_env_setup_skipped",
+  "launcher_preflight_started",
+  "launcher_preflight_ready",
+  "flow_main_started",
+  "credentials_ready",
+]);
+
+export const SUPERVISED_PRODUCTION_STAGES = new Set([
+  "not_started",
+  ...SUPERVISED_STDOUT_STAGE_TOKENS,
+  "accessibility_preflight",
+  "accessibility_ready",
+  "accessibility_missing",
+  "two_fa_code_acquired",
+  "two_fa_code_unavailable",
+  "two_fa_code_pending",
+  "browser_runtime_resolving",
+  "browser_backend_starting",
+  "browser_credentials_received",
+  "browser_url_validated",
+  "browser_runtime_imported",
+  "browser_constructing",
+  "browser_failure:not_started",
+  "browser_failure:credentials_received",
+  "browser_failure:url_validated",
+  "browser_failure:runtime_importing",
+  "browser_failure:runtime_imported",
+  "browser_failure:browser_constructing",
+  "browser_failure:browser_ready",
+  "browser_failure:login_navigation",
+  "browser_failure:login_page_loaded",
+  "browser_failure:login_state_detected",
+  "browser_failure:email_wait",
+  "browser_failure:email_input",
+  "browser_failure:email_submit",
+  "browser_failure:password_wait",
+  "browser_failure:password_input",
+  "browser_failure:remember_account",
+  "browser_failure:twofa_prepare",
+  "browser_failure:password_submit",
+  "browser_failure:twofa_page_wait",
+  "browser_failure:twofa_code_wait",
+  "browser_failure:twofa_input",
+  "browser_failure:signed_in",
+  "browser_failure:account_information",
+]);
+
+export const SUPERVISED_NODE_FAILURES = new Set([
+  "none",
+  "account_home_unconfirmed",
+  "backend_cleanup",
+  "backend_exit",
+  "backend_failed",
+  "backend_interrupted",
+  "backend_stdin",
+  "backend_timeout",
+  "broker_connect",
+  "broker_connect_timeout",
+  "broker_eof",
+  "broker_io",
+  "collector_cleanup",
+  "event_handler",
+  "event_handler_timeout",
+  "process_state",
+  "two_fa_preparation",
+  "two_fa_provider",
+  "unknown",
+]);
+
 const ATTESTATION_REQUIRED_KEYS = [
   "version",
   "nonce",
@@ -128,7 +203,12 @@ const ATTESTATION_REQUIRED_KEYS = [
   "markerConfirmed",
   "failureClass",
 ];
-const ATTESTATION_OPTIONAL_KEYS = ["ttyCapability", "twoFaDetail"];
+const ATTESTATION_OPTIONAL_KEYS = [
+  "ttyCapability",
+  "twoFaDetail",
+  "productionStage",
+  "nodeFailure",
+];
 const ATTESTATION_KEYS = new Set([
   ...ATTESTATION_REQUIRED_KEYS,
   ...ATTESTATION_OPTIONAL_KEYS,
@@ -149,6 +229,8 @@ export function createSupervisedAttestation(values = {}) {
     failureClass: values.failureClass ?? "NONE",
     ttyCapability: values.ttyCapability ?? "unknown",
     twoFaDetail: values.twoFaDetail ?? "none",
+    productionStage: values.productionStage ?? "not_started",
+    nodeFailure: values.nodeFailure ?? "none",
   };
 }
 
@@ -211,6 +293,31 @@ export function validateSupervisedAttestation(value, expected = {}) {
       value.failureClass !== "TWO_FA_CODE_UNAVAILABLE")
   ) {
     errors.push("attestation 2FA detail is inconsistent");
+  }
+  if (
+    hasOwn(value, "productionStage") &&
+    !SUPERVISED_PRODUCTION_STAGES.has(value.productionStage)
+  ) {
+    errors.push("attestation production stage is invalid");
+  }
+  if (hasOwn(value, "nodeFailure") && !SUPERVISED_NODE_FAILURES.has(value.nodeFailure)) {
+    errors.push("attestation node failure is invalid");
+  }
+  const hasProductionDiagnostic =
+    (hasOwn(value, "productionStage") && value.productionStage !== "not_started") ||
+    (hasOwn(value, "nodeFailure") && value.nodeFailure !== "none");
+  if (
+    hasProductionDiagnostic &&
+    !["failed", "accepted"].includes(value.status)
+  ) {
+    errors.push("attestation production diagnostics are inconsistent");
+  }
+  if (
+    hasOwn(value, "nodeFailure") &&
+    value.nodeFailure !== "none" &&
+    value.status !== "failed"
+  ) {
+    errors.push("attestation node failure is inconsistent");
   }
   if (expected.nonce !== undefined && value.nonce !== expected.nonce) {
     errors.push("attestation nonce does not match");

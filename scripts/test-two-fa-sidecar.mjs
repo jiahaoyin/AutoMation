@@ -1003,7 +1003,7 @@ async function settingsGracePeriodTest() {
 }
 
 async function settingsRetriesOnceAfterFiveSecondsTest() {
-  const { clock, native, collector, statuses } = createHarness({
+  const { clock, native, collector, audits, statuses } = createHarness({
     timeoutMs: 240_000,
   });
   await collector.prepare();
@@ -1012,7 +1012,9 @@ async function settingsRetriesOnceAfterFiveSecondsTest() {
   await clock.advance(8_000);
   assert.equal(native.stats.settingsStarts, 1);
   assert.equal(native.settingsRequests[0].options.timeoutMs, 60_000);
-  native.settingsRequests[0].reject(new Error("private settings failure 123456"));
+  const timeoutError = new Error("private settings failure 123456");
+  timeoutError.code = "2FA_SETTINGS_TIMEOUT";
+  native.settingsRequests[0].reject(timeoutError);
   await clock.flush();
 
   await clock.advance(4_999);
@@ -1035,6 +1037,13 @@ async function settingsRetriesOnceAfterFiveSecondsTest() {
     true
   );
   assert.equal(statuses.some(({ status }) => status === "settings_retry"), true);
+  assert.equal(
+    audits.some(
+      ({ phase, reason }) =>
+        phase === "settings_provider_failed" && reason === "settings_timeout"
+    ),
+    true
+  );
   await collector.dispose();
 }
 

@@ -46,7 +46,9 @@ import {
   buildProductionProcessSupervisorScript,
   classifyProcessCleanup,
   classifySupervisorStatus,
+  createProductionProtocolState,
   createSupervisorStatusProtocol,
+  drainProductionStderr,
   productionStdinForSupervisedInput,
   readBoundedRegularFile,
   supervisedTtyCapability,
@@ -144,6 +146,35 @@ assert.equal(
   }),
   "none"
 );
+const productionProtocol = createProductionProtocolState();
+assert.equal(
+  productionProtocol.processStdoutLine("[apple-automation] stage:flow_main_started"),
+  true
+);
+assert.equal(productionProtocol.productionStage, "flow_main_started");
+assert.equal(
+  productionProtocol.processStdoutLine("[ruyipage] status:node-failure:backend_exit"),
+  true
+);
+assert.equal(productionProtocol.nodeFailure, "backend_exit");
+const stageBeforeStderr = productionProtocol.productionStage;
+const nodeFailureBeforeStderr = productionProtocol.nodeFailure;
+assert.equal(
+  drainProductionStderr("[apple-automation] stage:credentials_ready\n"),
+  Buffer.byteLength("[apple-automation] stage:credentials_ready\n")
+);
+assert.equal(productionProtocol.productionStage, stageBeforeStderr);
+assert.equal(productionProtocol.nodeFailure, nodeFailureBeforeStderr);
+assert.equal(
+  productionProtocol.processStdoutLine("[apple-automation] stage:untrusted_stage"),
+  false
+);
+assert.equal(
+  productionProtocol.processStdoutLine("[ruyipage] status:node-failure:untrusted_failure"),
+  false
+);
+assert.equal(productionProtocol.productionStage, stageBeforeStderr);
+assert.equal(productionProtocol.nodeFailure, nodeFailureBeforeStderr);
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
   "utf8"
@@ -1777,6 +1808,18 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
+  /createProductionProtocolState[\s\S]*SUPERVISED_STDOUT_STAGE_TOKENS\.has\(stage\)[\s\S]*SUPERVISED_NODE_FAILURES\.has\(failure\)/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /const onStderrChunk = \(chunk\) => \{[\s\S]*drainProductionStderr\(chunk\)[\s\S]*\};/
+);
+assert.doesNotMatch(
+  supervisedTerminalBridgeSource,
+  /const onStderrChunk[\s\S]*processSafeLine\(/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
   /TERMINAL_BRIDGE_COMMAND_ID[\s\S]*PRODUCTION_SUPERVISOR_COMMAND_ID[\s\S]*commandSha256/
 );
 assert.match(
@@ -1812,10 +1855,21 @@ assert.doesNotMatch(
   /output\.write\((?:buffer|chunk|.*subarray)/
 );
 assert.match(supervisedTerminalBridgeSource, /2FA 自动取码处理中/);
-assert.match(
-  supervisedTerminalBridgeSource,
-  /\[2FA\] status:[\s\S]*permission_preflight_missing[\s\S]*two_fa_code_acquired[\s\S]*two_fa_code_unavailable[\s\S]*TWO_FA_LOGIN_FAILED[\s\S]*TWO_FA_CODE_UNAVAILABLE[\s\S]*TWO_FA_PAGE_FAILED[\s\S]*ACCESSIBILITY_PERMISSION_REQUIRED/
-);
+for (const token of [
+  'const twoFaPrefix = "[2FA] status:"',
+  'status === "permission_preflight_missing"',
+  'productionStage = "two_fa_code_acquired"',
+  'productionStage = "two_fa_code_unavailable"',
+  "TWO_FA_LOGIN_FAILED",
+  "TWO_FA_CODE_UNAVAILABLE",
+  "TWO_FA_PAGE_FAILED",
+  "ACCESSIBILITY_PERMISSION_REQUIRED",
+]) {
+  assert.ok(
+    supervisedTerminalBridgeSource.includes(token),
+    `strict supervised protocol must retain ${token}`
+  );
+}
 assert.match(
   supervisedTerminalBridgeSource,
   /APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE/
@@ -2315,6 +2369,8 @@ assert.equal(acceptedAttestation.commandId, SUPERVISED_COMMAND_ID);
 assert.equal(acceptedAttestation.commandSha256, SUPERVISED_COMMAND_SHA256);
 assert.equal(acceptedAttestation.ttyCapability, "unknown");
 assert.equal(acceptedAttestation.twoFaDetail, "none");
+assert.equal(acceptedAttestation.productionStage, "not_started");
+assert.equal(acceptedAttestation.nodeFailure, "none");
 assert.match(SUPERVISED_COMMAND_SHA256, /^[0-9a-f]{64}$/);
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(acceptedAttestation), {
@@ -2345,6 +2401,8 @@ assert.deepEqual(
 const legacyFailedAttestation = { ...detailedTwoFaAttestation };
 delete legacyFailedAttestation.ttyCapability;
 delete legacyFailedAttestation.twoFaDetail;
+delete legacyFailedAttestation.productionStage;
+delete legacyFailedAttestation.nodeFailure;
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(legacyFailedAttestation), {
     nonce: SUPERVISED_TOKEN,
@@ -2382,6 +2440,26 @@ assert.ok(
     attestationArtifact(invalidTtyCapabilityAttestation),
     { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
   ).errors.some((error) => /TTY capability is invalid/i.test(error))
+);
+const invalidProductionStageAttestation = {
+  ...detailedTwoFaAttestation,
+  productionStage: "untrusted-stage",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(invalidProductionStageAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /production stage is invalid/i.test(error))
+);
+const invalidNodeFailureAttestation = {
+  ...detailedTwoFaAttestation,
+  nodeFailure: "untrusted-node-failure",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(invalidNodeFailureAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /node failure is invalid/i.test(error))
 );
 
 function writeArtifacts(roundDir, overrides = {}) {

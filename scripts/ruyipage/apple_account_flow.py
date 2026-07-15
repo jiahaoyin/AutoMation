@@ -620,20 +620,25 @@ def input_password_with_owner_bidi_fallback(
     """Use ruyiPage's trusted element input when Firefox cannot expose focus state."""
     require_password_bidi_input_target(scope, field)
     emit_input_progress("password", "owner_bidi_fallback_started", "owner")
-    pause(180, 420)
-    field.input(value, clear=True)
-    emit_input_progress("password", "owner_bidi_typed", "owner")
-    pause(280, 680)
-    readable, actual = read_element_input_value(field)
-    read_state = classify_input_read(readable, actual, value)
-    emit_input_progress("password", f"owner_bidi_value_{read_state}", "owner")
-    if readable and str(actual) not in ("", value):
-        raise RuntimeError("password input verification failed")
-    if readable and str(actual) == value:
-        emit_input_progress("password", "verified", "owner")
-    else:
-        emit_input_progress("password", "password_compatibility_continue", "owner")
-    return scope
+    try:
+        pause(180, 420)
+        field.input(value, clear=True)
+        validate_apple_scope(scope)
+        emit_input_progress("password", "owner_bidi_typed", "owner")
+        pause(280, 680)
+        readable, actual = read_element_input_value(field)
+        read_state = classify_input_read(readable, actual, value)
+        emit_input_progress("password", f"owner_bidi_value_{read_state}", "owner")
+        if readable and str(actual) not in ("", value):
+            raise RuntimeError("password input verification failed")
+        if readable and str(actual) == value:
+            emit_input_progress("password", "verified", "owner")
+        else:
+            emit_input_progress("password", "password_compatibility_continue", "owner")
+        return scope
+    except Exception:
+        emit_input_progress("password", "failed")
+        raise
 
 
 def require_otp_bidi_input_target(scope: Any, element: Any, label: str) -> None:
@@ -672,6 +677,33 @@ def input_otp_with_owner_bidi_fallback(
     if not readable or str(actual) != value:
         raise RuntimeError(f"{label} input verification failed")
     emit_input_progress(label, "verified", "owner")
+    return scope
+
+
+def input_otp_digit_with_element_bidi(
+    scope: Any,
+    field: Any,
+    value: str,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    """Use the discovered digit cell directly when focus probing is flaky."""
+    require_otp_bidi_input_target(scope, field, "2FA digit")
+    emit_input_progress("2FA digit", "element_bidi_started", "owner")
+    pause(80, 180)
+    require_otp_bidi_input_target(scope, field, "2FA digit")
+    field.input(value, clear=True)
+    validate_two_factor_scope(scope)
+    emit_input_progress("2FA digit", "element_bidi_typed", "owner")
+    pause(120, 280)
+    readable, actual = read_element_input_value(field)
+    read_state = classify_input_read(readable, actual, value)
+    emit_input_progress("2FA digit", f"element_bidi_value_{read_state}", "owner")
+    if not readable or str(actual) == "":
+        emit_input_progress("2FA digit", "element_bidi_unverified_continue", "owner")
+        return scope
+    if str(actual) != value:
+        raise RuntimeError("2FA digit input verification failed")
+    emit_input_progress("2FA digit", "verified", "owner")
     return scope
 
 
@@ -818,6 +850,14 @@ def input_and_verify(
     root_page: Any | None = None,
 ) -> Any:
     root_page = root_page or scope
+    if label == "password":
+        return input_password_with_owner_bidi_fallback(
+            scope,
+            field,
+            value,
+            pause=pause,
+        )
+
     two_factor_scope = label in ("2FA code", "2FA digit")
     saw_readable_nonempty_mismatch = False
     action_scope: Any | None = None
@@ -907,11 +947,21 @@ def input_and_verify(
             read_state = classify_input_read(readable, actual, value)
             emit_input_progress(label, f"element_value_{read_state}", route)
         if not readable:
+            if label == "2FA digit" and not saw_readable_nonempty_mismatch:
+                emit_input_progress(label, "unverified_continue", route)
+                return action_scope
             if label == "password" and not saw_readable_nonempty_mismatch:
                 require_password_compatibility_target(scope, field)
                 emit_input_progress(label, "password_compatibility_continue", route)
                 return action_scope
             raise RuntimeError(f"{label} input verification failed")
+        if (
+            label == "2FA digit"
+            and str(actual) == ""
+            and not saw_readable_nonempty_mismatch
+        ):
+            emit_input_progress(label, "unverified_continue", route)
+            return action_scope
         if (
             label == "password"
             and str(actual) == ""
@@ -1362,15 +1412,23 @@ def fill_security_code(
         return
 
     for (scope, field), digit in zip(fields, digits):
-        input_and_verify(
-            scope,
-            field,
-            digit,
-            "2FA digit",
-            keys,
-            pause=pause,
-            root_page=page,
-        )
+        try:
+            input_otp_digit_with_element_bidi(
+                scope,
+                field,
+                digit,
+                pause=pause,
+            )
+        except Exception:
+            input_and_verify(
+                scope,
+                field,
+                digit,
+                "2FA digit",
+                keys,
+                pause=pause,
+                root_page=page,
+            )
         pause(80, 220)
 
 

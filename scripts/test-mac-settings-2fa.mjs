@@ -839,6 +839,8 @@ async function runSensitiveOutputSanitizationTest() {
     assertSafeError(error);
     assertNoSecrets(output.join("\n"));
     assert.deepEqual(output, ["[2FA] helper reported diagnostics"]);
+    assert.equal(error.code, "2FA_SETTINGS_INVALID_OUTPUT");
+    assert.equal(error.hasHelperStderr, true);
     assert.match(error.message, /invalid output/i);
     assert.match(error.message, /signal SIGTERM/i);
   } finally {
@@ -863,6 +865,9 @@ async function runHelperFailureSanitizationTest() {
 
     const error = await rejectionOf(request.promise);
     assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_HELPER_EXIT");
+    assert.equal(error.hasHelperStderr, true);
+    assert.equal(error.hasHelperMessage, true);
     assert.match(error.message, /helper failed/i);
     assert.match(error.message, /exit 7/i);
   } finally {
@@ -998,6 +1003,7 @@ async function runInvalidCodeTest() {
     harness.child.emit("close", 0, null);
     const error = await rejected;
     assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_INVALID_CODE");
     assert.match(error.message, /invalid verification code/i);
     assert.equal(fs.existsSync(harness.cancelFile()), false);
   } finally {
@@ -1014,7 +1020,7 @@ async function runSixtySecondBudgetIncludesCleanupGraceTest() {
       timeoutMs: 60_000,
       verbose: false,
     });
-    const rejected = assert.rejects(request.promise, /超时/);
+    const rejected = rejectionOf(request.promise);
 
     assert.equal(harness.timers.length, 1);
     assert.equal(
@@ -1035,7 +1041,8 @@ async function runSixtySecondBudgetIncludesCleanupGraceTest() {
     harness.fireTimer(1);
     assert.deepEqual(harness.child.killSignals, ["SIGKILL"]);
     harness.child.emit("close", null, "SIGKILL");
-    await rejected;
+    const error = await rejected;
+    assert.equal(error.code, "2FA_SETTINGS_TIMEOUT");
     assert.equal(fs.existsSync(harness.cancelFile()), false);
   } finally {
     harness.cleanup();
@@ -1077,9 +1084,10 @@ async function runTimeoutKeepsMarkerUntilChildClosesTest() {
     harness.fireTimer(1);
     assert.deepEqual(harness.child.killSignals, ["SIGKILL"]);
 
-    const rejected = assert.rejects(request.promise, /超时/);
+    const rejected = rejectionOf(request.promise);
     harness.child.emit("close", null, "SIGKILL");
-    await rejected;
+    const error = await rejected;
+    assert.equal(error.code, "2FA_SETTINGS_TIMEOUT");
     assert.equal(fs.existsSync(harness.cancelFile()), false);
     assert.equal(harness.timers.every((timer) => timer.active === false), true);
   } finally {

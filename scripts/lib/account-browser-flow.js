@@ -46,6 +46,24 @@ const RUYIPAGE_STARTUP_STATUSES = new Set([
   "browser_runtime_imported",
   "browser_constructing",
 ]);
+const PASSWORD_BIDI_INPUT_PROGRESS = new Map([
+  [
+    "password\u0000owner_bidi_fallback_started\u0000owner",
+    "password_bidi_input_started",
+  ],
+  ["password\u0000owner_bidi_typed\u0000owner", "password_bidi_input_sent"],
+  ["password\u0000verified\u0000owner", "password_input_verified"],
+  ["password\u0000failed\u0000none", "password_input_failed"],
+]);
+const SAFE_INPUT_FIELDS = new Set([
+  "email",
+  "password",
+  "twofa_code",
+  "twofa_digit",
+  "unknown",
+]);
+const SAFE_INPUT_ROUTES = new Set(["root", "owner", "none"]);
+const SAFE_INPUT_STEP_RE = /^[a-z0-9_]{1,80}$/;
 const RUYIPAGE_FAILURE_STAGES = new Set([
   "not_started",
   "credentials_received",
@@ -137,15 +155,29 @@ export function readBrowserFailureCode(error) {
   return BROWSER_RUN_FAILURE_CODES.has(code) ? code : "unknown";
 }
 
-function annotateBrowserRunFailure(error, override = null) {
+export function readBrowserFailureStage(error) {
+  const stage = error?.browserFailureStage;
+  return RUYIPAGE_FAILURE_STAGES.has(stage) ? stage : "unknown";
+}
+
+function sanitizeBrowserFailureStage(stage) {
+  return RUYIPAGE_FAILURE_STAGES.has(stage) ? stage : "unknown";
+}
+
+function annotateBrowserRunFailure(error, override = null, failureStage = "unknown") {
   const code = BROWSER_RUN_FAILURE_CODES.has(override)
     ? override
     : classifyBrowserRunFailure(error);
+  const stage = sanitizeBrowserFailureStage(failureStage);
   if (error && (typeof error === "object" || typeof error === "function")) {
     try {
       Object.defineProperty(error, "browserFailureCode", {
         configurable: true,
         value: code,
+      });
+      Object.defineProperty(error, "browserFailureStage", {
+        configurable: true,
+        value: stage,
       });
     } catch {
       /* The fixed status line remains sufficient for non-extensible errors. */
@@ -158,6 +190,92 @@ function annotateBrowserRunFailure(error, override = null) {
 function sanitizeReadyMode(mode) {
   const normalized = typeof mode === "string" ? mode.trim() : "";
   return ALLOWED_READY_MODES.has(normalized) ? normalized : "browser";
+}
+
+function passwordBidiInputProgressToken(event) {
+  if (
+    !event ||
+    typeof event !== "object" ||
+    event.event !== "status" ||
+    event.status !== "input_progress" ||
+    typeof event.field !== "string" ||
+    typeof event.step !== "string"
+  ) {
+    return null;
+  }
+  const route = Object.hasOwn(event, "route")
+    ? typeof event.route === "string"
+      ? event.route
+      : null
+    : "none";
+  if (route === null) return null;
+  return (
+    PASSWORD_BIDI_INPUT_PROGRESS.get(`${event.field}\u0000${event.step}\u0000${route}`) ??
+    null
+  );
+}
+
+function sanitizeInputField(field) {
+  return SAFE_INPUT_FIELDS.has(field) ? field : "unknown";
+}
+
+function sanitizeInputStep(step) {
+  return typeof step === "string" && SAFE_INPUT_STEP_RE.test(step)
+    ? step
+    : "unknown";
+}
+
+function sanitizeInputRoute(route) {
+  return SAFE_INPUT_ROUTES.has(route) ? route : "none";
+}
+
+function sanitizeBackendDiagnosticType(value) {
+  const token = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^[a-z0-9_.-]{1,96}$/.test(token) ? token : "unknown";
+}
+
+function classifyBackendDiagnosticMessage(value) {
+  const message = typeof value === "string" ? value : "";
+  const normalized = message.toLowerCase();
+  if (normalized.includes("2fa digit input verification failed")) {
+    return "twofa_digit_input_verification_failed";
+  }
+  if (normalized.includes("2fa code input was not detected")) {
+    return "twofa_input_missing";
+  }
+  if (normalized.includes("2fa code input must resolve")) {
+    return "twofa_input_target_count";
+  }
+  if (normalized.includes("2fa code page did not appear")) {
+    return "twofa_page_missing";
+  }
+  if (normalized.includes("password input verification failed")) {
+    return "password_input_verification_failed";
+  }
+  if (normalized.includes("login stopped before 2fa")) {
+    return "login_stopped_before_2fa";
+  }
+  if (normalized.includes("account session was not confirmed after 2fa")) {
+    return "account_session_unconfirmed_after_2fa";
+  }
+  if (normalized.includes("personal information page did not confirm")) {
+    return "account_home_unconfirmed";
+  }
+  if (message) return "backend_exception";
+  return "unknown";
+}
+
+function sanitizeNativeProviderCode(value) {
+  const token = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return /^2FA_[A-Z0-9_]{1,80}$/.test(token) ? token : "unknown";
+}
+
+function inputProgressStatusLine(event, passwordBidiInputProgress) {
+  if (passwordBidiInputProgress) return passwordBidiInputProgress;
+  if (event?.event !== "status" || event?.status !== "input_progress") return null;
+  return `input:${sanitizeInputField(event.field)}:${sanitizeInputStep(
+    event.step
+  )}:${sanitizeInputRoute(typeof event.route === "string" ? event.route : "none")}`;
 }
 
 function writeFlowAudit(flowAudit, source, event, details = {}) {
@@ -190,16 +308,28 @@ function auditRuyiPageEvent(flowAudit, event) {
     return;
   }
   if (event.event === "status") {
-    const details = {};
-    for (const key of [
-      "status",
-      "stage",
-      "failureStage",
-      "field",
-      "step",
-      "route",
-    ]) {
-      if (typeof event[key] === "string") details[key] = event[key];
+    const passwordBidiInputProgress = passwordBidiInputProgressToken(event);
+    const isInputProgress = event.status === "input_progress";
+    const details = {
+      status:
+        isInputProgress ||
+        event.status === "browser_failure" ||
+        RUYIPAGE_STARTUP_STATUSES.has(event.status)
+          ? event.status
+          : "unknown",
+    };
+    if (isInputProgress) {
+      details.field = sanitizeInputField(event.field);
+      details.step = sanitizeInputStep(event.step);
+      details.route = sanitizeInputRoute(
+        typeof event.route === "string" ? event.route : "none"
+      );
+    }
+    if (passwordBidiInputProgress) {
+      details.inputProgress = passwordBidiInputProgress;
+    }
+    if (event.status === "browser_failure") {
+      details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
     }
     if (Number.isInteger(event.attempt)) details.attempt = event.attempt;
     writeFlowAudit(flowAudit, "ruyipage", "status", details);
@@ -207,11 +337,12 @@ function auditRuyiPageEvent(flowAudit, event) {
   }
   if (event.event === "diagnostic") {
     writeFlowAudit(flowAudit, "ruyipage", "diagnostic", {
-      kind: event.kind,
-      failureStage: event.failureStage,
-      errorType: event.errorType,
-      message: event.message,
-      traceback: event.traceback,
+      failureStage: sanitizeBrowserFailureStage(event.failureStage),
+      errorType: "backend_diagnostic",
+      diagnosticErrorType: sanitizeBackendDiagnosticType(event.errorType),
+      diagnosticMessageClass: classifyBackendDiagnosticMessage(event.message),
+      hasDiagnosticMessage: typeof event.message === "string",
+      hasTraceback: typeof event.traceback === "string",
     });
     return;
   }
@@ -222,27 +353,26 @@ function auditRuyiPageEvent(flowAudit, event) {
   if (event.event === "need_2fa") {
     writeFlowAudit(flowAudit, "ruyipage", "need_2fa", {
       generation: event.generation,
-      state: event.state,
     });
     return;
   }
   if (event.event === "warning") {
     writeFlowAudit(flowAudit, "ruyipage", "warning", {
-      message: event.message,
+      warning: "backend_warning",
     });
     return;
   }
   if (event.event === "result") {
     writeFlowAudit(flowAudit, "ruyipage", "result", {
       success: event.success === true,
-      failureStage: event.failureStage,
+      failureStage: sanitizeBrowserFailureStage(event.failureStage),
       accountHomeConfirmed:
         event.browserLogin?.accountHomeConfirmed === true,
     });
     return;
   }
   writeFlowAudit(flowAudit, "ruyipage", "unknown_event", {
-    event: event.event,
+    event: "unknown",
   });
 }
 
@@ -356,12 +486,15 @@ export async function runAccountBrowserPhase(
         {
           source: entry?.source,
           phase: entry?.phase,
+          helperFailureCode: sanitizeNativeProviderCode(entry?.error?.code),
+          hasHelperStderr: entry?.error?.hasHelperStderr === true,
         }
       );
     },
   });
   let result;
   let runError = null;
+  let lastFailureStage = "unknown";
   let reportedFailureStage = null;
   try {
     console.log("[ruyipage] status:runtime_resolving");
@@ -373,6 +506,19 @@ export async function runAccountBrowserPhase(
       creds,
       reportDir,
       onEvent(event) {
+        const eventFailureStage = sanitizeBrowserFailureStage(event?.failureStage);
+        const passwordBidiInputProgress = passwordBidiInputProgressToken(event);
+        const inputStatusLine = inputProgressStatusLine(
+          event,
+          passwordBidiInputProgress
+        );
+        if (
+          eventFailureStage !== "unknown" &&
+          ((event.event === "status" && event.status === "browser_failure") ||
+            (event.event === "result" && event.success === false))
+        ) {
+          lastFailureStage = eventFailureStage;
+        }
         auditRuyiPageEvent(flowAudit, event);
         if (event.event === "ready") {
           console.log(`[ruyipage] 浏览器已就绪 (${sanitizeReadyMode(event.mode)})`);
@@ -381,23 +527,25 @@ export async function runAccountBrowserPhase(
           RUYIPAGE_STARTUP_STATUSES.has(event.status)
         ) {
           console.log(`[ruyipage] status:${event.status}`);
+        } else if (inputStatusLine) {
+          console.log(`[ruyipage] status:${inputStatusLine}`);
         } else if (
           event.event === "status" &&
           event.status === "browser_failure" &&
-          RUYIPAGE_FAILURE_STAGES.has(event.failureStage)
+          eventFailureStage !== "unknown"
         ) {
-          if (event.failureStage !== reportedFailureStage) {
-            reportedFailureStage = event.failureStage;
-            console.log(`[ruyipage] status:failure:${event.failureStage}`);
+          if (eventFailureStage !== reportedFailureStage) {
+            reportedFailureStage = eventFailureStage;
+            console.log(`[ruyipage] status:failure:${eventFailureStage}`);
           }
         } else if (
           event.event === "result" &&
           event.success === false &&
-          RUYIPAGE_FAILURE_STAGES.has(event.failureStage)
+          eventFailureStage !== "unknown"
         ) {
-          if (event.failureStage !== reportedFailureStage) {
-            reportedFailureStage = event.failureStage;
-            console.log(`[ruyipage] status:failure:${event.failureStage}`);
+          if (eventFailureStage !== reportedFailureStage) {
+            reportedFailureStage = eventFailureStage;
+            console.log(`[ruyipage] status:failure:${eventFailureStage}`);
           }
         } else if (event.event === "warning") {
           console.warn("[ruyipage] backend warning");
@@ -437,17 +585,22 @@ export async function runAccountBrowserPhase(
     });
   } catch (error) {
     runError = error;
+    const failureCode = classifyBrowserRunFailure(error);
+    const failureStage = sanitizeBrowserFailureStage(lastFailureStage);
     writeFlowAuditError(flowAudit, "account_browser", "runner_failed", error, {
-      failureCode: classifyBrowserRunFailure(error),
+      failureCode,
+      failureStage,
     });
-    throw annotateBrowserRunFailure(error);
+    throw annotateBrowserRunFailure(error, null, failureStage);
   } finally {
     try {
       await collector.dispose();
       writeFlowAudit(flowAudit, "two_factor", "collector_disposed");
     } catch (error) {
       writeFlowAuditError(flowAudit, "two_factor", "collector_dispose_failed", error);
-      if (!runError) throw annotateBrowserRunFailure(error, "collector_cleanup");
+      if (!runError) {
+        throw annotateBrowserRunFailure(error, "collector_cleanup", lastFailureStage);
+      }
       console.warn("[2FA] collector cleanup failed");
     }
   }
@@ -459,7 +612,9 @@ export async function runAccountBrowserPhase(
   ) {
     writeFlowAudit(flowAudit, "account_browser", "account_home_unconfirmed");
     throw annotateBrowserRunFailure(
-      new Error("ruyipage backend did not confirm the authenticated Apple account home")
+      new Error("ruyipage backend did not confirm the authenticated Apple account home"),
+      null,
+      lastFailureStage
     );
   }
 

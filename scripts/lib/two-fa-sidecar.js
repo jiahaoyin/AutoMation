@@ -105,6 +105,28 @@ function normalizeSixDigitCode(value) {
   return /^\d{6}$/.test(digits) ? digits : null;
 }
 
+function settingsFailureReason(error) {
+  if (isAccessibilityDeniedError(error)) return "accessibility_denied";
+  switch (error?.code) {
+    case "2FA_SETTINGS_TIMEOUT":
+      return "settings_timeout";
+    case "2FA_SETTINGS_INVALID_OUTPUT":
+      return "settings_invalid_output";
+    case "2FA_SETTINGS_INVALID_CODE":
+      return "settings_invalid_code";
+    case "2FA_SETTINGS_OUTPUT_LIMIT":
+      return "settings_output_limit";
+    case "2FA_SETTINGS_START_FAILED":
+      return "settings_start_failed";
+    case "2FA_SETTINGS_UNAVAILABLE":
+      return "settings_unavailable";
+    case "2FA_SETTINGS_HELPER_EXIT":
+      return "settings_helper_exit";
+    default:
+      return "settings_provider_failed";
+  }
+}
+
 const APPLE_HELPER_LABELS = [
   "FollowUpUI",
   "CoreAuthUI",
@@ -182,6 +204,12 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "ax_ocr_no_code",
     "ocr_permission_missing",
     "settings_start_failed",
+    "settings_timeout",
+    "settings_invalid_output",
+    "settings_invalid_code",
+    "settings_output_limit",
+    "settings_unavailable",
+    "settings_helper_exit",
     "accessibility_denied",
     "accessibility_unavailable",
     "cancelled",
@@ -1064,8 +1092,11 @@ export function createMac2FACollector(options = {}) {
           outcome = { kind: "failed" };
         }
 
-        const accessibilityDenied =
-          outcome.kind === "failed" && isAccessibilityDeniedError(outcome.error);
+        const failureReason =
+          outcome.kind === "failed"
+            ? settingsFailureReason(outcome.error)
+            : "settings_provider_failed";
+        const accessibilityDenied = failureReason === "accessibility_denied";
         if (outcome.kind === "failed" && outcome.error) {
           diagnostic({
             source: "settings",
@@ -1081,9 +1112,7 @@ export function createMac2FACollector(options = {}) {
           reason:
             outcome.kind === "cancelled"
               ? "cancelled"
-              : accessibilityDenied
-                ? "accessibility_denied"
-                : "settings_provider_failed",
+              : failureReason,
           elapsedSincePrepareMs: elapsedSincePrepare(),
         });
 

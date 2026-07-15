@@ -110,6 +110,12 @@ function cancelledError(message = "系统设置验证码请求已取消") {
   return error;
 }
 
+function codedSettingsError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 function resolveHelperPath(runtime) {
   if (runtime.helperPath) return runtime.helperPath;
   if (!is2FASettingsHelperAvailable()) {
@@ -141,10 +147,21 @@ export function start2FASettingsCodeRequest(opts = {}) {
   const schedule = runtime.setTimeout ?? globalThis.setTimeout;
   const cancelScheduled = runtime.clearTimeout ?? globalThis.clearTimeout;
   if (platform !== "darwin") {
-    throw new Error("2FA 系统设置 helper 不可用: non-darwin");
+    throw codedSettingsError(
+      "2FA 系统设置 helper 不可用: non-darwin",
+      "2FA_SETTINGS_UNAVAILABLE"
+    );
   }
 
-  const helperPath = resolveHelperPath(runtime);
+  let helperPath;
+  try {
+    helperPath = resolveHelperPath(runtime);
+  } catch {
+    throw codedSettingsError(
+      "2FA settings helper is unavailable",
+      "2FA_SETTINGS_UNAVAILABLE"
+    );
+  }
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
   const markerDir = opts.reportDir || os.tmpdir();
@@ -164,7 +181,10 @@ export function start2FASettingsCodeRequest(opts = {}) {
     });
   } catch {
     removeCancelFile(cancelFile);
-    throw new Error("2FA settings helper failed to start");
+    throw codedSettingsError(
+      "2FA settings helper failed to start",
+      "2FA_SETTINGS_START_FAILED"
+    );
   }
 
   let stdout = "";
@@ -214,6 +234,13 @@ export function start2FASettingsCodeRequest(opts = {}) {
     return next;
   };
 
+  const annotateHelperError = (error, parsed = null) => {
+    if (!error.code) error.code = "2FA_SETTINGS_HELPER_EXIT";
+    if (stderrBytes > 0) error.hasHelperStderr = true;
+    if (parsed && typeof parsed.message === "string") error.hasHelperMessage = true;
+    return error;
+  };
+
   child.stdout.on("data", (chunk) => {
     stdout = appendOutput(stdout, chunk, "stdout");
   });
@@ -226,12 +253,24 @@ export function start2FASettingsCodeRequest(opts = {}) {
       } catch {
         /* finish below */
       }
-      terminalError = new Error("2FA settings helper stderr output exceeded the limit");
+      terminalError = codedSettingsError(
+        "2FA settings helper stderr output exceeded the limit",
+        "2FA_SETTINGS_OUTPUT_LIMIT"
+      );
       return;
     }
     stderrBytes += bytes;
   });
-  child.once("error", () => finish(new Error("2FA settings helper failed to run")));
+  child.once("error", () =>
+    finish(
+      annotateHelperError(
+        codedSettingsError(
+          "2FA settings helper failed to run",
+          "2FA_SETTINGS_START_FAILED"
+        )
+      )
+    )
+  );
   child.once("close", (exitCode, signal) => {
     if (settled) return;
 
@@ -240,11 +279,15 @@ export function start2FASettingsCodeRequest(opts = {}) {
     }
 
     if (terminalError) {
-      finish(terminalError);
+      finish(annotateHelperError(terminalError));
       return;
     }
     if (timeoutRequested) {
-      finish(new Error("系统设置获取验证码超时"));
+      finish(
+        annotateHelperError(
+          codedSettingsError("2FA settings helper 超时", "2FA_SETTINGS_TIMEOUT")
+        )
+      );
       return;
     }
 
@@ -265,7 +308,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
     if (parsedOutput && parsed?.message === "Accessibility permission unavailable") {
       const error = new Error("2FA settings helper requires Accessibility permission");
       error.code = "2FA_SETTINGS_ACCESSIBILITY_DENIED";
-      finish(error);
+      finish(annotateHelperError(error, parsed));
       return;
     }
     const suffix =
@@ -275,17 +318,40 @@ export function start2FASettingsCodeRequest(opts = {}) {
           ? ` (exit ${exitCode})`
           : "";
     if (!parsedOutput) {
-      finish(new Error(`2FA settings helper returned invalid output${suffix}`));
+      finish(
+        annotateHelperError(
+          codedSettingsError(
+            `2FA settings helper returned invalid output${suffix}`,
+            "2FA_SETTINGS_INVALID_OUTPUT"
+          )
+        )
+      );
       return;
     }
     if (!parsed?.ok || parsed.code == null) {
-      finish(new Error(`2FA settings helper failed${suffix}`));
+      finish(
+        annotateHelperError(
+          codedSettingsError(
+            `2FA settings helper failed${suffix}`,
+            "2FA_SETTINGS_HELPER_EXIT"
+          ),
+          parsed
+        )
+      );
       return;
     }
 
     const code = String(parsed.code).replace(/\D/g, "");
     if (!/^\d{6}$/.test(code)) {
-      finish(new Error("2FA settings helper returned an invalid verification code"));
+      finish(
+        annotateHelperError(
+          codedSettingsError(
+            "2FA settings helper returned an invalid verification code",
+            "2FA_SETTINGS_INVALID_CODE"
+          ),
+          parsed
+        )
+      );
       return;
     }
 
