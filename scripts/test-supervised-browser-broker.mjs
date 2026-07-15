@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
+import { EventEmitter } from "node:events";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { Duplex, PassThrough } from "node:stream";
 
 import {
   SUPERVISED_PRODUCTION_ENV_KEYS,
@@ -9,10 +10,12 @@ import {
 import { buildRemoteScript } from "./mac-codex-orchestrator.mjs";
 import {
   browserBrokerIdentityMatches,
+  closeBrowserBrokerTransport,
   buildBrowserBrokerEnvironment,
   buildBrowserBrokerSupervisorScript,
   cleanupBrowserBroker,
   createBrowserBroker,
+  listenBrowserBrokerSocket,
   prepareBrowserBrokerFilesystem,
   productionEnvironment,
   resolveBrowserBrokerPaths,
@@ -27,12 +30,15 @@ const PRODUCTION_DIR =
 const NONCE = "0123456789abcdef0123456789abcdef";
 const EXPECTED_HEAD = "0123456789abcdef0123456789abcdef01234567";
 
-function fakeStats(type, mode) {
+function fakeStats(type, mode, dev = 1, ino = 1) {
   return {
+    dev,
+    ino,
     mode,
     isDirectory: () => type === "directory",
     isFIFO: () => type === "fifo",
     isFile: () => type === "file",
+    isSocket: () => type === "socket",
     isSymbolicLink: () => type === "symlink",
   };
 }
@@ -52,7 +58,7 @@ function createFakeFileSystem(initial = new Map()) {
       calls.push(["lstat", targetPath]);
       if (!entries.has(targetPath)) throw missing(targetPath);
       const entry = entries.get(targetPath);
-      return fakeStats(entry.type, entry.mode);
+      return fakeStats(entry.type, entry.mode, entry.dev, entry.ino);
     },
     mkdirSync(targetPath, options) {
       calls.push(["mkdir", targetPath, options]);
@@ -76,6 +82,65 @@ function createFakeFileSystem(initial = new Map()) {
   };
 }
 
+class FakeSocket extends Duplex {
+  constructor() {
+    super();
+    this.outbound = [];
+  }
+
+  _read() {}
+
+  _write(chunk, _encoding, callback) {
+    this.outbound.push(Buffer.from(chunk));
+    callback();
+  }
+
+  sendInbound(value) {
+    this.push(Buffer.from(value));
+  }
+
+  outboundText() {
+    return Buffer.concat(this.outbound).toString("utf8");
+  }
+}
+
+function createFakeSocketServer(fileSystem, socketPath, calls = []) {
+  let connectionHandler = null;
+  const server = new EventEmitter();
+  server.listening = false;
+  server.listen = (options, callback) => {
+    calls.push(["listen", options]);
+    assert.deepEqual(options, { path: socketPath, backlog: 1 });
+    fileSystem.entries.set(socketPath, { type: "socket", mode: 0o777 });
+    server.listening = true;
+    queueMicrotask(callback);
+    return server;
+  };
+  server.close = (callback) => {
+    calls.push(["close"]);
+    if (!server.listening) {
+      const error = new Error("server is not running");
+      error.code = "ERR_SERVER_NOT_RUNNING";
+      queueMicrotask(() => callback?.(error));
+      return server;
+    }
+    server.listening = false;
+    queueMicrotask(() => callback?.());
+    return server;
+  };
+  return {
+    server,
+    createServer(options, handler) {
+      calls.push(["create-server", options]);
+      connectionHandler = handler;
+      return server;
+    },
+    connect(socket) {
+      connectionHandler(socket);
+    },
+  };
+}
+
 const context = {
   repo: REPO,
   productionDir: PRODUCTION_DIR,
@@ -94,8 +159,11 @@ assert.equal(
   paths.reportScreenshotsDir,
   path.posix.join(PRODUCTION_DIR, "browser-broker", "report", "screenshots")
 );
-assert.equal(paths.commandsFifo, path.posix.join(paths.brokerDir, "commands.fifo"));
-assert.equal(paths.eventsFifo, path.posix.join(paths.brokerDir, "events.fifo"));
+assert.equal(paths.socketPath, `/tmp/apple-automation-${NONCE}.sock`);
+assert.ok(
+  Buffer.byteLength(paths.socketPath, "utf8") < 104,
+  "browser broker socket path must fit macOS sockaddr_un.sun_path"
+);
 assert.equal(paths.profileDir, path.posix.join(PRODUCTION_DIR, "firefox-profile"));
 assert.equal(
   paths.firefoxPath,
@@ -106,7 +174,7 @@ assert.throws(
   () =>
     validateBrowserBrokerPathScope({
       ...paths,
-      commandsFifo: "/private/outside/commands.fifo",
+      socketPath: `/tmp/apple-automation-${"f".repeat(32)}.sock`,
     }),
   /out of scope/i
 );
@@ -114,8 +182,6 @@ assert.throws(
 const executableFs = createFakeFileSystem(
   new Map([
     [paths.pythonPath, { type: "symlink", mode: 0o777 }],
-    [paths.relayNodePath, { type: "file", mode: 0o755 }],
-    [paths.relayScriptPath, { type: "file", mode: 0o644 }],
     [paths.firefoxPath, { type: "file", mode: 0o755 }],
     [paths.scriptPath, { type: "file", mode: 0o644 }],
   ])
@@ -123,13 +189,11 @@ const executableFs = createFakeFileSystem(
 validateBrowserBrokerExecutable(paths, { fs: executableFs });
 assert.deepEqual(
   executableFs.calls.filter(([operation]) => operation === "access").map((call) => call[1]),
-  [paths.pythonPath, paths.relayNodePath, paths.firefoxPath]
+  [paths.pythonPath, paths.firefoxPath]
 );
 const symlinkFirefoxFs = createFakeFileSystem(
   new Map([
     [paths.pythonPath, { type: "file", mode: 0o755 }],
-    [paths.relayNodePath, { type: "file", mode: 0o755 }],
-    [paths.relayScriptPath, { type: "file", mode: 0o644 }],
     [paths.firefoxPath, { type: "symlink", mode: 0o777 }],
     [paths.scriptPath, { type: "file", mode: 0o644 }],
   ])
@@ -139,68 +203,37 @@ assert.throws(
   /Firefox executable is invalid/
 );
 
-const fifoFs = createFakeFileSystem(
+const socketFs = createFakeFileSystem(
   new Map([[paths.profileDir, { type: "directory", mode: 0o700 }]])
 );
-const fifoCreationOrder = [];
-prepareBrowserBrokerFilesystem(paths, {
-  fs: fifoFs,
-  createFifo(fifoPath) {
-    fifoCreationOrder.push(fifoPath);
-    fifoFs.entries.set(fifoPath, { type: "fifo", mode: 0 });
-  },
-});
-assert.deepEqual(fifoCreationOrder, [paths.commandsFifo, paths.eventsFifo]);
+prepareBrowserBrokerFilesystem(paths, { fs: socketFs });
 for (const directory of [paths.brokerDir, paths.reportDir, paths.reportScreenshotsDir]) {
-  assert.deepEqual(fifoFs.entries.get(directory), {
+  assert.deepEqual(socketFs.entries.get(directory), {
     type: "directory",
     mode: 0o700,
   });
 }
-for (const fifoPath of [paths.commandsFifo, paths.eventsFifo]) {
-  assert.deepEqual(fifoFs.entries.get(fifoPath), { type: "fifo", mode: 0o600 });
-}
+assert.equal(socketFs.entries.has(paths.socketPath), false);
 
-const nonFifoFs = createFakeFileSystem(
-  new Map([[paths.profileDir, { type: "directory", mode: 0o700 }]])
+const symlinkSocketFs = createFakeFileSystem(
+  new Map([
+    [paths.profileDir, { type: "directory", mode: 0o700 }],
+    [paths.socketPath, { type: "symlink", mode: 0o777 }],
+  ])
 );
 assert.throws(
-  () =>
-    prepareBrowserBrokerFilesystem(paths, {
-      fs: nonFifoFs,
-      createFifo(fifoPath) {
-        nonFifoFs.entries.set(fifoPath, { type: "file", mode: 0o600 });
-      },
-    }),
-  /FIFO is invalid/i
-);
-const symlinkFifoFs = createFakeFileSystem(
-  new Map([[paths.profileDir, { type: "directory", mode: 0o700 }]])
-);
-assert.throws(
-  () =>
-    prepareBrowserBrokerFilesystem(paths, {
-      fs: symlinkFifoFs,
-      createFifo(fifoPath) {
-        symlinkFifoFs.entries.set(fifoPath, { type: "symlink", mode: 0o600 });
-      },
-    }),
-  /FIFO is invalid/i
+  () => prepareBrowserBrokerFilesystem(paths, { fs: symlinkSocketFs }),
+  /socket already exists/i
 );
 
-for (const key of [
-  "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
-  "APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO",
-  "APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO",
-]) {
+for (const key of ["APPLE_AUTOMATION_BROWSER_BROKER_SOCKET"]) {
   assert.equal(SUPERVISED_PRODUCTION_ENV_KEYS.filter((item) => item === key).length, 1);
   assert.ok(JSON.parse(SUPERVISED_PRODUCTION_ENV_POLICY).includes(key));
 }
 const brokerEnv = buildBrowserBrokerEnvironment(context, paths);
 assert.deepEqual(Object.keys(brokerEnv).sort(), [
-  "APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO",
-  "APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO",
   "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
+  "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
   "APPLE_AUTOMATION_REPORT_ROOT",
   "BROWSER_PROFILE_MODE",
   "FIREFOX_PROFILE_DIR",
@@ -223,14 +256,10 @@ const productionEnv = productionEnvironment(
   { ...context, helperDir: "/private/round/control/helpers" },
   paths
 );
-assert.equal(productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_MODE, "1");
+assert.equal(productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_MODE, undefined);
 assert.equal(
-  productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO,
-  paths.commandsFifo
-);
-assert.equal(
-  productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO,
-  paths.eventsFifo
+  productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_SOCKET,
+  paths.socketPath
 );
 
 const wrapper = buildBrowserBrokerSupervisorScript();
@@ -238,12 +267,12 @@ assert.match(wrapper, /^set -eu\numask 077/m);
 assert.match(wrapper, /ruyipage-broker-members/);
 assert.match(
   wrapper,
-  /"\$@" 3>&- < <\("\$relay_node" "\$relay_script" read "\$commands_fifo" 3>&-\) > >\("\$relay_node" "\$relay_script" write "\$events_fifo" 3>&-\) 2>\/dev\/null &/
+  /"\$@" 3>&- <&0 >&1 2>\/dev\/null &/
 );
 assert.doesNotMatch(
   wrapper,
-  /"\$@"[^\n]*< "\$commands_fifo"[^\n]*> "\$events_fifo"/,
-  "the supervisor leader must never block while opening a FIFO"
+  /(?:commands_fifo|events_fifo|relay_node|relay_script|control\.sock|< <\(|> >\()/,
+  "the supervisor must only use the bridge-provided stdio pipes"
 );
 assert.match(wrapper, /target_identity_is_current[\s\S]*\/bin\/kill -TERM/);
 assert.match(
@@ -272,6 +301,82 @@ assert.match(
 );
 assert.doesNotMatch(wrapper, /\bexec\b/);
 
+const socketTransportBroker = createBrowserBroker(context);
+const backendInput = new PassThrough();
+const backendOutput = new PassThrough();
+const backendInputChunks = [];
+backendInput.on("data", (chunk) => backendInputChunks.push(Buffer.from(chunk)));
+socketTransportBroker.child = { stdin: backendInput, stdout: backendOutput };
+const socketListenFs = createFakeFileSystem();
+const socketServerCalls = [];
+const socketServer = createFakeSocketServer(
+  socketListenFs,
+  paths.socketPath,
+  socketServerCalls
+);
+await listenBrowserBrokerSocket(socketTransportBroker, {
+  fs: socketListenFs,
+  createServer: socketServer.createServer,
+  connectTimeoutMs: 1_000,
+});
+assert.deepEqual(socketServerCalls[0], [
+  "create-server",
+  { allowHalfOpen: false, pauseOnConnect: true },
+]);
+assert.equal(socketListenFs.entries.get(paths.socketPath).mode, 0o600);
+assert.deepEqual(socketTransportBroker.socketIdentity, { dev: 1, ino: 1 });
+
+const firstClient = new FakeSocket();
+socketServer.connect(firstClient);
+assert.equal(socketTransportBroker.clientAccepted, true);
+assert.equal(socketTransportBroker.transportWired, true);
+firstClient.sendInbound('{"type":"credentials"}\n');
+backendOutput.write('{"type":"event"}\n');
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(
+  Buffer.concat(backendInputChunks).toString("utf8"),
+  '{"type":"credentials"}\n'
+);
+assert.equal(firstClient.outboundText(), '{"type":"event"}\n');
+
+const secondClient = new FakeSocket();
+socketServer.connect(secondClient);
+assert.equal(secondClient.destroyed, true);
+assert.equal(socketTransportBroker.client, firstClient);
+const firstClose = closeBrowserBrokerTransport(socketTransportBroker, {
+  closeTimeoutMs: 100,
+});
+assert.equal(
+  closeBrowserBrokerTransport(socketTransportBroker, { closeTimeoutMs: 100 }),
+  firstClose,
+  "transport cleanup must be idempotent"
+);
+assert.equal(await firstClose, true);
+assert.equal(socketServer.server.listening, false);
+
+const timeoutBroker = createBrowserBroker({
+  ...context,
+  deadlineMs: Date.now() + 1_000,
+});
+timeoutBroker.child = {
+  stdin: new PassThrough(),
+  stdout: new PassThrough(),
+};
+const timeoutFs = createFakeFileSystem();
+const timeoutServer = createFakeSocketServer(timeoutFs, paths.socketPath);
+await listenBrowserBrokerSocket(timeoutBroker, {
+  fs: timeoutFs,
+  createServer: timeoutServer.createServer,
+  connectTimeoutMs: 5,
+});
+await new Promise((resolve) => setTimeout(resolve, 15));
+assert.match(timeoutBroker.transportError?.message ?? "", /connection timed out/);
+assert.equal(timeoutBroker.child.stdin.writableEnded, true);
+assert.equal(
+  await closeBrowserBrokerTransport(timeoutBroker, { closeTimeoutMs: 100 }),
+  true
+);
+
 const broker = createBrowserBroker(context);
 const startOrder = [];
 let spawnCall = null;
@@ -295,14 +400,21 @@ await startBrowserBroker(
       startOrder.push("validate-executable");
     },
     prepareFilesystem() {
-      startOrder.push("prepare-fifos");
+      startOrder.push("prepare-socket-directory");
+    },
+    async listenSocket() {
+      startOrder.push("listen-socket");
     },
     spawn(command, args, options) {
       startOrder.push("spawn-broker");
       spawnCall = { command, args, options };
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
       return {
         pid: 4321,
-        stdio: [null, null, null, brokerStatusStream],
+        stdin,
+        stdout,
+        stdio: [stdin, stdout, null, brokerStatusStream],
         unref: () => startOrder.push("unref"),
       };
     },
@@ -327,8 +439,9 @@ await startBrowserBroker(
 );
 assert.deepEqual(startOrder, [
   "validate-executable",
-  "prepare-fifos",
+  "prepare-socket-directory",
   "lifecycle:preparing",
+  "listen-socket",
   "spawn-broker",
   "wait-identity",
   "process:starting",
@@ -339,15 +452,17 @@ assert.deepEqual(startOrder, [
 ]);
 assert.equal(spawnCall.command, "/bin/zsh");
 assert.equal(spawnCall.options.detached, true);
-assert.deepEqual(spawnCall.options.stdio, ["ignore", "ignore", "ignore", "pipe"]);
+assert.deepEqual(spawnCall.options.stdio, ["pipe", "pipe", "ignore", "pipe"]);
+assert.equal(
+  spawnCall.options.env.APPLE_AUTOMATION_BROWSER_BROKER_SOCKET,
+  paths.socketPath
+);
 assert.equal(spawnCall.options.env.APPLE_ID, undefined);
 assert.equal(spawnCall.options.env.APPLE_PASSWORD, undefined);
 for (const value of [
   "ruyipage-supervisor",
   NONCE,
   paths.scriptPath,
-  paths.relayNodePath,
-  paths.relayScriptPath,
   "--report-dir",
   paths.reportDir,
   "--profile-dir",
@@ -357,7 +472,9 @@ for (const value of [
 ]) {
   assert.ok(spawnCall.args.includes(value), `broker launch must include ${value}`);
 }
+assert.equal(spawnCall.args.includes(paths.socketPath), false);
 assert.equal(browserBrokerIdentityMatches(expectedIdentity, broker), true);
+broker.socketIdentity = { dev: 1, ino: 1 };
 brokerStatusStream.write("supervisor-ready\ngate-open\ntarget-launch\n");
 await new Promise((resolve) => setImmediate(resolve));
 assert.equal(broker.stage, "target-launch");
@@ -371,8 +488,7 @@ assert.equal(
 
 const cleanupFs = createFakeFileSystem(
   new Map([
-    [paths.commandsFifo, { type: "fifo", mode: 0o600 }],
-    [paths.eventsFifo, { type: "fifo", mode: 0o600 }],
+    [paths.socketPath, { type: "socket", mode: 0o600 }],
     [paths.launchGatePath, { type: "file", mode: 0o600 }],
   ])
 );
@@ -381,6 +497,9 @@ const cleanResult = await cleanupBrowserBroker(broker, {
   fs: cleanupFs,
   async cleanupRecorded() {
     return { ok: true, seen: true, cleanupEvidence: true };
+  },
+  async closeTransport() {
+    return true;
   },
   writeProcessState(_context, _filePath, _identity, state) {
     cleanupStates.push(`process:${state}`);
@@ -393,20 +512,20 @@ assert.deepEqual(cleanResult, { ok: true, seen: true, cleanupEvidence: true });
 assert.deepEqual(cleanupStates, ["process:inactive", "lifecycle:inactive"]);
 assert.deepEqual(
   cleanupFs.calls.filter(([operation]) => operation === "unlink").map((call) => call[1]),
-  [paths.commandsFifo, paths.eventsFifo, paths.launchGatePath]
+  [paths.socketPath, paths.launchGatePath]
 );
 
 const failedCleanupFs = createFakeFileSystem(
-  new Map([
-    [paths.commandsFifo, { type: "fifo", mode: 0o600 }],
-    [paths.eventsFifo, { type: "fifo", mode: 0o600 }],
-  ])
+  new Map([[paths.socketPath, { type: "socket", mode: 0o600 }]])
 );
 const failedCleanupStates = [];
 const failedCleanup = await cleanupBrowserBroker(broker, {
   fs: failedCleanupFs,
   async cleanupRecorded() {
     return { ok: false, seen: true, cleanupEvidence: false };
+  },
+  async closeTransport() {
+    return true;
   },
   writeProcessState(_context, _filePath, _identity, state) {
     failedCleanupStates.push(`process:${state}`);
@@ -423,20 +542,20 @@ assert.deepEqual(failedCleanupStates, [
 assert.equal(
   failedCleanupFs.calls.some(([operation]) => operation === "unlink"),
   false,
-  "identity or cleanup failure must retain both FIFOs"
+  "identity or cleanup failure must retain the socket path"
 );
 
 const unlinkFailureFs = createFakeFileSystem(
-  new Map([
-    [paths.commandsFifo, { type: "fifo", mode: 0o600 }],
-    [paths.eventsFifo, { type: "file", mode: 0o600 }],
-  ])
+  new Map([[paths.socketPath, { type: "file", mode: 0o600 }]])
 );
 const unlinkFailureStates = [];
 const unlinkFailure = await cleanupBrowserBroker(broker, {
   fs: unlinkFailureFs,
   async cleanupRecorded() {
     return { ok: true, seen: true, cleanupEvidence: true };
+  },
+  async closeTransport() {
+    return true;
   },
   writeProcessState(_context, _filePath, _identity, state) {
     unlinkFailureStates.push(`process:${state}`);
@@ -463,17 +582,16 @@ const remoteScript = buildRemoteScript({
   supervisedGui: true,
   supervisedToken: NONCE,
 });
-for (const key of [
-  "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
-  "APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO",
-  "APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO",
-]) {
+for (const key of ["APPLE_AUTOMATION_BROWSER_BROKER_SOCKET"]) {
   assert.match(remoteScript, new RegExp(`PRODUCTION_ENV_POLICY=.*${key}`));
 }
 assert.match(
   remoteScript,
-  /supervised-process-state-verifier\.mjs" ruyipage[\s\S]*\/usr\/bin\/unlink "\$broker_fifo"/
+  /supervised-process-state-verifier\.mjs" ruyipage[\s\S]*browser_broker_socket[\s\S]*browser_broker_gate[\s\S]*cleanup_failed=1/
 );
-assert.doesNotMatch(remoteScript, /(?:\/bin\/rm|\brm\b).*commands\.fifo/);
+assert.doesNotMatch(
+  remoteScript,
+  /(?:\/bin\/rm|\brm\b|\/usr\/bin\/unlink).*browser_broker_(?:socket|gate)/
+);
 
 console.log("supervised browser broker contract: ok");

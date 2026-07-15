@@ -253,7 +253,10 @@ export function buildRemoteScript(options) {
     remoteRepo
   );
   const supervisedProductionPermissionProfile = options.supervisedGui
-    ? createSupervisedProductionPermissionProfile(supervisedProductionDir)
+    ? createSupervisedProductionPermissionProfile(
+        supervisedProductionDir,
+        supervisedToken
+      )
     : "";
   const supervisedDeadlineBudgetMs = Math.min(
     900_000,
@@ -651,7 +654,7 @@ export function buildRemoteScript(options) {
     "    fi",
     "  fi",
     '  local ruyi_state_file="$control_dir/production/reports/.ruyipage-process.json" ruyi_lifecycle_file="$control_dir/production/reports/.ruyipage-lifecycle.json" ruyi_lifecycle_state="" ruyi_pid="" ruyi_pgid="" ruyi_started_at_b64="" ruyi_started_at="" ruyi_state="" ruyi_command_sha256="" ruyi_command="" current_ruyi_pgid="" current_ruyi_started_at="" current_ruyi_command_sha256="" ruyi_cleanup_identity_ok=1',
-    '  local browser_broker_dir="$control_dir/production/browser-broker" browser_commands_fifo="$control_dir/production/browser-broker/commands.fifo" browser_events_fifo="$control_dir/production/browser-broker/events.fifo" browser_broker_gate="$control_dir/production/browser-broker/broker.ready"',
+    '  local browser_broker_socket="/tmp/apple-automation-$SUPERVISED_TOKEN.sock" browser_broker_gate="$control_dir/production/browser-broker/broker.ready"',
     "  local -a ruyi_state_fields",
     '  if [[ -e "$ruyi_lifecycle_file" || -h "$ruyi_lifecycle_file" ]]; then',
     '    ruyi_lifecycle_state="$("$REMOTE_REPO/.runtime/node/bin/node" "$REMOTE_REPO/scripts/supervised-process-state-verifier.mjs" ruyipage-lifecycle "$ruyi_lifecycle_file" "$SUPERVISED_TOKEN" 2>/dev/null || true)"',
@@ -704,28 +707,9 @@ export function buildRemoteScript(options) {
     '      cleanup_failed=1; ruyi_cleanup_identity_ok=0',
     "    fi",
     "  fi",
-    '  if [[ -e "$browser_broker_dir" || -h "$browser_broker_dir" ]]; then',
-    '    if [[ ! -d "$browser_broker_dir" || -h "$browser_broker_dir" || "$(/usr/bin/stat -f %Lp "$browser_broker_dir" 2>/dev/null || true)" != "700" ]]; then cleanup_failed=1; ruyi_cleanup_identity_ok=0; fi',
-    "  fi",
     '  if (( ruyi_cleanup_identity_ok == 1 )); then',
-    '    local broker_fifo="" broker_fifo_mode=""',
-    '    for broker_fifo in "$browser_commands_fifo" "$browser_events_fifo"; do',
-    '      if [[ -e "$broker_fifo" || -h "$broker_fifo" ]]; then',
-    '        broker_fifo_mode="$(/usr/bin/stat -f %Lp "$broker_fifo" 2>/dev/null || true)"',
-    '        if [[ -p "$broker_fifo" && ! -h "$broker_fifo" && "$broker_fifo_mode" == "600" ]]; then',
-    '          /usr/bin/unlink "$broker_fifo" 2>/dev/null || cleanup_failed=1',
-    "        else",
-    '          cleanup_failed=1',
-    "        fi",
-    "      fi",
-    "    done",
-    '    if [[ -e "$browser_broker_gate" || -h "$browser_broker_gate" ]]; then',
-    '      if [[ -f "$browser_broker_gate" && ! -h "$browser_broker_gate" && "$(/usr/bin/stat -f %Lp "$browser_broker_gate" 2>/dev/null || true)" == "600" ]]; then',
-    '        /usr/bin/unlink "$browser_broker_gate" 2>/dev/null || cleanup_failed=1',
-    "      else",
-    '        cleanup_failed=1',
-    "      fi",
-    "    fi",
+    '    [[ ! -e "$browser_broker_socket" && ! -h "$browser_broker_socket" ]] || cleanup_failed=1',
+    '    [[ ! -e "$browser_broker_gate" && ! -h "$browser_broker_gate" ]] || cleanup_failed=1',
     "  fi",
     '  SUPERVISED_CLEANUP_RESULT="$cleanup_failed"',
     "  SUPERVISED_CLEANUP_STATE=complete",

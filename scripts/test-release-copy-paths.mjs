@@ -103,7 +103,6 @@ for (const rel of [
   "scripts/lib/firefox-runtime.js",
   "scripts/lib/ruyipage-runtime.js",
   "scripts/lib/ruyipage-backend-runner.js",
-  "scripts/ruyipage-fifo-relay.mjs",
   "scripts/ruyipage/apple_account_flow.py",
   "scripts/lib/2fa-audit.js",
   "scripts/lib/mac-2fa-allow.js",
@@ -119,6 +118,17 @@ for (const rel of [
 ]) {
   assert.ok(COPY_PATHS.includes(rel), `${rel} missing from COPY_PATHS`);
 }
+
+assert.equal(
+  COPY_PATHS.includes("scripts/ruyipage-fifo-relay.mjs"),
+  false,
+  "the retired FIFO relay must not be copied into releases"
+);
+assert.equal(
+  fs.existsSync(path.join(repositoryRoot, "scripts", "ruyipage-fifo-relay.mjs")),
+  false,
+  "the retired FIFO relay file must be removed"
+);
 
 for (const rel of [
   "scripts/browser-fill-debug.mjs",

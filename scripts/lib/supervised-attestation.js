@@ -23,9 +23,7 @@ export const SUPERVISED_PRODUCTION_ENV_KEYS = Object.freeze([
   "APPLE_AUTOMATION_SUPERVISED_GUI",
   "APPLE_AUTOMATION_SUPERVISED_TOKEN",
   "APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE",
-  "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
-  "APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO",
-  "APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO",
+  "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
   "FIREFOX_PROFILE_DIR",
   "BROWSER_PROFILE_MODE",
   "APPLE_AUTOMATION_HELPER_DIR",
@@ -37,12 +35,16 @@ export const SUPERVISED_PRODUCTION_ENV_POLICY = JSON.stringify(
   SUPERVISED_PRODUCTION_ENV_KEYS
 );
 
-export function createSupervisedProductionPermissionProfile(productionDir) {
+export function createSupervisedProductionPermissionProfile(productionDir, nonce) {
   const value = String(productionDir ?? "");
   if (!value.startsWith("/") || /["\\\r\n\0]/.test(value)) {
     throw new Error("Supervised production directory is invalid");
   }
-  return `{ extends = ":read-only", filesystem = { "${value}" = "write" } }`;
+  if (!/^[0-9a-f]{32}$/.test(String(nonce ?? ""))) {
+    throw new Error("Supervised production nonce is invalid");
+  }
+  const socketPath = `/tmp/apple-automation-${nonce}.sock`;
+  return `{ extends = ":read-only", filesystem = { "${value}" = "write", "${socketPath}" = "write" } }`;
 }
 
 export function createMacVerificationPermissionProfile(runTmpDir, repository) {

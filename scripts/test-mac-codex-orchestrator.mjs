@@ -18,6 +18,8 @@ import {
 import {
   SUPERVISED_COMMAND_ID,
   SUPERVISED_COMMAND_SHA256,
+  SUPERVISED_PRODUCTION_ENV_KEYS,
+  SUPERVISED_PRODUCTION_ENV_POLICY,
   SUPERVISED_SUCCESS_MARKER,
   createMacVerificationPermissionProfile,
   createSupervisedAttestation,
@@ -56,6 +58,21 @@ const SUPERVISED_TOKEN = "0123456789abcdef0123456789abcdef";
 const OTHER_SUPERVISED_TOKEN = "fedcba9876543210fedcba9876543210";
 const SUPERVISED_HELPER_COMMAND = "node scripts/supervised-mac-acceptance.mjs";
 const RAW_SECRET_CANARY = "raw-secret-canary-must-not-leak";
+const expectedBrowserBrokerEnvironment = [
+  "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
+];
+assert.deepEqual(
+  SUPERVISED_PRODUCTION_ENV_KEYS.filter((key) =>
+    key.startsWith("APPLE_AUTOMATION_BROWSER_BROKER_")
+  ),
+  expectedBrowserBrokerEnvironment
+);
+assert.deepEqual(
+  JSON.parse(SUPERVISED_PRODUCTION_ENV_POLICY).filter((key) =>
+    key.startsWith("APPLE_AUTOMATION_BROWSER_BROKER_")
+  ),
+  expectedBrowserBrokerEnvironment
+);
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
   "utf8"
@@ -1327,7 +1344,7 @@ for (const requiredText of [
   'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
   'SUPERVISED_ATTESTATION="$SUPERVISED_CONTROL_DIR/supervised-attestation.json"',
   'SUPERVISED_BRIDGE_SCRIPT="$SUPERVISED_CONTROL_DIR/terminal-bridge.command"',
-  `PRODUCTION_PERMISSION_PROFILE='{ extends = ":read-only", filesystem = { "${remoteOptions.remoteRoundDir}/supervised-control/production" = "write" } }'`,
+  `PRODUCTION_PERMISSION_PROFILE='{ extends = ":read-only", filesystem = { "${remoteOptions.remoteRoundDir}/supervised-control/production" = "write", "/tmp/apple-automation-${SUPERVISED_TOKEN}.sock" = "write" } }'`,
   'APPLE_AUTOMATION_SUPERVISED_WRITABLE_TMP=${(q)RUN_TMP_DIR}',
   'APPLE_AUTOMATION_SUPERVISED_CONTROL_DIR=${(q)SUPERVISED_CONTROL_DIR}',
   'APPLE_AUTOMATION_SUPERVISED_TRIGGER=${(q)SUPERVISED_TRIGGER}',
@@ -1654,7 +1671,7 @@ const productionSpawnIndex = supervisedTerminalBridgeSource.indexOf(
 assert.ok(
   browserBrokerStartIndex >= 0 &&
     productionSpawnIndex > browserBrokerStartIndex,
-  "the trusted browser broker and both FIFOs must be ready before production starts"
+  "the trusted browser broker socket must be ready before production starts"
 );
 assert.match(supervisedTerminalBridgeSource, /runtime_resolving/);
 assert.match(supervisedTerminalBridgeSource, /backend_starting/);
@@ -1768,6 +1785,16 @@ assert.match(
 assert.match(
   supervisedRemoteScript,
   /supervised-process-state-verifier\.mjs" ruyipage-lifecycle[\s\S]*ruyi_lifecycle_state" != \(preparing\|active\|inactive\|cleanup_failed\)[\s\S]*ruyi_cleanup_identity_ok=0/
+);
+assert.match(
+  supervisedRemoteScript,
+  /browser_broker_socket="\/tmp\/apple-automation-\$SUPERVISED_TOKEN\.sock" browser_broker_gate="\$control_dir\/production\/browser-broker\/broker\.ready"[\s\S]*if \(\( ruyi_cleanup_identity_ok == 1 \)\); then[\s\S]*! -e "\$browser_broker_socket"[\s\S]*cleanup_failed=1[\s\S]*! -e "\$browser_broker_gate"[\s\S]*cleanup_failed=1/,
+  "outer cleanup must fail closed when broker transport artifacts remain"
+);
+assert.doesNotMatch(
+  supervisedRemoteScript,
+  /commands\.fifo|events\.fifo|broker_fifo/,
+  "outer cleanup must not retain FIFO cleanup paths"
 );
 assert.doesNotMatch(supervisedRemoteScript, /-z "\$(?:\/bin\/)?ps .*command=/);
 assert.match(supervisedRemoteScript, /MODEL_TMP_OK=1/);

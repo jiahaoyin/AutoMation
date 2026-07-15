@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import { createConnection as connectToBrowserBroker } from "node:net";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
@@ -16,7 +17,6 @@ import { resolvePythonCommand } from "./ruyipage-runtime.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "../..");
 const DEFAULT_SCRIPT = path.join(ROOT, "scripts", "ruyipage", "apple_account_flow.py");
-const DEFAULT_FIFO_RELAY = path.join(ROOT, "scripts", "ruyipage-fifo-relay.mjs");
 const MAX_KILL_GRACE_MS = 5_000;
 const RUYIPAGE_PROCESS_STATE_NAME = ".ruyipage-process.json";
 export const RUYIPAGE_LIFECYCLE_STATE_NAME = ".ruyipage-lifecycle.json";
@@ -25,12 +25,10 @@ const RUYIPAGE_LAUNCH_CANCEL_NAME = ".ruyipage-launch.cancel";
 export const RUYIPAGE_SUPERVISOR_COMMAND_ID = "ruyipage-supervisor-v1";
 const DEFAULT_BROWSER_BROKER_CONNECT_TIMEOUT_MS = 60_000;
 const BROWSER_BROKER_ERRORS = Object.freeze({
-  eof: "ruyipage browser broker events FIFO closed",
-  open: "ruyipage browser broker FIFO open failed",
-  openTimeout: "ruyipage browser broker FIFO open timed out",
-  read: "ruyipage browser broker events FIFO read failed",
-  write: "ruyipage browser broker FIFO write failed",
-  writeTimeout: "ruyipage browser broker FIFO write timed out",
+  eof: "ruyipage browser broker socket closed",
+  connect: "ruyipage browser broker socket connection failed",
+  connectTimeout: "ruyipage browser broker socket connection timed out",
+  io: "ruyipage browser broker socket I/O failed",
 });
 const RUYIPAGE_LIFECYCLE_STATES = new Set([
   "preparing",
@@ -389,21 +387,31 @@ export function buildRuyiPageProcessSupervisorScript() {
   ].join("\n");
 }
 
-function createBrowserBrokerRelayChild(options) {
-  const fsApi = options?.relayFsApi ?? fs;
-  const spawnProcess = options?.spawnRelay ?? spawn;
-  const relayNode = options?.relayNode ?? process.execPath;
-  const relayScript = options?.relayScript ?? DEFAULT_FIFO_RELAY;
+/**
+ * Create the child-process-shaped transport used by the supervised browser broker.
+ * One connected Unix-domain socket carries commands and events as JSONL.
+ *
+ * @param {{
+ *   socketPath: string,
+ *   creds: {appleId: string, password: string},
+ *   connectTimeoutMs?: number,
+ *   createConnection?: typeof connectToBrowserBroker,
+ * }} options
+ */
+export function createBrowserBrokerChild(options) {
+  const createConnection = options?.createConnection ?? connectToBrowserBroker;
+  const connectTimeoutMs =
+    Number.isFinite(options?.connectTimeoutMs) && options.connectTimeoutMs > 0
+      ? options.connectTimeoutMs
+      : DEFAULT_BROWSER_BROKER_CONNECT_TIMEOUT_MS;
   const child = new EventEmitter();
-  const stdout = new PassThrough();
   const stderr = new PassThrough();
-  let commandRelay = null;
-  let eventRelay = null;
+  let socket = null;
+  let socketConnected = false;
   let credentialsWritten = false;
   let terminalRequested = false;
   let terminal = false;
-  let openTimer = null;
-  let writeTimer = null;
+  let connectTimer = null;
   let resolveConnected;
   let rejectConnected;
   let resolveClosed;
@@ -416,29 +424,19 @@ function createBrowserBrokerRelayChild(options) {
   });
   void connected.catch(() => {});
 
-  const stopRelays = (signal = "SIGTERM") => {
+  const destroySocket = () => {
     try {
-      commandRelay?.stdin?.end();
+      socket?.destroy();
     } catch {
-      /* Relay cleanup remains best-effort. */
-    }
-    for (const relay of [commandRelay, eventRelay]) {
-      try {
-        relay?.kill(signal);
-      } catch {
-        /* The production process supervisor owns final group cleanup. */
-      }
+      /* Socket cleanup remains best-effort and bounded. */
     }
   };
   const finishTerminal = ({ error = null, exitCode = null, signal = null } = {}) => {
     if (terminal) return;
     terminal = true;
-    if (openTimer !== null) clearTimeout(openTimer);
-    if (writeTimer !== null) clearTimeout(writeTimer);
-    openTimer = null;
-    writeTimer = null;
-    stopRelays(signal === "SIGKILL" ? "SIGKILL" : "SIGTERM");
-    if (!stdout.destroyed && !stdout.writableEnded) stdout.end();
+    if (connectTimer !== null) clearTimeout(connectTimer);
+    connectTimer = null;
+    destroySocket();
     if (!stderr.destroyed && !stderr.writableEnded) stderr.end();
     const finalExitCode = error && exitCode == null ? 1 : exitCode;
     child.exitCode = finalExitCode;
@@ -459,9 +457,9 @@ function createBrowserBrokerRelayChild(options) {
   const fail = (message) => requestTerminal({ error: new Error(message) });
 
   Object.assign(child, {
-    stdout,
-    stderr,
     stdin: null,
+    stdout: null,
+    stderr,
     pid: undefined,
     exitCode: null,
     signalCode: null,
@@ -474,310 +472,84 @@ function createBrowserBrokerRelayChild(options) {
     kill(signal = "SIGTERM") {
       if (terminalRequested || terminal) return false;
       child.killed = true;
-      stopRelays(signal);
+      destroySocket();
       requestTerminal({ signal: typeof signal === "string" ? signal : "SIGTERM" });
       return true;
     },
     unref() {
-      commandRelay?.unref?.();
-      eventRelay?.unref?.();
+      socket?.unref?.();
     },
   });
   child.on("error", () => {});
 
   try {
-    for (const fifoPath of [options.commandsFifo, options.eventsFifo]) {
-      const stats = fsApi.lstatSync(fifoPath);
-      if (
-        !stats.isFIFO() ||
-        stats.isSymbolicLink() ||
-        (Number(stats.mode ?? 0) & 0o777) !== 0o600
-      ) {
-        throw new Error(BROWSER_BROKER_ERRORS.open);
-      }
+    const socketPath = String(options?.socketPath ?? "");
+    if (!socketPath || !path.isAbsolute(socketPath) || /[\0\r\n]/.test(socketPath)) {
+      throw new Error(BROWSER_BROKER_ERRORS.connect);
     }
-
-    // Each potentially blocking FIFO open lives in a dedicated, killable relay.
-    // The production Node process therefore remains bounded if the broker dies.
-    commandRelay = spawnProcess(
-      relayNode,
-      [relayScript, "write", options.commandsFifo],
-      {
-      stdio: ["pipe", "ignore", "pipe"],
-      }
-    );
-    eventRelay = spawnProcess(
-      relayNode,
-      [relayScript, "read", options.eventsFifo],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
-    if (!commandRelay?.stdin || !eventRelay?.stdout) {
-      throw new Error(BROWSER_BROKER_ERRORS.open);
-    }
-    child.stdin = commandRelay.stdin;
-    eventRelay.stdout.pipe(stdout, { end: false });
-    eventRelay.stdout.once("data", () => {
-      if (openTimer !== null) clearTimeout(openTimer);
-      openTimer = null;
-    });
-    commandRelay.stderr?.resume();
-    eventRelay.stderr?.resume();
-    commandRelay.once("error", () => fail(BROWSER_BROKER_ERRORS.open));
-    eventRelay.once("error", () => fail(BROWSER_BROKER_ERRORS.open));
-    commandRelay.stdin.once("error", () => fail(BROWSER_BROKER_ERRORS.write));
-    eventRelay.stdout.once("error", () => fail(BROWSER_BROKER_ERRORS.read));
-    eventRelay.once("close", (code, signal) => {
-      if (terminalRequested || terminal) return;
-      if (code === 0) requestTerminal({ exitCode: 0, signal: signal ?? null });
-      else fail(credentialsWritten ? BROWSER_BROKER_ERRORS.read : BROWSER_BROKER_ERRORS.open);
-    });
-    commandRelay.once("close", (code) => {
-      if (terminalRequested || terminal || code === 0) return;
-      fail(credentialsWritten ? BROWSER_BROKER_ERRORS.write : BROWSER_BROKER_ERRORS.open);
-    });
-
-    const credentialsFrame = {
-      type: "credentials",
-      appleId: options.creds.appleId,
-      password: options.creds.password,
-    };
-    const connectTimeoutMs =
-      Number.isFinite(options?.connectTimeoutMs) && options.connectTimeoutMs > 0
-        ? options.connectTimeoutMs
-        : DEFAULT_BROWSER_BROKER_CONNECT_TIMEOUT_MS;
-    openTimer = setTimeout(() => fail(BROWSER_BROKER_ERRORS.openTimeout), connectTimeoutMs);
-    writeTimer = setTimeout(() => fail(BROWSER_BROKER_ERRORS.writeTimeout), connectTimeoutMs);
-    commandRelay.stdin.write(`${JSON.stringify(credentialsFrame)}\n`, (error) => {
-      if (terminalRequested || terminal) return;
-      if (error) {
-        fail(BROWSER_BROKER_ERRORS.write);
-        return;
-      }
-      if (writeTimer !== null) clearTimeout(writeTimer);
-      writeTimer = null;
-      credentialsWritten = true;
-      resolveConnected();
-    });
-  } catch {
-    fail(BROWSER_BROKER_ERRORS.open);
-  }
-
-  return child;
-}
-
-/**
- * Create the child-process-shaped transport used by the supervised Terminal broker.
- * The facade owns only its FIFO streams and never signals a process or PID.
- *
- * @param {{
- *   commandsFifo: string,
- *   eventsFifo: string,
- *   creds: {appleId: string, password: string},
- *   connectTimeoutMs?: number,
- *   fsApi?: Pick<typeof fs, "createReadStream"|"createWriteStream"|"fstat">,
- * }} options
- */
-export function createBrowserBrokerChild(options) {
-  if (!options?.fsApi) return createBrowserBrokerRelayChild(options);
-  const fsApi = options?.fsApi ?? fs;
-  const connectTimeoutMs =
-    Number.isFinite(options?.connectTimeoutMs) && options.connectTimeoutMs > 0
-      ? options.connectTimeoutMs
-      : DEFAULT_BROWSER_BROKER_CONNECT_TIMEOUT_MS;
-  const child = new EventEmitter();
-  const stdout = new PassThrough();
-  const stderr = new PassThrough();
-  const fallbackStdin = new PassThrough();
-  let commandsStream = fallbackStdin;
-  let eventsStream = null;
-  let commandsOpen = false;
-  let eventsOpen = false;
-  let credentialsWritten = false;
-  let terminalRequested = false;
-  let terminal = false;
-  let openTimer = null;
-  let writeTimer = null;
-  let resolveConnected;
-  let rejectConnected;
-  let resolveClosed;
-  const connected = new Promise((resolve, reject) => {
-    resolveConnected = resolve;
-    rejectConnected = reject;
-  });
-  const closed = new Promise((resolve) => {
-    resolveClosed = resolve;
-  });
-  void connected.catch(() => {});
-
-  Object.assign(child, {
-    stdout,
-    stderr,
-    stdin: fallbackStdin,
-    pid: undefined,
-    exitCode: null,
-    signalCode: null,
-    killed: false,
-    connected,
-    cleanup() {
-      child.kill("SIGTERM");
-      return closed;
-    },
-    kill(signal = "SIGTERM") {
-      if (terminalRequested || terminal) return false;
-      child.killed = true;
-      requestTerminal({ signal: typeof signal === "string" ? signal : "SIGTERM" });
-      return true;
-    },
-    unref() {},
-  });
-  // Match ChildProcess behavior without allowing a transport failure to become
-  // an uncaught EventEmitter error before the runner installs its listener.
-  child.on("error", () => {});
-
-  const clearTimers = () => {
-    if (openTimer !== null) clearTimeout(openTimer);
-    if (writeTimer !== null) clearTimeout(writeTimer);
-    openTimer = null;
-    writeTimer = null;
-  };
-  const closeStreams = () => {
-    try {
-      commandsStream.end();
-    } catch {
-      /* Stream cleanup remains best-effort and bounded. */
-    }
-    try {
-      commandsStream.destroy();
-    } catch {
-      /* Stream cleanup remains best-effort and bounded. */
-    }
-    try {
-      eventsStream?.destroy();
-    } catch {
-      /* Stream cleanup remains best-effort and bounded. */
-    }
-  };
-  const finishTerminal = ({ error = null, exitCode = null, signal = null } = {}) => {
-    if (terminal) return;
-    terminal = true;
-    const finalExitCode = error && exitCode == null ? 1 : exitCode;
-    clearTimers();
-    closeStreams();
-    if (!stdout.destroyed && !stdout.writableEnded) stdout.end();
-    if (!stderr.destroyed && !stderr.writableEnded) stderr.end();
-    child.exitCode = finalExitCode;
-    child.signalCode = signal;
-    if (!credentialsWritten) {
-      rejectConnected(error ?? new Error(BROWSER_BROKER_ERRORS.eof));
-    }
-    if (error) child.emit("error", error);
-    child.emit("exit", finalExitCode, signal);
-    child.emit("close", finalExitCode, signal);
-    resolveClosed();
-  };
-  function requestTerminal({ error = null, exitCode = null, signal = null } = {}) {
-    if (terminalRequested || terminal) return;
-    terminalRequested = true;
-    queueMicrotask(() => finishTerminal({ error, exitCode, signal }));
-  }
-  const fail = (message) => requestTerminal({ error: new Error(message) });
-  const handleEventsError = () => {
-    fail(eventsOpen ? BROWSER_BROKER_ERRORS.read : BROWSER_BROKER_ERRORS.open);
-  };
-  const handleCommandsError = () => {
-    fail(commandsOpen ? BROWSER_BROKER_ERRORS.write : BROWSER_BROKER_ERRORS.open);
-  };
-  const validateFifoOpen = (fd, markOpen) => {
-    if (!Number.isInteger(fd) || fd < 0 || typeof fsApi.fstat !== "function") {
-      fail(BROWSER_BROKER_ERRORS.open);
-      return;
-    }
-    try {
-      fsApi.fstat(fd, (error, stats) => {
-        if (terminalRequested || terminal) return;
-        if (error || typeof stats?.isFIFO !== "function" || !stats.isFIFO()) {
-          fail(BROWSER_BROKER_ERRORS.open);
-          return;
-        }
-        markOpen();
-        finishConnection();
-      });
-    } catch {
-      fail(BROWSER_BROKER_ERRORS.open);
-    }
-  };
-  const finishConnection = () => {
+    socket = createConnection({ path: socketPath });
     if (
-      terminalRequested ||
-      terminal ||
-      credentialsWritten ||
-      !commandsOpen ||
-      !eventsOpen
+      !socket ||
+      typeof socket.once !== "function" ||
+      typeof socket.write !== "function" ||
+      typeof socket.destroy !== "function"
     ) {
-      return;
+      throw new Error(BROWSER_BROKER_ERRORS.connect);
     }
-    if (openTimer !== null) clearTimeout(openTimer);
-    openTimer = null;
-    writeTimer = setTimeout(() => {
-      fail(BROWSER_BROKER_ERRORS.writeTimeout);
+    child.stdin = socket;
+    child.stdout = socket;
+
+    connectTimer = setTimeout(() => {
+      destroySocket();
+      fail(BROWSER_BROKER_ERRORS.connectTimeout);
     }, connectTimeoutMs);
-    const credentialsFrame = {
-      type: "credentials",
-      appleId: options.creds.appleId,
-      password: options.creds.password,
-    };
-    try {
-      commandsStream.write(`${JSON.stringify(credentialsFrame)}\n`, (error) => {
-        if (terminalRequested || terminal) return;
-        if (error) {
-          fail(BROWSER_BROKER_ERRORS.write);
-          return;
-        }
-        if (writeTimer !== null) clearTimeout(writeTimer);
-        writeTimer = null;
-        credentialsWritten = true;
-        resolveConnected();
-      });
-      eventsStream.pipe(stdout, { end: false });
-    } catch {
-      fail(BROWSER_BROKER_ERRORS.write);
-    }
-  };
 
-  openTimer = setTimeout(() => {
-    fail(BROWSER_BROKER_ERRORS.openTimeout);
-  }, connectTimeoutMs);
-
-  try {
-    const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-    eventsStream = fsApi.createReadStream(options.eventsFifo, {
-      flags: fs.constants.O_RDONLY | noFollow,
+    socket.once("connect", () => {
+      if (terminalRequested || terminal) return;
+      socketConnected = true;
+      if (connectTimer !== null) clearTimeout(connectTimer);
+      connectTimer = null;
+      const credentialsFrame = {
+        type: "credentials",
+        appleId: options.creds.appleId,
+        password: options.creds.password,
+      };
+      try {
+        socket.write(`${JSON.stringify(credentialsFrame)}\n`, (error) => {
+          if (terminalRequested || terminal) return;
+          if (error) {
+            fail(BROWSER_BROKER_ERRORS.io);
+            return;
+          }
+          credentialsWritten = true;
+          resolveConnected();
+        });
+      } catch {
+        fail(BROWSER_BROKER_ERRORS.io);
+      }
     });
-    commandsStream = fsApi.createWriteStream(options.commandsFifo, {
-      flags: fs.constants.O_WRONLY | noFollow,
+    socket.once("error", () => {
+      fail(
+        socketConnected
+          ? BROWSER_BROKER_ERRORS.io
+          : BROWSER_BROKER_ERRORS.connect
+      );
     });
-    child.stdin = commandsStream;
-    fallbackStdin.destroy();
-    eventsStream.once("open", (fd) => {
-      validateFifoOpen(fd, () => {
-        eventsOpen = true;
-      });
-    });
-    commandsStream.once("open", (fd) => {
-      validateFifoOpen(fd, () => {
-        commandsOpen = true;
-      });
-    });
-    eventsStream.once("error", handleEventsError);
-    commandsStream.once("error", handleCommandsError);
-    eventsStream.once("end", () => requestTerminal({ exitCode: 0 }));
-    eventsStream.once("close", () => {
-      if (!terminalRequested && !terminal) requestTerminal({ exitCode: 0 });
+    socket.once("end", () => requestTerminal({ exitCode: 0 }));
+    socket.once("close", (hadError) => {
+      if (terminalRequested || terminal) return;
+      if (hadError) {
+        fail(
+          socketConnected
+            ? BROWSER_BROKER_ERRORS.io
+            : BROWSER_BROKER_ERRORS.connect
+        );
+      } else {
+        requestTerminal({ exitCode: 0 });
+      }
     });
   } catch {
-    fail(BROWSER_BROKER_ERRORS.open);
+    fail(BROWSER_BROKER_ERRORS.connect);
   }
 
   return child;
@@ -1058,14 +830,9 @@ async function runRuyiPageBackend({
     resolveFirefoxExecutable(),
     ...args,
   ];
-  const brokerCommandsFifo =
-    process.env.APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO?.trim();
-  const brokerEventsFifo =
-    process.env.APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO?.trim();
-  const usesBrowserBroker =
-    process.env.APPLE_AUTOMATION_BROWSER_BROKER_MODE === "1" &&
-    Boolean(brokerCommandsFifo) &&
-    Boolean(brokerEventsFifo);
+  const brokerSocketPath =
+    process.env.APPLE_AUTOMATION_BROWSER_BROKER_SOCKET?.trim();
+  const usesBrowserBroker = Boolean(brokerSocketPath);
   const usesProcessStateSupervisor =
     !usesBrowserBroker &&
     process.platform !== "win32" &&
@@ -1095,8 +862,7 @@ async function runRuyiPageBackend({
   const child = usesBrowserBroker
     ? createBrowserBrokerChild({
         ...browserBrokerTransportOptions,
-        commandsFifo: brokerCommandsFifo,
-        eventsFifo: brokerEventsFifo,
+        socketPath: brokerSocketPath,
         creds,
         connectTimeoutMs:
           browserBrokerTransportOptions.connectTimeoutMs ??
@@ -1194,7 +960,7 @@ async function runRuyiPageBackend({
     if (stdinFailure) return stdinFailure;
     stdinFailure = new Error(
       usesBrowserBroker
-        ? BROWSER_BROKER_ERRORS.write
+        ? BROWSER_BROKER_ERRORS.io
         : "ruyipage backend stdin failed"
     );
     processingError ??= stdinFailure;
@@ -1203,7 +969,7 @@ async function runRuyiPageBackend({
     if (!childEnded) stopper.stop();
     return stdinFailure;
   };
-  child.stdin?.on("error", failStdin);
+  if (!usesBrowserBroker) child.stdin?.on("error", failStdin);
   let resolveBackendTimeout;
   const backendTimeoutOutcome = new Promise((resolve) => {
     resolveBackendTimeout = resolve;

@@ -3,6 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
@@ -28,6 +29,9 @@ const TERMINAL_BRIDGE_COMMAND_ID = "supervised-terminal-bridge-v1";
 const PRODUCTION_SUPERVISOR_COMMAND_ID = "supervised-production-v1";
 const BROWSER_BROKER_COMMAND_ID = RUYIPAGE_SUPERVISOR_COMMAND_ID;
 const MACOS_DEFAULT_FIREFOX = "/Applications/Firefox.app/Contents/MacOS/firefox";
+const BROWSER_BROKER_CONNECT_TIMEOUT_MS = 60_000;
+const BROWSER_BROKER_LISTEN_TIMEOUT_MS = 5_000;
+const BROWSER_BROKER_CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RAW_LOG_BYTES = 1024 * 1024;
 const MANUAL_CODE_PROMPT =
   "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
@@ -94,9 +98,9 @@ function assertPrivateDirectory(fileSystem, directory, label) {
   }
 }
 
-function assertPrivateFifo(fileSystem, fifoPath, label) {
-  const stats = fileSystem.lstatSync(fifoPath);
-  if (!stats.isFIFO() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
+function assertPrivateSocket(fileSystem, socketPath, label) {
+  const stats = fileSystem.lstatSync(socketPath);
+  if (!stats.isSocket() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
     throw new Error(`${label} is invalid`);
   }
 }
@@ -108,15 +112,7 @@ function createPrivateDirectory(fileSystem, directory, label) {
   assertPrivateDirectory(fileSystem, directory, label);
 }
 
-function defaultCreateFifo(fifoPath) {
-  const result = spawnSync("/usr/bin/mkfifo", ["-m", "600", fifoPath], {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024,
-  });
-  if (result.status !== 0) throw new Error("browser broker FIFO creation failed");
-}
-
-export function resolveBrowserBrokerPaths({ repo, productionDir }) {
+export function resolveBrowserBrokerPaths({ repo, productionDir, nonce }) {
   const resolvedRepo = requireAbsolutePosixPath(repo, "repository");
   const resolvedProductionDir = requireAbsolutePosixPath(
     productionDir,
@@ -125,19 +121,21 @@ export function resolveBrowserBrokerPaths({ repo, productionDir }) {
   const brokerDir = path.posix.join(resolvedProductionDir, "browser-broker");
   const reportDir = path.posix.join(brokerDir, "report");
   const reportScreenshotsDir = path.posix.join(reportDir, "screenshots");
-  const commandsFifo = path.posix.join(brokerDir, "commands.fifo");
-  const eventsFifo = path.posix.join(brokerDir, "events.fifo");
+  if (!/^[0-9a-f]{32}$/.test(String(nonce ?? ""))) {
+    throw new Error("browser broker nonce is invalid");
+  }
+  const socketPath = `/tmp/apple-automation-${nonce}.sock`;
   const launchGatePath = path.posix.join(brokerDir, "broker.ready");
   const reportRoot = path.posix.join(resolvedProductionDir, "reports");
   const values = {
     repo: resolvedRepo,
     productionDir: resolvedProductionDir,
+    nonce,
     reportRoot,
     brokerDir,
     reportDir,
     reportScreenshotsDir,
-    commandsFifo,
-    eventsFifo,
+    socketPath,
     launchGatePath,
     statePath: path.posix.join(reportRoot, ".ruyipage-process.json"),
     lifecyclePath: path.posix.join(reportRoot, RUYIPAGE_LIFECYCLE_STATE_NAME),
@@ -147,18 +145,6 @@ export function resolveBrowserBrokerPaths({ repo, productionDir }) {
       "ruyipage-venv",
       "bin",
       "python"
-    ),
-    relayNodePath: path.posix.join(
-      resolvedRepo,
-      ".runtime",
-      "node",
-      "bin",
-      "node"
-    ),
-    relayScriptPath: path.posix.join(
-      resolvedRepo,
-      "scripts",
-      "ruyipage-fifo-relay.mjs"
     ),
     scriptPath: path.posix.join(
       resolvedRepo,
@@ -174,6 +160,9 @@ export function resolveBrowserBrokerPaths({ repo, productionDir }) {
 }
 
 export function validateBrowserBrokerPathScope(values) {
+  if (values.socketPath !== `/tmp/apple-automation-${values.nonce}.sock`) {
+    throw new Error("browser broker socket is out of scope");
+  }
   for (const [candidate, parent, label] of [
     [values.brokerDir, values.productionDir, "browser broker directory"],
     [values.reportDir, values.brokerDir, "browser broker report directory"],
@@ -182,14 +171,10 @@ export function validateBrowserBrokerPathScope(values) {
       values.reportDir,
       "browser broker screenshots directory",
     ],
-    [values.commandsFifo, values.brokerDir, "browser broker commands FIFO"],
-    [values.eventsFifo, values.brokerDir, "browser broker events FIFO"],
     [values.launchGatePath, values.brokerDir, "browser broker launch gate"],
     [values.statePath, values.reportRoot, "ruyipage process state"],
     [values.lifecyclePath, values.reportRoot, "ruyipage lifecycle state"],
     [values.pythonPath, values.repo, "ruyipage Python"],
-    [values.relayNodePath, values.repo, "FIFO relay Node"],
-    [values.relayScriptPath, values.repo, "FIFO relay script"],
     [values.scriptPath, values.repo, "ruyipage script"],
     [values.profileDir, values.productionDir, "Firefox profile"],
   ]) {
@@ -210,15 +195,6 @@ export function validateBrowserBrokerExecutable(paths, options = {}) {
     throw new Error("ruyipage Python is invalid");
   }
   fileSystem.accessSync(paths.pythonPath, fs.constants.X_OK);
-  const relayNodeStats = fileSystem.lstatSync(paths.relayNodePath);
-  if (!relayNodeStats.isFile() && !relayNodeStats.isSymbolicLink()) {
-    throw new Error("FIFO relay Node is invalid");
-  }
-  fileSystem.accessSync(paths.relayNodePath, fs.constants.X_OK);
-  const relayScriptStats = fileSystem.lstatSync(paths.relayScriptPath);
-  if (!relayScriptStats.isFile() || relayScriptStats.isSymbolicLink()) {
-    throw new Error("FIFO relay script is invalid");
-  }
   if (!path.posix.isAbsolute(paths.firefoxPath)) {
     throw new Error("Firefox executable is invalid");
   }
@@ -235,7 +211,6 @@ export function validateBrowserBrokerExecutable(paths, options = {}) {
 
 export function prepareBrowserBrokerFilesystem(paths, options = {}) {
   const fileSystem = options.fs ?? fs;
-  const createFifo = options.createFifo ?? defaultCreateFifo;
   validateBrowserBrokerPathScope(paths);
   assertPrivateDirectory(fileSystem, paths.profileDir, "Firefox profile directory");
   for (const [directory, label] of [
@@ -245,14 +220,8 @@ export function prepareBrowserBrokerFilesystem(paths, options = {}) {
   ]) {
     createPrivateDirectory(fileSystem, directory, label);
   }
-  for (const [fifoPath, label] of [
-    [paths.commandsFifo, "browser broker commands FIFO"],
-    [paths.eventsFifo, "browser broker events FIFO"],
-  ]) {
-    if (lstatIfPresent(fileSystem, fifoPath)) throw new Error(`${label} already exists`);
-    createFifo(fifoPath);
-    fileSystem.chmodSync(fifoPath, 0o600);
-    assertPrivateFifo(fileSystem, fifoPath, label);
+  if (lstatIfPresent(fileSystem, paths.socketPath)) {
+    throw new Error("browser broker socket already exists");
   }
   assertPrivateDirectory(fileSystem, paths.brokerDir, "browser broker directory");
   return paths;
@@ -370,7 +339,10 @@ function validateEnvironment(env) {
     }
   }
   const permissionProfile = env.APPLE_AUTOMATION_PRODUCTION_PERMISSION_PROFILE ?? "";
-  if (permissionProfile !== createSupervisedProductionPermissionProfile(productionDir)) {
+  if (
+    permissionProfile !==
+    createSupervisedProductionPermissionProfile(productionDir, nonce)
+  ) {
     throw new Error("production permission profile is invalid");
   }
   const shellEnvironmentPolicy = env.APPLE_AUTOMATION_PRODUCTION_ENV_POLICY ?? "";
@@ -815,11 +787,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "cancel_file=$7",
     "outer_cancel_file=$8",
     "deadline_ms=$9",
-    "commands_fifo=${10}",
-    "events_fifo=${11}",
-    "relay_node=${12}",
-    "relay_script=${13}",
-    "shift 13",
+    "shift 9",
     "interrupted_status=0",
     'broker_status() { print -r -- "$1" >&3; }',
     "(( ${#launch_nonce} == 32 )) && [[ \"$launch_nonce\" != *[^0-9a-f]* ]] || exit 125",
@@ -836,11 +804,6 @@ export function buildBrowserBrokerSupervisorScript() {
     "  (( interrupted_status == 0 )) || return \"$interrupted_status\"",
     "  return 0",
     "}",
-    "[[ -p \"$commands_fifo\" && ! -h \"$commands_fifo\" ]] || exit 125",
-    "[[ -p \"$events_fifo\" && ! -h \"$events_fifo\" ]] || exit 125",
-    "[[ \"$(/usr/bin/stat -f %Lp \"$commands_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
-    "[[ \"$(/usr/bin/stat -f %Lp \"$events_fifo\" 2>/dev/null || true)\" == \"600\" ]] || exit 125",
-    "[[ -x \"$relay_node\" && -f \"$relay_script\" && ! -h \"$relay_script\" ]] || exit 125",
     'broker_status "supervisor-ready" || exit 125',
     "expected_gate=\"{\\\"version\\\":1,\\\"nonce\\\":\\\"$launch_nonce\\\",\\\"pid\\\":$$}\"",
     "while :; do",
@@ -956,7 +919,7 @@ export function buildBrowserBrokerSupervisorScript() {
     "trap 'interrupted_status=143' TERM",
     "trap 'interrupted_status=129' HUP",
     'broker_status "target-launch" || exit 125',
-    "\"$@\" 3>&- < <(\"$relay_node\" \"$relay_script\" read \"$commands_fifo\" 3>&-) > >(\"$relay_node\" \"$relay_script\" write \"$events_fifo\" 3>&-) 2>/dev/null &",
+    "\"$@\" 3>&- <&0 >&1 2>/dev/null &",
     "backend_pid=$!",
     "identity_attempt=0",
     "while /bin/kill -0 \"$backend_pid\" 2>/dev/null && (( identity_attempt < 1000 )); do",
@@ -1285,8 +1248,7 @@ export function buildBrowserBrokerEnvironment(context, paths) {
     TMPDIR: path.posix.join(context.productionDir, "tmp"),
     APPLE_AUTOMATION_REPORT_ROOT: paths.reportDir,
     APPLE_AUTOMATION_BROWSER_BROKER_MODE: "1",
-    APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO: paths.commandsFifo,
-    APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO: paths.eventsFifo,
+    APPLE_AUTOMATION_BROWSER_BROKER_SOCKET: paths.socketPath,
     FIREFOX_PROFILE_DIR: paths.profileDir,
     BROWSER_PROFILE_MODE: "persistent",
     PYTHONDONTWRITEBYTECODE: "1",
@@ -1349,12 +1311,228 @@ export function attachBrowserBrokerStatusStream(broker, stream) {
   return broker;
 }
 
+function recordBrowserBrokerTransportError(broker, error) {
+  broker.transportError ??= error instanceof Error
+    ? error
+    : new Error("browser broker socket transport failed");
+}
+
+function clearBrowserBrokerConnectionTimer(broker) {
+  if (broker.connectionTimer !== null) clearTimeout(broker.connectionTimer);
+  broker.connectionTimer = null;
+}
+
+function endBrowserBrokerInput(broker) {
+  try {
+    broker.child?.stdin?.end();
+  } catch {
+    recordBrowserBrokerTransportError(
+      broker,
+      new Error("browser broker stdin could not be closed")
+    );
+  }
+}
+
+function wireBrowserBrokerSocket(broker) {
+  if (!broker.client || !broker.child || broker.transportWired) return;
+  if (
+    typeof broker.client.pipe !== "function" ||
+    typeof broker.child.stdin?.write !== "function" ||
+    typeof broker.child.stdout?.pipe !== "function"
+  ) {
+    throw new Error("browser broker stdio is unavailable");
+  }
+  broker.client.pipe(broker.child.stdin);
+  broker.child.stdout.pipe(broker.client);
+  broker.client.resume?.();
+  broker.transportWired = true;
+}
+
+export function attachBrowserBrokerSocketClient(broker, socket) {
+  if (!socket || typeof socket.destroy !== "function") {
+    throw new Error("browser broker socket client is invalid");
+  }
+  socket.on?.("error", (error) => recordBrowserBrokerTransportError(broker, error));
+  if (broker.transportClosing || broker.clientAccepted) {
+    socket.destroy();
+    return false;
+  }
+  broker.clientAccepted = true;
+  broker.client = socket;
+  clearBrowserBrokerConnectionTimer(broker);
+  socket.once?.("close", () => endBrowserBrokerInput(broker));
+  wireBrowserBrokerSocket(broker);
+  return true;
+}
+
+export async function listenBrowserBrokerSocket(broker, options = {}) {
+  const fileSystem = options.fs ?? fs;
+  const createServer = options.createServer ?? net.createServer;
+  const now = options.now ?? Date.now;
+  const requestedListenTimeout =
+    Number.isFinite(options.listenTimeoutMs) && options.listenTimeoutMs > 0
+      ? options.listenTimeoutMs
+      : BROWSER_BROKER_LISTEN_TIMEOUT_MS;
+  const remainingMs = Math.max(1, broker.context.deadlineMs - now());
+  const listenTimeoutMs = Math.max(1, Math.min(requestedListenTimeout, remainingMs));
+  const server = createServer(
+    { allowHalfOpen: false, pauseOnConnect: true },
+    (socket) => {
+      try {
+        attachBrowserBrokerSocketClient(broker, socket);
+      } catch (error) {
+        recordBrowserBrokerTransportError(broker, error);
+        socket?.destroy?.();
+        endBrowserBrokerInput(broker);
+      }
+    }
+  );
+  if (!server || typeof server.listen !== "function") {
+    throw new Error("browser broker socket server is unavailable");
+  }
+  broker.server = server;
+  server.on("error", (error) => recordBrowserBrokerTransportError(broker, error));
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      server.removeListener?.("error", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error) => finish(error);
+    const timer = setTimeout(
+      () => finish(new Error("browser broker socket listen timed out")),
+      listenTimeoutMs
+    );
+    server.once("error", onError);
+    try {
+      server.listen({ path: broker.paths.socketPath, backlog: 1 }, () => finish());
+    } catch (error) {
+      finish(error);
+    }
+  });
+
+  fileSystem.chmodSync(broker.paths.socketPath, 0o600);
+  assertPrivateSocket(fileSystem, broker.paths.socketPath, "browser broker socket");
+  const socketStats = fileSystem.lstatSync(broker.paths.socketPath);
+  broker.socketIdentity = { dev: socketStats.dev, ino: socketStats.ino };
+  const requestedConnectTimeout =
+    Number.isFinite(options.connectTimeoutMs) && options.connectTimeoutMs > 0
+      ? options.connectTimeoutMs
+      : BROWSER_BROKER_CONNECT_TIMEOUT_MS;
+  const connectTimeoutMs = Math.max(
+    1,
+    Math.min(requestedConnectTimeout, Math.max(1, broker.context.deadlineMs - now()))
+  );
+  broker.connectionTimer = setTimeout(() => {
+    broker.connectionTimer = null;
+    broker.transportClosing = true;
+    recordBrowserBrokerTransportError(
+      broker,
+      new Error("browser broker socket connection timed out")
+    );
+    endBrowserBrokerInput(broker);
+    try {
+      server.close();
+    } catch {
+      /* Cleanup will record an unclosed server. */
+    }
+  }, connectTimeoutMs);
+  broker.connectionTimer.unref?.();
+  return server;
+}
+
+function destroyBrowserBrokerClient(client, timeoutMs) {
+  if (!client || client.destroyed === true) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.removeListener?.("close", onClose);
+      resolve(ok);
+    };
+    const onClose = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    client.once?.("close", onClose);
+    try {
+      client.destroy();
+      if (client.destroyed === true && typeof client.once !== "function") finish(true);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+function closeBrowserBrokerServer(server, timeoutMs) {
+  if (!server) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      server.close((error) => {
+        finish(!error || error?.code === "ERR_SERVER_NOT_RUNNING");
+      });
+    } catch (error) {
+      finish(error?.code === "ERR_SERVER_NOT_RUNNING");
+    }
+  });
+}
+
+export function closeBrowserBrokerTransport(broker, options = {}) {
+  if (!broker) return Promise.resolve(true);
+  if (broker.transportClosePromise) return broker.transportClosePromise;
+  const closeTimeoutMs =
+    Number.isFinite(options.closeTimeoutMs) && options.closeTimeoutMs > 0
+      ? options.closeTimeoutMs
+      : BROWSER_BROKER_CLOSE_TIMEOUT_MS;
+  broker.transportClosing = true;
+  clearBrowserBrokerConnectionTimer(broker);
+  try {
+    broker.client?.unpipe?.(broker.child?.stdin);
+    broker.child?.stdout?.unpipe?.(broker.client);
+    broker.child?.stdin?.end?.();
+    broker.child?.stdin?.destroy?.();
+    broker.child?.stdout?.destroy?.();
+  } catch {
+    recordBrowserBrokerTransportError(
+      broker,
+      new Error("browser broker stdio cleanup failed")
+    );
+  }
+  broker.transportClosePromise = Promise.all([
+    destroyBrowserBrokerClient(broker.client, closeTimeoutMs),
+    closeBrowserBrokerServer(broker.server, closeTimeoutMs),
+  ]).then(([clientClosed, serverClosed]) => clientClosed && serverClosed);
+  return broker.transportClosePromise;
+}
+
 export function createBrowserBroker(context) {
   return {
     context,
     paths: resolveBrowserBrokerPaths(context),
     child: null,
     identity: null,
+    server: null,
+    client: null,
+    clientAccepted: false,
+    connectionTimer: null,
+    transportError: null,
+    transportWired: false,
+    transportClosing: false,
+    transportClosePromise: null,
+    socketIdentity: null,
     filesystemTouched: false,
     lifecycleStarted: false,
     stage: "created",
@@ -1371,6 +1549,7 @@ export async function startBrowserBroker(
   const prepareFilesystem =
     options.prepareFilesystem ?? prepareBrowserBrokerFilesystem;
   const spawnProcess = options.spawn ?? spawn;
+  const listenSocket = options.listenSocket ?? listenBrowserBrokerSocket;
   const waitForIdentity = options.waitForIdentity ?? waitForFixedProcessIdentity;
   const writeLifecycle =
     options.writeLifecycle ?? atomicBrowserBrokerLifecycleState;
@@ -1386,6 +1565,7 @@ export async function startBrowserBroker(
     "preparing"
   );
   broker.lifecycleStarted = true;
+  await listenSocket(broker, options.socketOptions);
   const supervisorScript = buildBrowserBrokerSupervisorScript();
   const backendArgs = [
     broker.paths.pythonPath,
@@ -1412,24 +1592,33 @@ export async function startBrowserBroker(
       broker.context.cancelPath,
       broker.context.outerCancelPath,
       String(broker.context.deadlineMs),
-      broker.paths.commandsFifo,
-      broker.paths.eventsFifo,
-      broker.paths.relayNodePath,
-      broker.paths.relayScriptPath,
       ...backendArgs,
     ],
     {
       cwd: broker.context.repo,
       detached: true,
       env: buildBrowserBrokerEnvironment(broker.context, broker.paths),
-      stdio: ["ignore", "ignore", "ignore", "pipe"],
+      stdio: ["pipe", "pipe", "ignore", "pipe"],
     }
   );
   if (!Number.isInteger(broker.child?.pid) || broker.child.pid <= 0) {
     throw new Error("browser broker process did not start");
   }
+  if (
+    typeof broker.child.stdin?.write !== "function" ||
+    typeof broker.child.stdout?.pipe !== "function"
+  ) {
+    throw new Error("browser broker stdio is unavailable");
+  }
   broker.stage = "spawned";
+  broker.child.stdin?.on?.("error", (error) =>
+    recordBrowserBrokerTransportError(broker, error)
+  );
+  broker.child.stdout?.on?.("error", (error) =>
+    recordBrowserBrokerTransportError(broker, error)
+  );
   attachBrowserBrokerStatusStream(broker, broker.child.stdio?.[3]);
+  wireBrowserBrokerSocket(broker);
   broker.identity = await waitForIdentity(
     broker.child.pid,
     (identity) => browserBrokerIdentityMatches(identity, broker)
@@ -1457,15 +1646,22 @@ export async function startBrowserBroker(
   return broker;
 }
 
-function removeValidatedBrowserBrokerFifo(fileSystem, fifoPath, label) {
-  const stats = lstatIfPresent(fileSystem, fifoPath);
+function removeValidatedBrowserBrokerSocket(fileSystem, socketPath, expectedIdentity) {
+  const stats = lstatIfPresent(fileSystem, socketPath);
   if (!stats) return true;
-  if (!stats.isFIFO() || stats.isSymbolicLink() || permissionBits(stats) !== 0o600) {
+  if (
+    !expectedIdentity ||
+    !stats.isSocket() ||
+    stats.isSymbolicLink() ||
+    permissionBits(stats) !== 0o600 ||
+    stats.dev !== expectedIdentity.dev ||
+    stats.ino !== expectedIdentity.ino
+  ) {
     return false;
   }
   try {
-    fileSystem.unlinkSync(fifoPath);
-    return lstatIfPresent(fileSystem, fifoPath) === null;
+    fileSystem.unlinkSync(socketPath);
+    return lstatIfPresent(fileSystem, socketPath) === null;
   } catch {
     return false;
   }
@@ -1490,11 +1686,16 @@ export async function cleanupBrowserBroker(broker, options = {}) {
   const fileSystem = options.fs ?? fs;
   const cleanupRecorded =
     options.cleanupRecorded ?? cleanupRecordedRuyiPageProcess;
+  const closeTransport =
+    options.closeTransport ?? closeBrowserBrokerTransport;
   const groupExists = options.processGroupExists ?? processGroupExists;
   const writeLifecycle =
     options.writeLifecycle ?? atomicBrowserBrokerLifecycleState;
   const writeProcessState =
     options.writeProcessState ?? atomicBrowserBrokerProcessState;
+  const transportClosed = await closeTransport(broker, {
+    closeTimeoutMs: options.closeTimeoutMs,
+  });
   let processCleanup = { ok: true, seen: false, cleanupEvidence: false };
   if (broker.identity) {
     processCleanup = await cleanupRecorded(
@@ -1506,7 +1707,7 @@ export async function cleanupBrowserBroker(broker, options = {}) {
     processCleanup = { ok: false, seen: true, cleanupEvidence: false };
   }
 
-  let stateOk = processCleanup.ok;
+  let stateOk = processCleanup.ok && transportClosed;
   const finalState = stateOk ? "inactive" : "cleanup_failed";
   if (broker.identity) {
     try {
@@ -1541,13 +1742,14 @@ export async function cleanupBrowserBroker(broker, options = {}) {
 
   let filesOk = true;
   if (broker.filesystemTouched) {
-    for (const [fifoPath, label] of [
-      [broker.paths.commandsFifo, "browser broker commands FIFO"],
-      [broker.paths.eventsFifo, "browser broker events FIFO"],
-    ]) {
-      if (!removeValidatedBrowserBrokerFifo(fileSystem, fifoPath, label)) {
-        filesOk = false;
-      }
+    if (
+      !removeValidatedBrowserBrokerSocket(
+        fileSystem,
+        broker.paths.socketPath,
+        broker.socketIdentity
+      )
+    ) {
+      filesOk = false;
     }
     if (!removeValidatedBrowserBrokerGate(fileSystem, broker.paths.launchGatePath)) {
       filesOk = false;
@@ -1608,9 +1810,7 @@ export function productionEnvironment(context, brokerPaths) {
       reportRoot,
       ".ruyipage-process.json"
     ),
-    APPLE_AUTOMATION_BROWSER_BROKER_MODE: "1",
-    APPLE_AUTOMATION_BROWSER_BROKER_COMMANDS_FIFO: brokerPaths.commandsFifo,
-    APPLE_AUTOMATION_BROWSER_BROKER_EVENTS_FIFO: brokerPaths.eventsFifo,
+    APPLE_AUTOMATION_BROWSER_BROKER_SOCKET: brokerPaths.socketPath,
     APPLE_AUTOMATION_HELPER_DIR: context.helperDir,
     FIREFOX_PROFILE_DIR: profileDir,
     BROWSER_PROFILE_MODE: "persistent",
