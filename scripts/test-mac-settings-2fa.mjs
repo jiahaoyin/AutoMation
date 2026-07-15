@@ -1140,7 +1140,7 @@ function runSwiftCancellationContractTest() {
   assert.match(source, /func findExactButton\(/);
   assert.match(
     source,
-    /let verificationAlertCloseButtons\s*=\s*\[\s*"好"\s*,\s*"OK"\s*\]/
+    /let verificationAlertCloseButtons\s*=\s*\[[\s\S]*"好"[\s\S]*"OK"[\s\S]*"Done"[\s\S]*"完成"[\s\S]*\]/
   );
   assert.match(
     source,
@@ -1653,6 +1653,21 @@ function runStrictVerificationCodeSourceContractTest() {
     "verification-code extraction must use digit boundaries inside alert prose"
   );
 
+  const splitNodeCandidate = functionBody("sixWhitespaceSeparatedDigitNodeCandidate");
+  assert.match(splitNodeCandidate, /texts\.count\s*==\s*6/);
+  assert.match(splitNodeCandidate, /joined\(separator:\s*" "\)/);
+  assert.match(splitNodeCandidate, /\^\[0-9\]\(\?: \[0-9\]\)\{5\}\$/);
+  assert.match(splitNodeCandidate, /replacingOccurrences\(of:\s*" ",\s*with:\s*""\)/);
+
+  const acceptsSixSeparatedSingleDigitNodes = (texts) =>
+    texts.length === 6 && /^[0-9](?: [0-9]){5}$/.test(texts.join(" "));
+  assert.equal(acceptsSixSeparatedSingleDigitNodes(Array(6).fill("7")), true);
+  assert.equal(acceptsSixSeparatedSingleDigitNodes(Array(7).fill("7")), false);
+  assert.equal(
+    acceptsSixSeparatedSingleDigitNodes(["7", "7", "7", "7", "7", "77"]),
+    false
+  );
+
   const codeScan = functionBody("findSixDigitCodeInAlert");
   assert.match(codeScan, /kAXStaticTextRole/);
   assert.match(codeScan, /kAXGroupRole/);
@@ -1660,6 +1675,13 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(codeScan, /Set<String>\(\)/);
   assert.match(codeScan, /candidates\.(?:insert|formUnion)/);
   assert.match(codeScan, /candidates\.count\s*==\s*1/);
+  assert.match(codeScan, /var singleDigitTextNodes:\s*\[String\]\s*=\s*\[\]/);
+  assert.match(codeScan, /role == kAXStaticTextRole as String/);
+  assert.match(codeScan, /let nodeTexts = Set\(texts\)/);
+  assert.match(
+    codeScan,
+    /sixWhitespaceSeparatedDigitNodeCandidate\(singleDigitTextNodes\)[\s\S]*candidates\.insert\(code\)/
+  );
   assert.doesNotMatch(codeScan, /blobDeep|axDescription\(node\)|extractSixDigit/);
 
   const scan = functionBody("scanCodeFromAlertOnly");

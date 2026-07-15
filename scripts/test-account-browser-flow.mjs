@@ -208,13 +208,13 @@ async function runFlowAuditForwardingTest() {
   );
 }
 
-async function runSupervisedCollectorTimeoutTest() {
+async function runCollectorTimeoutIsAlways240SecondsTest() {
   const previous = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
   const supervised = createRuntime(async () => successfulResult());
   try {
     process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
     await runAccountBrowserPhase(params, supervised.runtime);
-    assert.equal(supervised.collectorTimeoutMs, 130_000);
+    assert.equal(supervised.collectorTimeoutMs, 240_000);
 
     process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "0";
     const regular = createRuntime(async () => successfulResult());
@@ -250,6 +250,12 @@ async function runFixedTwoFactorStatusPromptsTest() {
     });
     harness.emitStatus({ status: "manual_allow", remainingSec: 185 });
     harness.emitStatus({ status: "manual_code", source: "manual", remainingSec: 150 });
+    harness.emitStatus({
+      status: "manual_unavailable",
+      source: "manual",
+      remainingSec: 150,
+      secret: SECRET_FIXTURE,
+    });
     harness.emitStatus({ status: "winner", source: "popup", remainingSec: 140 });
     harness.emitStatus({ status: "winner", source: "settings", remainingSec: 130 });
     harness.emitStatus({ status: "winner", source: "manual", remainingSec: 120 });
@@ -272,6 +278,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
     "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
+    "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
     "[2FA] 已从 Apple 验证码弹窗取得验证码。",
     "[2FA] 已从系统设置取得验证码。",
     "[2FA] 已使用终端手动输入的验证码。",
@@ -286,6 +293,33 @@ async function runFixedTwoFactorStatusPromptsTest() {
     ]
   );
   assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
+}
+
+async function runSupervisedManualUnavailableStatusTest() {
+  const previous = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+  try {
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
+    const harness = createRuntime(async () => {
+      harness.emitStatus({
+        status: "manual_unavailable",
+        source: "manual",
+        remainingSec: 240,
+        secret: SECRET_FIXTURE,
+      });
+      return successfulResult();
+    });
+    const logs = await captureConsole("log", () =>
+      runAccountBrowserPhase(params, harness.runtime)
+    );
+    assert.deepEqual(logs.filter((line) => line.startsWith("[2FA]")), [
+      "[2FA] status:manual_unavailable",
+      "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
+    ]);
+    assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
+  } finally {
+    if (previous === undefined) delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+    else process.env.APPLE_AUTOMATION_SUPERVISED_GUI = previous;
+  }
 }
 
 async function runFailureDisposalTest() {
@@ -608,8 +642,10 @@ const focusedTests = {
   },
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
+  "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
   generations: runTwoGenerationForwardingTest,
   "status-prompts": runFixedTwoFactorStatusPromptsTest,
+  "manual-unavailable-status": runSupervisedManualUnavailableStatusTest,
 };
 
 const focusedTest = process.env.ACCOUNT_BROWSER_FLOW_FOCUSED_TEST;
@@ -624,8 +660,9 @@ if (focusedTest) {
 await runTwoFactorLifecycleTest();
 await runTwoGenerationForwardingTest();
 await runFlowAuditForwardingTest();
-await runSupervisedCollectorTimeoutTest();
+await runCollectorTimeoutIsAlways240SecondsTest();
 await runFixedTwoFactorStatusPromptsTest();
+await runSupervisedManualUnavailableStatusTest();
 await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();

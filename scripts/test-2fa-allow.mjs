@@ -816,6 +816,7 @@ test("zh-Hant code reading and completion cleanup share one state chain", () => 
   const clickDone = sourceFunctionBody(popupReadSwiftSource, "func clickDone");
   const scanWindow = sourceFunctionBody(popupReadSwiftSource, "func scanWindow");
   const readCode = sourceFunctionBody(popupReadSwiftSource, "func tryReadCode");
+  const probeState = sourceFunctionBody(popupReadSwiftSource, "func probeState");
   const dismissStale = sourceFunctionBody(popupReadSwiftSource, "func tryDismissStale");
   const dismissDone = sourceFunctionBody(popupReadSwiftSource, "func tryDismissDone");
 
@@ -830,7 +831,11 @@ test("zh-Hant code reading and completion cleanup share one state chain", () => 
   );
   assert.match(
     readCode,
-    /isEligibleCodeWindow\([\s\S]*hasCodePrompt: item\.scan\.hasCodePrompt[\s\S]*looksLikeCodeDisplay\(raw\)/
+    /isEligibleCodeWindow\([\s\S]*hasCodePrompt: item\.scan\.hasCodePrompt,[\s\S]*hasCodeDisplay: item\.scan\.code != nil[\s\S]*looksLikeCodeDisplay\(raw\)/
+  );
+  assert.match(
+    probeState,
+    /isEligibleCodeWindow\([\s\S]*hasCodePrompt: item\.scan\.hasCodePrompt,[\s\S]*hasCodeDisplay: item\.scan\.code != nil[\s\S]*"has_code_dialog"/
   );
   for (const [body, label] of [
     [dismissStale, "dismiss stale"],

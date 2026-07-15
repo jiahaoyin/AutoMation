@@ -366,7 +366,8 @@ func tryReadCode(_ windows: [ScannedWindow]) -> (String, String)? {
         guard isEligibleCodeWindow(
             kind: item.candidateKind,
             blob: item.scan.blob,
-            hasCodePrompt: item.scan.hasCodePrompt
+            hasCodePrompt: item.scan.hasCodePrompt,
+            hasCodeDisplay: item.scan.code != nil
         ) else { continue }
         if let c = item.scan.code, let raw = item.scan.codeRaw, looksLikeCodeDisplay(raw) {
             return (c, item.appName)
@@ -380,7 +381,8 @@ func probeState(_ windows: [ScannedWindow]) -> (String, String?) {
         guard isEligibleCodeWindow(
             kind: item.candidateKind,
             blob: item.scan.blob,
-            hasCodePrompt: item.scan.hasCodePrompt
+            hasCodePrompt: item.scan.hasCodePrompt,
+            hasCodeDisplay: item.scan.code != nil
         ) else { continue }
         return ("has_code_dialog", item.appName)
     }

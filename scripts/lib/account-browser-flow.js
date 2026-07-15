@@ -20,7 +20,10 @@ const ALLOWED_READY_MODES = new Set([
 ]);
 
 const FIXED_ENVIRONMENT_WARNING = "[Firefox] 环境提示: browser environment warning";
+const TWO_FACTOR_TIMEOUT_MS = 240_000;
 const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
+  manual_unavailable:
+    "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
   settings_accessibility:
     "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
   manual_allow:
@@ -259,6 +262,7 @@ function reportTwoFactorStatus(event) {
         "settings_accessibility",
         "manual_allow",
         "manual_code",
+        "manual_unavailable",
         "ocr_permission_missing",
         "timeout",
       ].includes(event.status)
@@ -334,8 +338,7 @@ export async function runAccountBrowserPhase(
   }
 
   const collector = createCollector({
-    timeoutMs:
-      process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1" ? 130_000 : 240_000,
+    timeoutMs: TWO_FACTOR_TIMEOUT_MS,
     reportDir,
     onStatus(event) {
       writeFlowAudit(flowAudit, "two_factor", "status", event);

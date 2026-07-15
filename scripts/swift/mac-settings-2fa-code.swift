@@ -115,7 +115,7 @@ let verificationAlertTitles = [
     "Apple ID Verification Code",
 ]
 
-let verificationAlertCloseButtons = ["好", "OK"]
+let verificationAlertCloseButtons = ["好", "OK", "Done", "完成"]
 let verificationPromptFragments = [
     "在网页上输入此验证码",
     "输入此验证码以登录",
@@ -150,6 +150,16 @@ func sixDigitCodeCandidates(_ text: String) -> Set<String> {
         codes.insert(String(candidate[range]).replacingOccurrences(of: " ", with: ""))
     }
     return codes
+}
+
+func sixWhitespaceSeparatedDigitNodeCandidate(_ texts: [String]) -> String? {
+    guard texts.count == 6 else { return nil }
+    let separated = texts.map(normalizedAXText).joined(separator: " ")
+    guard separated.range(
+        of: #"^[0-9](?: [0-9]){5}$"#,
+        options: .regularExpression
+    ) != nil else { return nil }
+    return separated.replacingOccurrences(of: " ", with: "")
 }
 
 func axParent(_ element: AXUIElement) -> AXUIElement? {
@@ -431,19 +441,32 @@ func findSixDigitCodeInAlert(
     var visited = 0
     var candidates = Set<String>()
     var allTexts: [String] = []
+    var singleDigitTextNodes: [String] = []
     while !queue.isEmpty && visited < maxNodes {
         let node = queue.removeFirst()
         visited += 1
         let role = axRole(node)
         if elementBelongsToProcess(node, pid: expectedPid),
-           (role == kAXStaticTextRole as String ||
-            role == kAXGroupRole as String) {
-            for text in axExactTexts(node) {
+            (role == kAXStaticTextRole as String ||
+             role == kAXGroupRole as String) {
+            let texts = axExactTexts(node)
+            for text in texts {
                 candidates.formUnion(sixDigitCodeCandidates(text))
                 allTexts.append(text)
             }
+            if role == kAXStaticTextRole as String {
+                let nodeTexts = Set(texts)
+                if nodeTexts.count == 1,
+                    let text = nodeTexts.first,
+                    text.range(of: #"^[0-9]$"#, options: .regularExpression) != nil {
+                    singleDigitTextNodes.append(text)
+                }
+            }
         }
         queue.append(contentsOf: axChildren(node))
+    }
+    if let code = sixWhitespaceSeparatedDigitNodeCandidate(singleDigitTextNodes) {
+        candidates.insert(code)
     }
     candidates.formUnion(sixDigitCodeCandidates(allTexts.joined(separator: " ")))
     guard isTrustedSystemSettingsProcess(expectedPid),

@@ -36,6 +36,27 @@ const MAX_RAW_LOG_BYTES = 1024 * 1024;
 const MANUAL_CODE_PROMPT =
   "[2FA] 自动取码仍未完成，请输入 Mac 上显示的 6 位验证码: ";
 
+export function supervisedTtyCapability(input) {
+  return input?.isTTY === true && typeof input.setRawMode === "function"
+    ? "available"
+    : "unavailable";
+}
+
+export function productionStdinForSupervisedInput(input, ttyCapability) {
+  return ttyCapability === "available" ? input : "ignore";
+}
+
+export function supervisedTwoFaDetail({
+  failureClass,
+  ttyCapability,
+  manualPromptObserved,
+}) {
+  if (failureClass !== "TWO_FA_CODE_UNAVAILABLE") return "none";
+  if (manualPromptObserved) return "manual_prompt_timeout";
+  if (ttyCapability === "unavailable") return "manual_tty_unavailable";
+  return "automatic_code_unavailable";
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -376,6 +397,7 @@ function atomicAttestation(context, values) {
   const attestation = createSupervisedAttestation({
     nonce: context.nonce,
     expectedHead: context.expectedHead,
+    ttyCapability: values.ttyCapability ?? context.ttyCapability ?? "unknown",
     ...values,
   });
   const temporaryPath = path.join(
@@ -1833,6 +1855,8 @@ export async function runSupervisedTerminalBridge(options = {}) {
   const cleanupBroker = options.cleanupBrowserBroker ?? cleanupBrowserBroker;
   const output = options.stdout ?? process.stdout;
   const input = options.stdin ?? process.stdin;
+  const ttyCapability = supervisedTtyCapability(input);
+  context.ttyCapability = ttyCapability;
   const maxRawLogBytes = options.maxRawLogBytes ?? MAX_RAW_LOG_BYTES;
   let headBefore = null;
   let child = null;
@@ -1977,6 +2001,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let promptTail = Buffer.alloc(0);
     let markerConfirmedInOutput = false;
     let manualPromptVisible = false;
+    let manualPromptObserved = false;
     let manualPromptCount = 0;
     let productionStage = "starting";
     let browserNodeFailure = null;
@@ -2021,6 +2046,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
             "settings_accessibility",
             "manual_allow",
             "manual_code",
+            "manual_unavailable",
             "ocr_permission_missing",
           ].includes(status) &&
           productionStage !== "two_fa_code_acquired"
@@ -2169,6 +2195,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
           const combined = Buffer.concat([promptTail, buffer]);
           if (combined.includes(manualPromptBytes)) {
             manualPromptVisible = true;
+            manualPromptObserved = true;
             manualPromptCount += 1;
             promptTail = Buffer.alloc(0);
             safeWrite(MANUAL_CODE_PROMPT);
@@ -2322,7 +2349,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
         cwd: context.repo,
         detached: true,
         env,
-        stdio: [input?.isTTY === true ? input : "ignore", "pipe", "pipe", "pipe"],
+        stdio: [
+          productionStdinForSupervisedInput(input, ttyCapability),
+          "pipe",
+          "pipe",
+          "pipe",
+        ],
       }
     );
     outcome = createOutcome(now);
@@ -2589,6 +2621,11 @@ export async function runSupervisedTerminalBridge(options = {}) {
 
     const accepted = failureClass === "NONE";
     const cancelled = failureClass === "CANCELLED";
+    const twoFaDetail = supervisedTwoFaDetail({
+      failureClass,
+      ttyCapability,
+      manualPromptObserved,
+    });
     const attestedExitCode = accepted
       ? 0
       : timedOut
@@ -2601,6 +2638,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       exitCode: attestedExitCode,
       markerConfirmed,
       failureClass,
+      twoFaDetail,
       observedHeadBefore: headBefore,
       observedHeadAfter: headAfter,
     });

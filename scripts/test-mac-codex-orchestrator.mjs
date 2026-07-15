@@ -47,7 +47,10 @@ import {
   classifyProcessCleanup,
   classifySupervisorStatus,
   createSupervisorStatusProtocol,
+  productionStdinForSupervisedInput,
   readBoundedRegularFile,
+  supervisedTtyCapability,
+  supervisedTwoFaDetail,
 } from "./supervised-terminal-bridge.mjs";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000;
@@ -72,6 +75,74 @@ assert.deepEqual(
     key.startsWith("APPLE_AUTOMATION_BROWSER_BROKER_")
   ),
   expectedBrowserBrokerEnvironment
+);
+
+const interactiveTerminalInput = {
+  isTTY: true,
+  setRawMode() {},
+};
+const nonInteractiveInput = {
+  isTTY: false,
+  setRawMode() {},
+};
+const ttyWithoutRawMode = { isTTY: true };
+assert.equal(supervisedTtyCapability(interactiveTerminalInput), "available");
+assert.equal(
+  productionStdinForSupervisedInput(
+    interactiveTerminalInput,
+    supervisedTtyCapability(interactiveTerminalInput)
+  ),
+  interactiveTerminalInput
+);
+assert.equal(supervisedTtyCapability(nonInteractiveInput), "unavailable");
+assert.equal(
+  productionStdinForSupervisedInput(
+    nonInteractiveInput,
+    supervisedTtyCapability(nonInteractiveInput)
+  ),
+  "ignore",
+  "non-TTY stdin must never reach the production process"
+);
+assert.equal(supervisedTtyCapability(ttyWithoutRawMode), "unavailable");
+assert.equal(
+  productionStdinForSupervisedInput(
+    ttyWithoutRawMode,
+    supervisedTtyCapability(ttyWithoutRawMode)
+  ),
+  "ignore",
+  "a terminal without raw-mode support must not claim manual input capability"
+);
+assert.equal(
+  supervisedTwoFaDetail({
+    failureClass: "TWO_FA_CODE_UNAVAILABLE",
+    ttyCapability: "unavailable",
+    manualPromptObserved: false,
+  }),
+  "manual_tty_unavailable"
+);
+assert.equal(
+  supervisedTwoFaDetail({
+    failureClass: "TWO_FA_CODE_UNAVAILABLE",
+    ttyCapability: "available",
+    manualPromptObserved: true,
+  }),
+  "manual_prompt_timeout"
+);
+assert.equal(
+  supervisedTwoFaDetail({
+    failureClass: "TWO_FA_CODE_UNAVAILABLE",
+    ttyCapability: "available",
+    manualPromptObserved: false,
+  }),
+  "automatic_code_unavailable"
+);
+assert.equal(
+  supervisedTwoFaDetail({
+    failureClass: "TWO_FA_LOGIN_FAILED",
+    ttyCapability: "available",
+    manualPromptObserved: true,
+  }),
+  "none"
 );
 const projectInstructions = fs.readFileSync(
   new URL("../AGENTS.md", import.meta.url),
@@ -1694,6 +1765,18 @@ assert.match(
 );
 assert.match(
   supervisedTerminalBridgeSource,
+  /combined\.includes\(manualPromptBytes\)[\s\S]*manualPromptObserved = true/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /"manual_code",\s*"manual_unavailable",\s*"ocr_permission_missing"[\s\S]*productionStage = "two_fa_code_pending"/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
+  /supervisedTwoFaDetail\(\{[\s\S]*failureClass,[\s\S]*ttyCapability,[\s\S]*manualPromptObserved/
+);
+assert.match(
+  supervisedTerminalBridgeSource,
   /TERMINAL_BRIDGE_COMMAND_ID[\s\S]*PRODUCTION_SUPERVISOR_COMMAND_ID[\s\S]*commandSha256/
 );
 assert.match(
@@ -2230,6 +2313,8 @@ function attestationArtifact(value) {
 const acceptedAttestation = acceptedSupervisedAttestation();
 assert.equal(acceptedAttestation.commandId, SUPERVISED_COMMAND_ID);
 assert.equal(acceptedAttestation.commandSha256, SUPERVISED_COMMAND_SHA256);
+assert.equal(acceptedAttestation.ttyCapability, "unknown");
+assert.equal(acceptedAttestation.twoFaDetail, "none");
 assert.match(SUPERVISED_COMMAND_SHA256, /^[0-9a-f]{64}$/);
 assert.deepEqual(
   parseSupervisedAttestation(attestationArtifact(acceptedAttestation), {
@@ -2237,6 +2322,66 @@ assert.deepEqual(
     expectedHead: EXPECTED_HEAD,
   }).errors,
   []
+);
+
+const detailedTwoFaAttestation = createSupervisedAttestation({
+  nonce: SUPERVISED_TOKEN,
+  expectedHead: EXPECTED_HEAD,
+  observedHeadBefore: EXPECTED_HEAD,
+  observedHeadAfter: EXPECTED_HEAD,
+  status: "failed",
+  exitCode: 1,
+  failureClass: "TWO_FA_CODE_UNAVAILABLE",
+  ttyCapability: "unavailable",
+  twoFaDetail: "manual_tty_unavailable",
+});
+assert.deepEqual(
+  parseSupervisedAttestation(attestationArtifact(detailedTwoFaAttestation), {
+    nonce: SUPERVISED_TOKEN,
+    expectedHead: EXPECTED_HEAD,
+  }).errors,
+  []
+);
+const legacyFailedAttestation = { ...detailedTwoFaAttestation };
+delete legacyFailedAttestation.ttyCapability;
+delete legacyFailedAttestation.twoFaDetail;
+assert.deepEqual(
+  parseSupervisedAttestation(attestationArtifact(legacyFailedAttestation), {
+    nonce: SUPERVISED_TOKEN,
+    expectedHead: EXPECTED_HEAD,
+  }).errors,
+  [],
+  "legacy failed attestations without TTY/detail fields must remain valid"
+);
+const invalidTwoFaDetailAttestation = {
+  ...detailedTwoFaAttestation,
+  twoFaDetail: "untrusted-detail",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(invalidTwoFaDetailAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /2FA detail is invalid/i.test(error))
+);
+const inconsistentTwoFaDetailAttestation = {
+  ...detailedTwoFaAttestation,
+  failureClass: "PRODUCTION_EXIT_NONZERO",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(inconsistentTwoFaDetailAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /2FA detail is inconsistent/i.test(error))
+);
+const invalidTtyCapabilityAttestation = {
+  ...detailedTwoFaAttestation,
+  ttyCapability: "untrusted-capability",
+};
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(invalidTtyCapabilityAttestation),
+    { nonce: SUPERVISED_TOKEN, expectedHead: EXPECTED_HEAD }
+  ).errors.some((error) => /TTY capability is invalid/i.test(error))
 );
 
 function writeArtifacts(roundDir, overrides = {}) {

@@ -102,7 +102,20 @@ export const SUPERVISED_FAILURE_CLASSES = new Set([
   "INTERNAL_ERROR",
 ]);
 
-const ATTESTATION_KEYS = [
+export const SUPERVISED_TTY_CAPABILITIES = new Set([
+  "unknown",
+  "available",
+  "unavailable",
+]);
+
+export const SUPERVISED_TWO_FA_DETAILS = new Set([
+  "none",
+  "manual_tty_unavailable",
+  "manual_prompt_timeout",
+  "automatic_code_unavailable",
+]);
+
+const ATTESTATION_REQUIRED_KEYS = [
   "version",
   "nonce",
   "expectedHead",
@@ -115,6 +128,11 @@ const ATTESTATION_KEYS = [
   "markerConfirmed",
   "failureClass",
 ];
+const ATTESTATION_OPTIONAL_KEYS = ["ttyCapability", "twoFaDetail"];
+const ATTESTATION_KEYS = new Set([
+  ...ATTESTATION_REQUIRED_KEYS,
+  ...ATTESTATION_OPTIONAL_KEYS,
+]);
 
 export function createSupervisedAttestation(values = {}) {
   return {
@@ -129,6 +147,8 @@ export function createSupervisedAttestation(values = {}) {
     exitCode: values.exitCode ?? null,
     markerConfirmed: values.markerConfirmed === true,
     failureClass: values.failureClass ?? "NONE",
+    ttyCapability: values.ttyCapability ?? "unknown",
+    twoFaDetail: values.twoFaDetail ?? "none",
   };
 }
 
@@ -136,14 +156,20 @@ function isHead(value) {
   return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
 }
 
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 export function validateSupervisedAttestation(value, expected = {}) {
   const errors = [];
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return ["attestation must be an object"];
   }
-  const keys = Object.keys(value).sort();
-  const expectedKeys = [...ATTESTATION_KEYS].sort();
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+  const keys = Object.keys(value);
+  if (
+    keys.some((key) => !ATTESTATION_KEYS.has(key)) ||
+    ATTESTATION_REQUIRED_KEYS.some((key) => !hasOwn(value, key))
+  ) {
     errors.push("attestation keys are invalid");
   }
   if (value.version !== SUPERVISED_ATTESTATION_VERSION) errors.push("attestation version is invalid");
@@ -165,6 +191,26 @@ export function validateSupervisedAttestation(value, expected = {}) {
   if (typeof value.markerConfirmed !== "boolean") errors.push("attestation marker state is invalid");
   if (!SUPERVISED_FAILURE_CLASSES.has(value.failureClass)) {
     errors.push("attestation failure class is invalid");
+  }
+  if (
+    hasOwn(value, "ttyCapability") &&
+    !SUPERVISED_TTY_CAPABILITIES.has(value.ttyCapability)
+  ) {
+    errors.push("attestation TTY capability is invalid");
+  }
+  if (
+    hasOwn(value, "twoFaDetail") &&
+    !SUPERVISED_TWO_FA_DETAILS.has(value.twoFaDetail)
+  ) {
+    errors.push("attestation 2FA detail is invalid");
+  }
+  if (
+    hasOwn(value, "twoFaDetail") &&
+    value.twoFaDetail !== "none" &&
+    (value.status !== "failed" ||
+      value.failureClass !== "TWO_FA_CODE_UNAVAILABLE")
+  ) {
+    errors.push("attestation 2FA detail is inconsistent");
   }
   if (expected.nonce !== undefined && value.nonce !== expected.nonce) {
     errors.push("attestation nonce does not match");

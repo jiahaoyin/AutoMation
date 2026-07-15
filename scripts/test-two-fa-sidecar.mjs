@@ -1303,6 +1303,31 @@ async function manualFallbackStartsAtNinetySecondsTest() {
   await collector.dispose();
 }
 
+async function manualFallbackReservesNinetySecondInputWindowTest() {
+  const manual = createManualProviderHarness();
+  const { clock, collector } = createHarness({
+    timeoutMs: 130_000,
+    settingsFallback: false,
+    manualFallback: true,
+    manualCodeProvider: manual.provider,
+    isTTY: true,
+    pollIntervalMs: 1_000,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+
+  await clock.advance(39_999);
+  assert.equal(manual.calls.length, 0);
+  await clock.advance(1);
+  assert.equal(manual.calls.length, 1);
+  assert.equal(manual.calls[0].timeoutMs, 90_000);
+
+  manual.calls[0].resolve("234567");
+  await clock.flush();
+  assert.equal(await codePromise, "234567");
+  await collector.dispose();
+}
+
 async function automaticWinnerAbortsManualFallbackTest() {
   const manual = createManualProviderHarness();
   const { clock, native, collector } = createHarness({
@@ -1475,7 +1500,7 @@ async function manualWinnerStopsInFlightPopupActionsTest() {
 
 async function nonTtyNeverStartsManualFallbackTest() {
   const manual = createManualProviderHarness();
-  const { clock, collector } = createHarness({
+  const { clock, collector, audits, statuses } = createHarness({
     timeoutMs: 240_000,
     settingsFallback: false,
     manualFallback: true,
@@ -1488,6 +1513,20 @@ async function nonTtyNeverStartsManualFallbackTest() {
   const rejected = assert.rejects(codePromise, /disposed/i);
   await clock.advance(120_000);
   assert.equal(manual.calls.length, 0);
+  assert.deepEqual(
+    statuses.filter(({ status }) => status === "manual_unavailable"),
+    [{ status: "manual_unavailable", source: "manual", remainingSec: 240 }]
+  );
+  assert.equal(
+    audits.some(
+      (entry) =>
+        entry.phase === "manual_provider_unavailable" &&
+        entry.source === "manual" &&
+        entry.reason === "tty_unavailable" &&
+        entry.outcome === "unavailable"
+    ),
+    true
+  );
   await collector.dispose();
   await rejected;
 }
@@ -2062,6 +2101,7 @@ const focusedTests = {
   "settings-accessibility-failure": settingsAccessibilityFailureIsFixedAndBoundedTest,
   "allow-budget": allowBudgetStopsAtTwoAndReportsManualOnceTest,
   "manual-start": manualFallbackStartsAtNinetySecondsTest,
+  "manual-window": manualFallbackReservesNinetySecondInputWindowTest,
   "manual-auto": automaticWinnerAbortsManualFallbackTest,
   "manual-auto-order": automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest,
   "manual-settings": manualWinnerCancelsActiveSettingsTest,
@@ -2119,6 +2159,7 @@ if (focusedTest) {
   await settingsAccessibilityFailureIsFixedAndBoundedTest();
   await allowBudgetStopsAtTwoAndReportsManualOnceTest();
   await manualFallbackStartsAtNinetySecondsTest();
+  await manualFallbackReservesNinetySecondInputWindowTest();
   await automaticWinnerAbortsManualFallbackTest();
   await automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest();
   await manualWinnerCancelsActiveSettingsTest();

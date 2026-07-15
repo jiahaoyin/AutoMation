@@ -14,6 +14,7 @@ const MAX_SETTINGS_ATTEMPTS = 2;
 const SETTINGS_ATTEMPT_TIMEOUT_MS = 60_000;
 const SETTINGS_RETRY_DELAY_MS = 5_000;
 const MANUAL_FALLBACK_AFTER_MS = 90_000;
+const MIN_MANUAL_INPUT_WINDOW_MS = 90_000;
 const PREEXISTING_ALLOW_CLEAR_IDLE_HITS = 3;
 const STATUS_NAMES = new Set([
   "settings_start",
@@ -21,6 +22,7 @@ const STATUS_NAMES = new Set([
   "settings_accessibility",
   "manual_allow",
   "manual_code",
+  "manual_unavailable",
   "ocr_permission_missing",
   "timeout",
   "winner",
@@ -147,6 +149,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "settings_provider_cancel",
     "settings_provider_force_stop",
     "settings_provider_force_stop_cleanup",
+    "manual_provider_unavailable",
     "2fa_acquisition_requested",
     "2fa_winner",
     "popup_dispose_cleanup",
@@ -183,6 +186,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "accessibility_unavailable",
     "cancelled",
     "settings_provider_failed",
+    "tty_unavailable",
     "popup_won",
     "collector_disposed",
     "dispose_probe_or_cleanup_failed",
@@ -346,6 +350,7 @@ export function createMac2FACollector(options = {}) {
   let lastProbeAuditAt = null;
   let idlePollCount = 0;
   let manualAllowStatusSent = false;
+  let manualUnavailableStatusSent = false;
   let ocrPermissionStatusSent = false;
   let timeoutStatusSent = false;
   const auditTimes = new Map();
@@ -1170,8 +1175,32 @@ export function createMac2FACollector(options = {}) {
   };
 
   const startManualProvider = async (acquisition) => {
-    if (!config.manualFallback || !isTTY) return;
-    const startsAt = sharedAcquisitionStartedAt + MANUAL_FALLBACK_AFTER_MS;
+    if (!config.manualFallback) return;
+    if (!isTTY) {
+      if (!manualUnavailableStatusSent) {
+        manualUnavailableStatusSent = true;
+        status("manual_unavailable", {
+          source: "manual",
+          remainingSec: remainingSeconds(acquisition.deadline),
+        });
+        audit({
+          phase: "manual_provider_unavailable",
+          source: "manual",
+          reason: "tty_unavailable",
+          outcome: "unavailable",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+      }
+      return;
+    }
+    const latestManualStartAt = Math.max(
+      sharedAcquisitionStartedAt,
+      acquisition.deadline - MIN_MANUAL_INPUT_WINDOW_MS
+    );
+    const startsAt = Math.min(
+      sharedAcquisitionStartedAt + MANUAL_FALLBACK_AFTER_MS,
+      latestManualStartAt
+    );
     const waitMs = Math.max(0, startsAt - runtime.now());
     if (waitMs > 0) {
       manualStartDelay = scheduleDelay(waitMs);
