@@ -51,6 +51,22 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "runtime_imported",
   "browser_constructing",
   "browser_ready",
+  "login_navigation",
+  "login_page_loaded",
+  "login_state_detected",
+  "email_wait",
+  "email_input",
+  "email_submit",
+  "password_wait",
+  "password_input",
+  "remember_account",
+  "twofa_prepare",
+  "password_submit",
+  "twofa_page_wait",
+  "twofa_code_wait",
+  "twofa_input",
+  "signed_in",
+  "account_information",
 ]);
 
 function sanitizeReadyMode(mode) {

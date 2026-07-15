@@ -99,6 +99,22 @@ BROWSER_STARTUP_STAGES = {
     "runtime_imported",
     "browser_constructing",
     "browser_ready",
+    "login_navigation",
+    "login_page_loaded",
+    "login_state_detected",
+    "email_wait",
+    "email_input",
+    "email_submit",
+    "password_wait",
+    "password_input",
+    "remember_account",
+    "twofa_prepare",
+    "password_submit",
+    "twofa_page_wait",
+    "twofa_code_wait",
+    "twofa_input",
+    "signed_in",
+    "account_information",
 }
 browser_startup_stage = "not_started"
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
@@ -1618,9 +1634,11 @@ def browser_flow(args: argparse.Namespace) -> int:
         browser_startup_stage = "browser_ready"
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
+        browser_startup_stage = "login_navigation"
         page.get(sign_in_url)
         page.wait.doc_loaded(timeout=20)
         human_pause(900, 1800)
+        browser_startup_stage = "login_page_loaded"
 
         initial_state = detect_login_state(page)
         initial_state = settle_trust_state(
@@ -1630,15 +1648,19 @@ def browser_flow(args: argparse.Namespace) -> int:
         )
         if initial_state.get("error"):
             raise RuntimeError("login page reported an authentication error")
+        browser_startup_stage = "login_state_detected"
         skipped_login = bool(initial_state.get("trusted"))
         skipped_2fa = skipped_login
         remember_checked: bool | None = None
 
         if not skipped_login:
             if initial_state.get("twofa"):
+                browser_startup_stage = "twofa_prepare"
                 request_two_factor_preparation()
             else:
+                browser_startup_stage = "email_wait"
                 email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
+                browser_startup_stage = "email_input"
                 input_and_verify(
                     email_scope,
                     email,
@@ -1647,6 +1669,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                     root_page=page,
                 )
+                browser_startup_stage = "email_submit"
                 submit_element_with_enter(
                     page,
                     email_scope,
@@ -1654,11 +1677,13 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                 )
 
+                browser_startup_stage = "password_wait"
                 password_scope, password_field = wait_for_element(
                     page,
                     PASSWORD_SELECTORS,
                     timeout_s=45,
                 )
+                browser_startup_stage = "password_input"
                 input_and_verify(
                     password_scope,
                     password_field,
@@ -1667,8 +1692,11 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                     root_page=page,
                 )
+                browser_startup_stage = "remember_account"
                 remember_checked = ensure_remember_checked(page)
+                browser_startup_stage = "twofa_prepare"
                 request_two_factor_preparation()
+                browser_startup_stage = "password_submit"
                 submit_element_with_enter(
                     page,
                     password_scope,
@@ -1678,11 +1706,14 @@ def browser_flow(args: argparse.Namespace) -> int:
                     max_ms=900,
                 )
 
+            browser_startup_stage = "twofa_page_wait"
             login_state = wait_for_2fa_or_session(page)
             if login_state.get("trusted"):
                 skipped_2fa = True
+                browser_startup_stage = "signed_in"
             else:
                 for generation in (1, 2):
+                    browser_startup_stage = "twofa_code_wait"
                     emit(
                         {
                             "event": "need_2fa",
@@ -1708,6 +1739,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                         read_command(),
                         generation,
                     )
+                    browser_startup_stage = "twofa_input"
                     fields = wait_for_otp_target(page)
                     fill_security_code(page, code, Keys, fields=fields)
                     submitted = click_two_factor_submit(page)
@@ -1722,7 +1754,10 @@ def browser_flow(args: argparse.Namespace) -> int:
                             raise RuntimeError("2FA/login failed")
                         login_state = signed_in_state
                         continue
+                    browser_startup_stage = "signed_in"
                     break
+        else:
+            browser_startup_stage = "signed_in"
 
         screenshots["afterLogin"] = take_screenshot(
             page, success_screenshot_paths[0]
@@ -1730,6 +1765,7 @@ def browser_flow(args: argparse.Namespace) -> int:
         if screenshots["afterLogin"] is not None:
             generated_screenshot_paths.append(success_screenshot_paths[0])
 
+        browser_startup_stage = "account_information"
         page.get(ACCOUNT_INFORMATION_URL)
         page.wait.doc_loaded(timeout=20)
         human_pause(1200, 2400)

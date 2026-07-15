@@ -1872,6 +1872,22 @@ export async function runSupervisedTerminalBridge(options = {}) {
             "runtime_imported",
             "browser_constructing",
             "browser_ready",
+            "login_navigation",
+            "login_page_loaded",
+            "login_state_detected",
+            "email_wait",
+            "email_input",
+            "email_submit",
+            "password_wait",
+            "password_input",
+            "remember_account",
+            "twofa_prepare",
+            "password_submit",
+            "twofa_page_wait",
+            "twofa_code_wait",
+            "twofa_input",
+            "signed_in",
+            "account_information",
           ].includes(failureStage)
         ) {
           productionStage = `browser_failure:${failureStage}`;
@@ -2255,6 +2271,41 @@ export async function runSupervisedTerminalBridge(options = {}) {
         ].includes(productionStage)
       ) {
         failureClass = "BROWSER_LAUNCH_FAILED";
+      } else if (productionStage === "browser_failure:login_navigation") {
+        failureClass = "BROWSER_PAGE_LOAD_FAILED";
+      } else if (
+        [
+          "browser_failure:login_page_loaded",
+          "browser_failure:login_state_detected",
+          "browser_failure:email_wait",
+          "browser_failure:email_input",
+          "browser_failure:email_submit",
+          "browser_failure:password_wait",
+        ].includes(productionStage)
+      ) {
+        failureClass = "BROWSER_EMAIL_STEP_FAILED";
+      } else if (
+        [
+          "browser_failure:password_input",
+          "browser_failure:remember_account",
+          "browser_failure:twofa_prepare",
+          "browser_failure:password_submit",
+        ].includes(productionStage)
+      ) {
+        failureClass = "BROWSER_PASSWORD_STEP_FAILED";
+      } else if (productionStage === "browser_failure:twofa_page_wait") {
+        failureClass = "TWO_FA_PAGE_FAILED";
+      } else if (productionStage === "browser_failure:twofa_code_wait") {
+        failureClass = "TWO_FA_CODE_UNAVAILABLE";
+      } else if (productionStage === "browser_failure:twofa_input") {
+        failureClass = "TWO_FA_LOGIN_FAILED";
+      } else if (
+        [
+          "browser_failure:signed_in",
+          "browser_failure:account_information",
+        ].includes(productionStage)
+      ) {
+        failureClass = "ACCOUNT_INFORMATION_FAILED";
       } else if (productionStage === "browser_failure:not_started") {
         failureClass = "BROWSER_BROKER_TRANSPORT_FAILED";
       } else if (productionStage === "browser_credentials_received") {
