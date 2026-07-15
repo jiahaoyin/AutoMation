@@ -17,9 +17,12 @@ readonly REQUIRED_SWIFT_HELPERS=(
   "mac-2fa-popup-ocr"
   "mac-2fa-click-allow"
 )
-readonly COMPILED_SWIFT_HELPERS=(
+readonly OPTIONAL_SWIFT_HELPERS=(
   "mac-settings-ax-fill"
+)
+readonly COMPILED_SWIFT_HELPERS=(
   "${REQUIRED_SWIFT_HELPERS[@]}"
+  "${OPTIONAL_SWIFT_HELPERS[@]}"
 )
 
 swiftc_usable() {
@@ -84,6 +87,7 @@ compile_swift_helper() {
 
   if ! "$SWIFTC_BIN" -O -o "$output_path" "scripts/swift/${helper}.swift" "$@" 2>/dev/null; then
     echo "错误: Swift helper 编译失败: ${helper}。请确认 Apple Xcode Command Line Tools 已完成安装，然后重新运行 ./install.sh。" >&2
+    echo "诊断命令: /usr/bin/xcrun swiftc -O -o /tmp/${helper} scripts/swift/${helper}.swift $*" >&2
     return 1
   fi
   if ! swift_product_is_executable "$output_path"; then
@@ -101,9 +105,7 @@ compile_swift_helpers() {
     return 1
   }
 
-  if ! compile_swift_helper "$temp_dir" "mac-settings-ax-fill" \
-    -framework ApplicationServices -framework AppKit ||
-    ! compile_swift_helper "$temp_dir" "mac-settings-2fa-code" \
+  if ! compile_swift_helper "$temp_dir" "mac-settings-2fa-code" \
       -framework ApplicationServices -framework AppKit ||
     ! compile_swift_helper "$temp_dir" "mac-2fa-popup-read" \
       -framework ApplicationServices -framework AppKit ||
@@ -116,8 +118,18 @@ compile_swift_helpers() {
     return 1
   fi
 
+  local optional_ax_fill_compiled=0
+  if [[ -f "scripts/swift/mac-settings-ax-fill.swift" ]] &&
+    compile_swift_helper "$temp_dir" "mac-settings-ax-fill" \
+      -framework ApplicationServices -framework AppKit; then
+    optional_ax_fill_compiled=1
+  else
+    echo "警告: 可选 Swift helper 编译失败: mac-settings-ax-fill。跳过 Mac 系统设置登录辅助；./run.sh --skip-mac 浏览器流程仍可继续。" >&2
+    /bin/rm -f -- "$temp_dir/mac-settings-ax-fill"
+  fi
+
   local helper
-  for helper in "${COMPILED_SWIFT_HELPERS[@]}"; do
+  for helper in "${REQUIRED_SWIFT_HELPERS[@]}"; do
     if ! /bin/mv -f -- "$temp_dir/${helper}" "scripts/bin/${helper}"; then
       echo "错误: 无法替换 Swift helper: ${helper}" >&2
       cleanup_swift_helper_temp_dir "$temp_dir"
@@ -125,6 +137,15 @@ compile_swift_helpers() {
     fi
     echo "✓ ${helper} 已编译"
   done
+  if [[ "$optional_ax_fill_compiled" == "1" ]]; then
+    helper="mac-settings-ax-fill"
+    if ! /bin/mv -f -- "$temp_dir/${helper}" "scripts/bin/${helper}"; then
+      echo "错误: 无法替换 Swift helper: ${helper}" >&2
+      cleanup_swift_helper_temp_dir "$temp_dir"
+      return 1
+    fi
+    echo "✓ ${helper} 已编译"
+  fi
 
   if ! /bin/rmdir "$temp_dir"; then
     echo "错误: 无法清理 Swift helper 临时目录" >&2

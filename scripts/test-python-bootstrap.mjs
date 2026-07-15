@@ -312,13 +312,28 @@ function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "")
   }
 }
 
-for (const failingHelper of swiftHelpers) {
+for (const failingHelper of requiredSwiftHelpers) {
   const outcome = runSwiftInstallCompileHarness("0644", failingHelper);
   assert.notEqual(outcome.result.status, 0, `${failingHelper} 0644 output was accepted`);
   assert.equal(outcome.precreatedOutput, false, `${failingHelper} output was pre-created`);
   assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
   for (const helper of swiftHelpers) {
     assert.equal(outcome.binaries[helper], `old-${helper}\n`, `${helper} old binary changed`);
+  }
+}
+
+for (const failureMode of ["compile", "incomplete", "0644"]) {
+  const outcome = runSwiftInstallCompileHarness(failureMode, "mac-settings-ax-fill");
+  assert.equal(
+    outcome.result.status,
+    0,
+    `optional mac-settings-ax-fill ${failureMode} failure blocked install`
+  );
+  assert.equal(outcome.precreatedOutput, false, "optional helper output must not be pre-created");
+  assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
+  assert.equal(outcome.binaries["mac-settings-ax-fill"], "old-mac-settings-ax-fill\n");
+  for (const helper of requiredSwiftHelpers) {
+    assert.equal(outcome.binaries[helper], `new-${helper}\n`);
   }
 }
 
