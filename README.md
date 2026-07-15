@@ -136,7 +136,7 @@ TCC 或 macOS 15 原生 UI 已验收。
 - 浏览器 2FA 的「辅助功能」检查和提示由现有 `mac-2fa-popup-read.swift` 通过 `AXIsProcessTrusted()`、`AXIsProcessTrustedWithOptions(...)` 及 `--preflight-accessibility` / `--prompt-accessibility` 原生完成。旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 只要求当前终端 App 获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有执行 macOS“系统设置登录 Apple Account”阶段时，才要求「自动化」中允许当前终端 App 控制“系统设置”。
-- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会请求权限，也不会阻断安装；AX、Settings 和隐藏终端手输仍可工作。受监督验收复用 `install.sh` 编译到 `scripts/bin` 的稳定 helper，避免每轮随机路径触发新的 TCC 身份；更新代码后先重新运行 `./install.sh`。
+- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会请求权限，也不会阻断安装；AX、Settings 和隐藏终端手输仍可工作。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
 - 权限变更后应按 macOS 提示退出并重新打开终端，再开始下一次运行。
 
 ## macOS 15 验收

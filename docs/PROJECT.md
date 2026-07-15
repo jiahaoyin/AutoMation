@@ -91,7 +91,7 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 - 浏览器 Accessibility 使用 `mac-2fa-popup-read.swift` 的 `AXIsProcessTrusted()` / `AXIsProcessTrustedWithOptions(...)` 原生 preflight/prompt；旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 仍要求终端「辅助功能」，但不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有 macOS 系统设置登录阶段需要「自动化」权限，即允许当前终端 App 控制“系统设置”。
-- Vision OCR 使用「屏幕与系统音频录制」权限。未授权时固定降级为 `permission_missing`，AX、系统设置和隐藏手输仍工作。需要 OCR 时，应在下次运行前前往「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」勾选当前终端，并重新打开终端。受监督验收始终复用 `install.sh` 写入 `scripts/bin` 的稳定 native helper，避免每轮随机路径被 macOS 当作新的 TCC 客户端；拉取更新后先运行一次 `./install.sh`。
+- Vision OCR 使用「屏幕与系统音频录制」权限。未授权时固定降级为 `permission_missing`，AX、系统设置和隐藏手输仍工作。需要 OCR 时，应在下次运行前前往「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」勾选当前终端，并重新打开终端。普通运行复用 `install.sh` 写入 `scripts/bin` 的 native helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径被 macOS 当作新的 TCC 客户端。
 
 切换账号时优先使用 `fresh`，避免身份和 Cookie 串用。
 

@@ -1466,7 +1466,7 @@ for (const requiredText of [
   `SUPERVISED_TOKEN='${SUPERVISED_TOKEN}'`,
   'SUPERVISED_CONTROL_DIR="$REMOTE_ROUND_DIR/supervised-control"',
   'SUPERVISED_PRODUCTION_DIR="$SUPERVISED_CONTROL_DIR/production"',
-  'SUPERVISED_HELPER_DIR="$REMOTE_REPO/scripts/bin"',
+  'SUPERVISED_HELPER_DIR="$HOME/.apple-automation/supervised-helpers"',
   'SUPERVISED_TRIGGER="$RUN_TMP_DIR/supervised-trigger.json"',
   'SUPERVISED_CANCEL="$RUN_TMP_DIR/supervised-cancel.json"',
   'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
@@ -1501,18 +1501,19 @@ for (const helper of [
   "mac-settings-2fa-code",
   "mac-2fa-popup-ocr",
 ]) {
-  const helperCheckIndex = supervisedRemoteScript.indexOf(
-    `[[ ! -x "$SUPERVISED_HELPER_DIR/${helper}" ]]`
+  const helperCompileIndex = supervisedRemoteScript.indexOf(
+    `compile_supervised_helper "${helper}"`
   );
   assert.ok(
-    helperCheckIndex > 0 && helperCheckIndex < supervisedHelperFailureIndex,
-    `${helper} must be checked before the supervised hard-failure marker`
+    helperCompileIndex > 0 && helperCompileIndex < supervisedHelperFailureIndex,
+    `${helper} must be compiled before the supervised hard-failure marker`
   );
 }
-assert.doesNotMatch(
-  supervisedRemoteScript,
-  /swiftc[\s\S]*SUPERVISED_HELPER_DIR|SUPERVISED_HELPER_DIR[\s\S]*scripts\/swift/
-);
+assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_DIR"/);
+assert.match(supervisedRemoteScript, /\[\[ -x "\$output" && "\$output" -nt "\$source" \]\]/);
+assert.match(supervisedRemoteScript, /\.\$1\.tmp\.\$\$/);
+assert.match(supervisedRemoteScript, /swiftc -module-cache-path "\$SWIFT_MODULE_CACHE" -O -o "\$temporary"/);
+assert.match(supervisedRemoteScript, /\/bin\/chmod 500 "\$temporary" && \/bin\/mv -f "\$temporary" "\$output"/);
 assert.doesNotMatch(supervisedRemoteScript, /SUPERVISED_CONTROL_DIR\/helpers/);
 for (const forbiddenText of [
   "supervised-terminal.status",
