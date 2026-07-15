@@ -1491,7 +1491,7 @@ for (const requiredText of [
     `supervised remote script must include: ${requiredText}`
   );
 }
-const supervisedHelperFailureIndex = supervisedRemoteScript.indexOf(
+const supervisedHelperFailureIndex = supervisedRemoteScript.lastIndexOf(
   'write_supervised_attestation failed 1 false HELPER_COMPILE_FAILED "$EXPECTED_HEAD"'
 );
 assert.ok(supervisedHelperFailureIndex > 0, "supervised helper hard-failure marker is required");
@@ -1509,7 +1509,8 @@ for (const helper of [
     `${helper} must be compiled before the supervised hard-failure marker`
   );
 }
-assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_DIR"/);
+assert.match(supervisedRemoteScript, /\[\[ -L "\$SUPERVISED_HELPER_DIR" \]\]/);
+assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_DIR" && ! -d "\$SUPERVISED_HELPER_DIR" \]\]/);
 assert.match(supervisedRemoteScript, /\[\[ -x "\$output" && "\$output" -nt "\$source" \]\]/);
 assert.match(supervisedRemoteScript, /\.\$1\.tmp\.\$\$/);
 assert.match(supervisedRemoteScript, /swiftc -module-cache-path "\$SWIFT_MODULE_CACHE" -O -o "\$temporary"/);
