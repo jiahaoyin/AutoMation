@@ -31,11 +31,19 @@ for (const source of [rootInstall, generatedInstall]) {
   assert.match(source, /\/usr\/bin\/xcode-select --install/);
   assert.match(source, /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/);
   assert.match(source, /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/);
+  assert.match(source, /readonly SWIFT_SOFTWAREUPDATE_LIST_TIMEOUT_SECONDS=[1-9][0-9]*/);
+  assert.match(source, /readonly SWIFT_SOFTWAREUPDATE_INSTALL_TIMEOUT_SECONDS=[1-9][0-9]*/);
+  assert.match(source, /readonly SWIFT_MODULE_CACHE_DIR=/);
+  assert.match(source, /run_command_with_timeout\(\)/);
+  assert.match(source, /run_swiftc\(\)/);
+  assert.match(source, /\/usr\/bin\/xcrun swiftc -module-cache-path/);
+  assert.match(source, /\/usr\/sbin\/softwareupdate --install/);
+  assert.match(source, /\/usr\/bin\/sudo -v/);
   assert.match(
     source,
     /错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 \.\/install\.sh。/
   );
-  assert.doesNotMatch(source, /xcodebuild[^\n]*license|softwareupdate[^\n]*--install/i);
+  assert.doesNotMatch(source, /xcodebuild[^\n]*license/i);
 }
 assert.doesNotMatch(
   rootInstall.slice(0, rootInstall.indexOf("bootstrap_macos_install_runtime")),
@@ -166,16 +174,32 @@ function removeTreeOneFileAtATime(directory) {
   fs.rmdirSync(directory);
 }
 
+const timeoutFunction = shellFunction(rootInstall, "run_command_with_timeout") ?? "";
+const cltInstallFunction = shellFunction(rootInstall, "install_command_line_tools_from_softwareupdate") ?? "";
+const cltRequestFunction = shellFunction(rootInstall, "request_command_line_tools_install") ?? "";
+assert.doesNotMatch(
+  cltRequestFunction.replace(/^request_command_line_tools_install\(\)\s*\{/, ""),
+  /\brequest_command_line_tools_install\b/,
+  "CLT request helper must not call itself"
+);
 const ensureSwiftcFunction = shellFunction(rootInstall, "ensure_swiftc");
 assert.ok(ensureSwiftcFunction, "ensure_swiftc shell function is required");
 const swiftcUsableFunction = shellFunction(rootInstall, "swiftc_usable") ?? "";
-const harnessEnsureSwiftc = `${swiftcUsableFunction}\n${ensureSwiftcFunction}`
+const harnessEnsureSwiftc = `${swiftcUsableFunction}\n${timeoutFunction}\n${cltInstallFunction}\n${cltRequestFunction}\n${ensureSwiftcFunction}`
   .replace(
     "if [[ -x /usr/bin/xcode-select ]]; then",
     "if fake_xcode_select_available; then"
   )
+  .replace(
+    "[[ ! -x /usr/bin/xcode-select ]] || /usr/bin/xcode-select --install",
+    "! fake_xcode_select_available || fake_xcode_select --install"
+  )
   .replaceAll("/usr/bin/xcrun", "fake_xcrun")
   .replaceAll("/usr/bin/xcode-select", "fake_xcode_select")
+  .replaceAll("/usr/bin/sudo -n /usr/bin/true", "fake_sudo_true")
+  .replaceAll("/usr/bin/sudo -v", "fake_sudo_refresh")
+  .replaceAll("/usr/bin/sudo -n /usr/sbin/softwareupdate", "fake_sudo_softwareupdate")
+  .replaceAll("/usr/sbin/softwareupdate", "fake_softwareupdate")
   .replaceAll("/bin/sleep", "fake_sleep");
 
 const triggeredInstall = spawnSync(
@@ -186,10 +210,11 @@ const triggeredInstall = spawnSync(
       `SWIFTC_BIN=''; swift_available=0; xcode_select_calls=0; sleep_calls=0; ` +
       `command() { if [[ "$1" == "-v" && "$2" == "swiftc" ]]; then ` +
       `return 0; fi; builtin command "$@"; }; ` +
-      `fake_xcrun() { if (( swift_available == 1 )); then printf '/usr/bin/true\n'; ` +
-      `else printf '/usr/bin/false\n'; fi; }; ` +
+      `fake_xcrun() { if (( swift_available == 1 )); then printf '/usr/bin/true\n'; return 0; ` +
+      `else printf '/usr/bin/false\n'; return 1; fi; }; ` +
       `fake_xcode_select_available() { return 0; }; ` +
       `fake_xcode_select() { (( xcode_select_calls += 1 )); swift_available=1; }; ` +
+      `fake_softwareupdate() { return 1; }; fake_sudo_softwareupdate() { return 1; }; ` +
       `fake_sleep() { (( sleep_calls += 1 )); }; ` +
       `${harnessEnsureSwiftc}; ensure_swiftc; status=$?; ` +
       `printf '%s %s %s %s' "$status" "$xcode_select_calls" "$sleep_calls" "$SWIFTC_BIN"`,
@@ -213,6 +238,7 @@ const unavailableInstall = spawnSync(
       `fake_xcrun() { printf '/usr/bin/false\n'; }; ` +
       `fake_xcode_select_available() { return 0; }; ` +
       `fake_xcode_select() { (( xcode_select_calls += 1 )); return 1; }; ` +
+      `fake_softwareupdate() { return 1; }; fake_sudo_softwareupdate() { return 1; }; ` +
       `fake_sleep() { (( sleep_calls += 1 )); }; ` +
       `${harnessEnsureSwiftc}; ensure_swiftc; status=$?; ` +
       `printf '%s %s %s' "$status" "$xcode_select_calls" "$sleep_calls"`,
@@ -224,6 +250,32 @@ assert.equal(unavailableInstall.stdout.trim().split(/\r?\n/).at(-1), "1 1 3");
 assert.match(
   unavailableInstall.stderr,
   /错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 \.\/install\.sh。/
+);
+
+const softwareupdateInstall = spawnSync(
+  bash,
+  [
+    "-lc",
+    `SWIFTC_INSTALL_MAX_ATTEMPTS=3; SWIFTC_INSTALL_POLL_SECONDS=1; ` +
+      `SWIFT_SOFTWAREUPDATE_LIST_TIMEOUT_SECONDS=3; SWIFT_SOFTWAREUPDATE_INSTALL_TIMEOUT_SECONDS=3; ` +
+      `SWIFTC_BIN=''; marker="$(mktemp)"; list_marker="$(mktemp)"; install_marker="$(mktemp)"; rm -f "$marker" "$list_marker" "$install_marker"; xcode_select_calls=0; sudo_refresh_calls=0; ` +
+      `command() { if [[ "$1" == "-v" && "$2" == "swiftc" ]]; then return 0; fi; builtin command "$@"; }; ` +
+      `fake_xcrun() { if [[ -f "$marker" ]]; then printf '/usr/bin/true\n'; return 0; else printf '/usr/bin/false\n'; return 1; fi; }; ` +
+      `fake_xcode_select_available() { return 0; }; ` +
+      `fake_xcode_select() { (( xcode_select_calls += 1 )); return 1; }; ` +
+      `fake_softwareupdate() { if [[ "$1" == "--list" ]]; then printf ok > "$list_marker"; printf '* Label: Command Line Tools for Xcode-Test\n'; return 0; fi; return 1; }; ` +
+      `fake_sudo_true() { return 1; }; fake_sudo_refresh() { (( sudo_refresh_calls += 1 )); return 0; }; ` +
+      `fake_sudo_softwareupdate() { if [[ "$1" == "--install" ]]; then printf ok > "$install_marker"; printf ok > "$marker"; return 0; fi; return 1; }; ` +
+      `fake_sleep() { :; }; ` +
+      `${harnessEnsureSwiftc}; ensure_swiftc; status=$?; list_seen=0; install_seen=0; [[ -f "$list_marker" ]] && list_seen=1; [[ -f "$install_marker" ]] && install_seen=1; rm -f "$marker" "$list_marker" "$install_marker"; ` +
+      `printf '%s %s %s %s %s %s' "$status" "$xcode_select_calls" "$list_seen" "$install_seen" "$sudo_refresh_calls" "$SWIFTC_BIN"`,
+  ],
+  { encoding: "utf8" }
+);
+assert.equal(softwareupdateInstall.status, 0, softwareupdateInstall.stderr);
+assert.equal(
+  softwareupdateInstall.stdout.trim().split(/\r?\n/).at(-1),
+  "0 1 1 1 1 /usr/bin/true"
 );
 
 const swiftHelpers = [
@@ -246,14 +298,20 @@ assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), [
 const installCompileFunctions = [
   "swift_product_is_executable",
   "cleanup_swift_helper_temp_dir",
+  "run_swiftc",
+  "print_swift_compile_log",
+  "swift_compile_error_is_environmental",
+  "repair_swift_toolchain_after_compile_failure",
   "compile_swift_helper",
   "compile_swift_helpers",
 ]
   .map((name) => shellFunction(rootInstall, name))
   .filter(Boolean)
   .join("\n")
+  .replaceAll("/usr/bin/xcrun", "fake_xcrun_compile")
   .replaceAll("/bin/mv", "fake_mv");
 assert.match(installCompileFunctions, /compile_swift_helpers\(\)/);
+assert.match(installCompileFunctions, /fake_xcrun_compile swiftc -module-cache-path/);
 
 function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "") {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "swift-install-test-"));
@@ -276,10 +334,16 @@ function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "")
     `REQUIRED_SWIFT_HELPERS=(${requiredSwiftHelpers.map(bashQuote).join(" ")})`,
     `OPTIONAL_SWIFT_HELPERS=(${optionalSwiftHelpers.map(bashQuote).join(" ")})`,
     `COMPILED_SWIFT_HELPERS=(${swiftHelpers.map(bashQuote).join(" ")})`,
+    `SWIFT_MODULE_CACHE_DIR=${bashQuote(toBashPath(path.join(fixtureDir, "module-cache")))}`,
     `FAILURE_MODE=${bashQuote(failureMode)}`,
     `FAILING_HELPER=${bashQuote(failingHelper)}`,
     `PRECREATED_MARKER=${bashQuote(toBashPath(precreatedMarker))}`,
     "SWIFTC_BIN=fake_swiftc",
+    "fake_xcrun_compile() {",
+    '  if [[ "$1" != "swiftc" ]]; then return 1; fi',
+    "  shift",
+    '  fake_swiftc "$@"',
+    "}",
     "fake_swiftc() {",
     "  local output=''",
     "  while (( $# )); do",

@@ -10,6 +10,9 @@ bootstrap_macos_install_runtime
 
 readonly SWIFTC_INSTALL_MAX_ATTEMPTS=120
 readonly SWIFTC_INSTALL_POLL_SECONDS=5
+readonly SWIFT_SOFTWAREUPDATE_LIST_TIMEOUT_SECONDS=120
+readonly SWIFT_SOFTWAREUPDATE_INSTALL_TIMEOUT_SECONDS=1800
+readonly SWIFT_MODULE_CACHE_DIR="${TMPDIR:-/tmp}/apple-automation-swift-module-cache"
 SWIFTC_BIN=""
 readonly REQUIRED_SWIFT_HELPERS=(
   "mac-2fa-popup-read"
@@ -30,7 +33,56 @@ swiftc_usable() {
   swiftc_path="$(/usr/bin/xcrun --find swiftc 2>/dev/null)" || return 1
   [[ -n "$swiftc_path" && -x "$swiftc_path" ]] || return 1
   "$swiftc_path" --version >/dev/null 2>&1 || return 1
+  /usr/bin/xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1 || return 1
   SWIFTC_BIN="$swiftc_path"
+}
+
+run_command_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  "$@" &
+  local command_pid="$!"
+  local elapsed=0
+  while /bin/kill -0 "$command_pid" 2>/dev/null; do
+    if (( elapsed >= timeout_seconds )); then
+      /bin/kill "$command_pid" 2>/dev/null || true
+      wait "$command_pid" 2>/dev/null || true
+      return 124
+    fi
+    /bin/sleep 1
+    (( elapsed += 1 ))
+  done
+  wait "$command_pid"
+}
+
+install_command_line_tools_from_softwareupdate() {
+  local label list_output
+  list_output="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/apple-automation-clt-list.XXXXXX")" || return 1
+  if run_command_with_timeout "$SWIFT_SOFTWAREUPDATE_LIST_TIMEOUT_SECONDS" \
+    /usr/sbin/softwareupdate --list >"$list_output" 2>/dev/null; then
+    label="$(
+      /usr/bin/sed -n 's/^.*\* Label: \(Command Line Tools.*\)$/\1/p' "$list_output" |
+        /usr/bin/tail -n 1
+    )" || true
+  else
+    label=""
+  fi
+  /bin/rm -f -- "$list_output"
+  if [[ -z "$label" ]]; then
+    return 1
+  fi
+  echo ">>> 检测到 Command Line Tools 更新: ${label}"
+  if ! /usr/bin/sudo -n /usr/bin/true 2>/dev/null; then
+    echo "==> 需要管理员权限补齐 Apple Command Line Tools"
+    /usr/bin/sudo -v || return 1
+  fi
+  run_command_with_timeout "$SWIFT_SOFTWAREUPDATE_INSTALL_TIMEOUT_SECONDS" \
+    /usr/bin/sudo -n /usr/sbin/softwareupdate --install "$label" --verbose
+}
+
+request_command_line_tools_install() {
+  [[ ! -x /usr/bin/xcode-select ]] || /usr/bin/xcode-select --install >/dev/null 2>&1 || true
+  install_command_line_tools_from_softwareupdate || true
 }
 
 ensure_swiftc() {
@@ -39,9 +91,7 @@ ensure_swiftc() {
   fi
 
   echo "==> 未找到 swiftc，正在请求安装 Apple Xcode Command Line Tools"
-  if [[ -x /usr/bin/xcode-select ]]; then
-    /usr/bin/xcode-select --install >/dev/null 2>&1 || true
-  fi
+  request_command_line_tools_install
 
   local attempt
   for (( attempt = 1; attempt <= SWIFTC_INSTALL_MAX_ATTEMPTS; attempt++ )); do
@@ -52,6 +102,45 @@ ensure_swiftc() {
   done
 
   echo "错误: 未找到 swiftc。请完成 Apple 官方 Xcode Command Line Tools 安装后重新运行 ./install.sh。" >&2
+  return 1
+}
+
+run_swiftc() {
+  /bin/mkdir -p "$SWIFT_MODULE_CACHE_DIR"
+  /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE_DIR" "$@"
+}
+
+print_swift_compile_log() {
+  local compile_log="$1"
+  if [[ ! -s "$compile_log" ]]; then
+    return 0
+  fi
+  echo "---- swiftc 输出开始 ----" >&2
+  /usr/bin/sed -n '1,80p' "$compile_log" >&2 || true
+  echo "---- swiftc 输出结束 ----" >&2
+}
+
+swift_compile_error_is_environmental() {
+  local compile_log="$1"
+  /usr/bin/grep -Eiq \
+    "invalid active developer path|unable to find utility|unable to find sdk|SDK .* cannot be located|no such module 'AppKit'|no such module 'ApplicationServices'|unable to load standard library|xcrun: error|license" \
+    "$compile_log"
+}
+
+repair_swift_toolchain_after_compile_failure() {
+  local compile_log="$1"
+  if ! swift_compile_error_is_environmental "$compile_log"; then
+    return 1
+  fi
+  echo ">>> Swift 编译环境不完整，尝试补齐 Apple Command Line Tools 后重试"
+  request_command_line_tools_install
+  local attempt
+  for (( attempt = 1; attempt <= SWIFTC_INSTALL_MAX_ATTEMPTS; attempt++ )); do
+    /bin/sleep "$SWIFTC_INSTALL_POLL_SECONDS"
+    if swiftc_usable; then
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -75,6 +164,7 @@ cleanup_swift_helper_temp_dir() {
   local helper
   for helper in "${COMPILED_SWIFT_HELPERS[@]}"; do
     /bin/rm -f -- "$temp_dir/${helper}"
+    /bin/rm -f -- "$temp_dir/${helper}.compile.log"
   done
   /bin/rmdir "$temp_dir" 2>/dev/null || true
 }
@@ -89,12 +179,22 @@ compile_swift_helper() {
     shift
   fi
   local output_path="$temp_dir/${helper}"
+  local compile_log="$temp_dir/${helper}.compile.log"
 
-  if ! "$SWIFTC_BIN" -O -o "$output_path" "scripts/swift/${helper}.swift" "$@" 2>/dev/null; then
-    echo "${failure_label}: Swift helper 编译失败: ${helper}。请确认 Apple Xcode Command Line Tools 已完成安装，然后重新运行 ./install.sh。" >&2
-    echo "诊断命令: /usr/bin/xcrun swiftc -O -o /tmp/${helper} scripts/swift/${helper}.swift $*" >&2
-    return 1
+  if ! run_swiftc -O -o "$output_path" "scripts/swift/${helper}.swift" "$@" >"$compile_log" 2>&1; then
+    if [[ "$failure_label" == "错误" ]] &&
+      repair_swift_toolchain_after_compile_failure "$compile_log" &&
+      run_swiftc -O -o "$output_path" "scripts/swift/${helper}.swift" "$@" >"$compile_log" 2>&1; then
+      :
+    else
+      print_swift_compile_log "$compile_log"
+      echo "${failure_label}: Swift helper 编译失败: ${helper}。请确认 Apple Xcode Command Line Tools 已完成安装，然后重新运行 ./install.sh。" >&2
+      echo "诊断命令: /usr/bin/xcrun swiftc -module-cache-path \"$SWIFT_MODULE_CACHE_DIR\" -O -o /tmp/${helper} scripts/swift/${helper}.swift $*" >&2
+      /bin/rm -f -- "$compile_log"
+      return 1
+    fi
   fi
+  /bin/rm -f -- "$compile_log"
   if ! swift_product_is_executable "$output_path"; then
     echo "${failure_label}: Swift helper 编译产物无效: ${helper}" >&2
     return 1

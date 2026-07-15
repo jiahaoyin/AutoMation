@@ -232,6 +232,12 @@ for (const [label, installSource] of [
   requirePattern(/swiftc_usable\(\)/, "missing usable swiftc probe");
   requirePattern(/\/usr\/bin\/xcrun --find swiftc/, "swiftc is not resolved through xcrun");
   requirePattern(/"\$swiftc_path" --version/, "resolved swiftc is not executed");
+  requirePattern(/\/usr\/bin\/xcrun --sdk macosx --show-sdk-path/, "macOS SDK is not verified through xcrun");
+  requirePattern(/readonly SWIFT_MODULE_CACHE_DIR=/, "missing Swift module cache directory");
+  requirePattern(/run_swiftc\(\)/, "missing xcrun Swift compiler wrapper");
+  requirePattern(/\/usr\/bin\/xcrun swiftc -module-cache-path/, "Swift helpers are not compiled through xcrun with a module cache");
+  requirePattern(/\/usr\/sbin\/softwareupdate --install/, "missing automatic Command Line Tools install fallback");
+  requirePattern(/\/usr\/bin\/sudo -v/, "missing admin authorization refresh for Command Line Tools install");
   if (/command -v swiftc/.test(installSource)) {
     installContractViolations.push(`${label}: accepts a swiftc shim without executing it`);
   }
@@ -248,6 +254,15 @@ for (const [label, installSource] of [
     /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/,
     "missing fixed positive CLT polling interval"
   );
+  requirePattern(
+    /readonly SWIFT_SOFTWAREUPDATE_LIST_TIMEOUT_SECONDS=[1-9][0-9]*/,
+    "missing bounded softwareupdate list timeout"
+  );
+  requirePattern(
+    /readonly SWIFT_SOFTWAREUPDATE_INSTALL_TIMEOUT_SECONDS=[1-9][0-9]*/,
+    "missing bounded softwareupdate install timeout"
+  );
+  requirePattern(/run_command_with_timeout\(\)/, "missing bounded command runner for softwareupdate");
   requirePattern(
     /for \(\( attempt = 1; attempt <= SWIFTC_INSTALL_MAX_ATTEMPTS; attempt\+\+ \)\)/,
     "CLT polling is not bounded by SWIFTC_INSTALL_MAX_ATTEMPTS"
@@ -294,7 +309,7 @@ for (const [label, installSource] of [
   if (/AppleScript.{0,40}回退|回退.{0,40}AppleScript/s.test(installSource)) {
     installContractViolations.push(`${label}: advertises an AppleScript fallback`);
   }
-  if (/xcodebuild[^\n]*license|softwareupdate[^\n]*--install|curl[^\n]*(?:swift|xcode)|brew[^\n]*install/i.test(installSource)) {
+  if (/xcodebuild[^\n]*license|curl[^\n]*(?:swift|xcode)|brew[^\n]*install/i.test(installSource)) {
     installContractViolations.push(`${label}: contains an unapproved Swift toolchain install path`);
   }
   for (const helper of requiredSwiftHelpers) {
