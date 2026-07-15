@@ -704,6 +704,76 @@ class InputTests(unittest.TestCase):
             ["human_click", "perform"],
         )
 
+    def test_password_uses_owner_bidi_input_when_focus_probe_is_unavailable(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        password = FakeElement(attrs={"type": "password"}, focused=False)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input[type='password']": [password]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        with patch("apple_account_flow.emit") as emit_event:
+            action_scope = input_and_verify(
+                frame,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=root,
+            )
+
+        self.assertIs(action_scope, frame)
+        self.assertEqual(password.inputs, [("secret", True)])
+        self.assertEqual(
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+            [
+                "focus_started",
+                "owner_focus_unconfirmed",
+                "owner_bidi_fallback_started",
+                "owner_bidi_typed",
+                "owner_bidi_value_matched",
+                "verified",
+            ],
+        )
+
+    def test_password_submit_uses_owner_enter_when_focus_probe_is_unavailable(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        password = FakeElement(attrs={"type": "password"}, focused=False)
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input[type='password']": [password]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        with patch("apple_account_flow.emit") as emit_event:
+            submit_element_with_enter(
+                root,
+                frame,
+                password,
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(frame.actions.calls[-2:], [("press", "ENTER"), ("perform",)])
+        self.assertEqual(
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+            ["submit_owner_focus_unconfirmed", "submit_owner_enter_sent"],
+        )
+
     def test_frame_input_does_not_fall_back_after_the_target_becomes_disabled(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         iframe = FakeElement(attrs={"src": auth_url})

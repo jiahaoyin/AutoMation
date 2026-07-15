@@ -92,6 +92,7 @@ APPLE_AUTH_HOSTS = frozenset(
 SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
+FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
 BROWSER_STARTUP_STAGES = {
     "not_started",
     "credentials_received",
@@ -587,18 +588,51 @@ def require_keyboard_target_ready(element: Any) -> None:
     if not element_is_interactable(element):
         raise RuntimeError("ruyiPage input target is not interactable")
     if not element_focus_is_confirmed(element):
-        raise RuntimeError("ruyiPage input target focus was not confirmed")
+        raise RuntimeError(FOCUS_NOT_CONFIRMED_REASON)
 
 
 def require_password_compatibility_target(scope: Any, element: Any) -> None:
     validate_apple_scope(scope)
     require_keyboard_target_ready(element)
+    require_password_bidi_input_target(scope, element)
+
+
+def require_password_bidi_input_target(scope: Any, element: Any) -> None:
+    """Validate the exact password target before a trusted element-input fallback."""
+    validate_apple_scope(scope)
+    if not element_is_interactable(element):
+        raise RuntimeError("ruyiPage input target is not interactable")
     try:
         input_type = str(element.attr("type") or "").strip().lower()
     except Exception as exc:
         raise RuntimeError("password input target type was not confirmed") from exc
     if input_type != "password":
         raise RuntimeError("password input target type was not confirmed")
+
+
+def input_password_with_owner_bidi_fallback(
+    scope: Any,
+    field: Any,
+    value: str,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    """Use ruyiPage's trusted element input when Firefox cannot expose focus state."""
+    require_password_bidi_input_target(scope, field)
+    emit_input_progress("password", "owner_bidi_fallback_started", "owner")
+    pause(180, 420)
+    field.input(value, clear=True)
+    emit_input_progress("password", "owner_bidi_typed", "owner")
+    pause(280, 680)
+    readable, actual = read_element_input_value(field)
+    read_state = classify_input_read(readable, actual, value)
+    emit_input_progress("password", f"owner_bidi_value_{read_state}", "owner")
+    if readable and str(actual) not in ("", value):
+        raise RuntimeError("password input verification failed")
+    if readable and str(actual) == value:
+        emit_input_progress("password", "verified", "owner")
+    else:
+        emit_input_progress("password", "password_compatibility_continue", "owner")
+    return scope
 
 
 def element_uses_rendered_text(element: Any) -> bool:
@@ -707,7 +741,18 @@ def input_and_verify(
     actual: Any = None
     try:
         emit_input_progress(label, "focus_started")
-        action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
+        try:
+            action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
+        except RuntimeError as error:
+            if label != "password" or str(error) != FOCUS_NOT_CONFIRMED_REASON:
+                raise
+            emit_input_progress(label, "owner_focus_unconfirmed", "owner")
+            return input_password_with_owner_bidi_fallback(
+                scope,
+                field,
+                value,
+                pause=pause,
+            )
         route = "root" if action_scope is root_page else "owner"
         emit_input_progress(label, "focus_confirmed", route)
         action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
@@ -810,7 +855,23 @@ def submit_element_with_enter(
     min_ms: int = 350,
     max_ms: int = 800,
 ) -> None:
-    action_scope = focus_keyboard_target(root_page, scope, element, pause=pause)
+    try:
+        action_scope = focus_keyboard_target(root_page, scope, element, pause=pause)
+    except RuntimeError as error:
+        if str(error) != FOCUS_NOT_CONFIRMED_REASON:
+            raise
+        try:
+            input_type = str(element.attr("type") or "").strip().lower()
+        except Exception:
+            raise error
+        if input_type != "password":
+            raise error
+        require_password_bidi_input_target(scope, element)
+        emit_input_progress("password", "submit_owner_focus_unconfirmed", "owner")
+        pause(min_ms, max_ms)
+        scope.actions.press(keys.ENTER).perform()
+        emit_input_progress("password", "submit_owner_enter_sent", "owner")
+        return
     submit_with_enter(
         action_scope,
         element,
