@@ -301,8 +301,12 @@ def find_elements(page: Any, selector: str) -> list[Any]:
 
 
 def find_scoped_elements(page: Any, selector: str) -> list[tuple[Any, Any]]:
-    for scope in iter_page_scopes(page):
-        elements = [element for element in safe_elements(scope, selector) if element_is_interactable(element)]
+    for scope, root in current_element_search_roots(page):
+        elements = [
+            element
+            for element in safe_elements(root, selector, timeout_s=0)
+            if element_is_interactable(element)
+        ]
         if elements:
             return [(scope, element) for element in elements]
     return []
@@ -317,10 +321,16 @@ def find_first_scoped_element(
     page: Any,
     selectors: tuple[str, ...],
 ) -> tuple[Any, Any] | None:
+    search_roots = current_element_search_roots(page)
     for selector in selectors:
-        elements = find_scoped_elements(page, selector)
-        if elements:
-            return elements[0]
+        for scope, root in search_roots:
+            elements = [
+                element
+                for element in safe_elements(root, selector, timeout_s=0)
+                if element_is_interactable(element)
+            ]
+            if elements:
+                return scope, elements[0]
     return None
 
 

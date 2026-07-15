@@ -3473,6 +3473,87 @@ class FrameLocationTests(unittest.TestCase):
 
         self.assertIs(find_first_element(FakePage(frames=[frame]), ("css:#target",)), target)
 
+    def test_finds_credential_element_inside_frame_shadow_root(self):
+        password = FakeElement(attrs={"type": "password"})
+        shadow_root = FakePage({"css:input[type='password']": [password]})
+        frame = FakePage(shadow_roots=[shadow_root])
+        page = FakePage(frames=[frame])
+        frame.parent = page
+
+        found = account_flow.find_first_scoped_element(
+            page,
+            account_flow.PASSWORD_SELECTORS,
+        )
+
+        self.assertEqual(found, (frame, password))
+        self.assertEqual(frame.shadow_roots_calls, [("all", False)])
+        self.assertIn(("css:input[type='password']", 0), shadow_root.eles_calls)
+
+    def test_finds_credential_element_inside_top_level_shadow_root(self):
+        password = FakeElement(attrs={"type": "password"})
+        shadow_root = FakePage({"css:input[type='password']": [password]})
+        page = FakePage(shadow_roots=[shadow_root])
+
+        found = account_flow.find_first_scoped_element(
+            page,
+            account_flow.PASSWORD_SELECTORS,
+        )
+
+        self.assertEqual(found, (page, password))
+        self.assertEqual(page.shadow_roots_calls, [("all", False)])
+
+    def test_hidden_document_credential_does_not_mask_shadow_credential(self):
+        hidden = FakeElement(displayed=False, attrs={"type": "password"})
+        password = FakeElement(attrs={"type": "password"})
+        shadow_root = FakePage({"css:input[type='password']": [password]})
+        page = FakePage(
+            {"css:input[type='password']": [hidden]},
+            shadow_roots=[shadow_root],
+        )
+
+        self.assertEqual(
+            account_flow.find_first_scoped_element(
+                page,
+                account_flow.PASSWORD_SELECTORS,
+            ),
+            (page, password),
+        )
+
+    def test_shadow_enumeration_failure_keeps_document_credentials_available(self):
+        password = FakeElement(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            shadow_error=RuntimeError("shadow serialization unavailable"),
+        )
+
+        found = account_flow.find_first_scoped_element(
+            page,
+            account_flow.PASSWORD_SELECTORS,
+        )
+
+        self.assertEqual(found, (page, password))
+        self.assertIn(("css:input[type='password']", 0), page.eles_calls)
+
+    def test_wait_rediscovers_frame_and_shadow_root_after_navigation(self):
+        password = FakeElement(attrs={"type": "password"})
+        shadow_root = FakePage({"css:input[type='password']": [password]})
+        navigated_frame = FakePage(shadow_roots=[shadow_root])
+        page = FakePage(
+            frame_results=[RuntimeError("stale browsing context"), [navigated_frame]]
+        )
+        navigated_frame.parent = page
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            found = account_flow.wait_for_element(
+                page,
+                account_flow.PASSWORD_SELECTORS,
+                timeout_s=0.05,
+            )
+
+        self.assertEqual(found, (navigated_frame, password))
+        self.assertGreaterEqual(page.get_frames_calls, 2)
+        self.assertEqual(navigated_frame.shadow_roots_calls, [("all", False)])
+
     def test_2fa_wait_accepts_code_fields_discovered_inside_frame(self):
         fields = [FakeElement() for _ in range(6)]
         frame = FakePage({"css:input[maxlength='1']": fields})
