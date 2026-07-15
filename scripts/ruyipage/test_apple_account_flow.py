@@ -669,6 +669,38 @@ class InputTests(unittest.TestCase):
         self.assertEqual(field.scroll.calls, [("to_see",)])
         self.assertEqual(iframe.scroll.calls, [("to_see",)])
 
+    def test_otp_input_uses_the_owner_context_for_a_trusted_opaque_frame(self):
+        field = FakeElement(
+            attrs={
+                "type": "text",
+                "maxlength": "1",
+                "autocomplete": "one-time-code",
+            }
+        )
+        root = FakePage(
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input[autocomplete='one-time-code']": [field]},
+            state={"href": "about:blank", "twofa": True},
+            parent=root,
+        )
+
+        action_scope = input_and_verify(
+            frame,
+            field,
+            "7",
+            "2FA digit",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=root,
+        )
+
+        self.assertIs(action_scope, frame)
+        self.assertEqual(root.actions.calls, [])
+        self.assertEqual(field.value, "7")
+
     def test_frame_input_sends_no_keys_when_both_focus_routes_fail(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         iframe = FakeElement(attrs={"src": auth_url})
@@ -2840,6 +2872,31 @@ class OtpTargetWaitTests(unittest.TestCase):
         self.assertEqual(page.actions.calls, [])
         self.assertEqual(frame.actions.calls, [])
 
+    def test_wait_rejects_opaque_otp_frame_below_a_non_apple_parent(self):
+        field = FakeElement(attrs={"autocomplete": "one-time-code"})
+        opaque_frame = FakePage(
+            {"css:input[autocomplete='one-time-code']": [field]},
+            state={"href": "about:blank", "twofa": True},
+        )
+        non_apple_frame = FakePage(
+            frames=[opaque_frame],
+            state={"href": "https://evil.example/verify", "twofa": False},
+        )
+        page = FakePage(
+            frames=[non_apple_frame],
+            state={"href": "https://account.apple.com/sign-in", "twofa": False},
+        )
+        non_apple_frame.parent = page
+        opaque_frame.parent = non_apple_frame
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            with self.assertRaisesRegex(RuntimeError, "OTP target"):
+                account_flow.wait_for_otp_target(page, timeout_s=0.01)
+
+        self.assertEqual(page.actions.calls, [])
+        self.assertEqual(non_apple_frame.actions.calls, [])
+        self.assertEqual(opaque_frame.actions.calls, [])
+
     def test_wait_rejects_unrelated_custom_text_targets(self):
         role_field = FakeElement(attrs={"role": "textbox", "aria-label": "Decode value"})
         editable_field = FakeElement(attrs={"contenteditable": "true"})
@@ -3017,18 +3074,31 @@ class OtpTargetWaitTests(unittest.TestCase):
 
                 self.assertTrue(account_flow.element_has_otp_semantics(field))
 
-    def test_wait_rejects_six_unrelated_role_textboxes(self):
-        fields = [FakeElement(attrs={"role": "textbox"}) for _ in range(6)]
-        shadow_root = FakePage({"css:[role='textbox']": fields})
+    def test_wait_rejects_six_generic_role_textboxes_in_an_opaque_2fa_frame(self):
+        fields = [
+            FakeElement(attrs={"role": "textbox", "maxlength": "1"})
+            for _ in range(6)
+        ]
         page = FakePage(
-            shadow_roots=[shadow_root],
-            state={"twofa": True, "trusted": False, "error": False},
+            state={
+                "href": "https://account.apple.com/sign-in",
+                "twofa": False,
+                "trusted": False,
+                "error": False,
+            }
         )
+        frame = FakePage(
+            {"css:[role='textbox']": fields},
+            state={"href": "about:blank", "twofa": True},
+            parent=page,
+        )
+        page.frames = [frame]
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             with self.assertRaisesRegex(RuntimeError, "OTP target"):
                 account_flow.wait_for_otp_target(page, timeout_s=0.01)
         self.assertEqual(page.actions.calls, [])
+        self.assertEqual(frame.actions.calls, [])
 
     def test_wait_rejects_two_one_time_code_fields_split_across_shadow_roots(self):
         first = FakeElement(attrs={"autocomplete": "one-time-code"})
@@ -3493,6 +3563,26 @@ class TrustBrowserTests(unittest.TestCase):
         self.assertFalse(clicked)
         self.assertEqual(verify.clicks, 0)
 
+    def test_two_factor_submit_rejects_an_opaque_top_level_frame_chain(self):
+        verify = FakeElement("Verify", prompt_semantics={"twofa": True})
+        top = FakePage(state={"href": "about:blank", "twofa": False})
+        apple_frame = FakePage(
+            state={"href": "https://idmsa.apple.com/appleauth/auth/verify", "twofa": False},
+            parent=top,
+        )
+        opaque_frame = FakePage(
+            buttons=[verify],
+            state={"href": "about:blank", "twofa": True, "codeInputCount": 6},
+            parent=apple_frame,
+        )
+        top.frames = [apple_frame]
+        apple_frame.frames = [opaque_frame]
+
+        clicked = click_two_factor_submit(top, pause=lambda *_: None)
+
+        self.assertFalse(clicked)
+        self.assertEqual(opaque_frame.actions.calls, [])
+
     def test_signed_in_wait_handles_a_shadow_only_trust_prompt(self):
         trust = FakeElement(
             "Trust this browser",
@@ -3804,10 +3894,17 @@ class TrustBrowserTests(unittest.TestCase):
             },
         ]
 
-        def next_state(_script):
+        current_state = page.state
+
+        def next_state(script):
+            nonlocal current_state
+            if "location.href" in script and "JSON.stringify" not in script:
+                return current_state["href"]
             if len(states) > 1:
-                return serialize_scope_state(states.pop(0))
-            return serialize_scope_state(states[0])
+                current_state = states.pop(0)
+            else:
+                current_state = states[0]
+            return serialize_scope_state(current_state)
 
         page.run_js = next_state
         with patch("apple_account_flow.human_pause", lambda *_: None):
@@ -3849,10 +3946,17 @@ class TrustBrowserTests(unittest.TestCase):
             },
         ]
 
-        def next_state(_script):
+        current_state = page.state
+
+        def next_state(script):
+            nonlocal current_state
+            if "location.href" in script and "JSON.stringify" not in script:
+                return current_state["href"]
             if len(states) > 1:
-                return serialize_scope_state(states.pop(0))
-            return serialize_scope_state(states[0])
+                current_state = states.pop(0)
+            else:
+                current_state = states[0]
+            return serialize_scope_state(current_state)
 
         page.run_js = next_state
         with patch("apple_account_flow.human_pause", lambda *_: None):
@@ -4120,8 +4224,19 @@ class FrameLocationTests(unittest.TestCase):
 
     def test_2fa_wait_accepts_code_fields_discovered_inside_frame(self):
         fields = [FakeElement() for _ in range(6)]
-        frame = FakePage({"css:input[maxlength='1']": fields})
-        page = FakePage(frames=[frame], state={"twofa": False, "codeInputCount": 0})
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/sign-in",
+                "twofa": False,
+                "codeInputCount": 0,
+            }
+        )
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            state={"href": "about:blank", "twofa": True},
+            parent=page,
+        )
+        page.frames = [frame]
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             state = wait_for_2fa_or_session(page, timeout_s=0.05)
@@ -4129,6 +4244,114 @@ class FrameLocationTests(unittest.TestCase):
         self.assertEqual(state["codeInputCount"], 6)
         self.assertTrue(state.get("twofaVisible"))
         self.assertTrue(state.get("inputReady"))
+
+    def test_login_state_accepts_two_factor_in_an_opaque_apple_child_frame(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in", "twofa": False}
+        )
+        frame = FakePage(
+            state={"href": "about:blank", "twofa": True, "codeInputCount": 6},
+            parent=page,
+        )
+        page.frames = [frame]
+
+        state = detect_login_state(page)
+
+        self.assertTrue(state["twofa"])
+        self.assertTrue(state["twofaVisible"])
+        self.assertEqual(state["codeInputCount"], 6)
+
+    def test_login_state_rejects_two_factor_in_an_opaque_non_apple_child_chain(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in", "twofa": False}
+        )
+        non_apple_frame = FakePage(
+            state={"href": "https://evil.example/verify", "twofa": False},
+            parent=page,
+        )
+        opaque_frame = FakePage(
+            state={"href": "about:blank", "twofa": True, "codeInputCount": 6},
+            parent=non_apple_frame,
+        )
+        page.frames = [non_apple_frame]
+        non_apple_frame.frames = [opaque_frame]
+
+        state = detect_login_state(page)
+
+        self.assertFalse(state["twofa"])
+        self.assertEqual(state["codeInputCount"], 0)
+
+    def test_two_factor_scope_rechecks_a_leaf_url_that_changed_after_state_read(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in", "twofa": False}
+        )
+        frame = FakePage(
+            state={"href": "https://evil.example/after-state-read", "twofa": True},
+            parent=page,
+        )
+
+        self.assertFalse(
+            account_flow.is_trusted_two_factor_scope(
+                frame,
+                "https://idmsa.apple.com/appleauth/auth/verify",
+            )
+        )
+
+    def test_two_factor_scope_accepts_an_apple_rooted_srcdoc_child(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in", "twofa": False}
+        )
+        frame = FakePage(
+            state={"href": "about:srcdoc", "twofa": True, "codeInputCount": 6},
+            parent=page,
+        )
+
+        self.assertTrue(account_flow.is_trusted_two_factor_scope(frame))
+
+    def test_2fa_wait_retries_a_transient_unreadable_scope_before_rechecking(self):
+        recovered_state = {
+            "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+            "twofa": True,
+            "trusted": False,
+            "error": False,
+            "codeInputCount": 0,
+        }
+        with patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=[
+                RuntimeError("unable to inspect login page state through ruyiPage"),
+                recovered_state,
+            ],
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_2fa_or_session(FakePage(), timeout_s=0.05)
+
+        self.assertTrue(state["twofa"])
+        self.assertTrue(state["twofaVisible"])
+
+    def test_2fa_wait_rediscovers_an_opaque_frame_after_enumeration_failure(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in", "twofa": False}
+        )
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            state={"href": "about:blank", "twofa": True},
+            parent=page,
+        )
+        page.frame_results = [RuntimeError("stale browsing context"), [frame]]
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_2fa_or_session(page, timeout_s=0.05)
+
+        self.assertTrue(state["twofaVisible"])
+        self.assertTrue(state["inputReady"])
+        self.assertEqual(state["codeInputCount"], 6)
+        self.assertGreaterEqual(page.get_frames_calls, 2)
+        self.assertEqual(page.actions.calls, [])
+        self.assertEqual(frame.actions.calls, [])
 
     def test_login_state_includes_nested_frame_prompts_and_errors(self):
         frame = FakePage(

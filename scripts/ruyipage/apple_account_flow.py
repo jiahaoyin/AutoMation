@@ -89,6 +89,7 @@ APPLE_AUTH_HOSTS = frozenset(
         "idmsa.apple.com",
     }
 )
+OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
 SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
@@ -637,7 +638,7 @@ def input_password_with_owner_bidi_fallback(
 
 def require_otp_bidi_input_target(scope: Any, element: Any, label: str) -> None:
     """Validate an already-discovered OTP target before trusted element input."""
-    validate_apple_scope(scope)
+    validate_two_factor_scope(scope)
     if not element_is_interactable(element) or not element_is_editable_text_control(element):
         raise RuntimeError("2FA input target is not interactable")
     try:
@@ -750,8 +751,12 @@ def focus_keyboard_target_in_owner_context(
     scope: Any,
     field: Any,
     pause: Callable[[int, int], None] = human_pause,
+    two_factor_scope: bool = False,
 ) -> Any:
-    validate_apple_scope(scope)
+    if two_factor_scope:
+        validate_two_factor_scope(scope)
+    else:
+        validate_apple_scope(scope)
     human_click(scope, field, pause=pause)
     pause(180, 480)
     require_keyboard_target_ready(field)
@@ -763,9 +768,13 @@ def focus_keyboard_target(
     scope: Any,
     field: Any,
     pause: Callable[[int, int], None] = human_pause,
+    two_factor_scope: bool = False,
 ) -> Any:
     """Focus a field through the top context, then fall back to its owner context."""
-    validate_apple_scope(scope)
+    if two_factor_scope:
+        validate_two_factor_scope(scope)
+    else:
+        validate_apple_scope(scope)
     root_page = root_page or scope
     if scope is root_page:
         human_click(scope, field, pause=pause)
@@ -774,6 +783,13 @@ def focus_keyboard_target(
         return scope
 
     validate_apple_scope(root_page)
+    if two_factor_scope and is_opaque_two_factor_frame_url(scope_location_url(scope)):
+        return focus_keyboard_target_in_owner_context(
+            scope,
+            field,
+            pause=pause,
+            two_factor_scope=True,
+        )
     click_target = prepare_frame_input_target(root_page, scope, field)
     human_click(root_page, click_target, pause=pause)
     pause(180, 480)
@@ -784,7 +800,12 @@ def focus_keyboard_target(
 
     # A shadow-root target can reject a top-context coordinate focus even when
     # its owning frame context can target the same element directly.
-    return focus_keyboard_target_in_owner_context(scope, field, pause=pause)
+    return focus_keyboard_target_in_owner_context(
+        scope,
+        field,
+        pause=pause,
+        two_factor_scope=two_factor_scope,
+    )
 
 
 def input_and_verify(
@@ -797,6 +818,7 @@ def input_and_verify(
     root_page: Any | None = None,
 ) -> Any:
     root_page = root_page or scope
+    two_factor_scope = label in ("2FA code", "2FA digit")
     saw_readable_nonempty_mismatch = False
     action_scope: Any | None = None
     route: str | None = None
@@ -805,7 +827,13 @@ def input_and_verify(
     try:
         emit_input_progress(label, "focus_started")
         try:
-            action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
+            action_scope = focus_keyboard_target(
+                root_page,
+                scope,
+                field,
+                pause=pause,
+                two_factor_scope=two_factor_scope,
+            )
         except RuntimeError as error:
             if str(error) != FOCUS_NOT_CONFIRMED_REASON:
                 raise
@@ -843,6 +871,7 @@ def input_and_verify(
                 scope,
                 field,
                 pause=pause,
+                two_factor_scope=two_factor_scope,
             )
             route = "owner"
             emit_input_progress(label, "owner_focus_confirmed", route)
@@ -1171,15 +1200,6 @@ def unique_scoped_elements(
     return result
 
 
-def element_has_per_digit_semantics(element: Any) -> bool:
-    if element_has_otp_semantics(element):
-        return True
-    try:
-        return str(element.attr("maxlength") or "").strip() == "1"
-    except Exception:
-        return False
-
-
 def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
     all_candidates: list[tuple[Any, Any]] = []
     grouped: list[tuple[Any, list[Any]]] = []
@@ -1196,7 +1216,10 @@ def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
             state = detect_scope_login_state(scope)
         except Exception:
             continue
-        if not isinstance(state, dict) or not is_apple_url(str(state.get("href") or "")):
+        if not isinstance(state, dict) or not is_trusted_two_factor_scope(
+            scope,
+            str(state.get("href") or ""),
+        ):
             continue
 
         shadow_twofa = any(
@@ -1241,11 +1264,6 @@ def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
             candidates.extend(
                 field for field in role_textboxes if element_has_otp_semantics(field)
             )
-            per_digit_textboxes = [
-                field for field in role_textboxes if element_has_per_digit_semantics(field)
-            ]
-            if len(role_textboxes) == 6 and len(per_digit_textboxes) == 6:
-                candidates.extend(per_digit_textboxes)
 
         candidates = unique_elements(candidates)
         all_candidates.extend((scope, field) for field in candidates)
@@ -1447,9 +1465,7 @@ def click_two_factor_submit(
             state = detect_scope_login_state(scope)
         except Exception:
             continue
-        try:
-            validate_apple_url(str(state.get("href") or ""))
-        except Exception:
+        if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
             continue
         for button in safe_elements(root, "css:button"):
             if not element_is_interactable(button):
@@ -1574,6 +1590,62 @@ def is_apple_url(url: str) -> bool:
     return parse_valid_apple_url(url) is not None
 
 
+def scope_location_url(scope: Any) -> str:
+    try:
+        return str(scope.run_js("return location.href") or "").strip()
+    except Exception:
+        return ""
+
+
+def is_opaque_two_factor_frame_url(url: str) -> bool:
+    normalized = str(url or "").strip().lower()
+    normalized = normalized.split("#", 1)[0].split("?", 1)[0]
+    return normalized in OPAQUE_TWO_FACTOR_FRAME_URLS
+
+
+def trusted_two_factor_scope_url(
+    scope: Any,
+    initial_url: str | None = None,
+) -> str | None:
+    """Return the Apple root only for an Apple-rooted opaque 2FA frame chain."""
+    current = scope
+    seen: set[int] = set()
+    use_initial_url = initial_url is not None
+    while current is not None:
+        identity = id(current)
+        if identity in seen:
+            return None
+        seen.add(identity)
+        current_href = scope_location_url(current)
+        if use_initial_url:
+            if current_href != str(initial_url or "").strip():
+                return None
+            use_initial_url = False
+        href = current_href
+        validated = parse_valid_apple_url(href)
+        if validated is None and not is_opaque_two_factor_frame_url(href):
+            return None
+        parent = getattr(current, "parent", None)
+        # An opaque top-level document never establishes an Apple trust anchor.
+        # Only descendants of a verified Apple HTTPS top-level context may use
+        # the narrow 2FA-only opaque-frame allowance.
+        if parent is None:
+            return validated.geturl() if validated is not None else None
+        current = parent
+    return None
+
+
+def is_trusted_two_factor_scope(scope: Any, initial_url: str | None = None) -> bool:
+    return trusted_two_factor_scope_url(scope, initial_url) is not None
+
+
+def validate_two_factor_scope(scope: Any) -> str:
+    trusted_url = trusted_two_factor_scope_url(scope)
+    if trusted_url is None:
+        raise RuntimeError("2FA target must stay within a trusted Apple frame chain")
+    return trusted_url
+
+
 def is_account_manage_url(url: str) -> bool:
     parsed = parse_valid_apple_url(url)
     if parsed is None:
@@ -1585,14 +1657,14 @@ def is_account_manage_url(url: str) -> bool:
 
 
 def detect_login_state(page: Any) -> dict[str, Any]:
-    states: list[dict[str, Any]] = []
+    scope_states: list[tuple[Any, dict[str, Any]]] = []
     for scope in iter_page_scopes(page):
         try:
             state = detect_scope_login_state(scope)
         except Exception:
             continue
         if isinstance(state, dict):
-            if is_apple_url(str(state.get("href") or "")):
+            if is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
                 try:
                     shadow_roots = scope.shadow_roots(
                         mode="all",
@@ -1611,46 +1683,51 @@ def detect_login_state(page: Any) -> dict[str, Any]:
                     ):
                         if shadow_state.get(key):
                             state = {**state, key: True}
-            states.append(state)
+            scope_states.append((scope, state))
 
-    if not states:
+    if not scope_states:
         raise RuntimeError("unable to inspect login page state through ruyiPage")
 
-    root_state = states[0]
+    root_state = scope_states[0][1]
     root_href = str(root_state.get("href") or "")
     root_is_account_manage = is_account_manage_url(root_href)
     apple_states = [
         state
-        for state in states
+        for _scope, state in scope_states
         if is_apple_url(str(state.get("href") or ""))
+    ]
+    two_factor_states = [
+        state
+        for scope, state in scope_states
+        if is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
     ]
     has_apple_account_marker = any(
         is_apple_url(str(state.get("href") or ""))
         and bool(state.get("trusted") or state.get("accountMarker"))
-        for state in states
+        for _scope, state in scope_states
     )
     has_auth_ui = any(
         bool(state.get(key))
         for state in apple_states
-        for key in ("email", "password", "twofa", "trustPrompt")
-    )
-    twofa_visible = any(bool(state.get("twofa")) for state in apple_states)
+        for key in ("email", "password", "trustPrompt")
+    ) or any(bool(state.get("twofa")) for state in two_factor_states)
+    twofa_visible = any(bool(state.get("twofa")) for state in two_factor_states)
     code_input_count = max(
-        (int(state.get("codeInputCount") or 0) for state in apple_states),
+        (int(state.get("codeInputCount") or 0) for state in two_factor_states),
         default=0,
     )
     return {
         "href": root_href or next(
-            (state.get("href") for state in states if state.get("href")),
+            (state.get("href") for _scope, state in scope_states if state.get("href")),
             "",
         ),
         "twofa": twofa_visible,
         "twofaVisible": twofa_visible,
         "inputReady": False,
-        "trustPrompt": any(bool(state.get("trustPrompt")) for state in apple_states),
-        "error": any(bool(state.get("error")) for state in apple_states),
-        "otpRejected": any(bool(state.get("otpRejected")) for state in apple_states),
-        "blocked": any(bool(state.get("blocked")) for state in apple_states),
+        "trustPrompt": any(bool(state.get("trustPrompt")) for state in two_factor_states),
+        "error": any(bool(state.get("error")) for state in two_factor_states),
+        "otpRejected": any(bool(state.get("otpRejected")) for state in two_factor_states),
+        "blocked": any(bool(state.get("blocked")) for state in two_factor_states),
         "trusted": (
             not has_auth_ui
             and root_is_account_manage
@@ -1714,8 +1791,14 @@ def wait_for_2fa_or_session(page: Any, timeout_s: int = 75) -> dict[str, Any]:
     deadline = started + timeout_s
     last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last_state = detect_login_state(page)
-        last_state = settle_trust_state(page, last_state, deadline=deadline)
+        try:
+            last_state = detect_login_state(page)
+            last_state = settle_trust_state(page, last_state, deadline=deadline)
+        except RuntimeError as error:
+            if str(error) != "unable to inspect login page state through ruyiPage":
+                raise
+            human_pause(500, 1000)
+            continue
         if last_state.get("error"):
             raise RuntimeError("login stopped before 2FA")
         elapsed_ms = min(
