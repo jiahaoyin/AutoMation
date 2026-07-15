@@ -32,7 +32,7 @@ launcher_audit_record() {
   local timestamp
 
   case "$stage" in
-    launcher_entered|launcher_bootstrap_started|launcher_bootstrap_ready|launcher_env_setup_started|launcher_env_setup_skipped|launcher_env_setup_ready|launcher_preflight_started|launcher_preflight_skipped|launcher_preflight_ready|flow_main_started|credentials_ready|apple_flow_exec|failure) ;;
+    launcher_entered|launcher_bootstrap_started|launcher_bootstrap_ready|launcher_env_setup_started|launcher_env_setup_skipped|launcher_env_setup_ready|launcher_preflight_started|launcher_preflight_skipped|launcher_preflight_ready|flow_main_started|credentials_ready|apple_flow_exec|settings_smoke_exec|settings_smoke_completed|failure) ;;
     *) return 1 ;;
   esac
   [[ "$exit_code" =~ ^[0-9]+$ ]] || return 1
@@ -77,6 +77,16 @@ for arg in "$@"; do
   fi
 done
 
+if [[ "${APPLE_AUTOMATION_SETTINGS_SMOKE:-}" == "1" ]]; then
+  if [[ "${skip_mac}" != "1" || "${skip_browser}" == "1" ]]; then
+    exit 1
+  fi
+  launcher_stage settings_smoke_exec
+  node scripts/supervised-settings-2fa-smoke.mjs
+  launcher_stage settings_smoke_completed
+  exit 0
+fi
+
 if [[ "${SKIP_ENV_SETUP:-}" != "1" ]]; then
   launcher_stage launcher_env_setup_started
   setup_args=(--quiet)
@@ -94,7 +104,7 @@ fi
 
 if [[ "${skip_browser}" != "1" ]]; then
   launcher_stage launcher_preflight_started
-  node scripts/preflight-2fa-permissions.mjs --quiet
+  node scripts/preflight-2fa-permissions.mjs --quiet --settings-only
   launcher_stage launcher_preflight_ready
 else
   launcher_stage launcher_preflight_skipped

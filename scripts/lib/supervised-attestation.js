@@ -5,6 +5,31 @@ export const SUPERVISED_COMMAND_ID = "run-sh-skip-mac";
 export const SUPERVISED_COMMAND = "./run.sh --skip-mac";
 export const SUPERVISED_SUCCESS_MARKER = "[验收] REAL_ACCOUNT_HOME_CONFIRMED";
 export const SUPERVISED_ACCEPTANCE_VALUE = "REAL_ACCOUNT_HOME_CONFIRMED";
+export const SUPERVISED_ACCOUNT_MODE = "account";
+export const SUPERVISED_SETTINGS_SMOKE_MODE = "settings_smoke";
+export const SUPERVISED_MODES = new Set([
+  SUPERVISED_ACCOUNT_MODE,
+  SUPERVISED_SETTINGS_SMOKE_MODE,
+]);
+export const SUPERVISED_MODE_ENV_KEY = "APPLE_AUTOMATION_SUPERVISED_MODE";
+export const SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER =
+  "[验收] SETTINGS_2FA_TWICE_CONFIRMED";
+export const SUPERVISED_SETTINGS_SMOKE_ACCEPTANCE_VALUE =
+  "SETTINGS_2FA_TWICE_CONFIRMED";
+
+export function supervisedSuccessMarkerForMode(mode) {
+  if (!SUPERVISED_MODES.has(mode)) throw new Error("supervised mode is invalid");
+  return mode === SUPERVISED_SETTINGS_SMOKE_MODE
+    ? SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER
+    : SUPERVISED_SUCCESS_MARKER;
+}
+
+export function supervisedAcceptanceValueForMode(mode) {
+  if (!SUPERVISED_MODES.has(mode)) throw new Error("supervised mode is invalid");
+  return mode === SUPERVISED_SETTINGS_SMOKE_MODE
+    ? SUPERVISED_SETTINGS_SMOKE_ACCEPTANCE_VALUE
+    : SUPERVISED_ACCEPTANCE_VALUE;
+}
 export const SUPERVISED_COMMAND_SHA256 = crypto
   .createHash("sha256")
   .update(SUPERVISED_COMMAND, "utf8")
@@ -22,8 +47,10 @@ export const SUPERVISED_PRODUCTION_ENV_KEYS = Object.freeze([
   "APPLE_AUTOMATION_ACCEPTANCE_MARKER",
   "APPLE_AUTOMATION_SUPERVISED_GUI",
   "APPLE_AUTOMATION_SUPERVISED_TOKEN",
+  SUPERVISED_MODE_ENV_KEY,
   "APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE",
   "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
+  "APPLE_AUTOMATION_SETTINGS_SMOKE",
   "FIREFOX_PROFILE_DIR",
   "BROWSER_PROFILE_MODE",
   "APPLE_AUTOMATION_HELPER_DIR",
@@ -35,13 +62,23 @@ export const SUPERVISED_PRODUCTION_ENV_POLICY = JSON.stringify(
   SUPERVISED_PRODUCTION_ENV_KEYS
 );
 
-export function createSupervisedProductionPermissionProfile(productionDir, nonce) {
+export function createSupervisedProductionPermissionProfile(
+  productionDir,
+  nonce,
+  mode = SUPERVISED_ACCOUNT_MODE
+) {
   const value = String(productionDir ?? "");
   if (!value.startsWith("/") || /["\\\r\n\0]/.test(value)) {
     throw new Error("Supervised production directory is invalid");
   }
   if (!/^[0-9a-f]{32}$/.test(String(nonce ?? ""))) {
     throw new Error("Supervised production nonce is invalid");
+  }
+  if (!SUPERVISED_MODES.has(mode)) {
+    throw new Error("Supervised production mode is invalid");
+  }
+  if (mode === SUPERVISED_SETTINGS_SMOKE_MODE) {
+    return `{ extends = ":read-only", filesystem = { "${value}" = "write" } }`;
   }
   const socketPath = `/tmp/apple-automation-${nonce}.sock`;
   return `{ extends = ":read-only", filesystem = { "${value}" = "write", "${socketPath}" = "write" }, network = { enabled = true, domains = {}, unix_sockets = { "${socketPath}" = "allow" } } }`;
@@ -228,6 +265,7 @@ const ATTESTATION_REQUIRED_KEYS = [
   "observedHeadAfter",
   "commandId",
   "commandSha256",
+  "mode",
   "status",
   "exitCode",
   "markerConfirmed",
@@ -256,6 +294,7 @@ export function createSupervisedAttestation(values = {}) {
     observedHeadAfter: values.observedHeadAfter ?? null,
     commandId: SUPERVISED_COMMAND_ID,
     commandSha256: SUPERVISED_COMMAND_SHA256,
+    mode: values.mode ?? SUPERVISED_ACCOUNT_MODE,
     status: values.status ?? "pending",
     exitCode: values.exitCode ?? null,
     markerConfirmed: values.markerConfirmed === true,
@@ -302,6 +341,9 @@ export function validateSupervisedAttestation(value, expected = {}) {
   if (value.commandId !== SUPERVISED_COMMAND_ID) errors.push("attestation command id is invalid");
   if (value.commandSha256 !== SUPERVISED_COMMAND_SHA256) {
     errors.push("attestation command digest is invalid");
+  }
+  if (!SUPERVISED_MODES.has(value.mode)) {
+    errors.push("attestation mode is invalid");
   }
   if (!SUPERVISED_STATUSES.has(value.status)) errors.push("attestation status is invalid");
   if (value.exitCode !== null && (!Number.isInteger(value.exitCode) || value.exitCode < 0 || value.exitCode > 255)) {
@@ -415,6 +457,13 @@ export function validateSupervisedAttestation(value, expected = {}) {
   }
   if (expected.expectedHead !== undefined && value.expectedHead !== expected.expectedHead) {
     errors.push("attestation expected head does not match");
+  }
+  if (expected.mode !== undefined) {
+    if (!SUPERVISED_MODES.has(expected.mode)) {
+      errors.push("expected attestation mode is invalid");
+    } else if (value.mode !== expected.mode) {
+      errors.push("attestation mode does not match");
+    }
   }
   if (value.status === "accepted") {
     if (

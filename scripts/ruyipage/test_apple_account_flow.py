@@ -1170,15 +1170,15 @@ class InputTests(unittest.TestCase):
                     [],
                 )
 
-    def test_contenteditable_verification_requires_readable_rendered_text(self):
+    def test_contenteditable_otp_keeps_trusted_input_when_readback_is_unreadable(self):
         field = FakeElement(
             attrs={"contenteditable": "true", "role": "textbox"},
             rendered_text=None,
         )
         page = FakePage({"css:[contenteditable='true']": [field]})
 
-        with self.assertRaisesRegex(RuntimeError, "verification failed"):
-            input_and_verify(
+        with patch("apple_account_flow.emit") as emit_event:
+            action_scope = input_and_verify(
                 page,
                 field,
                 "123456",
@@ -1186,6 +1186,17 @@ class InputTests(unittest.TestCase):
                 FakeKeys,
                 pause=lambda *_: None,
             )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(field.value, "123456")
+        self.assertEqual(field.inputs, [])
+        self.assertEqual(
+            [call[1] for call in page.actions.calls if call[0] == "type"],
+            ["123456"],
+        )
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("keyboard_unverified_continue", steps)
+        self.assertNotIn("element_fallback_started", steps)
 
     def test_password_retries_keyboard_after_unreadable_trusted_input(self):
         password = FakeElement(attrs={"type": "password"})
@@ -2671,6 +2682,19 @@ class StrongTwoFactorClassifierTests(unittest.TestCase):
 
 
 class TwoFactorStateTests(unittest.TestCase):
+    def test_first_generation_requires_an_explicit_otp_rejection_for_retry(self):
+        state = {
+            "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+            "twofa": True,
+            "error": True,
+            "otpRejected": False,
+            "blocked": False,
+        }
+
+        self.assertFalse(account_flow.otp_retry_allowed(state, generation=1))
+        state["otpRejected"] = True
+        self.assertTrue(account_flow.otp_retry_allowed(state, generation=1))
+
     def test_first_generation_explicit_apple_otp_rejection_allows_one_retry(self):
         state = {
             "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
@@ -3660,7 +3684,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_empty_element_bidi_switches_once_to_owner_sequence(self):
+    def test_six_digit_empty_element_bidi_continues_without_replaying_code(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3683,26 +3707,20 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[(True, ""), *[(True, digit) for digit in "123456"]],
+            side_effect=[(True, "")] * 6,
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
-            [[("1", True)], [], [], [], [], []],
+            [[(digit, True)] for digit in "123456"],
         )
         self.assertEqual([field.value for field in fields], list("123456"))
-        self.assertEqual(
-            len([call for call in frame_actions.calls if call[0] == "human_click"]),
-            1,
-        )
-        self.assertEqual(
-            [call[1] for call in frame_actions.calls if call[0] == "type"],
-            ["123456"],
-        )
+        self.assertEqual(frame_actions.calls, [])
         self.assertEqual(page.actions.calls, [])
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertIn("sequence_verified", steps)
+        self.assertEqual(steps.count("element_bidi_unverified_continue"), 6)
+        self.assertNotIn("sequence_focus_started", steps)
         self.assertNotIn("sequence_failed", steps)
 
     def test_six_digit_mismatched_element_bidi_switches_once_to_owner_sequence(self):
@@ -3784,6 +3802,40 @@ class SecurityCodeTests(unittest.TestCase):
             ["123456"],
         )
 
+    def test_six_digit_late_element_failure_never_replays_the_full_code(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1"},
+                location={"x": 20 + index * 45, "y": 30},
+            )
+            for index in range(6)
+        ]
+
+        def input_raises(*_args, **_kwargs):
+            raise RuntimeError("synthetic second-cell input failure")
+
+        fields[1].input = input_raises
+        frame_actions = FakeActions(auto_advance_targets=fields)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
+        frame.parent = page
+
+        with self.assertRaisesRegex(RuntimeError, "2FA code sequence verification failed"):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual(fields[0].inputs, [("1", True)])
+        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
+        self.assertEqual(frame_actions.calls, [])
+        self.assertEqual(page.actions.calls, [])
+
     def test_six_digit_sequence_failure_stops_after_the_first_direct_cell(self):
         fields = [
             FakeElement(
@@ -3811,7 +3863,10 @@ class SecurityCodeTests(unittest.TestCase):
         )
         frame.parent = page
 
-        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=[(True, "wrong")] * 7,
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
             RuntimeError,
             "2FA code sequence verification failed",
         ):
@@ -3869,7 +3924,10 @@ class SecurityCodeTests(unittest.TestCase):
         )
         frame.parent = page
 
-        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=[(True, "wrong")] * 6,
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
             RuntimeError,
             "2FA code sequence verification failed",
         ) as failure:

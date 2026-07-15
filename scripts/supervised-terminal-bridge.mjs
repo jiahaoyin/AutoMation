@@ -9,17 +9,22 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import {
-  SUPERVISED_ACCEPTANCE_VALUE,
+  SUPERVISED_ACCOUNT_MODE,
   SUPERVISED_COMMAND_ID,
+  SUPERVISED_MODE_ENV_KEY,
+  SUPERVISED_MODES,
   SUPERVISED_NODE_FAILURES,
   SUPERVISED_PRODUCTION_ENV_POLICY,
   SUPERVISED_PRODUCTION_STAGES,
+  SUPERVISED_SETTINGS_SMOKE_MODE,
   SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS,
   SUPERVISED_SETTINGS_PROVIDER_STATES,
   SUPERVISED_SUCCESS_MARKER,
   SUPERVISED_STDOUT_STAGE_TOKENS,
   createSupervisedProductionPermissionProfile,
   createSupervisedAttestation,
+  supervisedAcceptanceValueForMode,
+  supervisedSuccessMarkerForMode,
 } from "./lib/supervised-attestation.js";
 import {
   RUYIPAGE_LIFECYCLE_STATE_NAME,
@@ -834,9 +839,11 @@ function validateEnvironment(env) {
   );
   const helperDir = requireAbsolutePath(env.APPLE_AUTOMATION_HELPER_DIR, "helper directory");
   const nonce = env.APPLE_AUTOMATION_SUPERVISED_TOKEN ?? "";
+  const mode = env[SUPERVISED_MODE_ENV_KEY] ?? "";
   const expectedHead = env.APPLE_AUTOMATION_EXPECTED_HEAD ?? "";
   const deadlineMs = Number(env.APPLE_AUTOMATION_SUPERVISED_DEADLINE_EPOCH_MS);
   if (!/^[0-9a-f]{32}$/.test(nonce)) throw new Error("nonce is invalid");
+  if (!SUPERVISED_MODES.has(mode)) throw new Error("supervised mode is invalid");
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead)) {
     throw new Error("expected head is invalid");
   }
@@ -876,7 +883,7 @@ function validateEnvironment(env) {
   const permissionProfile = env.APPLE_AUTOMATION_PRODUCTION_PERMISSION_PROFILE ?? "";
   if (
     permissionProfile !==
-    createSupervisedProductionPermissionProfile(productionDir, nonce)
+    createSupervisedProductionPermissionProfile(productionDir, nonce, mode)
   ) {
     throw new Error("production permission profile is invalid");
   }
@@ -895,6 +902,7 @@ function validateEnvironment(env) {
     productionDir,
     helperDir,
     nonce,
+    mode,
     expectedHead,
     deadlineMs,
     codexBin: requireAbsolutePath(env.APPLE_AUTOMATION_CODEX_BIN, "Codex binary"),
@@ -906,10 +914,14 @@ function validateEnvironment(env) {
 }
 
 function atomicAttestation(context, values) {
+  if (values.mode !== undefined && values.mode !== context.mode) {
+    throw new Error("attestation mode does not match trusted mode");
+  }
   const attestation = createSupervisedAttestation({
     nonce: context.nonce,
     expectedHead: context.expectedHead,
     ttyCapability: values.ttyCapability ?? context.ttyCapability ?? "unknown",
+    mode: context.mode,
     ...values,
   });
   const temporaryPath = path.join(
@@ -924,21 +936,20 @@ function atomicAttestation(context, values) {
   fs.renameSync(temporaryPath, context.attestationPath);
 }
 
-function readTriggerState(context) {
+function readTrigger(context) {
   const file = readBoundedRegularFile(context.triggerPath, 256);
-  if (file.state !== "present") return file.state;
+  if (file.state !== "present") return { state: file.state, mode: null };
   try {
     const value = JSON.parse(file.text);
-    return (
+    const valid =
       value?.version === 1 &&
       value?.nonce === context.nonce &&
       value?.commandId === SUPERVISED_COMMAND_ID &&
-      Object.keys(value).sort().join(",") === "commandId,nonce,version"
-    )
-      ? "valid"
-      : "invalid";
+      value?.mode === context.mode &&
+      Object.keys(value).sort().join(",") === "commandId,mode,nonce,version";
+    return { state: valid ? "valid" : "invalid", mode: valid ? value.mode : null };
   } catch {
-    return "invalid";
+    return { state: "invalid", mode: null };
   }
 }
 
@@ -2324,11 +2335,15 @@ export async function cleanupBrowserBroker(broker, options = {}) {
   };
 }
 
-export function productionEnvironment(context, brokerPaths) {
+export function productionEnvironment(context, brokerPaths = null) {
+  const mode = context.mode ?? SUPERVISED_ACCOUNT_MODE;
+  const settingsSmoke = mode === SUPERVISED_SETTINGS_SMOKE_MODE;
+  if (![SUPERVISED_ACCOUNT_MODE, SUPERVISED_SETTINGS_SMOKE_MODE].includes(mode)) {
+    throw new Error("supervised production mode is invalid");
+  }
   const runtimeTmp = path.posix.join(context.productionDir, "tmp");
   const reportRoot = path.posix.join(context.productionDir, "reports");
-  const profileDir = path.posix.join(context.productionDir, "firefox-profile");
-  return {
+  const environment = {
     HOME: context.home,
     USER: context.user,
     SHELL: "/bin/zsh",
@@ -2339,20 +2354,28 @@ export function productionEnvironment(context, brokerPaths) {
     APPLE_AUTOMATION_REPORT_ROOT: reportRoot,
     APPLE_AUTOMATION_ACCEPTANCE_MARKER: path.posix.join(
       reportRoot,
-      ".account-home-confirmed"
+      settingsSmoke ? ".settings-2fa-twice-confirmed" : ".account-home-confirmed"
     ),
     APPLE_AUTOMATION_SUPERVISED_GUI: "1",
     APPLE_AUTOMATION_SUPERVISED_TOKEN: context.nonce,
+    [SUPERVISED_MODE_ENV_KEY]: mode,
+    APPLE_AUTOMATION_HELPER_DIR: context.helperDir,
+    SKIP_ENV_SETUP: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+  };
+  if (settingsSmoke) {
+    return { ...environment, APPLE_AUTOMATION_SETTINGS_SMOKE: "1" };
+  }
+  if (!brokerPaths) throw new Error("browser broker paths are unavailable");
+  return {
+    ...environment,
     APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE: path.posix.join(
       reportRoot,
       ".ruyipage-process.json"
     ),
     APPLE_AUTOMATION_BROWSER_BROKER_SOCKET: brokerPaths.socketPath,
-    APPLE_AUTOMATION_HELPER_DIR: context.helperDir,
-    FIREFOX_PROFILE_DIR: profileDir,
+    FIREFOX_PROFILE_DIR: path.posix.join(context.productionDir, "firefox-profile"),
     BROWSER_PROFILE_MODE: "persistent",
-    SKIP_ENV_SETUP: "1",
-    PYTHONDONTWRITEBYTECODE: "1",
   };
 }
 
@@ -2437,10 +2460,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
       registeredSignals.push(signal);
     }
 
-    let triggerState = "missing";
-    while (now() < context.deadlineMs && triggerState !== "valid") {
-      triggerState = readTriggerState(context);
-      if (triggerState === "invalid") {
+    let trigger = { state: "missing", mode: null };
+    while (now() < context.deadlineMs && trigger.state !== "valid") {
+      trigger = readTrigger(context);
+      if (trigger.state === "invalid") {
         atomicAttestation(context, {
           status: "failed",
           exitCode: 1,
@@ -2462,7 +2485,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       }
       await wait(POLL_MS);
     }
-    if (triggerState !== "valid") {
+    if (trigger.state !== "valid") {
       atomicAttestation(context, {
         status: "failed",
         exitCode: 124,
@@ -2515,6 +2538,9 @@ export async function runSupervisedTerminalBridge(options = {}) {
     let manualPromptObserved = false;
     let manualPromptCount = 0;
     let twoFaWinnerConfirmations = 0;
+    const settingsSmoke = context.mode === SUPERVISED_SETTINGS_SMOKE_MODE;
+    const successMarker = supervisedSuccessMarkerForMode(context.mode);
+    const acceptanceValue = supervisedAcceptanceValueForMode(context.mode);
     productionProtocol = createProductionProtocolState();
     const settingsHelperPath = path.join(context.helperDir, SETTINGS_HELPER_NAME);
     const observeSettingsHelperSpawn = () => {
@@ -2554,10 +2580,10 @@ export async function runSupervisedTerminalBridge(options = {}) {
         }
         return;
       }
-      if (line === SUPERVISED_SUCCESS_MARKER) {
+      if (line === successMarker) {
         markerConfirmedInOutput = true;
-        productionProtocol.processStdoutLine(line);
-        emitStatus("success", SUPERVISED_SUCCESS_MARKER);
+        if (!settingsSmoke) productionProtocol.processStdoutLine(line);
+        emitStatus("success", successMarker);
         return;
       }
       if (!productionProtocol.processStdoutLine(line)) return;
@@ -2660,15 +2686,20 @@ export async function runSupervisedTerminalBridge(options = {}) {
       rawBytes += drainProductionStderr(chunk);
       if (rawBytes > maxRawLogBytes) logLimitExceeded = true;
     };
-    emitStatus("starting", "[mac:supervised] 受监督 Apple Account 登录已启动");
+    emitStatus(
+      "starting",
+      settingsSmoke
+        ? "[mac:supervised] System Settings 双次验证码验收已启动"
+        : "[mac:supervised] 受监督 Apple Account 登录已启动"
+    );
 
-    browserBroker = createBrowserBroker(context);
-    const env = productionEnvironment(context, browserBroker.paths);
+    browserBroker = settingsSmoke ? null : createBrowserBroker(context);
+    const env = productionEnvironment(context, browserBroker?.paths ?? null);
     for (const directory of [
       env.TMPDIR,
       env.APPLE_AUTOMATION_REPORT_ROOT,
       env.FIREFOX_PROFILE_DIR,
-    ]) {
+    ].filter(Boolean)) {
       fs.mkdirSync(directory, { recursive: false, mode: 0o700 });
     }
     if (cancellationRequested || cancellationIsPresent(context)) {
@@ -2758,7 +2789,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       });
       return 124;
     }
-    await startBroker(browserBroker, bridgeIdentity);
+    if (browserBroker) await startBroker(browserBroker, bridgeIdentity);
     if (
       cancellationRequested ||
       cancellationIsPresent(context) ||
@@ -2888,7 +2919,9 @@ export async function runSupervisedTerminalBridge(options = {}) {
     } finally {
       removeSingleFile(productionLaunchGatePath);
     }
-    const ruyiPageCleanup = await cleanupBroker(browserBroker);
+    const ruyiPageCleanup = browserBroker
+      ? await cleanupBroker(browserBroker)
+      : { ok: true, cleanupEvidence: true };
 
     const productionExit = Number.isInteger(outcome.value?.exitCode)
       ? outcome.value.exitCode
@@ -2906,8 +2939,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
     const finalStatus = git(context.repo, ["status", "--porcelain=v1"]);
     const markerFile = readBoundedRegularFile(env.APPLE_AUTOMATION_ACCEPTANCE_MARKER, 64);
     const markerValue = markerFile.state === "present" ? markerFile.text.trim() : "";
-    const markerConfirmed =
-      markerConfirmedInOutput && markerValue === SUPERVISED_ACCEPTANCE_VALUE;
+    const markerConfirmed = markerConfirmedInOutput && markerValue === acceptanceValue;
     const processCleanupOutcome = classifyProcessCleanup({
       productionGroupClean: cleanupSucceeded,
       ruyiPageGroupClean: ruyiPageCleanup.ok,
@@ -2967,6 +2999,9 @@ export async function runSupervisedTerminalBridge(options = {}) {
     else if (headAfter !== context.expectedHead) failureClass = "HEAD_MISMATCH";
     else if (finalStatus !== "") failureClass = "GIT_DIRTY";
     else if (productionExit !== 0) {
+      if (settingsSmoke) {
+        failureClass = "TWO_FA_CODE_UNAVAILABLE";
+      } else {
       const accessibilityBlockedTwoFa =
         accessibilityPreflight === "missing" &&
         (
@@ -3088,6 +3123,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       } else {
         failureClass = "PRODUCTION_EXIT_NONZERO";
       }
+      }
     }
     else if (!markerConfirmed) failureClass = "ACCEPTANCE_EVIDENCE_MISSING";
 
@@ -3124,7 +3160,12 @@ export async function runSupervisedTerminalBridge(options = {}) {
       observedHeadAfter: headAfter,
     });
     if (accepted) {
-      emitStatus("accepted", "[mac:supervised] Apple Account 首页验收通过");
+      emitStatus(
+        "accepted",
+        settingsSmoke
+          ? "[mac:supervised] System Settings 双次验证码验收通过"
+          : "[mac:supervised] Apple Account 首页验收通过"
+      );
     } else {
       if (processCleanupOutcome === "recovered") {
         emitStatus(
@@ -3157,7 +3198,9 @@ export async function runSupervisedTerminalBridge(options = {}) {
       }
     }
     if (productionLaunchGatePath) removeSingleFile(productionLaunchGatePath);
-    const ruyiPageCleanup = await cleanupBroker(browserBroker);
+    const ruyiPageCleanup = browserBroker
+      ? await cleanupBroker(browserBroker)
+      : { ok: true, cleanupEvidence: true };
     cleanupSucceeded = cleanupSucceeded && ruyiPageCleanup.ok;
     const headAfter = git(context.repo, ["rev-parse", "HEAD"]);
     try {

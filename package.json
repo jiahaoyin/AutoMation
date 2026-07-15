@@ -27,6 +27,7 @@
     "test:2fa-settings": "node scripts/test-2fa-settings-code.mjs",
     "test:2fa-sidecar": "node scripts/test-two-fa-sidecar.mjs",
     "test:2fa-settings-unit": "node scripts/test-mac-settings-2fa.mjs",
+    "test:supervised-settings-smoke": "node scripts/test-supervised-settings-2fa-smoke.mjs",
     "test:account-browser-flow": "node scripts/test-account-browser-flow.mjs",
     "test:flow-audit": "node scripts/test-flow-audit.mjs",
     "test:browser-backend": "node scripts/test-browser-backend.mjs",

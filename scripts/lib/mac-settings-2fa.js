@@ -18,6 +18,7 @@ const BIN = resolveNativeHelperPath(
   "mac-settings-2fa-code"
 );
 const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
+const HELPER_SUCCESS_REASON = "ok";
 const HELPER_FAILURES = Object.freeze({
   cancelled: ["2FA_SETTINGS_CANCELLED", "2FA settings request was cancelled"],
   accessibility_unavailable: [
@@ -118,20 +119,11 @@ export function is2FASettingsHelperAvailable(options = {}) {
   const binaryPath = options.binaryPath ?? BIN;
   if (platform !== "darwin") return false;
   if (swiftNeedsRecompile(sourcePath, binaryPath)) {
+    // Runtime callers may only consume a helper prepared during setup.
+    if (options.compileIfNeeded !== true) return false;
     return compile2FASettingsHelper({ ...options, quiet: true }).ok;
   }
   return binaryIsExecutable(binaryPath, options);
-}
-
-function is2FASettingsHelperPrepared(options = {}) {
-  const platform = options.platform ?? process.platform;
-  const sourcePath = options.sourcePath ?? SWIFT_SRC;
-  const binaryPath = options.binaryPath ?? BIN;
-  return (
-    platform === "darwin" &&
-    !swiftNeedsRecompile(sourcePath, binaryPath) &&
-    binaryIsExecutable(binaryPath, options)
-  );
 }
 
 function removeCancelFile(cancelFile) {
@@ -161,19 +153,16 @@ function helperReasonError(reason) {
 
 function resolveHelperPath(runtime) {
   if (runtime.helperPath) return runtime.helperPath;
-  if (runtime.compileIfNeeded === false) {
-    if (!is2FASettingsHelperPrepared(runtime)) {
-      throw new Error("2FA settings helper is unavailable");
-    }
-    return BIN;
+  const binaryPath = runtime.binaryPath ?? BIN;
+  const helperOptions = {
+    ...runtime,
+    binaryPath,
+    compileIfNeeded: runtime.compileIfNeeded === true,
+  };
+  if (!is2FASettingsHelperAvailable(helperOptions)) {
+    throw new Error("2FA settings helper is unavailable");
   }
-  if (!is2FASettingsHelperAvailable()) {
-    const built = compile2FASettingsHelper({ quiet: true });
-    if (!built.ok) {
-      throw new Error("2FA settings helper is unavailable");
-    }
-  }
-  return BIN;
+  return binaryPath;
 }
 
 /**
@@ -182,7 +171,7 @@ function resolveHelperPath(runtime) {
  *   verbose?: boolean,
  *   reportDir?: string,
  *   cancelFile?: string,
- *   runtime?: { platform?: string, helperPath?: string, spawn?: typeof spawn, compileIfNeeded?: boolean }
+ *   runtime?: { platform?: string, helperPath?: string, sourcePath?: string, binaryPath?: string, spawn?: typeof spawn, spawnSync?: typeof spawnSync, compileIfNeeded?: boolean }
  * }} [opts]
  * @returns {{
  *   promise: Promise<{ code: string }>,
@@ -378,7 +367,11 @@ export function start2FASettingsCodeRequest(opts = {}) {
       );
       return;
     }
-    if (!parsed?.ok || parsed.code == null) {
+    if (
+      parsed?.ok !== true ||
+      parsed?.reason !== HELPER_SUCCESS_REASON ||
+      parsed.code == null
+    ) {
       finish(
         annotateHelperError(
           codedSettingsError(

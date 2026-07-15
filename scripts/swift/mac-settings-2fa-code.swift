@@ -32,6 +32,7 @@ let appleIDSettingsExecutablePaths: Set<String> = [
     "/System/Applications/System Settings.app/Contents/PlugIns/AccountsSettingsExtension.appex/Contents/MacOS/AccountsSettingsExtension",
 ]
 let axSheetsAttribute = "AXSheets"
+let accessibilityPermissionPollIntervalMs = 250
 var cancelFilePath: String?
 var verificationCodeRequested = false
 
@@ -128,7 +129,7 @@ let verificationAlertTitles = [
     "Apple ID Verification Code",
 ]
 
-let verificationAlertCloseButtons = ["好", "OK", "Done", "完成"]
+let verificationAlertCloseButtons = ["好", "OK", "Done", "完成", "关闭", "Close"]
 let verificationPromptFragments = [
     "在网页上输入此验证码",
     "输入此验证码以登录",
@@ -445,6 +446,59 @@ func findVerificationCodeAlertRoot(
     return nil
 }
 
+struct VerificationCodeAlert {
+    let appElement: AXUIElement
+    let root: AXUIElement
+    let ownerPid: pid_t
+}
+
+struct TrustedSettingsControl {
+    let appElement: AXUIElement
+    let element: AXUIElement
+    let ownerPid: pid_t
+}
+
+func trustedSettingsOwnerPids(expectedPid: pid_t) -> [pid_t] {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return [] }
+    var ownerPids = [expectedPid]
+    let extensions = NSWorkspace.shared.runningApplications.filter(
+        isTrustedAppleIDSettingsExtension
+    )
+    if extensions.count == 1,
+       extensions[0].processIdentifier != expectedPid,
+       isTrustedSystemSettingsProcess(extensions[0].processIdentifier) {
+        ownerPids.append(extensions[0].processIdentifier)
+    }
+    if let settingsHost = uniqueTrustedSettingsApp(),
+       settingsHost.processIdentifier != expectedPid,
+       isTrustedSystemSettingsProcess(settingsHost.processIdentifier) {
+        ownerPids.append(settingsHost.processIdentifier)
+    }
+    return ownerPids
+}
+
+func locateVerificationCodeAlert(
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> VerificationCodeAlert? {
+    for ownerPid in trustedSettingsOwnerPids(expectedPid: expectedPid) {
+        let ownerElement = ownerPid == expectedPid
+            ? appElement
+            : AXUIElementCreateApplication(ownerPid)
+        guard elementBelongsToProcess(ownerElement, pid: ownerPid),
+              let root = findVerificationCodeAlertRoot(
+                  appElement: ownerElement,
+                  expectedPid: ownerPid
+              ) else { continue }
+        return VerificationCodeAlert(
+            appElement: ownerElement,
+            root: root,
+            ownerPid: ownerPid
+        )
+    }
+    return nil
+}
+
 func findSixDigitCodeInAlert(
     _ root: AXUIElement,
     expectedPid: pid_t,
@@ -490,15 +544,18 @@ func findSixDigitCodeInAlert(
 }
 
 func scanCodeFromAlertOnly(appElement: AXUIElement, expectedPid: pid_t) -> String? {
-    guard let alert = findVerificationCodeAlertRoot(
+    guard let alert = locateVerificationCodeAlert(
         appElement: appElement,
         expectedPid: expectedPid
     ) else { return nil }
-    return findSixDigitCodeInAlert(alert, expectedPid: expectedPid)
+    return findSixDigitCodeInAlert(
+        alert.root,
+        expectedPid: alert.ownerPid
+    )
 }
 
 func hasVerificationCodeAlert(appElement: AXUIElement, expectedPid: pid_t) -> Bool {
-    findVerificationCodeAlertRoot(appElement: appElement, expectedPid: expectedPid) != nil
+    locateVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) != nil
 }
 
 func hasVerificationCodePrompt(
@@ -566,6 +623,59 @@ func findVerificationCodePromptRoot(
     return nil
 }
 
+func findGetCodeControl(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    twoFactorNames: [String],
+    buttonNames: [String]
+) -> TrustedSettingsControl? {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
+    var matches: [TrustedSettingsControl] = []
+    for ownerPid in trustedSettingsOwnerPids(expectedPid: expectedPid) {
+        let ownerElement = ownerPid == expectedPid
+            ? appElement
+            : AXUIElementCreateApplication(ownerPid)
+        guard elementBelongsToProcess(ownerElement, pid: ownerPid) else { continue }
+
+        var roots = collectSheetRoots(ownerElement, expectedPid: ownerPid)
+        if !roots.contains(where: { $0 == ownerElement }) {
+            roots.append(ownerElement)
+        }
+        for root in roots {
+            guard elementBelongsToProcess(root, pid: ownerPid),
+                  treeContainsExactText(
+                      root,
+                      names: twoFactorNames,
+                      expectedPid: ownerPid,
+                      maxNodes: 2_000
+                  ),
+                  let button = findExactButton(
+                      in: root,
+                      names: buttonNames,
+                      expectedPid: ownerPid,
+                      maxNodes: 2_000
+                  ),
+                  settingsActionScopeAllowsElement(
+                      button,
+                      appElement: ownerElement,
+                      expectedPid: ownerPid
+                  ) else { continue }
+            if !matches.contains(where: { $0.element == button }) {
+                matches.append(
+                    TrustedSettingsControl(
+                        appElement: ownerElement,
+                        element: button,
+                        ownerPid: ownerPid
+                    )
+                )
+            }
+        }
+    }
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          matches.count == 1 else { return nil }
+    return matches[0]
+}
+
 func findGetCodeButton(
     appElement: AXUIElement,
     expectedPid: pid_t,
@@ -573,33 +683,12 @@ func findGetCodeButton(
     buttonNames: [String]
 ) -> AXUIElement? {
     guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
-    var roots = collectSheetRoots(appElement, expectedPid: expectedPid)
-    if roots.isEmpty { roots = [appElement] }
-    var matches: [AXUIElement] = []
-    for root in roots {
-        guard elementBelongsToProcess(root, pid: expectedPid),
-              treeContainsExactText(
-                  root,
-                  names: twoFactorNames,
-                  expectedPid: expectedPid,
-                  maxNodes: 2_000
-              ),
-              let button = findExactButton(
-                  in: root,
-                  names: buttonNames,
-                  expectedPid: expectedPid,
-                  maxNodes: 2_000
-              ) else { continue }
-        guard settingsActionScopeAllowsElement(
-            button,
-            appElement: appElement,
-            expectedPid: expectedPid
-        ) else { continue }
-        if !matches.contains(where: { $0 == button }) { matches.append(button) }
-    }
-    guard isTrustedSystemSettingsProcess(expectedPid),
-          matches.count == 1 else { return nil }
-    return matches[0]
+    return findGetCodeControl(
+        appElement: appElement,
+        expectedPid: expectedPid,
+        twoFactorNames: twoFactorNames,
+        buttonNames: buttonNames
+    )?.element
 }
 
 func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
@@ -1140,6 +1229,31 @@ func clickNamed(
     )
 }
 
+func clickNamedInTrustedSettingsOwners(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    names: [String],
+    deadline: Date
+) -> Bool {
+    guard Date() < deadline,
+          isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    for ownerPid in trustedSettingsOwnerPids(expectedPid: expectedPid) {
+        let ownerElement = ownerPid == expectedPid
+            ? appElement
+            : AXUIElementCreateApplication(ownerPid)
+        guard elementBelongsToProcess(ownerElement, pid: ownerPid) else { continue }
+        if clickNamed(
+            in: ownerElement,
+            names: names,
+            expectedPid: ownerPid,
+            deadline: deadline
+        ) {
+            return true
+        }
+    }
+    return false
+}
+
 func nearestNavigationPressableAncestor(
     from element: AXUIElement,
     appElement: AXUIElement,
@@ -1204,6 +1318,28 @@ func hasNavigableNamedElement(
     return false
 }
 
+func hasNavigableNamedElementInTrustedSettingsOwners(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    names: [String]
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
+    for ownerPid in trustedSettingsOwnerPids(expectedPid: expectedPid) {
+        let ownerElement = ownerPid == expectedPid
+            ? appElement
+            : AXUIElementCreateApplication(ownerPid)
+        guard elementBelongsToProcess(ownerElement, pid: ownerPid) else { continue }
+        if hasNavigableNamedElement(
+            in: ownerElement,
+            names: names,
+            expectedPid: ownerPid
+        ) {
+            return true
+        }
+    }
+    return false
+}
+
 func waitForTwoFactorNavigationTarget(
     appElement: AXUIElement,
     expectedPid: pid_t,
@@ -1225,8 +1361,8 @@ func waitForTwoFactorNavigationTarget(
         ) != nil {
             return .getCodeReady
         }
-        if hasNavigableNamedElement(
-            in: appElement,
+        if hasNavigableNamedElementInTrustedSettingsOwners(
+            appElement: appElement,
             names: twoFactor,
             expectedPid: expectedPid
         ) {
@@ -1568,7 +1704,7 @@ func closeVerificationCodeAlert(
     var coordinateFallbackUsed = false
     repeat {
         guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
-        guard let alert = findVerificationCodeAlertRoot(
+        guard let alert = locateVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid
         ) else {
@@ -1579,23 +1715,23 @@ func closeVerificationCodeAlert(
             continue
         }
         if let closeButton = findExactButton(
-            in: alert,
+            in: alert.root,
             names: verificationAlertCloseButtons,
-            expectedPid: expectedPid
+            expectedPid: alert.ownerPid
         ) {
             if pressAttempts < 2 {
                 _ = pressExactButton(
                     closeButton,
-                    appElement: appElement,
-                    expectedPid: expectedPid,
+                    appElement: alert.appElement,
+                    expectedPid: alert.ownerPid,
                     names: verificationAlertCloseButtons
                 )
                 pressAttempts += 1
             } else if !coordinateFallbackUsed {
                 _ = clickElementAtVerifiedFrame(
                     closeButton,
-                    appElement: appElement,
-                    expectedPid: expectedPid,
+                    appElement: alert.appElement,
+                    expectedPid: alert.ownerPid,
                     names: verificationAlertCloseButtons
                 )
                 coordinateFallbackUsed = true
@@ -1603,7 +1739,7 @@ func closeVerificationCodeAlert(
         }
         if Date() >= deadline {
             guard isTrustedSystemSettingsProcess(expectedPid) else { return false }
-            let alertGone = findVerificationCodeAlertRoot(
+            let alertGone = locateVerificationCodeAlert(
                 appElement: appElement,
                 expectedPid: expectedPid
             ) == nil
@@ -1640,6 +1776,31 @@ func cancellablePause(
         remaining -= step
     }
     stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+}
+
+func requestAccessibilityPermissionPrompt() -> Bool {
+    let options = [
+        kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true,
+    ] as CFDictionary
+    return AXIsProcessTrustedWithOptions(options)
+}
+
+func waitForAccessibilityPermission(deadline: Date) -> Bool {
+    stopIfCancelled()
+    if AXIsProcessTrusted() { return true }
+    guard Date() < deadline else { return false }
+    if requestAccessibilityPermissionPrompt(), Date() < deadline { return true }
+
+    repeat {
+        stopIfCancelled()
+        if AXIsProcessTrusted() { return true }
+        let pauseMs = remainingMilliseconds(
+            until: deadline,
+            cappedAt: accessibilityPermissionPollIntervalMs
+        )
+        guard pauseMs > 0 else { return false }
+        cancellablePause(UInt32(pauseMs * 1_000))
+    } while true
 }
 
 func waitForVerificationCodeAlert(
@@ -1701,7 +1862,8 @@ func requestVerificationCodeAlert(
         }
     }
 
-    for attempt in 1...3 {
+    var actionAttempts = 0
+    while Date() < deadline {
         guard actionMayProceed(
             deadline: deadline,
             appElement: appElement,
@@ -1714,7 +1876,7 @@ func requestVerificationCodeAlert(
                 expectedPid: expectedPid
             )
         }
-        let button = findGetCodeButton(
+        let control = findGetCodeControl(
             appElement: appElement,
             expectedPid: expectedPid,
             twoFactorNames: twoFactorNames,
@@ -1725,11 +1887,11 @@ func requestVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid
         ) else { return false }
-        guard let button else {
+        guard let control else {
             if waitForVerificationCodeAlert(
                 appElement: appElement,
                 expectedPid: expectedPid,
-                timeoutMs: 250,
+                timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 250),
                 deadline: deadline
             ) {
                 return true
@@ -1738,39 +1900,37 @@ func requestVerificationCodeAlert(
         }
 
         verificationCodeRequested = true
-        if attempt < 3 {
+        if actionAttempts < 2 {
             _ = pressExactButton(
-                button,
-                appElement: appElement,
-                expectedPid: expectedPid,
+                control.element,
+                appElement: control.appElement,
+                expectedPid: control.ownerPid,
                 names: buttonNames,
                 deadline: deadline
             )
-        } else {
+        } else if actionAttempts == 2 {
             _ = clickElementAtVerifiedFrame(
-                button,
-                appElement: appElement,
-                expectedPid: expectedPid,
+                control.element,
+                appElement: control.appElement,
+                expectedPid: control.ownerPid,
                 names: buttonNames,
                 deadline: deadline
             )
         }
+        actionAttempts += 1
 
         if waitForVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid,
-            timeoutMs: 2_000,
+            timeoutMs: actionAttempts <= 3
+                ? remainingMilliseconds(until: deadline, cappedAt: 2_000)
+                : remainingMilliseconds(until: deadline, cappedAt: 250),
             deadline: deadline
         ) {
             return true
         }
     }
-    return waitForVerificationCodeAlert(
-        appElement: appElement,
-        expectedPid: expectedPid,
-        timeoutMs: 500,
-        deadline: deadline
-    )
+    return false
 }
 
 enum VerificationPreparationResult {
@@ -1818,26 +1978,27 @@ func prepareVerificationCodeAlert(
         logStep(4, "Two-Factor Authentication already open")
     } else {
         logStep(3, "click Sign-In & Security")
-        if clickNamed(
-            in: appElement,
+        _ = clickNamedInTrustedSettingsOwners(
+            appElement: appElement,
             names: signInSecurity,
             expectedPid: expectedPid,
             deadline: deadline
+        )
+        switch waitForTwoFactorNavigationTarget(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            deadline: deadline
         ) {
-            switch waitForTwoFactorNavigationTarget(
-                appElement: appElement,
-                expectedPid: expectedPid,
-                deadline: deadline
-            ) {
-            case .getCodeReady:
-                logStep(4, "Two-Factor Authentication already open")
-            case .twoFactorReady:
-                break
-            case .ownerLost:
-                return .ownerLost
-            case .timedOut:
-                return .timedOut
-            }
+        case .getCodeReady:
+            logStep(4, "Two-Factor Authentication already open")
+        case .twoFactorReady:
+            break
+        case .ownerLost:
+            return .ownerLost
+        case .timedOut:
+            return isTrustedSystemSettingsProcess(expectedPid)
+                ? .twoFactorNotFound
+                : .ownerLost
         }
         guard actionMayProceed(
             deadline: deadline,
@@ -1856,38 +2017,20 @@ func prepareVerificationCodeAlert(
             logStep(4, "Two-Factor Authentication already open")
         } else {
             logStep(4, "click Two-Factor Authentication")
-            let openedTwoFactor = clickNamed(
-                in: appElement,
+            _ = clickNamedInTrustedSettingsOwners(
+                appElement: appElement,
                 names: twoFactor,
                 expectedPid: expectedPid,
                 deadline: deadline
             )
-            if !openedTwoFactor {
-                let fallbackButton = findGetCodeButton(
-                   appElement: appElement,
-                   expectedPid: expectedPid,
-                   twoFactorNames: twoFactor,
-                   buttonNames: getCodeBtn
-                )
-                guard actionMayProceed(
-                    deadline: deadline,
-                    appElement: appElement,
-                    expectedPid: expectedPid
-                ) else {
-                    return isTrustedSystemSettingsProcess(expectedPid)
-                        ? .timedOut
-                        : .ownerLost
-                }
-                if fallbackButton == nil {
-                    return .twoFactorNotFound
-                }
-            }
             guard waitForGetCodeButton(
                 appElement: appElement,
                 expectedPid: expectedPid,
                 deadline: deadline
             ) == .getCodeReady else {
-                return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+                return isTrustedSystemSettingsProcess(expectedPid)
+                    ? .twoFactorNotFound
+                    : .ownerLost
             }
         }
     }
@@ -1939,12 +2082,11 @@ while i < args.count {
     i += 1
 }
 
-stopIfCancelled()
-guard AXIsProcessTrusted() else {
+let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutSec)))
+guard waitForAccessibilityPermission(deadline: deadline) else {
     logStep(0, "Accessibility permission unavailable")
     emit(Output(ok: false, code: nil, message: "Accessibility permission unavailable", reason: OutputReason.accessibilityUnavailable.rawValue))
 }
-let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
 
 for uiOwnerAttempt in 1...2 {
     stopIfCancelled()

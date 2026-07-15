@@ -227,6 +227,11 @@ def classify_input_read(readable: bool, actual: Any, expected: str) -> str:
     return "mismatch"
 
 
+def otp_input_readback_is_limited(readable: bool, actual: Any) -> bool:
+    """Apple can accept a trusted OTP input while withholding its rendered value."""
+    return not readable or str(actual) == ""
+
+
 def configure_browser_stage_file(report_dir: Path) -> None:
     global browser_stage_file
     configured = os.environ.get(BROWSER_STAGE_FILE_ENV, "").strip()
@@ -671,14 +676,21 @@ def input_otp_with_owner_bidi_fallback(
     emit_input_progress(label, "owner_bidi_fallback_started", "owner")
     pause(180, 420)
     field.input(value, clear=True)
+    validate_two_factor_scope(scope)
     emit_input_progress(label, "owner_bidi_typed", "owner")
     pause(280, 680)
     readable, actual = read_element_input_value(field)
     read_state = classify_input_read(readable, actual, value)
     emit_input_progress(label, f"owner_bidi_value_{read_state}", "owner")
-    if not readable or str(actual) != value:
+    if readable and str(actual) == value:
+        emit_input_progress(label, "verified", "owner")
+    elif otp_input_readback_is_limited(readable, actual):
+        # The element input call is a trusted ruyiPage BiDi action. Do not
+        # replay a code when Apple masks a cell value after accepting it.
+        validate_two_factor_scope(scope)
+        emit_input_progress(label, "owner_bidi_unverified_continue", "owner")
+    else:
         raise RuntimeError(f"{label} input verification failed")
-    emit_input_progress(label, "verified", "owner")
     return scope
 
 
@@ -687,7 +699,7 @@ def input_otp_digit_with_element_bidi(
     field: Any,
     value: str,
     pause: Callable[[int, int], None] = human_pause,
-) -> Any:
+) -> bool:
     """Use the discovered digit cell directly when focus probing is flaky."""
     require_otp_bidi_input_target(scope, field, "2FA digit")
     emit_input_progress("2FA digit", "element_bidi_started", "owner")
@@ -700,10 +712,17 @@ def input_otp_digit_with_element_bidi(
     readable, actual = read_element_input_value(field)
     read_state = classify_input_read(readable, actual, value)
     emit_input_progress("2FA digit", f"element_bidi_value_{read_state}", "owner")
-    if not readable or str(actual) != value:
-        raise RuntimeError("2FA digit input verification failed")
-    emit_input_progress("2FA digit", "verified", "owner")
-    return scope
+    if readable and str(actual) == value:
+        emit_input_progress("2FA digit", "verified", "owner")
+        return True
+    if otp_input_readback_is_limited(readable, actual):
+        # A successful element.input() has already generated trusted input
+        # events in this exact owner context. Apple sometimes hides the cell's
+        # value while still advancing the OTP widget, so preserve that event.
+        validate_two_factor_scope(scope)
+        emit_input_progress("2FA digit", "element_bidi_unverified_continue", "owner")
+        return False
+    raise RuntimeError("2FA digit input verification failed")
 
 
 def input_otp_digits_with_owner_actions(
@@ -737,15 +756,19 @@ def input_otp_digits_with_owner_actions(
     except Exception:
         return False
 
-    verified = True
+    readback_limited = False
     for (_candidate_scope, field), digit in zip(fields, digits):
         readable, actual = read_element_input_value(field)
-        if not readable or str(actual) != digit:
-            verified = False
-            break
-    if verified:
+        if otp_input_readback_is_limited(readable, actual):
+            readback_limited = True
+        elif str(actual) != digit:
+            return False
+    if readback_limited:
+        validate_two_factor_scope(scope)
+        emit_input_progress("2FA code", "sequence_unverified_continue", "owner")
+    else:
         emit_input_progress("2FA code", "sequence_verified", "owner")
-    return verified
+    return True
 
 
 def input_with_owner_bidi_fallback(
@@ -956,6 +979,8 @@ def input_and_verify(
         pause(120, 320)
         require_keyboard_target_ready(field)
         action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
+        if two_factor_scope:
+            validate_two_factor_scope(scope)
         emit_input_progress(label, "keyboard_typed", route)
         pause(280, 680)
         readable, actual = read_element_input_value(field)
@@ -963,6 +988,12 @@ def input_and_verify(
         emit_input_progress(label, f"value_{read_state}", route)
         if readable and str(actual) == value:
             emit_input_progress(label, "verified", route)
+            return action_scope
+        if two_factor_scope and otp_input_readback_is_limited(readable, actual):
+            # The focused ruyiPage actions route is trusted. Avoid a second
+            # keystroke sequence solely because Apple masks the OTP value.
+            validate_two_factor_scope(scope)
+            emit_input_progress(label, "keyboard_unverified_continue", route)
             return action_scope
         saw_readable_nonempty_mismatch = readable and str(actual) != ""
 
@@ -981,6 +1012,8 @@ def input_and_verify(
             pause(120, 320)
             require_keyboard_target_ready(field)
             action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
+            if two_factor_scope:
+                validate_two_factor_scope(scope)
             emit_input_progress(label, "owner_keyboard_typed", route)
             pause(280, 680)
             readable, actual = read_element_input_value(field)
@@ -1004,11 +1037,17 @@ def input_and_verify(
             pause(120, 320)
             require_keyboard_target_ready(field)
             field.input(value, clear=False)
+            if two_factor_scope:
+                validate_two_factor_scope(scope)
             emit_input_progress(label, "element_typed", route)
             pause(280, 680)
             readable, actual = read_element_input_value(field)
             read_state = classify_input_read(readable, actual, value)
             emit_input_progress(label, f"element_value_{read_state}", route)
+        if two_factor_scope and otp_input_readback_is_limited(readable, actual):
+            validate_two_factor_scope(scope)
+            emit_input_progress(label, "element_unverified_continue", route)
+            return action_scope
         if not readable:
             raise RuntimeError(f"{label} input verification failed")
         if (
@@ -1475,6 +1514,7 @@ def fill_security_code(
     for _scope, field in fields:
         require_otp_bidi_input_target(sequence_scope, field, "2FA digit")
 
+    direct_digits_entered = 0
     for (scope, field), digit in zip(fields, digits):
         try:
             input_otp_digit_with_element_bidi(
@@ -1484,18 +1524,38 @@ def fill_security_code(
                 pause=pause,
             )
         except Exception:
-            try:
-                sequenced = input_otp_digits_with_owner_actions(
-                    fields,
-                    digits,
-                    pause=pause,
-                )
-            except Exception:
-                sequenced = False
-            if sequenced:
-                return
+            if direct_digits_entered == 0:
+                try:
+                    sequenced = input_otp_digits_with_owner_actions(
+                        fields,
+                        digits,
+                        pause=pause,
+                    )
+                except Exception:
+                    sequenced = False
+                if sequenced:
+                    return
+            else:
+                # Earlier cells may already have advanced after a trusted
+                # element input. Retry only the failed cell, never replay the
+                # complete six-digit code into a moving Apple OTP widget.
+                try:
+                    input_otp_with_owner_bidi_fallback(
+                        scope,
+                        field,
+                        digit,
+                        "2FA digit",
+                        pause=pause,
+                    )
+                except Exception:
+                    pass
+                else:
+                    direct_digits_entered += 1
+                    pause(80, 220)
+                    continue
             emit_input_progress("2FA code", "sequence_failed", "owner")
             raise RuntimeError("2FA code sequence verification failed")
+        direct_digits_entered += 1
         pause(80, 220)
 
 

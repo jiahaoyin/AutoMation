@@ -39,6 +39,31 @@ assert.match(
   preflightEntrySource,
   /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityGranted\(\{\s*compileIfNeeded:\s*false\s*\}\)[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*compileIfNeeded:\s*false[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight\(\{[\s\S]*compileIfNeeded:\s*false/
 );
+const settingsOnlyStart = preflightEntrySource.indexOf("if (settingsOnly) {");
+const firstNonSettingsBranch = preflightEntrySource.indexOf("if (supervised)", settingsOnlyStart);
+const settingsOnlyBranch = preflightEntrySource.slice(
+  settingsOnlyStart,
+  firstNonSettingsBranch
+);
+assert.match(
+  settingsOnlyBranch,
+  /is2FASettingsHelperAvailable\(\{\s*compileIfNeeded:\s*true\s*\}\)/,
+  "the production Settings-only preflight must prepare the same helper before the browser reaches 2FA"
+);
+assert.match(
+  settingsOnlyBranch,
+  /throw settingsHelperUnavailableError\(\)/,
+  "a missing Settings helper must fail before browser login rather than waiting through the 2FA deadline"
+);
+assert.match(
+  preflightEntrySource,
+  /function settingsHelperUnavailableError\(\)[\s\S]{0,220}error\.code\s*=\s*"2FA_SETTINGS_HELPER_UNAVAILABLE"/
+);
+assert.match(
+  preflightEntrySource,
+  /e\?\.code\s*===\s*"2FA_SETTINGS_HELPER_UNAVAILABLE"[\s\S]{0,220}process\.exitCode\s*=\s*1/,
+  "a missing helper must remain fatal in supervised mode so run.sh cannot start the browser"
+);
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 
 function exportedFunctionSource(source, name) {

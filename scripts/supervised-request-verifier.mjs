@@ -3,7 +3,10 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { SUPERVISED_COMMAND_ID } from "./lib/supervised-attestation.js";
+import {
+  SUPERVISED_COMMAND_ID,
+  SUPERVISED_MODES,
+} from "./lib/supervised-attestation.js";
 import { readBoundedRegularFile } from "./supervised-terminal-bridge.mjs";
 
 function exactObject(file, expected) {
@@ -28,22 +31,34 @@ export function validateSupervisedRequestArtifacts(options = {}) {
   const triggerPath = path.resolve(String(options.triggerPath ?? ""));
   const cancelPath = path.resolve(String(options.cancelPath ?? ""));
   const nonce = String(options.nonce ?? "");
+  const expectedMode = String(options.expectedMode ?? "");
   const accepted = options.accepted === true;
   if (
     !path.isAbsolute(String(options.triggerPath ?? "")) ||
     !path.isAbsolute(String(options.cancelPath ?? "")) ||
     triggerPath === cancelPath ||
-    !/^[0-9a-f]{32}$/.test(nonce)
+    !/^[0-9a-f]{32}$/.test(nonce) ||
+    !SUPERVISED_MODES.has(expectedMode)
   ) {
     return false;
   }
 
   const trigger = readBoundedRegularFile(triggerPath, 256);
+  let triggerMode = null;
+  if (trigger.state === "present") {
+    try {
+      triggerMode = JSON.parse(trigger.text)?.mode ?? null;
+    } catch {
+      triggerMode = null;
+    }
+  }
   if (
+    triggerMode !== expectedMode ||
     !exactObject(trigger, {
       version: 1,
       nonce,
       commandId: SUPERVISED_COMMAND_ID,
+      mode: triggerMode,
     })
   ) {
     return false;
@@ -65,7 +80,7 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
-  const [triggerPath, cancelPath, nonce, acceptanceState, ...extra] =
+  const [triggerPath, cancelPath, nonce, expectedMode, acceptanceState, ...extra] =
     process.argv.slice(2);
   const validMode = acceptanceState === "accepted" || acceptanceState === "not_accepted";
   const valid =
@@ -75,6 +90,7 @@ if (isMainModule()) {
       triggerPath,
       cancelPath,
       nonce,
+      expectedMode,
       accepted: acceptanceState === "accepted",
     });
   process.exitCode = valid ? 0 : 1;

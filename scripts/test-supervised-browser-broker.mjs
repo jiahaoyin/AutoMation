@@ -5,8 +5,12 @@ import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 
 import {
+  SUPERVISED_ACCOUNT_MODE,
+  SUPERVISED_MODE_ENV_KEY,
   SUPERVISED_PRODUCTION_ENV_KEYS,
   SUPERVISED_PRODUCTION_ENV_POLICY,
+  SUPERVISED_SETTINGS_SMOKE_MODE,
+  createSupervisedProductionPermissionProfile,
 } from "./lib/supervised-attestation.js";
 import { buildRemoteScript } from "./mac-codex-orchestrator.mjs";
 import {
@@ -265,13 +269,63 @@ assert.equal("APPLE_ID" in brokerEnv, false);
 assert.equal("APPLE_PASSWORD" in brokerEnv, false);
 
 const productionEnv = productionEnvironment(
-  { ...context, helperDir: "/private/round/control/helpers" },
+  {
+    ...context,
+    helperDir: "/private/round/control/helpers",
+    mode: SUPERVISED_ACCOUNT_MODE,
+  },
   paths
 );
 assert.equal(productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_MODE, undefined);
 assert.equal(
   productionEnv.APPLE_AUTOMATION_BROWSER_BROKER_SOCKET,
   paths.socketPath
+);
+assert.equal(productionEnv[SUPERVISED_MODE_ENV_KEY], SUPERVISED_ACCOUNT_MODE);
+
+const accountPermissionProfile = createSupervisedProductionPermissionProfile(
+  PRODUCTION_DIR,
+  NONCE,
+  SUPERVISED_ACCOUNT_MODE
+);
+assert.match(accountPermissionProfile, /network = \{ enabled = true/);
+assert.match(accountPermissionProfile, new RegExp(paths.socketPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+const settingsSmokePermissionProfile = createSupervisedProductionPermissionProfile(
+  PRODUCTION_DIR,
+  NONCE,
+  SUPERVISED_SETTINGS_SMOKE_MODE
+);
+assert.doesNotMatch(settingsSmokePermissionProfile, /network|socket|unix_sockets/i);
+assert.match(settingsSmokePermissionProfile, /filesystem = \{ .* = "write" \}/);
+
+const settingsSmokeProductionEnv = productionEnvironment({
+  ...context,
+  helperDir: "/private/round/control/helpers",
+  mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+assert.equal(
+  settingsSmokeProductionEnv[SUPERVISED_MODE_ENV_KEY],
+  SUPERVISED_SETTINGS_SMOKE_MODE
+);
+assert.equal(settingsSmokeProductionEnv.APPLE_AUTOMATION_SETTINGS_SMOKE, "1");
+for (const key of [
+  "APPLE_AUTOMATION_RUYIPAGE_PROCESS_STATE_FILE",
+  "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
+  "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
+  "FIREFOX_PROFILE_DIR",
+  "BROWSER_PROFILE_MODE",
+]) {
+  assert.equal(
+    settingsSmokeProductionEnv[key],
+    undefined,
+    `settings smoke must not receive ${key}`
+  );
+}
+assert.equal(
+  Object.keys(settingsSmokeProductionEnv).some((key) => /BROKER|FIREFOX|RUYIPAGE/.test(key)),
+  false,
+  "settings smoke must not receive browser broker or Firefox environment variables"
 );
 
 const wrapper = buildBrowserBrokerSupervisorScript();
@@ -610,9 +664,37 @@ assert.doesNotMatch(
   remoteScript,
   /(?:\/bin\/rm|\brm\b|\/usr\/bin\/unlink).*browser_broker_(?:socket|gate)/
 );
+const settingsSmokeRemoteScript = buildRemoteScript({
+  task: "Run supervised System Settings smoke acceptance",
+  sync: true,
+  remoteRepo: REPO,
+  remoteRoundDir: "/Users/admin/.codex-orchestrator/runs/test/mac/round-01",
+  branch: "codex/ruyipage-risk-reduction",
+  expectedHead: EXPECTED_HEAD,
+  supervisedGui: true,
+  supervisedToken: NONCE,
+  supervisedMode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+assert.match(settingsSmokeRemoteScript, /SUPERVISED_MODE='settings_smoke'/);
+assert.match(
+  settingsSmokeRemoteScript,
+  /SUPERVISED_MODE='settings_smoke'[\s\S]*APPLE_AUTOMATION_SUPERVISED_MODE=\$\{\(q\)SUPERVISED_MODE\}[\s\S]*scripts\/supervised-terminal-bridge\.mjs/,
+  "the settings smoke mode must be injected into the trusted bridge environment"
+);
+const settingsSmokeProfileLine = settingsSmokeRemoteScript.match(
+  /PRODUCTION_PERMISSION_PROFILE='([^']+)'/
+)?.[1];
+assert.ok(settingsSmokeProfileLine, "settings smoke must define a production permission profile");
+assert.doesNotMatch(settingsSmokeProfileLine, /network|socket|unix_sockets/i);
+
 const bridgeSource = fs.readFileSync(
   new URL("./supervised-terminal-bridge.mjs", import.meta.url),
   "utf8"
+);
+assert.match(
+  bridgeSource,
+  /const settingsSmoke = context\.mode === SUPERVISED_SETTINGS_SMOKE_MODE;[\s\S]*browserBroker = settingsSmoke \? null : createBrowserBroker\(context\);[\s\S]*const env = productionEnvironment\(context, browserBroker\?\.paths \?\? null\);[\s\S]*if \(browserBroker\) await startBroker\(browserBroker, bridgeIdentity\);/,
+  "settings smoke must build its production environment without creating or launching a browser broker"
 );
 assert.match(
   bridgeSource,

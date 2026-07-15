@@ -189,7 +189,7 @@ function assertSettingsOwnerSafetyContract(source) {
 
   const request = swiftFunctionBodyFromSource(source, "requestVerificationCodeAlert");
   const requestAttemptFlag = request.indexOf("verificationCodeRequested = true");
-  const requestActionBranch = request.indexOf("if attempt < 3");
+  const requestActionBranch = request.indexOf("if actionAttempts < 2");
   assert.ok(
     requestAttemptFlag >= 0 && requestAttemptFlag < requestActionBranch,
     "request cleanup state must be set before either button action is attempted"
@@ -674,6 +674,7 @@ function runStaleBinaryCompileFailureTest() {
       platform: "darwin",
       sourcePath,
       binaryPath,
+      compileIfNeeded: true,
       spawnSync(command, args) {
         const outputPath = args[args.indexOf("-o") + 1];
         compilerCalls.push({ command, args: [...args], outputPath });
@@ -693,6 +694,7 @@ function runStaleBinaryCompileFailureTest() {
       platform: "darwin",
       sourcePath,
       binaryPath,
+      compileIfNeeded: true,
       spawnSync(command, args) {
         const outputPath = args[args.indexOf("-o") + 1];
         compilerCalls.push({ command, args: [...args], outputPath });
@@ -773,6 +775,38 @@ function runPreparedOnlySettingsStartNeverCompilesTest() {
   assert.equal(spawnCalls, 0);
 }
 
+function runRuntimeSettingsStartNeverCompilesTest() {
+  let compilerCalls = 0;
+  let spawnCalls = 0;
+  const sourcePath = path.join(os.tmpdir(), "missing-runtime-settings-helper.swift");
+  const binaryPath = path.join(os.tmpdir(), "missing-runtime-settings-helper");
+
+  assert.throws(
+    () =>
+      start2FASettingsCodeRequest({
+        runtime: {
+          platform: "darwin",
+          sourcePath,
+          binaryPath,
+          spawnSync() {
+            compilerCalls += 1;
+            return { status: 0 };
+          },
+          spawn() {
+            spawnCalls += 1;
+            throw new Error("an unprepared runtime helper must not spawn");
+          },
+        },
+      }),
+    (error) => {
+      assert.equal(error?.code, "2FA_SETTINGS_UNAVAILABLE");
+      return true;
+    }
+  );
+  assert.equal(compilerCalls, 0);
+  assert.equal(spawnCalls, 0);
+}
+
 function runNonExecutableCompilerOutputTest() {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "settings-helper-non-executable-"));
   const sourcePath = path.join(fixtureDir, "mac-settings-2fa-code.swift");
@@ -787,6 +821,7 @@ function runNonExecutableCompilerOutputTest() {
       platform: "darwin",
       sourcePath,
       binaryPath,
+      compileIfNeeded: true,
       spawnSync(_command, args) {
         compilerOutput = args[args.indexOf("-o") + 1];
         fs.writeFileSync(compilerOutput, "non-executable-output\n", { mode: 0o644 });
@@ -838,6 +873,8 @@ async function runSuccessTest() {
       Buffer.from(
         JSON.stringify({
           ok: true,
+          reason: "ok",
+          message: "ok",
           code: "123 456",
           raw: SECRET_TEXT,
           screenshot: `C:/tmp/${SECRET_TEXT}`,
@@ -853,6 +890,66 @@ async function runSuccessTest() {
     if (fs.existsSync(screenshotDir)) fs.rmdirSync(screenshotDir);
     harness.cleanup();
   }
+}
+
+async function runFixedSuccessStateTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          ok: true,
+          reason: "unexpected",
+          message: SECRET_TEXT,
+          code: "123456",
+        }) + "\n"
+      )
+    );
+    harness.child.emit("close", 0, null);
+
+    const error = await rejectionOf(request.promise);
+    assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_HELPER_EXIT");
+    assert.match(error.message, /helper failed/i);
+  } finally {
+    harness.cleanup();
+  }
+}
+
+async function runSequentialSettingsCodeRequestsTest() {
+  const codes = ["123456", "654321"];
+  const cancelFiles = new Set();
+  for (const code of codes) {
+    const harness = createHarness();
+    try {
+      const request = start2FASettingsCodeRequest({
+        reportDir: harness.reportDir,
+        runtime: harness.runtime,
+        verbose: false,
+      });
+      cancelFiles.add(harness.cancelFile());
+      harness.child.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({ ok: true, reason: "ok", message: "ok", code }) +
+            "\n"
+        )
+      );
+      harness.child.emit("close", 0, null);
+
+      assert.deepEqual(await request.promise, { code });
+      assert.equal(fs.existsSync(harness.cancelFile()), false);
+    } finally {
+      harness.cleanup();
+    }
+  }
+  assert.equal(cancelFiles.size, codes.length);
 }
 
 async function runSensitiveOutputSanitizationTest() {
@@ -1099,7 +1196,14 @@ async function runInvalidCodeTest() {
     const rejected = rejectionOf(request.promise);
     harness.child.stdout.emit(
       "data",
-      Buffer.from(JSON.stringify({ ok: true, code: `1234567 ${SECRET_TEXT}` }) + "\n")
+      Buffer.from(
+        JSON.stringify({
+          ok: true,
+          reason: "ok",
+          message: "ok",
+          code: `1234567 ${SECRET_TEXT}`,
+        }) + "\n"
+      )
     );
     harness.child.emit("close", 0, null);
     const error = await rejected;
@@ -1230,10 +1334,11 @@ function runSwiftCancellationContractTest() {
 
   assert.match(source, /--cancel-file/);
   assert.match(source, /func stopIfCancelled/);
-  const normalStart = source.indexOf(
-    "stopIfCancelled()\nguard AXIsProcessTrusted() else"
+  const normalStart = source.lastIndexOf("let deadline = Date().addingTimeInterval(");
+  const accessibilityGate = source.indexOf(
+    "guard waitForAccessibilityPermission(deadline: deadline) else",
+    normalStart
   );
-  const accessibilityGate = source.indexOf("guard AXIsProcessTrusted() else", normalStart);
   const ownerAttempts = source.indexOf("for uiOwnerAttempt in 1...2", normalStart);
   assert.ok(
     normalStart >= 0 && accessibilityGate > normalStart && ownerAttempts > accessibilityGate,
@@ -1488,6 +1593,66 @@ function runSwiftCancellationContractTest() {
   }
 }
 
+function runAccessibilityPromptSourceContractTest() {
+  const source = readSettingsSwiftSource();
+  const prompt = swiftFunctionBodyFromSource(
+    source,
+    "requestAccessibilityPermissionPrompt"
+  );
+  const wait = swiftFunctionBodyFromSource(
+    source,
+    "waitForAccessibilityPermission"
+  );
+
+  assert.match(
+    prompt,
+    /kAXTrustedCheckOptionPrompt\.takeUnretainedValue\(\)\s+as\s+String:\s*true/
+  );
+  assert.match(prompt, /AXIsProcessTrustedWithOptions\(options\)/);
+  assert.match(wait, /stopIfCancelled\(\)/);
+  assert.match(wait, /if AXIsProcessTrusted\(\)\s*\{ return true \}/);
+  assert.match(wait, /guard Date\(\) < deadline else \{ return false \}/);
+  assert.match(
+    wait,
+    /if requestAccessibilityPermissionPrompt\(\), Date\(\) < deadline \{ return true \}/
+  );
+  assert.equal(
+    (wait.match(/requestAccessibilityPermissionPrompt\(\)/g) ?? []).length,
+    1,
+    "the Accessibility prompt must be requested once before polling"
+  );
+  assert.match(wait, /remainingMilliseconds\(\s*until:\s*deadline,\s*cappedAt:\s*accessibilityPermissionPollIntervalMs\s*\)/);
+  assert.match(wait, /cancellablePause\(UInt32\(pauseMs \* 1_000\)\)/);
+  assert.match(source, /let accessibilityPermissionPollIntervalMs\s*=\s*250/);
+  assert.doesNotMatch(source, /NSAppleScript|osascript|OCR/i);
+
+  const mainStart = source.lastIndexOf("let deadline = Date().addingTimeInterval(");
+  const accessibilityGate = source.indexOf(
+    "guard waitForAccessibilityPermission(deadline: deadline) else",
+    mainStart
+  );
+  const ownerAttempts = source.indexOf("for uiOwnerAttempt in 1...2", mainStart);
+  const mainPrefix = source.slice(mainStart, ownerAttempts);
+  assert.ok(
+    mainStart >= 0 && accessibilityGate > mainStart && ownerAttempts > accessibilityGate,
+    "the global timeout must bound permission waiting before Settings AX discovery"
+  );
+  assert.match(mainPrefix, /TimeInterval\(max\(0, timeoutSec\)\)/);
+  assert.match(
+    source.slice(accessibilityGate, ownerAttempts),
+    /OutputReason\.accessibilityUnavailable\.rawValue/
+  );
+  assert.match(
+    source.slice(accessibilityGate, ownerAttempts),
+    /emit\(Output\(ok: false, code: nil, message: "Accessibility permission unavailable"/
+  );
+
+  const originalPath = source.slice(ownerAttempts);
+  assert.match(originalPath, /openAppleAccountSettings\(deadline: deadline\)/);
+  assert.match(originalPath, /prepareVerificationCodeAlert\(/);
+  assert.match(originalPath, /scanCodeFromAlertOnly\(/);
+}
+
 function runStrictVerificationCodeSourceContractTest() {
   const source = readSettingsSwiftSource();
   const functionBody = (name) => {
@@ -1521,11 +1686,20 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(exactName, /expected\.contains/);
   assert.doesNotMatch(exactName, /blob\.contains|\.contains\(\$0\)/);
 
-  const getCodeFinder = functionBody("findGetCodeButton");
+  const getCodeFinder = functionBody("findGetCodeControl");
+  const getCodeWrapper = functionBody("findGetCodeButton");
+  assert.match(getCodeWrapper, /isTrustedSystemSettingsProcess\(expectedPid\)/);
+  assert.match(getCodeWrapper, /findGetCodeControl\(/);
   assert.match(getCodeFinder, /twoFactorNames/);
-  assert.match(getCodeFinder, /collectSheetRoots\(appElement,\s*expectedPid:\s*expectedPid\)/);
-  assert.match(getCodeFinder, /if roots\.isEmpty \{ roots = \[appElement\] \}/);
-  assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*expectedPid\)/);
+  assert.match(getCodeFinder, /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)/);
+  assert.match(getCodeFinder, /AXUIElementCreateApplication\(ownerPid\)/);
+  assert.match(getCodeFinder, /collectSheetRoots\(ownerElement,\s*expectedPid:\s*ownerPid\)/);
+  assert.match(
+    getCodeFinder,
+    /if !roots\.contains\(where:\s*\{ \$0 == ownerElement \}\)\s*\{\s*roots\.append\(ownerElement\)/,
+    "Get Verification Code lookup must retain the normal settings root when sheets are present"
+  );
+  assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*ownerPid\)/);
   assert.match(getCodeFinder, /treeContainsExactText\(\s*root,/);
   assert.match(getCodeFinder, /let button = findExactButton\(\s*in:\s*root,/);
   assert.match(getCodeFinder, /matches\.count\s*==\s*1/);
@@ -1543,10 +1717,7 @@ function runStrictVerificationCodeSourceContractTest() {
     /clickNamed|blob\.contains|AXLink|kAXMenuItemRole/,
     "Get Verification Code must use the strict button path"
   );
-  assert.match(
-    getCodeFinder,
-    /settingsActionScopeAllowsElement\(\s*button,\s*appElement:\s*appElement,/
-  );
+  assert.match(getCodeFinder, /settingsActionScopeAllowsElement\(\s*button,\s*appElement:\s*ownerElement,/);
   const sheetRoots = functionBody("collectSheetRoots");
   assert.match(source, /let axSheetsAttribute\s*=\s*"AXSheets"/);
   assert.match(functionBody("axSheets"), /axCopy\(element,\s*axSheetsAttribute\)/);
@@ -1562,6 +1733,12 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(sheetRoots, /collectWindows\(/);
 
   const navigationClick = functionBody("clickNamed");
+  const crossOwnerNavigationClick = functionBody(
+    "clickNamedInTrustedSettingsOwners"
+  );
+  const crossOwnerNavigationProbe = functionBody(
+    "hasNavigableNamedElementInTrustedSettingsOwners"
+  );
   const navigationAncestor = functionBody("nearestNavigationPressableAncestor");
   assert.match(navigationClick, /expectedPid/);
   assert.match(navigationClick, /hasExactName\(node,\s*names:\s*names\)/);
@@ -1578,15 +1755,28 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(navigationClick, /matches\.count\s*==\s*1/);
   assert.doesNotMatch(navigationClick, /blob\.contains|blob\s*=|names\.contains/);
+  for (const body of [crossOwnerNavigationClick, crossOwnerNavigationProbe]) {
+    assert.match(body, /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)/);
+    assert.match(body, /AXUIElementCreateApplication\(ownerPid\)/);
+    assert.match(body, /ownerPid == expectedPid\s*\?\s*appElement/);
+    assert.match(body, /elementBelongsToProcess\(ownerElement,\s*pid:\s*ownerPid\)/);
+  }
+  assert.match(crossOwnerNavigationClick, /clickNamed\([\s\S]{0,180}in:\s*ownerElement[\s\S]{0,180}expectedPid:\s*ownerPid/);
+  assert.match(crossOwnerNavigationProbe, /hasNavigableNamedElement\([\s\S]{0,180}in:\s*ownerElement[\s\S]{0,180}expectedPid:\s*ownerPid/);
 
   const navigationWait = functionBody("waitForTwoFactorNavigationTarget");
   const getCodeWait = functionBody("waitForGetCodeButton");
   assert.match(navigationWait, /findGetCodeButton\(/);
-  assert.match(navigationWait, /hasNavigableNamedElement\(/);
+  assert.match(navigationWait, /hasNavigableNamedElementInTrustedSettingsOwners\(/);
   assert.match(navigationWait, /cappedAt:\s*100/);
   assert.match(getCodeWait, /findGetCodeButton\(/);
   assert.match(getCodeWait, /cappedAt:\s*100/);
   assert.doesNotMatch(getCodeWait, /hasNavigableNamedElement\(/);
+
+  const navigationPrepare = functionBody("prepareVerificationCodeAlert");
+  assert.match(navigationPrepare, /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,220}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*deadline/);
+  assert.match(navigationPrepare, /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,220}waitForGetCodeButton\([\s\S]{0,180}deadline:\s*deadline/);
+  assert.doesNotMatch(source, /boundedNavigationDeadline|navigationSettleTimeoutMs/);
 
   assert.match(source, /enum OutputReason: String/);
   assert.match(source, /case twoFactorNotFound = "two_factor_not_found"/);
@@ -1682,26 +1872,17 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(request, /actionMayProceed\([\s\S]{0,120}deadline:\s*deadline/);
   assert.match(
     request,
-    /pressExactButton\([\s\S]{0,180}deadline:\s*deadline/
+    /pressExactButton\([\s\S]{0,320}deadline:\s*deadline/
   );
   assert.match(
     request,
-    /waitForVerificationCodeAlert\([\s\S]{0,180}deadline:\s*deadline/
+    /waitForVerificationCodeAlert\([\s\S]{0,320}deadline:\s*deadline/
   );
-  const retryMatch = request.match(/for\s+\w+\s+in\s+1\.\.\.([0-9_]+)/);
-  assert.ok(retryMatch, "verification-code request must have a bounded retry loop");
-  assert.ok(
-    Number(retryMatch[1].replaceAll("_", "")) <= 5,
-    "verification-code request retries must remain bounded"
-  );
-  const loopStart = request.indexOf("for ");
-  const loopEnd = request.indexOf(
-    "\n    }\n    return waitForVerificationCodeAlert(",
-    loopStart
-  );
-  const retryBody = request.slice(loopStart, loopEnd);
-  assert.match(retryBody, /findGetCodeButton\(/);
-  const postActionBody = retryBody.slice(retryBody.indexOf("if attempt < 3"));
+  const loopStart = request.indexOf("while Date() < deadline");
+  assert.ok(loopStart >= 0, "verification-code request must remain bounded by the global deadline");
+  const retryBody = request.slice(loopStart);
+  assert.match(retryBody, /findGetCodeControl\(/);
+  const postActionBody = retryBody.slice(retryBody.indexOf("if actionAttempts < 2"));
   assertOrdered(
     postActionBody,
     ["pressExactButton(", "clickElementAtVerifiedFrame(", "waitForVerificationCodeAlert(", "return true"],
@@ -1712,13 +1893,10 @@ function runStrictVerificationCodeSourceContractTest() {
     /return\s+true/,
     "button action success must not be treated as request success"
   );
-  const waitTimeout = request.match(
-    /waitForVerificationCodeAlert\([\s\S]*?timeoutMs:\s*([0-9_]+)/
-  );
-  assert.ok(waitTimeout, "verification-code request must use an explicit bounded alert wait");
-  assert.ok(
-    Number(waitTimeout[1].replaceAll("_", "")) <= 5_000,
-    "post-click alert confirmation must not consume the provider timeout"
+  assert.match(
+    request,
+    /timeoutMs:\s*actionAttempts <= 3[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
+    "post-click confirmation must be short while delayed alerts remain eligible until the global deadline"
   );
 
   const frameClick = functionBody("clickElementAtVerifiedFrame");
@@ -1736,12 +1914,15 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.doesNotMatch(frameClick, /screenshot|ocr|screencapture|CGWindowList/i);
   assert.match(
     request,
-    /clickElementAtVerifiedFrame\(\s*button,\s*appElement:\s*appElement,\s*expectedPid:[\s\S]{0,120}deadline:\s*deadline/
+    /clickElementAtVerifiedFrame\(\s*control\.element,\s*appElement:\s*control\.appElement,\s*expectedPid:\s*control\.ownerPid[\s\S]{0,120}deadline:\s*deadline/
   );
 
   const prepare = functionBody("prepareVerificationCodeAlert");
   assert.match(prepare, /deadline:\s*Date/);
-  assert.match(prepare, /clickNamed\([\s\S]{0,180}deadline:\s*deadline/);
+  assert.match(
+    prepare,
+    /clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*deadline/
+  );
   assert.match(
     prepare,
     /requestVerificationCodeAlert\([\s\S]{0,220}deadline:\s*deadline/
@@ -1814,14 +1995,27 @@ function runStrictVerificationCodeSourceContractTest() {
   const scan = functionBody("scanCodeFromAlertOnly");
   assertOrdered(
     scan,
-    ["findVerificationCodeAlertRoot(", "findSixDigitCodeInAlert("],
+    ["locateVerificationCodeAlert(", "findSixDigitCodeInAlert("],
     "code text may only be read after the alert root is verified"
   );
+  assert.match(scan, /alert\.root/);
+  assert.match(scan, /expectedPid:\s*alert\.ownerPid/);
+
+  const crossOwnerAlert = functionBody("locateVerificationCodeAlert");
+  assert.match(crossOwnerAlert, /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)/);
+  assert.match(crossOwnerAlert, /AXUIElementCreateApplication\(ownerPid\)/);
+  assert.match(crossOwnerAlert, /findVerificationCodeAlertRoot\([\s\S]{0,180}expectedPid:\s*ownerPid/);
+  const alertOwners = functionBody("trustedSettingsOwnerPids");
+  assert.match(alertOwners, /runningApplications\.filter\(\s*isTrustedAppleIDSettingsExtension/);
+  assert.match(alertOwners, /uniqueTrustedSettingsApp\(\)/);
+  assert.match(alertOwners, /isTrustedSystemSettingsProcess\(settingsHost\.processIdentifier\)/);
 
   const closeAlert = functionBody("closeVerificationCodeAlert");
-  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /locateVerificationCodeAlert\(/);
   assert.match(closeAlert, /findExactButton\(/);
   assert.match(closeAlert, /verificationAlertCloseButtons/);
+  assert.match(closeAlert, /appElement:\s*alert\.appElement/);
+  assert.match(closeAlert, /expectedPid:\s*alert\.ownerPid/);
   assert.doesNotMatch(closeAlert, /clickNamed/);
 
   assert.match(source, /let settingsPid\s*=\s*settingsUIApp\.processIdentifier/);
@@ -1883,10 +2077,20 @@ function runVerificationCodeHardeningSourceContractTest() {
   assert.match(codeScan, /candidates\.count\s*==\s*1/);
 
   const request = functionBody("requestVerificationCodeAlert");
-  const loopStart = request.search(/for\s+\w+\s+in\s+1\.\.\./);
-  assert.ok(loopStart >= 0, "verification-code request must retain a bounded retry loop");
-  const buttonIndex = request.indexOf("findGetCodeButton(", loopStart);
-  assert.ok(buttonIndex > loopStart, "each retry must freshly resolve the Get Verification Code button");
+  const loopStart = request.indexOf("while Date() < deadline");
+  assert.ok(loopStart >= 0, "verification-code request must wait only within its global deadline");
+  const buttonIndex = request.indexOf("findGetCodeControl(", loopStart);
+  assert.ok(buttonIndex > loopStart, "each poll must freshly resolve the Get Verification Code control");
+  assert.match(request, /var actionAttempts\s*=\s*0/);
+  assert.match(
+    request,
+    /if actionAttempts < 2\s*\{[\s\S]{0,280}pressExactButton\([\s\S]{0,180}control\.element[\s\S]{0,180}control\.ownerPid/
+  );
+  assert.match(
+    request,
+    /else if actionAttempts == 2\s*\{[\s\S]{0,320}clickElementAtVerifiedFrame\([\s\S]{0,180}control\.element[\s\S]{0,180}control\.ownerPid/
+  );
+  assert.match(request, /actionAttempts\s*\+=\s*1/);
 
   const closeBeforeLoop = request.indexOf("closeVerificationCodeAlert(");
   assert.ok(
@@ -1904,8 +2108,8 @@ function runVerificationCodeHardeningSourceContractTest() {
     (match) => match.index
   );
   assert.ok(
-    alertChecks.length >= 3,
-    "each retry needs pre-button, post-missing-button, and final late-alert checks"
+    alertChecks.length >= 2,
+    "each poll needs pre-button and missing-button late-alert checks"
   );
   assert.ok(alertChecks[0] < buttonIndex, "new-alert check must precede button lookup");
 
@@ -1919,9 +2123,10 @@ function runVerificationCodeHardeningSourceContractTest() {
   );
   assert.match(
     request,
-    /\n    \}\n    return\s+waitForVerificationCodeAlert\(/,
-    "retry loop must perform a final bounded late-alert check before failing"
+    /timeoutMs:\s*actionAttempts <= 3[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
+    "button actions must receive a short confirmation window while delayed alerts remain eligible until the global deadline"
   );
+  assert.match(request, /\n    return false\n\}/);
 
   const closeAlert = functionBody("closeVerificationCodeAlert");
   assert.match(
@@ -1933,21 +2138,21 @@ function runVerificationCodeHardeningSourceContractTest() {
   assert.match(closeAlert, /deadline/);
   assert.match(closeAlert, /Date\(\)\s*>=\s*deadline/);
   assert.match(closeAlert, /guard isTrustedSystemSettingsProcess\(expectedPid\) else \{ return false \}/);
-  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /locateVerificationCodeAlert\(/);
   assert.match(
     closeAlert,
     /return\s+isTrustedSystemSettingsProcess\(expectedPid\)/,
     "an absent alert is success only while the same trusted UI owner is still current"
   );
-  assert.match(closeAlert, /let alertGone\s*=\s*findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /let alertGone\s*=\s*locateVerificationCodeAlert\(/);
   assert.match(closeAlert, /return alertGone/);
   assert.doesNotMatch(
     closeAlert,
-    /guard\s+let\s+\w+\s*=\s*findVerificationCodeAlertRoot\([\s\S]*?else\s*\{\s*return\s*\}/,
+    /guard\s+let\s+\w+\s*=\s*locateVerificationCodeAlert\([\s\S]*?else\s*\{\s*return\s*\}/,
     "an initially absent alert must be watched until the bounded deadline"
   );
   assert.ok(
-    /findVerificationCodeAlertRoot\([\s\S]{0,200}==\s*nil/.test(
+    /locateVerificationCodeAlert\([\s\S]{0,200}==\s*nil/.test(
       closeAlert
     ),
     "observed verification alerts must be confirmed gone before close returns true"
@@ -1981,7 +2186,7 @@ function runVerificationCodeHardeningSourceContractTest() {
   );
   assert.match(
     closeAlert,
-    /let alertGone\s*=\s*findVerificationCodeAlertRoot\([\s\S]{0,240}guard isTrustedSystemSettingsProcess\(expectedPid\) else \{ return false \}[\s\S]{0,100}return alertGone/,
+    /let alertGone\s*=\s*locateVerificationCodeAlert\([\s\S]{0,240}guard isTrustedSystemSettingsProcess\(expectedPid\) else \{ return false \}[\s\S]{0,100}return alertGone/,
     "alert disappearance must be followed by a final owner revalidation"
   );
 
@@ -2052,11 +2257,11 @@ function runTraditionalChineseStateContractTest() {
   const scanAlert = functionBody("scanCodeFromAlertOnly");
   assert.match(
     scanAlert,
-    /findVerificationCodeAlertRoot\([\s\S]*findSixDigitCodeInAlert\(alert,\s*expectedPid:\s*expectedPid\)/
+    /locateVerificationCodeAlert\([\s\S]*findSixDigitCodeInAlert\(\s*alert\.root,\s*expectedPid:\s*alert\.ownerPid\s*\)/
   );
 
   const closeAlert = functionBody("closeVerificationCodeAlert");
-  assert.match(closeAlert, /findVerificationCodeAlertRoot\(/);
+  assert.match(closeAlert, /locateVerificationCodeAlert\(/);
   assert.match(closeAlert, /findExactButton\(/);
   assert.match(closeAlert, /verificationAlertCloseButtons/);
   assert.match(source, /let verificationAlertCloseButtons\s*=\s*\[[^\]]*"好"/);
@@ -2069,7 +2274,7 @@ function runTraditionalChineseStateContractTest() {
     "let existingButton = findGetCodeButton(",
     source.indexOf("func prepareVerificationCodeAlert(")
   );
-  const signInClick = source.indexOf("if clickNamed(", resumeProbe);
+  const signInClick = source.indexOf("_ = clickNamedInTrustedSettingsOwners(", resumeProbe);
   assert.ok(
     resumeProbe >= 0 && resumeProbe < signInClick,
     "Settings navigation must resume an already-open Two-Factor Authentication sheet"
@@ -2116,6 +2321,8 @@ function runManualSettingsPrivacyContractTest() {
 }
 
 await runSuccessTest();
+await runFixedSuccessStateTest();
+await runSequentialSettingsCodeRequestsTest();
 await runSensitiveOutputSanitizationTest();
 await runHelperFailureSanitizationTest();
 await runAccessibilityFailureClassificationTest();
@@ -2124,6 +2331,7 @@ await runChildErrorSanitizationTest();
 await runCancelTest();
 runMissingSourceRejectsOldBinaryTest();
 runPreparedOnlySettingsStartNeverCompilesTest();
+runRuntimeSettingsStartNeverCompilesTest();
 runStaleBinaryCompileFailureTest();
 runNonExecutableCompilerOutputTest();
 await runForceStopAllowsLatePopupCleanupTest();
@@ -2132,6 +2340,7 @@ await runSixtySecondBudgetIncludesCleanupGraceTest();
 await runTimeoutKeepsMarkerUntilChildClosesTest();
 runSettingsOwnerMutationResistanceTest();
 runSwiftCancellationContractTest();
+runAccessibilityPromptSourceContractTest();
 runVerificationCodeHardeningSourceContractTest();
 runStrictVerificationCodeSourceContractTest();
 runTraditionalChineseStateContractTest();

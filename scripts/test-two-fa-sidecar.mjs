@@ -136,6 +136,9 @@ function createNativeHarness(
     cleanupDismissals: 0,
     popupWinnerClosures: 0,
     popupCloseSignals: [],
+    popupCloseCalls: 0,
+    popupPhaseCalls: [],
+    stalePopupCleanupCalls: 0,
     settingsStarts: 0,
     settingsCancels: 0,
     settingsForceStops: 0,
@@ -153,6 +156,7 @@ function createNativeHarness(
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     async dismissStale2FAPopups() {
+      stats.stalePopupCleanupCalls += 1;
       return { count: staleCodes.length, codes: [...staleCodes] };
     },
     async probe2FAState() {
@@ -199,6 +203,7 @@ function createNativeHarness(
       return { code: popup.code, raw: popup.raw, source: popupSource };
     },
     async runPopupPhase(phase) {
+      stats.popupPhaseCalls.push(phase);
       if (phase === "read_code" && popup) {
         return { action: "read_code", code: popup.code, raw: popup.raw };
       }
@@ -215,6 +220,7 @@ function createNativeHarness(
       return { action: "none", code: null };
     },
     async dismissCodePopupForWebFill(_timeoutSec, options = {}) {
+      stats.popupCloseCalls += 1;
       const signal = options.signal;
       stats.popupCloseSignals.push(signal ?? null);
       if (!popup) return false;
@@ -356,6 +362,7 @@ function createHarness(options = {}) {
       timeoutMs: options.timeoutMs ?? 30_000,
       settingsFallbackAfterMs: options.settingsFallbackAfterMs ?? 8_000,
       settingsFallback: options.settingsFallback,
+      settingsOnly: options.settingsOnly,
       pollIntervalMs: options.pollIntervalMs ?? 10,
       auditThrottleMs: options.auditThrottleMs ?? 30,
       cleanupGraceMs: 50,
@@ -1493,6 +1500,191 @@ async function settingsGracePeriodTest() {
   native.settingsRequests[0].resolve({ code: "654321", raw: "654 321", screenshot: null });
   await clock.flush();
   assert.equal(await codePromise, "654321");
+  await collector.dispose();
+}
+
+function popupHelperStats(native) {
+  return {
+    stalePopupCleanupCalls: native.stats.stalePopupCleanupCalls,
+    probeCalls: native.stats.probeCalls,
+    allowAttempts: native.stats.allowAttempts.length,
+    popupReads: native.stats.popupReads.length,
+    popupPhaseCalls: native.stats.popupPhaseCalls.length,
+    popupCloseCalls: native.stats.popupCloseCalls,
+  };
+}
+
+async function settingsOnlyStartsImmediatelyWithoutPopupHelpersTest() {
+  const { clock, native, collector, statuses } = createHarness({
+    settingsOnly: true,
+    settingsFallbackAfterMs: 8_000,
+    manualFallback: false,
+  });
+  await collector.prepare();
+  assert.equal(native.stats.settingsStarts, 0, "prepare must not request a code before need_2fa");
+  assert.deepEqual(popupHelperStats(native), {
+    stalePopupCleanupCalls: 0,
+    probeCalls: 0,
+    allowAttempts: 0,
+    popupReads: 0,
+    popupPhaseCalls: 0,
+    popupCloseCalls: 0,
+  });
+
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+  assert.equal(native.stats.settingsStarts, 1, "settings-only must start Settings immediately");
+  assert.deepEqual(popupHelperStats(native), {
+    stalePopupCleanupCalls: 0,
+    probeCalls: 0,
+    allowAttempts: 0,
+    popupReads: 0,
+    popupPhaseCalls: 0,
+    popupCloseCalls: 0,
+  });
+  native.settingsRequests[0].resolve({ code: "135790" });
+  await clock.flush();
+  assert.equal(await codePromise, "135790");
+  assert.equal(
+    statuses.some(({ status, source }) => status === "winner" && source === "settings"),
+    true
+  );
+  await collector.dispose();
+  assert.deepEqual(
+    popupHelperStats(native),
+    {
+      stalePopupCleanupCalls: 0,
+      probeCalls: 0,
+      allowAttempts: 0,
+      popupReads: 0,
+      popupPhaseCalls: 0,
+      popupCloseCalls: 0,
+    },
+    "settings-only disposal must not touch popup/Allow/OCR helpers"
+  );
+}
+
+async function settingsOnlyManualFallbackStartsAtNinetySecondsTest() {
+  const manual = createManualProviderHarness();
+  const { clock, native, collector } = createHarness({
+    settingsOnly: true,
+    timeoutMs: 240_000,
+    settingsStartFailures: 2,
+    manualFallback: true,
+    manualCodeProvider: manual.provider,
+    isTTY: true,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(manual.calls.length, 0, "manual input must wait for Settings failure");
+  await clock.advance(4_999);
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(manual.calls.length, 0);
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 2);
+  await clock.advance(84_999);
+  assert.equal(manual.calls.length, 0, "manual input must retain the 90-second grace period");
+  await clock.advance(1);
+  assert.equal(
+    manual.calls.length,
+    1,
+    "manual input must start at 90 seconds even when Settings has already failed"
+  );
+  manual.calls[0].resolve("987654");
+  await clock.flush();
+  assert.equal(await codePromise, "987654");
+  assert.deepEqual(popupHelperStats(native), {
+    stalePopupCleanupCalls: 0,
+    probeCalls: 0,
+    allowAttempts: 0,
+    popupReads: 0,
+    popupPhaseCalls: 0,
+    popupCloseCalls: 0,
+  });
+  await collector.dispose();
+}
+
+async function settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest() {
+  const manual = createManualProviderHarness();
+  const never = deferred();
+  const { clock, native, collector, statuses } = createHarness({
+    settingsOnly: true,
+    timeoutMs: 240_000,
+    manualFallback: true,
+    manualCodeProvider: manual.provider,
+    isTTY: true,
+    accessibilityProvider() {
+      return never.promise;
+    },
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  assert.equal(
+    native.stats.accessibilityStarts,
+    0,
+    "settings-only must not wait on a different helper's Accessibility prompt"
+  );
+  assert.equal(
+    statuses.some(({ status, source }) =>
+      status === "settings_accessibility" && source === "settings"
+    ),
+    true
+  );
+
+  await clock.advance(5_000);
+  assert.equal(native.stats.settingsStarts, 2, "Settings remains eligible for its bounded retry");
+  await clock.advance(85_000);
+  assert.equal(
+    manual.calls.length,
+    1,
+    "the hidden terminal fallback must not wait for a stalled Settings request"
+  );
+  manual.calls[0].resolve("864209");
+  await clock.flush();
+  assert.equal(await codePromise, "864209");
+  await collector.dispose();
+}
+
+async function settingsOnlyGenerationTwoRejectsPreviousCodeTest() {
+  const { clock, native, collector } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+  });
+  await collector.prepare();
+
+  const first = collector.getCode({ generation: 1, rejectPrevious: false });
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(await first, "111111");
+
+  let secondSettled = false;
+  const second = collector
+    .getCode({ generation: 2, rejectPrevious: true })
+    .finally(() => {
+      secondSettled = true;
+    });
+  await clock.advance(5_000);
+  assert.equal(native.stats.settingsStarts, 2, "generation 2 must request a fresh Settings code");
+  native.settingsRequests[1].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(secondSettled, false, "generation 2 must reject the previous code");
+  await clock.advance(5_000);
+  assert.equal(native.stats.settingsStarts, 3, "generation 2 gets a second fresh Settings attempt");
+  native.settingsRequests[2].resolve({ code: "222222" });
+  await clock.flush();
+  assert.equal(await second, "222222");
+  assert.deepEqual(popupHelperStats(native), {
+    stalePopupCleanupCalls: 0,
+    probeCalls: 0,
+    allowAttempts: 0,
+    popupReads: 0,
+    popupPhaseCalls: 0,
+    popupCloseCalls: 0,
+  });
   await collector.dispose();
 }
 
@@ -2848,6 +3040,10 @@ const focusedTests = {
   "settings-retry": settingsRetriesOnceAfterFiveSecondsTest,
   "settings-max": settingsNeverStartsThirdAttemptTest,
   "settings-cancel": cancelledSettingsDoesNotRetryTest,
+  "settings-only": settingsOnlyStartsImmediatelyWithoutPopupHelpersTest,
+  "settings-only-manual": settingsOnlyManualFallbackStartsAtNinetySecondsTest,
+  "settings-only-accessibility-manual": settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest,
+  "settings-only-generation": settingsOnlyGenerationTwoRejectsPreviousCodeTest,
   "settings-accessibility": settingsAccessibilityRecoveryRestartsImmediatelyTest,
   "settings-sync-accessibility": synchronousSettingsAccessibilityFailureRecoversTest,
   "settings-accessibility-dispose": settingsAccessibilityDisposePreventsRestartTest,
@@ -2917,6 +3113,10 @@ if (focusedTest) {
   await popupCodeIsPublishedWhenDialogCleanupFailsTest();
   await popupCodeWinsAfterAllDialogCleanupPathsFailTest();
   await settingsGracePeriodTest();
+await settingsOnlyStartsImmediatelyWithoutPopupHelpersTest();
+await settingsOnlyManualFallbackStartsAtNinetySecondsTest();
+await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
+  await settingsOnlyGenerationTwoRejectsPreviousCodeTest();
   await settingsStartFailureEmitsFixedStatusAfterAuditTest();
   await settingsRetriesOnceAfterFiveSecondsTest();
   await settingsFixedFailureReasonIsPreservedTest();

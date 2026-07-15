@@ -418,7 +418,7 @@ function reportTwoFactorStatus(event) {
   if (event.status === "settings_start" && (event.attempt === 1 || event.attempt === 2)) {
     console.log(
       event.attempt === 1
-        ? "[2FA] 正在尝试通过系统设置获取验证码（第 1/2 次）..."
+        ? "[2FA] 正在尝试通过系统设置获取验证码（第 1/2 次）；如出现 macOS 辅助功能提示，请允许系统设置取码 helper。"
         : "[2FA] 正在尝试通过系统设置获取验证码（第 2/2 次）..."
     );
     return;
@@ -478,12 +478,16 @@ export async function runAccountBrowserPhase(
     granted: axOk,
   });
   if (!axOk) {
-    console.warn("[2FA] 警告: 辅助功能未授权，macOS 2FA 弹窗取码可能失败");
+    console.warn("[2FA] 警告: 辅助功能未授权，系统设置取码可能失败");
   }
 
   const collector = createCollector({
     timeoutMs: TWO_FACTOR_TIMEOUT_MS,
     reportDir,
+    settingsOnly: true,
+    settingsFallback: true,
+    settingsFallbackAfterMs: 0,
+    manualFallback: true,
     onStatus(event) {
       writeFlowAudit(flowAudit, "two_factor", "status", event);
       reportTwoFactorStatus(event);

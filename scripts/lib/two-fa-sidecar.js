@@ -40,12 +40,17 @@ function numberFromEnv(key, fallback) {
 }
 
 function resolveConfig(options) {
+  const settingsOnly = options.settingsOnly === true;
   return {
     timeoutMs: options.timeoutMs ?? 240_000,
-    settingsFallbackAfterMs:
-      options.settingsFallbackAfterMs ?? numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 8_000),
-    settingsFallback:
-      options.settingsFallback ?? process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
+    settingsOnly,
+    settingsFallbackAfterMs: settingsOnly
+      ? 0
+      : options.settingsFallbackAfterMs ??
+        numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 8_000),
+    settingsFallback: settingsOnly
+      ? true
+      : options.settingsFallback ?? process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
     manualFallback:
       options.manualFallback ?? process.env.BROWSER_2FA_MANUAL_FALLBACK !== "0",
     pollIntervalMs: Math.max(
@@ -1123,29 +1128,32 @@ export function createMac2FACollector(options = {}) {
         throw new Error("macOS 2FA collection requires macOS");
       }
 
-      const stale = await runtime.dismissStale2FAPopups(6, {
-        compileIfNeeded: false,
-      });
-      throwIfDisposedDuringPreparation();
-      for (const value of stale?.codes ?? []) {
-        const code = normalizeSixDigitCode(value);
-        if (code) rejectedCodes.add(code);
-      }
-
-      const visible = await runtime.probe2FAState(2);
-      throwIfDisposedDuringPreparation();
-      if (visible?.action === "has_allow_dialog") {
-        preexistingAllowGate = true;
-        preexistingAllowIdleHits = 0;
-      } else if (visible?.action === "has_code_dialog") {
-        const visibleCode = normalizeSixDigitCode(visible.code);
-        if (visibleCode) rejectedCodes.add(visibleCode);
-        const dismissed = await runtime.runPopupPhase("dismiss_stale", 2, {
+      let stale = { count: 0, codes: [] };
+      if (!config.settingsOnly) {
+        stale = await runtime.dismissStale2FAPopups(6, {
           compileIfNeeded: false,
         });
         throwIfDisposedDuringPreparation();
-        const dismissedCode = normalizeSixDigitCode(dismissed?.code);
-        if (dismissedCode) rejectedCodes.add(dismissedCode);
+        for (const value of stale?.codes ?? []) {
+          const code = normalizeSixDigitCode(value);
+          if (code) rejectedCodes.add(code);
+        }
+
+        const visible = await runtime.probe2FAState(2);
+        throwIfDisposedDuringPreparation();
+        if (visible?.action === "has_allow_dialog") {
+          preexistingAllowGate = true;
+          preexistingAllowIdleHits = 0;
+        } else if (visible?.action === "has_code_dialog") {
+          const visibleCode = normalizeSixDigitCode(visible.code);
+          if (visibleCode) rejectedCodes.add(visibleCode);
+          const dismissed = await runtime.runPopupPhase("dismiss_stale", 2, {
+            compileIfNeeded: false,
+          });
+          throwIfDisposedDuringPreparation();
+          const dismissedCode = normalizeSixDigitCode(dismissed?.code);
+          if (dismissedCode) rejectedCodes.add(dismissedCode);
+        }
       }
 
       throwIfDisposedDuringPreparation();
@@ -1157,8 +1165,10 @@ export function createMac2FACollector(options = {}) {
         rejectedStaleCodeCount: rejectedCodes.size,
         elapsedSincePrepareMs: 0,
       });
-      popupWatcherController = new AbortController();
-      popupWatcherPromise = watchPopup(popupWatcherController.signal);
+      if (!config.settingsOnly) {
+        popupWatcherController = new AbortController();
+        popupWatcherPromise = watchPopup(popupWatcherController.signal);
+      }
     })();
 
     return preparePromise;
@@ -1374,7 +1384,22 @@ export function createMac2FACollector(options = {}) {
         });
       }
 
-      if (accessibilityDenied && !settingsAccessibilityAttempted) {
+      if (accessibilityDenied && config.settingsOnly && !settingsAccessibilityAttempted) {
+        settingsAccessibilityAttempted = true;
+        status("settings_accessibility", {
+          attempt,
+          source: "settings",
+          remainingSec: remainingSeconds(acquisition.deadline),
+        });
+        audit({
+          phase: "settings_accessibility",
+          reason: "accessibility_denied",
+          outcome: "settings_helper_prompt_exhausted",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+      }
+
+      if (accessibilityDenied && !config.settingsOnly && !settingsAccessibilityAttempted) {
         const recovery = await recoverSettingsAccessibility(acquisition, attempt);
         if (recovery === "granted") continue;
         return;
@@ -1588,6 +1613,10 @@ export function createMac2FACollector(options = {}) {
     cleanupOnly = false;
     pendingAllowAttempt = null;
     resetPendingPopupClose();
+    if (config.settingsOnly) {
+      settingsAttempt = 0;
+      settingsAccessibilityAttempted = false;
+    }
   };
 
   const acquireCode = async ({ generation, rejectPrevious }) => {
@@ -1652,8 +1681,10 @@ export function createMac2FACollector(options = {}) {
       return true;
     };
     activeAcquisition = acquisition;
-    popupReady.promise.then((candidate) => acquisition.offer(candidate));
-    if (popupCandidate?.generation === generation) acquisition.offer(popupCandidate);
+    if (!config.settingsOnly) {
+      popupReady.promise.then((candidate) => acquisition.offer(candidate));
+      if (popupCandidate?.generation === generation) acquisition.offer(popupCandidate);
+    }
 
     const remainingMs = Math.max(0, acquisition.deadline - runtime.now());
     const deadlineDelay = scheduleDelay(remainingMs);
@@ -1746,7 +1777,7 @@ export function createMac2FACollector(options = {}) {
         }
       }
       if (popupWatcherPromise) await popupWatcherPromise;
-      if (prepared && runtime.platform === "darwin") {
+      if (prepared && runtime.platform === "darwin" && !config.settingsOnly) {
         try {
           const state = await runtime.probe2FAState(2);
           if (state?.action === "has_code_dialog") {

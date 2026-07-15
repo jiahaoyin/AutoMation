@@ -5,9 +5,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  SUPERVISED_ACCOUNT_MODE,
   SUPERVISED_COMMAND_ID,
-  SUPERVISED_SUCCESS_MARKER,
+  SUPERVISED_MODE_ENV_KEY,
+  SUPERVISED_MODES,
+  SUPERVISED_SETTINGS_SMOKE_MODE,
   parseSupervisedAttestation,
+  supervisedSuccessMarkerForMode,
 } from "./lib/supervised-attestation.js";
 
 export const DEFAULT_RUYIPAGE_BACKEND_TIMEOUT_MS = 720_000;
@@ -25,6 +29,14 @@ class FixedFailure extends Error {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function supervisedModeFromArgs(args) {
+  if (args.length === 0) return SUPERVISED_ACCOUNT_MODE;
+  if (args.length === 1 && args[0] === "--settings-smoke") {
+    return SUPERVISED_SETTINGS_SMOKE_MODE;
+  }
+  throw new FixedFailure("supervised helper arguments are invalid", 64);
 }
 
 function regularFileText(filePath, maxBytes = 4096) {
@@ -57,8 +69,12 @@ function validateEnvironment(env, nowMs) {
     throw new FixedFailure("supervised temporary directory is unavailable", 77);
   }
   const nonce = env.APPLE_AUTOMATION_SUPERVISED_TOKEN ?? "";
+  const mode = env[SUPERVISED_MODE_ENV_KEY] ?? "";
   if (!/^[0-9a-f]{32}$/.test(nonce)) {
     throw new FixedFailure("supervised bridge token is unavailable", 77);
+  }
+  if (!SUPERVISED_MODES.has(mode)) {
+    throw new FixedFailure("supervised mode is unavailable", 77);
   }
   const expectedHead = env.APPLE_AUTOMATION_EXPECTED_HEAD ?? "";
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedHead)) {
@@ -82,6 +98,7 @@ function validateEnvironment(env, nowMs) {
   return {
     tmpDir,
     nonce,
+    mode,
     expectedHead,
     triggerPath,
     cancelPath,
@@ -108,7 +125,7 @@ function writeExclusiveJson(targetPath, value) {
 
 export async function runSupervisedMacAcceptance(options = {}) {
   const args = options.args ?? process.argv.slice(2);
-  if (args.length !== 0) throw new FixedFailure("supervised helper takes no arguments", 64);
+  const mode = supervisedModeFromArgs(args);
   const env = options.env ?? process.env;
   const now = options.now ?? Date.now;
   const wait = options.sleep ?? sleep;
@@ -123,12 +140,16 @@ export async function runSupervisedMacAcceptance(options = {}) {
   }
   const {
     nonce,
+    mode: trustedMode,
     expectedHead,
     triggerPath,
     cancelPath,
     attestationPath,
     outerDeadlineMs,
   } = validateEnvironment(env, startedAt);
+  if (mode !== trustedMode) {
+    throw new FixedFailure("supervised helper mode is invalid", 77);
+  }
   const budgetDeadline = startedAt + timeoutMs;
   if (!Number.isSafeInteger(budgetDeadline)) {
     throw new FixedFailure("supervised helper deadline is invalid", 77);
@@ -140,6 +161,7 @@ export async function runSupervisedMacAcceptance(options = {}) {
       version: 1,
       nonce,
       commandId: SUPERVISED_COMMAND_ID,
+      mode,
     });
   } catch (error) {
     if (error?.code === "EEXIST") {
@@ -151,12 +173,16 @@ export async function runSupervisedMacAcceptance(options = {}) {
   while (now() < deadline) {
     const source = regularFileText(attestationPath);
     if (source != null) {
-      const parsed = parseSupervisedAttestation(source, { nonce, expectedHead });
+      const parsed = parseSupervisedAttestation(source, {
+        nonce,
+        expectedHead,
+        mode,
+      });
       if (parsed.errors.length > 0) {
         throw new FixedFailure("supervised attestation is invalid", 78);
       }
       if (parsed.value.status === "accepted") {
-        stdout.write(`${SUPERVISED_SUCCESS_MARKER}\n`);
+        stdout.write(`${supervisedSuccessMarkerForMode(mode)}\n`);
         return 0;
       }
       if (["failed", "cancelled"].includes(parsed.value.status)) {

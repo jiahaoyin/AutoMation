@@ -10,16 +10,21 @@ import {
   buildScpArgs,
   buildSshArgs,
   hasSupervisedAcceptanceEvent,
+  supervisedAcceptanceEventMode,
   parseArgs,
   runProcess,
   summarizeRun,
   validateFinalReport,
 } from "./mac-codex-orchestrator.mjs";
 import {
+  SUPERVISED_ACCOUNT_MODE,
   SUPERVISED_COMMAND_ID,
   SUPERVISED_COMMAND_SHA256,
+  SUPERVISED_MODE_ENV_KEY,
   SUPERVISED_PRODUCTION_ENV_KEYS,
   SUPERVISED_PRODUCTION_ENV_POLICY,
+  SUPERVISED_SETTINGS_SMOKE_MODE,
+  SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER,
   SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS,
   SUPERVISED_SETTINGS_PROVIDER_STATES,
   SUPERVISED_SUCCESS_MARKER,
@@ -69,6 +74,8 @@ const OTHER_HEAD = "fedcba9876543210fedcba9876543210fedcba98";
 const SUPERVISED_TOKEN = "0123456789abcdef0123456789abcdef";
 const OTHER_SUPERVISED_TOKEN = "fedcba9876543210fedcba9876543210";
 const SUPERVISED_HELPER_COMMAND = "node scripts/supervised-mac-acceptance.mjs";
+const SUPERVISED_SETTINGS_SMOKE_HELPER_COMMAND =
+  "node scripts/supervised-mac-acceptance.mjs --settings-smoke";
 const RAW_SECRET_CANARY = "raw-secret-canary-must-not-leak";
 const expectedBrowserBrokerEnvironment = [
   "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
@@ -1477,24 +1484,55 @@ try {
       version: 1,
       nonce: SUPERVISED_TOKEN,
       commandId: SUPERVISED_COMMAND_ID,
+      mode: SUPERVISED_ACCOUNT_MODE,
     })}\n`,
     "utf8"
   );
-  const validateRequests = (accepted) =>
+  const validateRequests = (accepted, expectedMode) =>
     validateSupervisedRequestArtifacts({
       triggerPath,
       cancelPath,
       nonce: SUPERVISED_TOKEN,
+      expectedMode,
       accepted,
     });
-  assert.equal(validateRequests(true), true);
+  assert.equal(validateRequests(true, SUPERVISED_ACCOUNT_MODE), true);
+  assert.equal(
+    validateRequests(true, SUPERVISED_SETTINGS_SMOKE_MODE),
+    false,
+    "request verification must bind the account trigger to the expected mode"
+  );
+  fs.writeFileSync(
+    triggerPath,
+    `${JSON.stringify({
+      version: 1,
+      nonce: SUPERVISED_TOKEN,
+      commandId: SUPERVISED_COMMAND_ID,
+      mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+    })}\n`,
+    "utf8"
+  );
+  assert.equal(
+    validateRequests(true, SUPERVISED_SETTINGS_SMOKE_MODE),
+    true,
+    "settings smoke triggers must be accepted only for the matching mode"
+  );
+  assert.equal(
+    validateRequests(true, SUPERVISED_ACCOUNT_MODE),
+    false,
+    "request verification must reject a settings smoke trigger for account mode"
+  );
   fs.writeFileSync(
     cancelPath,
     `${JSON.stringify({ version: 1, nonce: SUPERVISED_TOKEN })}\n`,
     "utf8"
   );
-  assert.equal(validateRequests(false), true);
-  assert.equal(validateRequests(true), false, "accepted runs must not retain cancel");
+  assert.equal(validateRequests(false, SUPERVISED_SETTINGS_SMOKE_MODE), true);
+  assert.equal(
+    validateRequests(true, SUPERVISED_SETTINGS_SMOKE_MODE),
+    false,
+    "accepted runs must not retain cancel"
+  );
   fs.unlinkSync(cancelPath);
   fs.writeFileSync(
     triggerPath,
@@ -1502,11 +1540,14 @@ try {
       version: 1,
       nonce: SUPERVISED_TOKEN,
       commandId: SUPERVISED_COMMAND_ID,
-      extra: true,
     })}\n`,
     "utf8"
   );
-  assert.equal(validateRequests(false), false, "trigger keys must be exact");
+  assert.equal(
+    validateRequests(false, SUPERVISED_SETTINGS_SMOKE_MODE),
+    false,
+    "trigger mode must be explicit and exact"
+  );
 } finally {
   removeTreeOneFileAtATime(requestVerifierDir);
 }
@@ -1528,6 +1569,7 @@ assert.deepEqual(defaults, {
   roundName: "round-01",
   timeoutMs: DEFAULT_TIMEOUT_MS,
   supervisedGui: false,
+  supervisedMode: SUPERVISED_ACCOUNT_MODE,
 });
 
 const taskFileDir = fs.mkdtempSync(path.join(os.tmpdir(), "mac-codex-task-"));
@@ -1556,6 +1598,7 @@ try {
     roundName: "round-07",
     timeoutMs: 45_000,
     supervisedGui: false,
+    supervisedMode: SUPERVISED_ACCOUNT_MODE,
   });
 } finally {
   removeTreeOneFileAtATime(taskFileDir);
@@ -1582,6 +1625,37 @@ assert.throws(
 
 const supervisedArgs = parseArgs(["--task", "执行受监督 GUI 验收", "--allow-supervised-gui"]);
 assert.equal(supervisedArgs.supervisedGui, true);
+assert.equal(supervisedArgs.supervisedMode, SUPERVISED_ACCOUNT_MODE);
+const settingsSmokeArgs = parseArgs([
+  "--task",
+  "settings smoke acceptance",
+  "--allow-supervised-gui",
+  "--supervised-mode",
+  SUPERVISED_SETTINGS_SMOKE_MODE,
+]);
+assert.equal(settingsSmokeArgs.supervisedGui, true);
+assert.equal(settingsSmokeArgs.supervisedMode, SUPERVISED_SETTINGS_SMOKE_MODE);
+assert.throws(
+  () =>
+    parseArgs([
+      "--task",
+      "settings smoke without trusted GUI",
+      "--supervised-mode",
+      SUPERVISED_SETTINGS_SMOKE_MODE,
+    ]),
+  /settings_smoke.*allow-supervised-gui/i
+);
+assert.throws(
+  () =>
+    parseArgs([
+      "--task",
+      "invalid supervised mode",
+      "--allow-supervised-gui",
+      "--supervised-mode",
+      "untrusted-mode",
+    ]),
+  /invalid supervised mode/i
+);
 assert.throws(
   () =>
     parseArgs([
@@ -1622,17 +1696,15 @@ const supervisedPrompt = buildAgentPrompt({
   supervisedGui: true,
 });
 for (const requiredText of [
-  "用户明确监督并授权 GUI 验收",
-  "真实 Apple 账号流程",
-  "ruyiPage",
+  "locked to mode account",
+  "Execute exactly one trusted helper command",
+  SUPERVISED_HELPER_COMMAND,
+  SUPERVISED_SUCCESS_MARKER,
   "生产脚本在进程内部加载凭据",
   "完整 Apple ID",
   "raw AX/OCR",
-  "固定成功标记",
   "supervised_gui",
-  "REAL_ACCOUNT_HOME_CONFIRMED",
-  SUPERVISED_HELPER_COMMAND,
-  "不得自行调用 open、launchctl、AppleScript",
+  "Do not run open, launchctl, AppleScript, run.sh",
 ]) {
   assert.match(
     supervisedPrompt,
@@ -1642,13 +1714,29 @@ for (const requiredText of [
 assert.doesNotMatch(supervisedPrompt, /不执行人工 2FA/);
 assert.match(
   supervisedPrompt,
-  /零参数入口 `node scripts\/supervised-mac-acceptance\.mjs`/
+  /This supervised run is locked to mode account; the only permitted command is node scripts\/supervised-mac-acceptance\.mjs\./
 );
 assert.doesNotMatch(
   supervisedPrompt,
-  /node scripts\/supervised-mac-acceptance\.mjs\s+--|supervised-mac-acceptance\.mjs[^`\r\n]+/
+  /node scripts\/supervised-mac-acceptance\.mjs --settings-smoke/
 );
 assert.doesNotMatch(prompt, /supervised-mac-acceptance\.mjs/);
+
+const settingsSmokePrompt = buildAgentPrompt({
+  task: "Run System Settings smoke acceptance",
+  supervisedGui: true,
+  supervisedMode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+for (const requiredText of [
+  "locked to mode settings_smoke",
+  SUPERVISED_SETTINGS_SMOKE_HELPER_COMMAND,
+  SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER,
+]) {
+  assert.match(
+    settingsSmokePrompt,
+    new RegExp(requiredText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  );
+}
 
 const remoteOptions = {
   task: "检查中文任务与登录流程",
@@ -2651,11 +2739,19 @@ function validReport(status = "passed", options = {}) {
 }
 
 function supervisedAcceptanceEventStream(overrides = {}) {
+  const mode = overrides.mode ?? SUPERVISED_ACCOUNT_MODE;
+  const settingsSmoke = mode === SUPERVISED_SETTINGS_SMOKE_MODE;
   const item = {
     id: "item-acceptance",
     type: "command_execution",
-    command: SUPERVISED_HELPER_COMMAND,
-    aggregated_output: `${SUPERVISED_SUCCESS_MARKER}\n`,
+    command: settingsSmoke
+      ? SUPERVISED_SETTINGS_SMOKE_HELPER_COMMAND
+      : SUPERVISED_HELPER_COMMAND,
+    aggregated_output: `${
+      settingsSmoke
+        ? SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER
+        : SUPERVISED_SUCCESS_MARKER
+    }\n`,
     exit_code: 0,
     status: "completed",
     ...overrides.item,
@@ -2672,6 +2768,10 @@ function supervisedAcceptanceEventStream(overrides = {}) {
 const supervisedAcceptanceEvents = supervisedAcceptanceEventStream();
 assert.equal(hasSupervisedAcceptanceEvent(supervisedAcceptanceEvents), true);
 assert.equal(
+  supervisedAcceptanceEventMode(supervisedAcceptanceEvents),
+  SUPERVISED_ACCOUNT_MODE
+);
+assert.equal(
   hasSupervisedAcceptanceEvent(
     supervisedAcceptanceEvents.replace(
       SUPERVISED_HELPER_COMMAND,
@@ -2680,6 +2780,32 @@ assert.equal(
   ),
   true
 );
+const supervisedSettingsSmokeEvents = supervisedAcceptanceEventStream({
+  mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+assert.equal(hasSupervisedAcceptanceEvent(supervisedSettingsSmokeEvents), true);
+assert.equal(
+  supervisedAcceptanceEventMode(supervisedSettingsSmokeEvents),
+  SUPERVISED_SETTINGS_SMOKE_MODE
+);
+for (const { mode, marker } of [
+  {
+    mode: SUPERVISED_ACCOUNT_MODE,
+    marker: SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER,
+  },
+  {
+    mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+    marker: SUPERVISED_SUCCESS_MARKER,
+  },
+]) {
+  assert.equal(
+    hasSupervisedAcceptanceEvent(
+      supervisedAcceptanceEventStream({ item: { aggregated_output: `${marker}\n` }, mode })
+    ),
+    false,
+    "the helper command and success marker must describe the same supervised mode"
+  );
+}
 const extraCommandEvent = `${JSON.stringify({
   type: "item.completed",
   item: {
@@ -2810,6 +2936,7 @@ function attestationArtifact(value) {
 }
 
 const acceptedAttestation = acceptedSupervisedAttestation();
+assert.equal(acceptedAttestation.mode, SUPERVISED_ACCOUNT_MODE);
 assert.equal(acceptedAttestation.commandId, SUPERVISED_COMMAND_ID);
 assert.equal(acceptedAttestation.commandSha256, SUPERVISED_COMMAND_SHA256);
 assert.equal(acceptedAttestation.ttyCapability, "unknown");
@@ -2826,6 +2953,48 @@ assert.deepEqual(
     expectedHead: EXPECTED_HEAD,
   }).errors,
   []
+);
+
+assert.deepEqual(
+  parseSupervisedAttestation(attestationArtifact(acceptedAttestation), {
+    nonce: SUPERVISED_TOKEN,
+    expectedHead: EXPECTED_HEAD,
+    mode: SUPERVISED_ACCOUNT_MODE,
+  }).errors,
+  []
+);
+const acceptedSettingsSmokeAttestationForParsing = acceptedSupervisedAttestation({
+  mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+assert.deepEqual(
+  parseSupervisedAttestation(
+    attestationArtifact(acceptedSettingsSmokeAttestationForParsing),
+    {
+      nonce: SUPERVISED_TOKEN,
+      expectedHead: EXPECTED_HEAD,
+      mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+    }
+  ).errors,
+  []
+);
+assert.ok(
+  parseSupervisedAttestation(
+    attestationArtifact(acceptedSettingsSmokeAttestationForParsing),
+    {
+      nonce: SUPERVISED_TOKEN,
+      expectedHead: EXPECTED_HEAD,
+      mode: SUPERVISED_ACCOUNT_MODE,
+    }
+  ).errors.some((error) => /mode does not match/i.test(error))
+);
+const missingModeAttestation = { ...acceptedAttestation };
+delete missingModeAttestation.mode;
+assert.ok(
+  parseSupervisedAttestation(attestationArtifact(missingModeAttestation), {
+    nonce: SUPERVISED_TOKEN,
+    expectedHead: EXPECTED_HEAD,
+    mode: SUPERVISED_ACCOUNT_MODE,
+  }).errors.some((error) => /keys are invalid/i.test(error))
 );
 
 const detailedTwoFaAttestation = createSupervisedAttestation({
@@ -3008,9 +3177,164 @@ try {
     processResults,
     EXPECTED_HEAD,
     "supervised_gui",
-    SUPERVISED_TOKEN
+    SUPERVISED_TOKEN,
+    SUPERVISED_ACCOUNT_MODE
   );
   assert.equal(supervised.status, "passed");
+  assert.equal(supervised.supervisedAcceptanceMode, SUPERVISED_ACCOUNT_MODE);
+
+  const supervisedSmokeDir = path.join(
+    artifactRoot,
+    "supervised-settings-smoke-passed"
+  );
+  const acceptedSettingsSmokeAttestation = acceptedSupervisedAttestation({
+    mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+  });
+  writeArtifacts(supervisedSmokeDir, {
+    "events.jsonl": supervisedSettingsSmokeEvents,
+    "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(acceptedSettingsSmokeAttestation),
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const supervisedSmoke = summarizeRun(
+    supervisedSmokeDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    SUPERVISED_SETTINGS_SMOKE_MODE
+  );
+  assert.equal(supervisedSmoke.status, "passed");
+  assert.equal(
+    supervisedSmoke.supervisedAcceptanceMode,
+    SUPERVISED_SETTINGS_SMOKE_MODE
+  );
+
+  const supervisedModeMismatchDir = path.join(
+    artifactRoot,
+    "supervised-command-attestation-mode-mismatch"
+  );
+  writeArtifacts(supervisedModeMismatchDir, {
+    "events.jsonl": supervisedSettingsSmokeEvents,
+    "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(acceptedAttestation),
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const supervisedModeMismatch = summarizeRun(
+    supervisedModeMismatchDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    SUPERVISED_ACCOUNT_MODE
+  );
+  assert.equal(supervisedModeMismatch.status, "failed");
+  for (const code of [
+    "supervised_command_mode_mismatch",
+    "supervised_acceptance_mode_mismatch",
+  ]) {
+    assert.ok(supervisedModeMismatch.errors.some((error) => error.code === code), code);
+  }
+
+  const mismatchedMarkerDir = path.join(artifactRoot, "supervised-marker-mode-mismatch");
+  writeArtifacts(mismatchedMarkerDir, {
+    "events.jsonl": supervisedAcceptanceEventStream({
+      mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+      item: { aggregated_output: `${SUPERVISED_SUCCESS_MARKER}\n` },
+    }),
+    "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(acceptedSettingsSmokeAttestation),
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const mismatchedMarker = summarizeRun(
+    mismatchedMarkerDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    SUPERVISED_SETTINGS_SMOKE_MODE
+  );
+  assert.equal(mismatchedMarker.status, "failed");
+  assert.ok(
+    mismatchedMarker.errors.some(
+      (error) => error.code === "supervised_acceptance_missing"
+    )
+  );
+
+  const attestationModeMismatchDir = path.join(
+    artifactRoot,
+    "supervised-attestation-mode-mismatch"
+  );
+  writeArtifacts(attestationModeMismatchDir, {
+    "events.jsonl": supervisedAcceptanceEvents,
+    "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(acceptedSettingsSmokeAttestation),
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const attestationModeMismatch = summarizeRun(
+    attestationModeMismatchDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    SUPERVISED_ACCOUNT_MODE
+  );
+  assert.equal(attestationModeMismatch.status, "failed");
+  assert.ok(
+    attestationModeMismatch.errors.some(
+      (error) => error.code === "invalid_supervised_attestation"
+    )
+  );
+
+  const missingAttestationModeDir = path.join(
+    artifactRoot,
+    "supervised-attestation-mode-missing"
+  );
+  writeArtifacts(missingAttestationModeDir, {
+    "events.jsonl": supervisedAcceptanceEvents,
+    "supervised-acceptance.txt": "accepted\n",
+    "supervised-attestation.json": attestationArtifact(missingModeAttestation),
+    "final.json": `${JSON.stringify(
+      validReport("passed", { executionMode: "supervised_gui" })
+    )}\n`,
+  });
+  const missingAttestationMode = summarizeRun(
+    missingAttestationModeDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    SUPERVISED_ACCOUNT_MODE
+  );
+  assert.equal(missingAttestationMode.status, "failed");
+  assert.ok(
+    missingAttestationMode.errors.some(
+      (error) => error.code === "invalid_supervised_attestation"
+    )
+  );
+
+  const missingExpectedSupervisedMode = summarizeRun(
+    supervisedDir,
+    processResults,
+    EXPECTED_HEAD,
+    "supervised_gui",
+    SUPERVISED_TOKEN,
+    ""
+  );
+  assert.equal(missingExpectedSupervisedMode.status, "failed");
+  assert.ok(
+    missingExpectedSupervisedMode.errors.some(
+      (error) => error.code === "invalid_supervised_mode"
+    )
+  );
   assert.deepEqual(supervised.errors, []);
   assert.equal(supervised.expectedExecutionMode, "supervised_gui");
   assert.equal(supervised.supervisedAcceptance, "accepted");
@@ -3255,12 +3579,23 @@ try {
 
 async function runSupervisedHelperHarness({
   args = [],
-  attestationFactory = () => acceptedSupervisedAttestation(),
+  attestationFactory,
+  trustedMode,
   timeoutMs = 1_000,
   useDefaultTimeout = false,
   outerDeadlineMs = 10_000,
   includeOuterDeadline = true,
 } = {}) {
+  const helperMode =
+    args.length === 1 && args[0] === "--settings-smoke"
+      ? SUPERVISED_SETTINGS_SMOKE_MODE
+      : SUPERVISED_ACCOUNT_MODE;
+  const effectiveTrustedMode =
+    trustedMode === undefined ? helperMode : trustedMode;
+  const effectiveAttestationFactory =
+    attestationFactory === undefined
+      ? () => acceptedSupervisedAttestation({ mode: helperMode })
+      : attestationFactory;
   const rootDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "apple-automation-supervised-helper-")
   );
@@ -3285,6 +3620,7 @@ async function runSupervisedHelperHarness({
           TMPDIR: tmpDir,
           APPLE_AUTOMATION_SUPERVISED_GUI: "1",
           APPLE_AUTOMATION_SUPERVISED_TOKEN: SUPERVISED_TOKEN,
+          [SUPERVISED_MODE_ENV_KEY]: effectiveTrustedMode,
           APPLE_AUTOMATION_EXPECTED_HEAD: EXPECTED_HEAD,
           APPLE_AUTOMATION_SUPERVISED_TRIGGER: triggerPath,
           APPLE_AUTOMATION_SUPERVISED_CANCEL: cancelPath,
@@ -3303,11 +3639,11 @@ async function runSupervisedHelperHarness({
           time += ms;
           if (
             !attestationWritten &&
-            attestationFactory &&
+            effectiveAttestationFactory &&
             fs.existsSync(triggerPath)
           ) {
             const trigger = JSON.parse(fs.readFileSync(triggerPath, "utf8"));
-            const attestation = attestationFactory(trigger);
+            const attestation = effectiveAttestationFactory(trigger);
             if (attestation !== null) {
               const source =
                 typeof attestation === "string"
@@ -3356,6 +3692,7 @@ const expectedTrigger = {
   version: 1,
   nonce: SUPERVISED_TOKEN,
   commandId: SUPERVISED_COMMAND_ID,
+  mode: SUPERVISED_ACCOUNT_MODE,
 };
 const expectedCancel = { version: 1, nonce: SUPERVISED_TOKEN };
 
@@ -3378,6 +3715,74 @@ assert.equal(supervisedHelper.triggerIsRegularFile, true);
 assert.equal(supervisedHelper.cancel, null);
 assert.deepEqual(supervisedHelper.tmpEntries, ["supervised-trigger.json"]);
 assert.deepEqual(supervisedHelper.controlEntries, ["supervised-attestation.json"]);
+
+const settingsSmokeHelper = await runSupervisedHelperHarness({
+  args: ["--settings-smoke"],
+});
+assert.equal(settingsSmokeHelper.error, null);
+assert.equal(settingsSmokeHelper.exitCode, 0);
+assert.equal(
+  settingsSmokeHelper.output,
+  `${SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER}\n`
+);
+assert.deepEqual(settingsSmokeHelper.trigger, {
+  ...expectedTrigger,
+  mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+
+const trustedModeMismatchHelper = await runSupervisedHelperHarness({
+  args: ["--settings-smoke"],
+  trustedMode: SUPERVISED_ACCOUNT_MODE,
+});
+assert.equal(trustedModeMismatchHelper.exitCode, null);
+assert.equal(trustedModeMismatchHelper.error?.exitCode, 77);
+assert.match(
+  trustedModeMismatchHelper.error?.message ?? "",
+  /helper mode is invalid/i
+);
+assert.equal(trustedModeMismatchHelper.trigger, null);
+
+const missingTrustedModeHelper = await runSupervisedHelperHarness({
+  args: ["--settings-smoke"],
+  trustedMode: "",
+});
+assert.equal(missingTrustedModeHelper.exitCode, null);
+assert.equal(missingTrustedModeHelper.error?.exitCode, 77);
+assert.match(
+  missingTrustedModeHelper.error?.message ?? "",
+  /supervised mode is unavailable/i
+);
+assert.equal(missingTrustedModeHelper.trigger, null);
+
+const attestationModeMismatchHelper = await runSupervisedHelperHarness({
+  args: ["--settings-smoke"],
+  attestationFactory: () => acceptedSupervisedAttestation(),
+});
+assert.equal(attestationModeMismatchHelper.exitCode, null);
+assert.equal(attestationModeMismatchHelper.error?.exitCode, 78);
+assert.match(
+  attestationModeMismatchHelper.error?.message ?? "",
+  /attestation is invalid/i
+);
+assert.deepEqual(attestationModeMismatchHelper.trigger, {
+  ...expectedTrigger,
+  mode: SUPERVISED_SETTINGS_SMOKE_MODE,
+});
+
+const missingAttestationModeHelper = await runSupervisedHelperHarness({
+  attestationFactory: () => {
+    const attestation = acceptedSupervisedAttestation();
+    delete attestation.mode;
+    return attestation;
+  },
+});
+assert.equal(missingAttestationModeHelper.exitCode, null);
+assert.equal(missingAttestationModeHelper.error?.exitCode, 78);
+assert.match(
+  missingAttestationModeHelper.error?.message ?? "",
+  /attestation is invalid/i
+);
+assert.deepEqual(missingAttestationModeHelper.trigger, expectedTrigger);
 
 const failedSupervisedHelper = await runSupervisedHelperHarness({
   attestationFactory: () =>
@@ -3500,12 +3905,17 @@ const helperWithArguments = await runSupervisedHelperHarness({
 });
 assert.equal(helperWithArguments.exitCode, null);
 assert.equal(helperWithArguments.error?.exitCode, 64);
-assert.match(helperWithArguments.error?.message ?? "", /takes no arguments/i);
+assert.match(helperWithArguments.error?.message ?? "", /arguments are invalid/i);
 assert.equal(helperWithArguments.trigger, null);
 assert.deepEqual(helperWithArguments.tmpEntries, []);
 
 for (const helperResult of [
   supervisedHelper,
+  settingsSmokeHelper,
+  trustedModeMismatchHelper,
+  missingTrustedModeHelper,
+  attestationModeMismatchHelper,
+  missingAttestationModeHelper,
   failedSupervisedHelper,
   cancelledSupervisedHelper,
   timeoutSupervisedHelper,
