@@ -3684,7 +3684,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_empty_element_bidi_continues_without_replaying_code(self):
+    def test_six_digit_empty_element_bidi_switches_once_to_verified_owner_sequence(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3707,21 +3707,71 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[(True, "")] * 6,
+            side_effect=[(True, ""), *[(True, digit) for digit in "123456"]],
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
+            [[("1", True)], [], [], [], [], []],
         )
         self.assertEqual([field.value for field in fields], list("123456"))
-        self.assertEqual(frame_actions.calls, [])
+        self.assertEqual(
+            len([call for call in frame_actions.calls if call[0] == "human_click"]),
+            1,
+        )
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
+        )
+        self.assertIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
+        self.assertIn(("press", FakeKeys.DELETE), frame_actions.calls)
         self.assertEqual(page.actions.calls, [])
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertEqual(steps.count("element_bidi_unverified_continue"), 6)
-        self.assertNotIn("sequence_focus_started", steps)
+        self.assertEqual(steps.count("element_bidi_unverified"), 1)
+        self.assertIn("sequence_focus_started", steps)
+        self.assertIn("sequence_cleared", steps)
+        self.assertIn("sequence_verified", steps)
         self.assertNotIn("sequence_failed", steps)
+
+    def test_six_digit_owner_sequence_rejects_empty_readback(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1"},
+                location={"x": 20 + index * 45, "y": 30},
+            )
+            for index in range(6)
+        ]
+        frame_actions = FakeActions(auto_advance_targets=fields)
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=frame_actions,
+        )
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            actions=FakeActions(coordinate_target=fields),
+        )
+        frame.parent = page
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=[(True, "")] * 7,
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA code sequence verification failed",
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual([field.inputs for field in fields], [[("1", True)], [], [], [], [], []])
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
+        )
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_failed", steps)
+        self.assertNotIn("sequence_verified", steps)
 
     def test_six_digit_mismatched_element_bidi_switches_once_to_owner_sequence(self):
         fields = [
