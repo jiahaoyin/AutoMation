@@ -39,6 +39,53 @@ from apple_account_flow import (
 )
 
 
+class BrowserStageRecorderTests(unittest.TestCase):
+    def test_records_only_a_fixed_stage_in_the_broker_report_directory(self):
+        configure = getattr(account_flow, "configure_browser_stage_file", None)
+        set_stage = getattr(account_flow, "set_browser_startup_stage", None)
+        self.assertIsNotNone(configure)
+        self.assertIsNotNone(set_stage)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            stage_path = report_dir / ".browser-stage.json"
+            with patch.dict(
+                os.environ,
+                {"APPLE_AUTOMATION_BROWSER_STAGE_FILE": str(stage_path)},
+                clear=False,
+            ):
+                configure(report_dir)
+                set_stage("email_wait")
+                self.assertEqual(
+                    json.loads(stage_path.read_text(encoding="utf-8")),
+                    {"version": 1, "stage": "email_wait"},
+                )
+                set_stage("password_wait")
+                self.assertEqual(
+                    json.loads(stage_path.read_text(encoding="utf-8")),
+                    {"version": 1, "stage": "password_wait"},
+                )
+                self.assertEqual(list(report_dir.glob("*.tmp-*")), [])
+                with self.assertRaisesRegex(RuntimeError, "stage is invalid"):
+                    set_stage("secret-value")
+
+        with patch.dict(os.environ, {}, clear=True):
+            configure(Path("unused"))
+
+    def test_rejects_a_stage_file_outside_the_report_directory(self):
+        configure = getattr(account_flow, "configure_browser_stage_file", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir) / "report"
+            report_dir.mkdir()
+            outside = Path(temp_dir) / ".browser-stage.json"
+            with patch.dict(
+                os.environ,
+                {"APPLE_AUTOMATION_BROWSER_STAGE_FILE": str(outside)},
+                clear=False,
+            ), self.assertRaisesRegex(RuntimeError, "path is invalid"):
+                configure(report_dir)
+
+
 class TwoFactorPreparationTests(unittest.TestCase):
     def test_accepts_only_two_factor_prepared_ack(self):
         with patch("apple_account_flow.emit") as emit_event, patch(

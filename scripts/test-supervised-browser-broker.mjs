@@ -160,6 +160,7 @@ assert.equal(
   paths.reportScreenshotsDir,
   path.posix.join(PRODUCTION_DIR, "browser-broker", "report", "screenshots")
 );
+assert.equal(paths.stagePath, path.posix.join(paths.reportDir, ".browser-stage.json"));
 assert.equal(paths.socketPath, `/tmp/apple-automation-${NONCE}.sock`);
 assert.ok(
   Buffer.byteLength(paths.socketPath, "utf8") < 104,
@@ -176,6 +177,14 @@ assert.throws(
     validateBrowserBrokerPathScope({
       ...paths,
       socketPath: `/tmp/apple-automation-${"f".repeat(32)}.sock`,
+    }),
+  /out of scope/i
+);
+assert.throws(
+  () =>
+    validateBrowserBrokerPathScope({
+      ...paths,
+      stagePath: "/private/outside/.browser-stage.json",
     }),
   /out of scope/i
 );
@@ -235,6 +244,7 @@ const brokerEnv = buildBrowserBrokerEnvironment(context, paths);
 assert.deepEqual(Object.keys(brokerEnv).sort(), [
   "APPLE_AUTOMATION_BROWSER_BROKER_MODE",
   "APPLE_AUTOMATION_BROWSER_BROKER_SOCKET",
+  "APPLE_AUTOMATION_BROWSER_STAGE_FILE",
   "APPLE_AUTOMATION_REPORT_ROOT",
   "BROWSER_PROFILE_MODE",
   "FIREFOX_PROFILE_DIR",
@@ -250,6 +260,7 @@ assert.deepEqual(Object.keys(brokerEnv).sort(), [
 assert.equal(brokerEnv.APPLE_AUTOMATION_REPORT_ROOT, paths.reportDir);
 assert.equal(brokerEnv.FIREFOX_PROFILE_DIR, paths.profileDir);
 assert.equal(brokerEnv.APPLE_AUTOMATION_BROWSER_BROKER_MODE, "1");
+assert.equal(brokerEnv.APPLE_AUTOMATION_BROWSER_STAGE_FILE, paths.stagePath);
 assert.equal("APPLE_ID" in brokerEnv, false);
 assert.equal("APPLE_PASSWORD" in brokerEnv, false);
 

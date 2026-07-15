@@ -117,8 +117,10 @@ BROWSER_STARTUP_STAGES = {
     "account_information",
 }
 browser_startup_stage = "not_started"
+browser_stage_file: Path | None = None
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
+BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
 BROKER_APPLE_ID_MAX_LENGTH = 320
 BROKER_PASSWORD_MAX_LENGTH = 1024
 BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
@@ -126,6 +128,54 @@ BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
 
 def emit(event: dict[str, Any]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def configure_browser_stage_file(report_dir: Path) -> None:
+    global browser_stage_file
+    configured = os.environ.get(BROWSER_STAGE_FILE_ENV, "").strip()
+    if not configured:
+        browser_stage_file = None
+        return
+    candidate = Path(configured).expanduser().resolve()
+    expected_parent = report_dir.expanduser().resolve()
+    if candidate.parent != expected_parent or candidate.name != ".browser-stage.json":
+        raise RuntimeError("browser stage file path is invalid")
+    browser_stage_file = candidate
+
+
+def set_browser_startup_stage(stage: str) -> None:
+    global browser_startup_stage
+    if stage not in BROWSER_STARTUP_STAGES:
+        raise RuntimeError("browser startup stage is invalid")
+    browser_startup_stage = stage
+    if browser_stage_file is None:
+        return
+    temporary = browser_stage_file.with_name(
+        f"{browser_stage_file.name}.tmp-{os.getpid()}"
+    )
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {"version": 1, "stage": stage},
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, browser_stage_file)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
@@ -1588,23 +1638,24 @@ def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
 
 
 def browser_flow(args: argparse.Namespace) -> int:
-    global browser_startup_stage
-    browser_startup_stage = "not_started"
+    report_dir = Path(args.report_dir)
+    configure_browser_stage_file(report_dir)
+    set_browser_startup_stage("not_started")
     apple_id, password = load_browser_credentials()
     broker_mode = browser_broker_mode_enabled()
     if broker_mode:
-        browser_startup_stage = "credentials_received"
+        set_browser_startup_stage("credentials_received")
         emit({"event": "status", "status": "broker_credentials_received"})
     sign_in_url = validate_apple_url(args.sign_in_url)
     if broker_mode:
-        browser_startup_stage = "url_validated"
+        set_browser_startup_stage("url_validated")
         emit({"event": "status", "status": "browser_url_validated"})
 
     if broker_mode:
-        browser_startup_stage = "runtime_importing"
+        set_browser_startup_stage("runtime_importing")
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
     if broker_mode:
-        browser_startup_stage = "runtime_imported"
+        set_browser_startup_stage("runtime_imported")
         emit({"event": "status", "status": "browser_runtime_imported"})
     opts = FirefoxOptions()
     if args.firefox:
@@ -1618,7 +1669,6 @@ def browser_flow(args: argparse.Namespace) -> int:
     if hasattr(opts, "set_human_algorithm"):
         opts.set_human_algorithm("windmouse")
 
-    report_dir = Path(args.report_dir)
     screenshots_dir = report_dir / "screenshots"
     success_screenshot_paths = (
         screenshots_dir / "02-ruyipage-after-login.png",
@@ -1627,18 +1677,18 @@ def browser_flow(args: argparse.Namespace) -> int:
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     if broker_mode:
-        browser_startup_stage = "browser_constructing"
+        set_browser_startup_stage("browser_constructing")
         emit({"event": "status", "status": "browser_constructing"})
     page = construct_firefox_page(FirefoxPage, opts)
     if broker_mode:
-        browser_startup_stage = "browser_ready"
+        set_browser_startup_stage("browser_ready")
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
-        browser_startup_stage = "login_navigation"
+        set_browser_startup_stage("login_navigation")
         page.get(sign_in_url)
         page.wait.doc_loaded(timeout=20)
         human_pause(900, 1800)
-        browser_startup_stage = "login_page_loaded"
+        set_browser_startup_stage("login_page_loaded")
 
         initial_state = detect_login_state(page)
         initial_state = settle_trust_state(
@@ -1648,19 +1698,19 @@ def browser_flow(args: argparse.Namespace) -> int:
         )
         if initial_state.get("error"):
             raise RuntimeError("login page reported an authentication error")
-        browser_startup_stage = "login_state_detected"
+        set_browser_startup_stage("login_state_detected")
         skipped_login = bool(initial_state.get("trusted"))
         skipped_2fa = skipped_login
         remember_checked: bool | None = None
 
         if not skipped_login:
             if initial_state.get("twofa"):
-                browser_startup_stage = "twofa_prepare"
+                set_browser_startup_stage("twofa_prepare")
                 request_two_factor_preparation()
             else:
-                browser_startup_stage = "email_wait"
+                set_browser_startup_stage("email_wait")
                 email_scope, email = wait_for_element(page, EMAIL_SELECTORS, timeout_s=45)
-                browser_startup_stage = "email_input"
+                set_browser_startup_stage("email_input")
                 input_and_verify(
                     email_scope,
                     email,
@@ -1669,7 +1719,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                     root_page=page,
                 )
-                browser_startup_stage = "email_submit"
+                set_browser_startup_stage("email_submit")
                 submit_element_with_enter(
                     page,
                     email_scope,
@@ -1677,13 +1727,13 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                 )
 
-                browser_startup_stage = "password_wait"
+                set_browser_startup_stage("password_wait")
                 password_scope, password_field = wait_for_element(
                     page,
                     PASSWORD_SELECTORS,
                     timeout_s=45,
                 )
-                browser_startup_stage = "password_input"
+                set_browser_startup_stage("password_input")
                 input_and_verify(
                     password_scope,
                     password_field,
@@ -1692,11 +1742,11 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                     root_page=page,
                 )
-                browser_startup_stage = "remember_account"
+                set_browser_startup_stage("remember_account")
                 remember_checked = ensure_remember_checked(page)
-                browser_startup_stage = "twofa_prepare"
+                set_browser_startup_stage("twofa_prepare")
                 request_two_factor_preparation()
-                browser_startup_stage = "password_submit"
+                set_browser_startup_stage("password_submit")
                 submit_element_with_enter(
                     page,
                     password_scope,
@@ -1706,14 +1756,14 @@ def browser_flow(args: argparse.Namespace) -> int:
                     max_ms=900,
                 )
 
-            browser_startup_stage = "twofa_page_wait"
+            set_browser_startup_stage("twofa_page_wait")
             login_state = wait_for_2fa_or_session(page)
             if login_state.get("trusted"):
                 skipped_2fa = True
-                browser_startup_stage = "signed_in"
+                set_browser_startup_stage("signed_in")
             else:
                 for generation in (1, 2):
-                    browser_startup_stage = "twofa_code_wait"
+                    set_browser_startup_stage("twofa_code_wait")
                     emit(
                         {
                             "event": "need_2fa",
@@ -1739,7 +1789,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                         read_command(),
                         generation,
                     )
-                    browser_startup_stage = "twofa_input"
+                    set_browser_startup_stage("twofa_input")
                     fields = wait_for_otp_target(page)
                     fill_security_code(page, code, Keys, fields=fields)
                     submitted = click_two_factor_submit(page)
@@ -1754,10 +1804,10 @@ def browser_flow(args: argparse.Namespace) -> int:
                             raise RuntimeError("2FA/login failed")
                         login_state = signed_in_state
                         continue
-                    browser_startup_stage = "signed_in"
+                    set_browser_startup_stage("signed_in")
                     break
         else:
-            browser_startup_stage = "signed_in"
+            set_browser_startup_stage("signed_in")
 
         screenshots["afterLogin"] = take_screenshot(
             page, success_screenshot_paths[0]
@@ -1765,7 +1815,7 @@ def browser_flow(args: argparse.Namespace) -> int:
         if screenshots["afterLogin"] is not None:
             generated_screenshot_paths.append(success_screenshot_paths[0])
 
-        browser_startup_stage = "account_information"
+        set_browser_startup_stage("account_information")
         page.get(ACCOUNT_INFORMATION_URL)
         page.wait.doc_loaded(timeout=20)
         human_pause(1200, 2400)
