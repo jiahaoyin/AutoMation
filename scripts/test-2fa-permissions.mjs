@@ -258,6 +258,14 @@ assert.ok(
 assert.match(popupSwiftSource, /AXIsProcessTrusted\(\)/);
 assert.match(popupSwiftSource, /AXIsProcessTrustedWithOptions/);
 assert.match(popupSwiftSource, /kAXTrustedCheckOptionPrompt/);
+const popupCodeDisplayMatcher = popupSwiftSource.match(
+  /func looksLikeCodeDisplay\(_ text: String\) -> Bool \{([\s\S]*?)\n\}/
+)?.[1] ?? "";
+assert.match(
+  popupCodeDisplayMatcher,
+  /\\d\(\?:\[\\s\\u00A0\\u2009\]\+\\d\)\{5\}/,
+  "the popup reader must accept a complete six-cell AX code display"
+);
 assert.match(
   popupSwiftSource,
   /struct AccessibilityCapabilityOutput:\s*Codable\s*\{[\s\S]*let capability:\s*String[\s\S]*\}/

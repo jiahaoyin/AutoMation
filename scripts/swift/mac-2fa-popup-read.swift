@@ -74,7 +74,7 @@ func extractSixDigits(_ text: String) -> String? {
 func looksLikeCodeDisplay(_ text: String) -> Bool {
     let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
     return t.range(
-        of: #"^(?:\d{3}[\s\u00A0\u2009]+\d{3}|\d{6})$"#,
+        of: #"^(?:\d{3}[\s\u00A0\u2009]+\d{3}|\d(?:[\s\u00A0\u2009]+\d){5}|\d{6})$"#,
         options: .regularExpression
     ) != nil
 }
