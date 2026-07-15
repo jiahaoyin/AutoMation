@@ -12,12 +12,12 @@ readonly SWIFTC_INSTALL_MAX_ATTEMPTS=120
 readonly SWIFTC_INSTALL_POLL_SECONDS=5
 SWIFTC_BIN=""
 readonly REQUIRED_SWIFT_HELPERS=(
-  "mac-settings-2fa-code"
   "mac-2fa-popup-read"
-  "mac-2fa-popup-ocr"
   "mac-2fa-click-allow"
 )
 readonly OPTIONAL_SWIFT_HELPERS=(
+  "mac-settings-2fa-code"
+  "mac-2fa-popup-ocr"
   "mac-settings-ax-fill"
 )
 readonly COMPILED_SWIFT_HELPERS=(
@@ -83,15 +83,20 @@ compile_swift_helper() {
   local temp_dir="$1"
   local helper="$2"
   shift 2
+  local failure_label="错误"
+  if [[ "${1:-}" == "--optional" ]]; then
+    failure_label="警告"
+    shift
+  fi
   local output_path="$temp_dir/${helper}"
 
   if ! "$SWIFTC_BIN" -O -o "$output_path" "scripts/swift/${helper}.swift" "$@" 2>/dev/null; then
-    echo "错误: Swift helper 编译失败: ${helper}。请确认 Apple Xcode Command Line Tools 已完成安装，然后重新运行 ./install.sh。" >&2
+    echo "${failure_label}: Swift helper 编译失败: ${helper}。请确认 Apple Xcode Command Line Tools 已完成安装，然后重新运行 ./install.sh。" >&2
     echo "诊断命令: /usr/bin/xcrun swiftc -O -o /tmp/${helper} scripts/swift/${helper}.swift $*" >&2
     return 1
   fi
   if ! swift_product_is_executable "$output_path"; then
-    echo "错误: Swift helper 编译产物无效: ${helper}" >&2
+    echo "${failure_label}: Swift helper 编译产物无效: ${helper}" >&2
     return 1
   fi
 }
@@ -105,28 +110,54 @@ compile_swift_helpers() {
     return 1
   }
 
-  if ! compile_swift_helper "$temp_dir" "mac-settings-2fa-code" \
+  if ! compile_swift_helper "$temp_dir" "mac-2fa-popup-read" \
       -framework ApplicationServices -framework AppKit ||
-    ! compile_swift_helper "$temp_dir" "mac-2fa-popup-read" \
-      -framework ApplicationServices -framework AppKit ||
-    ! compile_swift_helper "$temp_dir" "mac-2fa-popup-ocr" \
-      -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
-      -framework ScreenCaptureKit ||
     ! compile_swift_helper "$temp_dir" "mac-2fa-click-allow" \
       -framework ApplicationServices -framework AppKit; then
     cleanup_swift_helper_temp_dir "$temp_dir"
     return 1
   fi
 
-  local optional_ax_fill_compiled=0
-  if [[ -f "scripts/swift/mac-settings-ax-fill.swift" ]] &&
-    compile_swift_helper "$temp_dir" "mac-settings-ax-fill" \
-      -framework ApplicationServices -framework AppKit; then
-    optional_ax_fill_compiled=1
-  else
-    echo "警告: 可选 Swift helper 编译失败: mac-settings-ax-fill。跳过 Mac 系统设置登录辅助；./run.sh --skip-mac 浏览器流程仍可继续。" >&2
-    /bin/rm -f -- "$temp_dir/mac-settings-ax-fill"
-  fi
+  local optional_helper
+  local optional_compiled=()
+  for optional_helper in "${OPTIONAL_SWIFT_HELPERS[@]}"; do
+    case "$optional_helper" in
+      mac-settings-2fa-code)
+        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
+          compile_swift_helper "$temp_dir" "$optional_helper" \
+            --optional \
+            -framework ApplicationServices -framework AppKit; then
+          optional_compiled+=("$optional_helper")
+        else
+          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。跳过系统设置备用取码；网页登录、弹窗取码和手动兜底仍可继续。" >&2
+          /bin/rm -f -- "$temp_dir/${optional_helper}"
+        fi
+        ;;
+      mac-2fa-popup-ocr)
+        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
+          compile_swift_helper "$temp_dir" "$optional_helper" \
+            --optional \
+            -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
+            -framework ScreenCaptureKit; then
+          optional_compiled+=("$optional_helper")
+        else
+          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。跳过 Vision OCR 备用取码；AX 弹窗取码、系统设置取码和手动兜底仍可继续。" >&2
+          /bin/rm -f -- "$temp_dir/${optional_helper}"
+        fi
+        ;;
+      mac-settings-ax-fill)
+        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
+          compile_swift_helper "$temp_dir" "$optional_helper" \
+            --optional \
+            -framework ApplicationServices -framework AppKit; then
+          optional_compiled+=("$optional_helper")
+        else
+          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。跳过 Mac 系统设置登录辅助；./run.sh --skip-mac 浏览器流程仍可继续。" >&2
+          /bin/rm -f -- "$temp_dir/${optional_helper}"
+        fi
+        ;;
+    esac
+  done
 
   local helper
   for helper in "${REQUIRED_SWIFT_HELPERS[@]}"; do
@@ -137,15 +168,14 @@ compile_swift_helpers() {
     fi
     echo "✓ ${helper} 已编译"
   done
-  if [[ "$optional_ax_fill_compiled" == "1" ]]; then
-    helper="mac-settings-ax-fill"
+  for helper in "${optional_compiled[@]}"; do
     if ! /bin/mv -f -- "$temp_dir/${helper}" "scripts/bin/${helper}"; then
-      echo "错误: 无法替换 Swift helper: ${helper}" >&2
-      cleanup_swift_helper_temp_dir "$temp_dir"
-      return 1
+      echo "警告: 可选 Swift helper 无法替换: ${helper}。保留旧 helper，安装继续。" >&2
+      /bin/rm -f -- "$temp_dir/${helper}"
+      continue
     fi
     echo "✓ ${helper} 已编译"
-  fi
+  done
 
   if ! /bin/rmdir "$temp_dir"; then
     echo "错误: 无法清理 Swift helper 临时目录" >&2

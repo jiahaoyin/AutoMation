@@ -1465,6 +1465,32 @@ for (const requiredText of [
     `supervised remote script must include: ${requiredText}`
   );
 }
+const supervisedHelperFailureIndex = supervisedRemoteScript.indexOf(
+  'write_supervised_attestation failed 1 false HELPER_COMPILE_FAILED "$EXPECTED_HEAD"'
+);
+assert.ok(supervisedHelperFailureIndex > 0, "supervised helper hard-failure marker is required");
+for (const helper of ["mac-2fa-popup-read", "mac-2fa-click-allow"]) {
+  const helperCompileIndex = supervisedRemoteScript.indexOf(
+    `"$SUPERVISED_HELPER_DIR/${helper}" scripts/swift/${helper}.swift`
+  );
+  assert.ok(
+    helperCompileIndex > 0 && helperCompileIndex < supervisedHelperFailureIndex,
+    `${helper} must be compiled before the supervised hard-failure marker`
+  );
+}
+for (const helper of ["mac-settings-2fa-code", "mac-2fa-popup-ocr"]) {
+  const helperCompileIndex = supervisedRemoteScript.indexOf(
+    `scripts/swift/${helper}.swift`
+  );
+  assert.ok(
+    helperCompileIndex > supervisedHelperFailureIndex,
+    `${helper} must be compiled only after the supervised hard-failure block`
+  );
+  assert.ok(
+    supervisedRemoteScript.includes(`"$SUPERVISED_HELPER_DIR/${helper}" || true`),
+    `${helper} must be best-effort in supervised setup`
+  );
+}
 for (const forbiddenText of [
   "supervised-terminal.status",
   "supervised-terminal.trigger",

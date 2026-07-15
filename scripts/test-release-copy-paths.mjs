@@ -41,6 +41,12 @@ const repositoryTextExtensions = new Set([
   ".yml",
 ]);
 
+function readonlyArray(source, name) {
+  const match = source.match(new RegExp(`readonly ${name}=\\(\\r?\\n([\\s\\S]*?)\\r?\\n\\)`));
+  assert.ok(match, `${name} array is required`);
+  return [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
+}
+
 function collectRepositoryTextFiles(directory) {
   const files = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -192,15 +198,26 @@ assert.doesNotMatch(
   "the 2FA audit module must not retain the unused screenshot-path API"
 );
 const requiredSwiftHelpers = [
-  "mac-settings-2fa-code",
   "mac-2fa-popup-read",
-  "mac-2fa-popup-ocr",
   "mac-2fa-click-allow",
 ];
-const compiledSwiftHelpers = [
+const optionalSwiftHelpers = [
+  "mac-settings-2fa-code",
+  "mac-2fa-popup-ocr",
   "mac-settings-ax-fill",
-  ...requiredSwiftHelpers,
 ];
+const compiledSwiftHelpers = [
+  ...requiredSwiftHelpers,
+  ...optionalSwiftHelpers,
+];
+assert.deepEqual(readonlyArray(rootInstallSh, "REQUIRED_SWIFT_HELPERS"), requiredSwiftHelpers);
+assert.deepEqual(readonlyArray(rootInstallSh, "OPTIONAL_SWIFT_HELPERS"), optionalSwiftHelpers);
+for (const helper of optionalSwiftHelpers) {
+  assert.ok(
+    COPY_PATHS.includes(`scripts/swift/${helper}.swift`),
+    `${helper} source must be copied into the release package`
+  );
+}
 const installContractViolations = [];
 if (generatedInstallSh !== rootInstallSh) {
   installContractViolations.push("generated install.sh differs from repository install.sh");
@@ -290,11 +307,18 @@ assert.deepEqual(
   `install contract is incomplete:\n${installContractViolations.join("\n")}`
 );
 
-for (const helper of compiledSwiftHelpers) {
+for (const helper of requiredSwiftHelpers) {
   assert.match(
     generatedInstallSh,
     new RegExp(`compile_swift_helper "\\$temp_dir" "${helper}"`),
     `${helper} must be compiled by the release install script`
+  );
+}
+for (const helper of optionalSwiftHelpers) {
+  assert.match(
+    generatedInstallSh,
+    new RegExp(`"${helper}"`),
+    `${helper} must be listed as an optional Swift helper`
   );
 }
 assert.doesNotMatch(generatedInstallSh, /cliclick/);

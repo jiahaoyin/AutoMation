@@ -25,10 +25,9 @@ for (const source of [rootInstall, generatedInstall]) {
   assert.match(source, /\/usr\/bin\/xcrun --find swiftc/);
   assert.match(source, /"\$swiftc_path" --version/);
   assert.doesNotMatch(source, /command -v swiftc/);
-  assert.match(
-    source,
-    /mac-2fa-popup-ocr[\s\S]*?-framework ScreenCaptureKit[\s\S]*?mac-2fa-click-allow/
-  );
+  assert.match(source, /"mac-2fa-click-allow"/);
+  assert.match(source, /"mac-2fa-popup-ocr"[\s\S]*?-framework ScreenCaptureKit/);
+  assert.match(source, /readonly OPTIONAL_SWIFT_HELPERS=/);
   assert.match(source, /\/usr\/bin\/xcode-select --install/);
   assert.match(source, /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/);
   assert.match(source, /readonly SWIFTC_INSTALL_POLL_SECONDS=[1-9][0-9]*/);
@@ -151,6 +150,12 @@ function shellFunction(source, name) {
   return source.match(new RegExp(`${name}\\(\\) \\{[\\s\\S]*?\\n\\}`))?.[0] ?? null;
 }
 
+function readonlyArray(source, name) {
+  const match = source.match(new RegExp(`readonly ${name}=\\(\\r?\\n([\\s\\S]*?)\\r?\\n\\)`));
+  assert.ok(match, `${name} array is required`);
+  return [...match[1].matchAll(/"([^"]+)"/g)].map((entry) => entry[1]);
+}
+
 function removeTreeOneFileAtATime(directory) {
   if (!fs.existsSync(directory)) return;
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -228,7 +233,16 @@ const swiftHelpers = [
   "mac-2fa-popup-ocr",
   "mac-2fa-click-allow",
 ];
-const requiredSwiftHelpers = swiftHelpers.slice(1);
+const requiredSwiftHelpers = ["mac-2fa-popup-read", "mac-2fa-click-allow"];
+const optionalSwiftHelpers = swiftHelpers.filter(
+  (helper) => !requiredSwiftHelpers.includes(helper)
+);
+assert.deepEqual(readonlyArray(rootInstall, "REQUIRED_SWIFT_HELPERS"), requiredSwiftHelpers);
+assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), [
+  "mac-settings-2fa-code",
+  "mac-2fa-popup-ocr",
+  "mac-settings-ax-fill",
+]);
 const installCompileFunctions = [
   "swift_product_is_executable",
   "cleanup_swift_helper_temp_dir",
@@ -237,7 +251,8 @@ const installCompileFunctions = [
 ]
   .map((name) => shellFunction(rootInstall, name))
   .filter(Boolean)
-  .join("\n");
+  .join("\n")
+  .replaceAll("/bin/mv", "fake_mv");
 assert.match(installCompileFunctions, /compile_swift_helpers\(\)/);
 
 function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "") {
@@ -252,10 +267,14 @@ function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "")
     fs.writeFileSync(path.join(sourceDir, `${helper}.swift`), "// fixture\n");
     fs.writeFileSync(path.join(binaryDir, helper), `old-${helper}\n`, { mode: 0o755 });
   }
+  if (failureMode === "missing-source" && failingHelper) {
+    fs.unlinkSync(path.join(sourceDir, `${failingHelper}.swift`));
+  }
 
   const script = [
     `cd ${bashQuote(toBashPath(fixtureDir))}`,
     `REQUIRED_SWIFT_HELPERS=(${requiredSwiftHelpers.map(bashQuote).join(" ")})`,
+    `OPTIONAL_SWIFT_HELPERS=(${optionalSwiftHelpers.map(bashQuote).join(" ")})`,
     `COMPILED_SWIFT_HELPERS=(${swiftHelpers.map(bashQuote).join(" ")})`,
     `FAILURE_MODE=${bashQuote(failureMode)}`,
     `FAILING_HELPER=${bashQuote(failingHelper)}`,
@@ -284,6 +303,21 @@ function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "")
     '    /bin/chmod 0755 "$output"',
     "  fi",
     "  return 0",
+    "}",
+    "fake_mv() {",
+    "  local positional=()",
+    "  while (( $# )); do",
+    '    case "$1" in',
+    "      --) shift ;;",
+    "      -*) shift ;;",
+    '      *) positional+=("$1"); shift ;;',
+    "    esac",
+    "  done",
+    '  local src="${positional[0]-}"',
+    '  local dst="${positional[1]-}"',
+    '  local helper="$(basename "$dst")"',
+    '  if [[ "$helper" == "$FAILING_HELPER" && "$FAILURE_MODE" == "move" ]]; then return 1; fi',
+    '  command mv -f -- "$src" "$dst"',
     "}",
     installCompileFunctions,
     "swift_product_is_executable() {",
@@ -322,28 +356,40 @@ for (const failingHelper of requiredSwiftHelpers) {
   }
 }
 
-for (const failureMode of ["compile", "incomplete", "0644"]) {
-  const outcome = runSwiftInstallCompileHarness(failureMode, "mac-settings-ax-fill");
-  assert.equal(
-    outcome.result.status,
-    0,
-    `optional mac-settings-ax-fill ${failureMode} failure blocked install`
-  );
-  assert.equal(outcome.precreatedOutput, false, "optional helper output must not be pre-created");
-  assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
-  assert.equal(outcome.binaries["mac-settings-ax-fill"], "old-mac-settings-ax-fill\n");
-  for (const helper of requiredSwiftHelpers) {
-    assert.equal(outcome.binaries[helper], `new-${helper}\n`);
+for (const optionalHelper of optionalSwiftHelpers) {
+  for (const failureMode of ["compile", "incomplete", "0644", "move", "missing-source"]) {
+    const outcome = runSwiftInstallCompileHarness(failureMode, optionalHelper);
+    assert.equal(
+      outcome.result.status,
+      0,
+      `optional ${optionalHelper} ${failureMode} failure blocked install`
+    );
+    assert.equal(outcome.precreatedOutput, false, "optional helper output must not be pre-created");
+    assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
+    assert.equal(outcome.binaries[optionalHelper], `old-${optionalHelper}\n`);
+    for (const helper of requiredSwiftHelpers) {
+      assert.equal(outcome.binaries[helper], `new-${helper}\n`);
+    }
   }
 }
 
-for (const failureMode of ["compile", "incomplete"]) {
-  const outcome = runSwiftInstallCompileHarness(failureMode, "mac-2fa-popup-read");
-  assert.notEqual(outcome.result.status, 0, `${failureMode} compiler product was accepted`);
-  assert.equal(outcome.precreatedOutput, false, `${failureMode} output was pre-created`);
-  assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
-  for (const helper of swiftHelpers) {
-    assert.equal(outcome.binaries[helper], `old-${helper}\n`, `${helper} old binary changed`);
+for (const failingHelper of requiredSwiftHelpers) {
+  for (const failureMode of ["compile", "incomplete"]) {
+    const outcome = runSwiftInstallCompileHarness(failureMode, failingHelper);
+    assert.notEqual(outcome.result.status, 0, `${failingHelper} ${failureMode} compiler product was accepted`);
+    assert.equal(outcome.precreatedOutput, false, `${failureMode} output was pre-created`);
+    assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
+    for (const helper of swiftHelpers) {
+      assert.equal(outcome.binaries[helper], `old-${helper}\n`, `${helper} old binary changed`);
+    }
+  }
+  const moveOutcome = runSwiftInstallCompileHarness("move", failingHelper);
+  assert.notEqual(moveOutcome.result.status, 0, `${failingHelper} move failure did not block install`);
+  assert.equal(moveOutcome.precreatedOutput, false, `${failingHelper} move output was pre-created`);
+  assert.deepEqual(moveOutcome.binaryEntries, [...swiftHelpers].sort());
+  assert.equal(moveOutcome.binaries[failingHelper], `old-${failingHelper}\n`);
+  for (const helper of optionalSwiftHelpers) {
+    assert.equal(moveOutcome.binaries[helper], `old-${helper}\n`);
   }
 }
 
