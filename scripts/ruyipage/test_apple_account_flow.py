@@ -685,6 +685,46 @@ class InputTests(unittest.TestCase):
 
         self.assertEqual(frame.actions.calls, [])
 
+    def test_frame_input_does_not_fall_back_after_navigation_leaves_apple(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        field = FakeElement()
+        frame = FakePage(
+            {"css:input": [field]},
+            state={"href": auth_url},
+        )
+
+        class NavigateAfterRootTyping(FakeActions):
+            def perform(self):
+                had_pending_text = self.pending_text is not None
+                result = super().perform()
+                if had_pending_text:
+                    frame.state["href"] = "https://evil.example/sign-in"
+                return result
+
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=NavigateAfterRootTyping(
+                apply_typed_text=False,
+                coordinate_target=field,
+            ),
+        )
+        frame.parent = root
+
+        with self.assertRaisesRegex(RuntimeError, "Apple HTTPS"):
+            input_and_verify(
+                frame,
+                field,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=root,
+            )
+
+        self.assertEqual(frame.actions.calls, [])
+
     def test_top_level_input_rechecks_target_state_and_focus_before_keys(self):
         class StaleStates:
             @property
@@ -3594,7 +3634,10 @@ class FrameLocationTests(unittest.TestCase):
         page = FakePage(
             {"css:iframe": [iframe]},
             frames=[frame],
-            actions=FakeActions(coordinate_target=password),
+            actions=FakeActions(
+                apply_typed_text=False,
+                coordinate_target=password,
+            ),
         )
         frame.parent = page
 
@@ -3617,7 +3660,7 @@ class FrameLocationTests(unittest.TestCase):
             root_page=page,
         )
 
-        self.assertIs(action_scope, page)
+        self.assertIs(action_scope, frame)
         self.assertEqual(password.value, "test-password")
 
     def test_finds_credential_element_inside_top_level_shadow_root(self):

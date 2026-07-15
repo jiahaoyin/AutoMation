@@ -536,6 +536,18 @@ def human_click(
     scope.actions.human_click(element).perform()
 
 
+def focus_keyboard_target_in_owner_context(
+    scope: Any,
+    field: Any,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    validate_apple_scope(scope)
+    human_click(scope, field, pause=pause)
+    pause(180, 480)
+    require_keyboard_target_ready(field)
+    return scope
+
+
 def focus_keyboard_target(
     root_page: Any,
     scope: Any,
@@ -562,10 +574,7 @@ def focus_keyboard_target(
 
     # A shadow-root target can reject a top-context coordinate focus even when
     # its owning frame context can target the same element directly.
-    human_click(scope, field, pause=pause)
-    pause(180, 480)
-    require_keyboard_target_ready(field)
-    return scope
+    return focus_keyboard_target_in_owner_context(scope, field, pause=pause)
 
 
 def input_and_verify(
@@ -587,6 +596,21 @@ def input_and_verify(
     readable, actual = read_element_input_value(field)
     if readable and str(actual) == value:
         return action_scope
+
+    if scope is not root_page and action_scope is root_page:
+        action_scope = focus_keyboard_target_in_owner_context(
+            scope,
+            field,
+            pause=pause,
+        )
+        action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+        pause(120, 320)
+        require_keyboard_target_ready(field)
+        action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
+        pause(280, 680)
+        readable, actual = read_element_input_value(field)
+        if readable and str(actual) == value:
+            return action_scope
 
     if action_scope is scope:
         pause(180, 420)
