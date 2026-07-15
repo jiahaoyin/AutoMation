@@ -1,5 +1,6 @@
 import { strict as assert } from "node:assert";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 
@@ -597,6 +598,15 @@ assert.match(
 assert.doesNotMatch(
   remoteScript,
   /(?:\/bin\/rm|\brm\b|\/usr\/bin\/unlink).*browser_broker_(?:socket|gate)/
+);
+const bridgeSource = fs.readFileSync(
+  new URL("./supervised-terminal-bridge.mjs", import.meta.url),
+  "utf8"
+);
+assert.match(
+  bridgeSource,
+  /!productionStage\.startsWith\("browser_failure:"\)[\s\S]*\["broker_connect", "broker_connect_timeout", "broker_eof", "broker_io"\]\.includes/,
+  "an explicit page failure stage must take precedence over a later broker EOF"
 );
 
 console.log("supervised browser broker contract: ok");
