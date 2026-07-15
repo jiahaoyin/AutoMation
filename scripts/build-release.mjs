@@ -47,6 +47,7 @@ export const COPY_PATHS = [
   "scripts/lib/firefox-runtime.js",
   "scripts/lib/mac-settings-login.js",
   "scripts/lib/account-browser-flow.js",
+  "scripts/lib/flow-audit.js",
   "scripts/lib/credentials.js",
   "scripts/lib/prompt.js",
   "scripts/lib/ruyipage-backend-runner.js",

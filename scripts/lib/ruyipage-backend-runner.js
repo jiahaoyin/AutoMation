@@ -1118,6 +1118,7 @@ async function runRuyiPageBackend({
     const safeEventNames = new Set([
       "ready",
       "status",
+      "diagnostic",
       "prepare_2fa",
       "need_2fa",
       "warning",

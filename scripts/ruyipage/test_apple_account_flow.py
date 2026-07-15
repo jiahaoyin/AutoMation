@@ -85,6 +85,25 @@ class BrowserStageRecorderTests(unittest.TestCase):
             ), self.assertRaisesRegex(RuntimeError, "path is invalid"):
                 configure(report_dir)
 
+    def test_emits_fixed_browser_stage_events(self):
+        set_stage = getattr(account_flow, "set_browser_startup_stage", None)
+        self.assertIsNotNone(set_stage)
+        with patch("apple_account_flow.emit") as emit_event:
+            set_stage("email_wait")
+            set_stage("password_input")
+
+        self.assertEqual(
+            [call.args[0] for call in emit_event.call_args_list],
+            [
+                {"event": "status", "status": "browser_stage", "stage": "email_wait"},
+                {
+                    "event": "status",
+                    "status": "browser_stage",
+                    "stage": "password_input",
+                },
+            ],
+        )
+
 
 class TwoFactorPreparationTests(unittest.TestCase):
     def test_accepts_only_two_factor_prepared_ack(self):
@@ -437,6 +456,35 @@ class InputTests(unittest.TestCase):
         self.assertLessEqual(actions.calls[5][2], 180)
         self.assertEqual(actions.calls[6], ("perform",))
         self.assertEqual(field.value, "person@example.com")
+
+    def test_input_progress_records_route_and_verification_without_value(self):
+        field = FakeElement()
+        scope = FakePage({"css:input": [field]})
+
+        with patch("apple_account_flow.emit") as emit_event:
+            input_and_verify(
+                scope,
+                field,
+                "person@example.com",
+                "email",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        events = [call.args[0] for call in emit_event.call_args_list]
+        self.assertEqual(
+            [event["step"] for event in events],
+            [
+                "focus_started",
+                "focus_confirmed",
+                "keyboard_cleared",
+                "keyboard_typed",
+                "value_matched",
+                "verified",
+            ],
+        )
+        self.assertEqual(events[1]["route"], "root")
+        self.assertNotIn("person@example.com", json.dumps(events))
 
     def test_input_falls_back_to_element_bidi_input_when_actions_lose_focus(self):
         field = FakeElement()
@@ -1604,7 +1652,7 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertEqual(read_command.call_count, 3)
         self.assertEqual(filled_codes, ["111111", "222222"])
         self.assertEqual(
-            [event["event"] for event in events],
+            [event["event"] for event in events if event["event"] != "status"],
             ["ready", "prepare_2fa", "need_2fa", "need_2fa", "result"],
         )
         self.assertEqual(
@@ -2073,15 +2121,31 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             self.fail("run_cli() is missing")
 
         stderr = io.StringIO()
-        with patch(
-            "apple_account_flow.main",
-            side_effect=RuntimeError(f"BiDi navigation failed {self.SECRET_SENTINEL}"),
-        ), patch("apple_account_flow.emit") as emit_event, redirect_stderr(stderr):
-            return_code = run_cli([])
+        account_flow.configure_diagnostic_secrets(self.SECRET_SENTINEL)
+        try:
+            with patch(
+                "apple_account_flow.main",
+                side_effect=RuntimeError(
+                    f"BiDi navigation failed {self.SECRET_SENTINEL} 123 456 "
+                    "https://user:pw@example.invalid/path?token=secret#otp"
+                ),
+            ), patch("apple_account_flow.emit") as emit_event, redirect_stderr(stderr):
+                return_code = run_cli([])
+        finally:
+            account_flow.configure_diagnostic_secrets()
 
         self.assertEqual(return_code, 1)
+        events = [call.args[0] for call in emit_event.call_args_list]
+        self.assertEqual(events[0]["event"], "diagnostic")
+        self.assertEqual(events[0]["kind"], "python_exception")
+        self.assertEqual(events[0]["errorType"], "RuntimeError")
+        self.assertIn("RuntimeError", events[0]["traceback"])
+        self.assertNotIn(self.SECRET_SENTINEL, json.dumps(events[0]))
+        self.assertNotIn("123 456", json.dumps(events[0]))
+        self.assertNotIn("user:pw@", json.dumps(events[0]))
+        self.assertNotIn("?token=secret", json.dumps(events[0]))
         self.assertEqual(
-            emit_event.call_args.args[0],
+            events[-1],
             {
                 "event": "result",
                 "success": False,
@@ -3687,6 +3751,21 @@ class RememberAccountTests(unittest.TestCase):
         self.assertTrue(ensure_remember_checked(page, pause=lambda *_: None))
         self.assertEqual(field.clicks, 0)
         self.assertIn(("human_click", field), page.actions.calls)
+
+    def test_remember_progress_records_checked_state(self):
+        field = FakeElement()
+        field.on_click = lambda: setattr(field.states, "is_checked", True)
+        page = FakePage({"css:#remember-me": [field]})
+
+        with patch("apple_account_flow.emit") as emit_event:
+            self.assertTrue(ensure_remember_checked(page, pause=lambda *_: None))
+
+        events = [call.args[0] for call in emit_event.call_args_list]
+        self.assertEqual(
+            [event["step"] for event in events],
+            ["search_started", "target_found", "click_started", "checked"],
+        )
+        self.assertEqual(events[2]["route"], "root")
 
     def test_clicks_hidden_custom_checkbox_label_through_root_context(self):
         checkbox = FakeElement(displayed=False)

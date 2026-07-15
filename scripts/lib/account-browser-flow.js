@@ -157,6 +157,92 @@ function sanitizeReadyMode(mode) {
   return ALLOWED_READY_MODES.has(normalized) ? normalized : "browser";
 }
 
+function writeFlowAudit(flowAudit, source, event, details = {}) {
+  if (!flowAudit) return;
+  try {
+    flowAudit.write(source, event, details);
+  } catch {
+    console.warn("[报告] 统一诊断日志写入失败");
+  }
+}
+
+function writeFlowAuditError(flowAudit, source, event, error, details = {}) {
+  if (!flowAudit) return;
+  try {
+    flowAudit.writeError(source, event, error, details);
+  } catch {
+    console.warn("[报告] 统一诊断日志写入失败");
+  }
+}
+
+function auditRuyiPageEvent(flowAudit, event) {
+  if (!event || typeof event !== "object") {
+    writeFlowAudit(flowAudit, "ruyipage", "invalid_event");
+    return;
+  }
+  if (event.event === "ready") {
+    writeFlowAudit(flowAudit, "ruyipage", "ready", {
+      mode: sanitizeReadyMode(event.mode),
+    });
+    return;
+  }
+  if (event.event === "status") {
+    const details = {};
+    for (const key of [
+      "status",
+      "stage",
+      "failureStage",
+      "field",
+      "step",
+      "route",
+    ]) {
+      if (typeof event[key] === "string") details[key] = event[key];
+    }
+    if (Number.isInteger(event.attempt)) details.attempt = event.attempt;
+    writeFlowAudit(flowAudit, "ruyipage", "status", details);
+    return;
+  }
+  if (event.event === "diagnostic") {
+    writeFlowAudit(flowAudit, "ruyipage", "diagnostic", {
+      kind: event.kind,
+      failureStage: event.failureStage,
+      errorType: event.errorType,
+      message: event.message,
+      traceback: event.traceback,
+    });
+    return;
+  }
+  if (event.event === "prepare_2fa") {
+    writeFlowAudit(flowAudit, "ruyipage", "prepare_2fa");
+    return;
+  }
+  if (event.event === "need_2fa") {
+    writeFlowAudit(flowAudit, "ruyipage", "need_2fa", {
+      generation: event.generation,
+      state: event.state,
+    });
+    return;
+  }
+  if (event.event === "warning") {
+    writeFlowAudit(flowAudit, "ruyipage", "warning", {
+      message: event.message,
+    });
+    return;
+  }
+  if (event.event === "result") {
+    writeFlowAudit(flowAudit, "ruyipage", "result", {
+      success: event.success === true,
+      failureStage: event.failureStage,
+      accountHomeConfirmed:
+        event.browserLogin?.accountHomeConfirmed === true,
+    });
+    return;
+  }
+  writeFlowAudit(flowAudit, "ruyipage", "unknown_event", {
+    event: event.event,
+  });
+}
+
 function reportTwoFactorStatus(event) {
   if (!event || typeof event !== "object") return;
 
@@ -209,9 +295,13 @@ function reportTwoFactorStatus(event) {
  * @param {object} params
  * @param {{ appleId: string, password: string }} params.creds
  * @param {string} params.reportDir
+ * @param {object} [params.flowAudit]
  * @param {object} [runtime]
  */
-export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {}) {
+export async function runAccountBrowserPhase(
+  { creds, reportDir, flowAudit = null },
+  runtime = {}
+) {
   const getEnvironmentSummary =
     runtime.getBrowserEnvironmentSummary ?? getBrowserEnvironmentSummary;
   const checkAccessibility = runtime.isAccessibilityGranted ?? isAccessibilityGranted;
@@ -220,12 +310,25 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
 
   const summary = getEnvironmentSummary();
+  writeFlowAudit(flowAudit, "account_browser", "environment", {
+    backend: summary.backend,
+    backendReason: summary.backendReason,
+    warnings: summary.warnings,
+  });
   console.log(`[Firefox] 浏览器后端: ${summary.backend} (${summary.backendReason})`);
   for (const _warning of summary.warnings) {
     console.log(FIXED_ENVIRONMENT_WARNING);
   }
 
-  const axOk = await checkAccessibility().catch(() => false);
+  let axOk = false;
+  try {
+    axOk = await checkAccessibility();
+  } catch (error) {
+    writeFlowAuditError(flowAudit, "account_browser", "accessibility_check_failed", error);
+  }
+  writeFlowAudit(flowAudit, "account_browser", "accessibility", {
+    granted: axOk,
+  });
   if (!axOk) {
     console.warn("[2FA] 警告: 辅助功能未授权，macOS 2FA 弹窗取码可能失败");
   }
@@ -234,19 +337,28 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
     timeoutMs:
       process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1" ? 130_000 : 240_000,
     reportDir,
-    onStatus: reportTwoFactorStatus,
+    onStatus(event) {
+      writeFlowAudit(flowAudit, "two_factor", "status", event);
+      reportTwoFactorStatus(event);
+    },
+    onAudit(entry) {
+      writeFlowAudit(flowAudit, "two_factor", "audit", entry);
+    },
   });
   let result;
   let runError = null;
   let reportedFailureStage = null;
   try {
     console.log("[ruyipage] status:runtime_resolving");
+    writeFlowAudit(flowAudit, "ruyipage", "runtime_resolving");
     const runner = createRunner();
     console.log("[ruyipage] status:backend_starting");
+    writeFlowAudit(flowAudit, "ruyipage", "backend_starting");
     result = await runner.run({
       creds,
       reportDir,
       onEvent(event) {
+        auditRuyiPageEvent(flowAudit, event);
         if (event.event === "ready") {
           console.log(`[ruyipage] 浏览器已就绪 (${sanitizeReadyMode(event.mode)})`);
         } else if (
@@ -281,19 +393,45 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
         }
       },
       async prepare2FA() {
-        await collector.prepare();
+        writeFlowAudit(flowAudit, "two_factor", "prepare_started");
+        try {
+          await collector.prepare();
+        } catch (error) {
+          writeFlowAuditError(flowAudit, "two_factor", "prepare_failed", error);
+          throw error;
+        }
+        writeFlowAudit(flowAudit, "two_factor", "prepare_completed");
       },
       async get2FACode(request) {
-        return collector.getCode(request);
+        writeFlowAudit(flowAudit, "two_factor", "code_requested", request);
+        let code;
+        try {
+          code = await collector.getCode(request);
+        } catch (error) {
+          writeFlowAuditError(flowAudit, "two_factor", "code_provider_failed", error, {
+            generation: request?.generation,
+          });
+          throw error;
+        }
+        flowAudit?.addSecrets?.([code]);
+        writeFlowAudit(flowAudit, "two_factor", "code_acquired", {
+          generation: request?.generation,
+        });
+        return code;
       },
     });
   } catch (error) {
     runError = error;
+    writeFlowAuditError(flowAudit, "account_browser", "runner_failed", error, {
+      failureCode: classifyBrowserRunFailure(error),
+    });
     throw annotateBrowserRunFailure(error);
   } finally {
     try {
       await collector.dispose();
+      writeFlowAudit(flowAudit, "two_factor", "collector_disposed");
     } catch (error) {
+      writeFlowAuditError(flowAudit, "two_factor", "collector_dispose_failed", error);
       if (!runError) throw annotateBrowserRunFailure(error, "collector_cleanup");
       console.warn("[2FA] collector cleanup failed");
     }
@@ -304,10 +442,13 @@ export async function runAccountBrowserPhase({ creds, reportDir }, runtime = {})
     result.browserLogin.backend !== "ruyipage" ||
     result.browserLogin.accountHomeConfirmed !== true
   ) {
+    writeFlowAudit(flowAudit, "account_browser", "account_home_unconfirmed");
     throw annotateBrowserRunFailure(
       new Error("ruyipage backend did not confirm the authenticated Apple account home")
     );
   }
+
+  writeFlowAudit(flowAudit, "account_browser", "account_home_confirmed");
 
   return {
     browserLogin: result.browserLogin,

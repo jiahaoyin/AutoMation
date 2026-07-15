@@ -135,6 +135,62 @@ async function runTwoGenerationForwardingTest() {
   assert.deepEqual(harness.codeRequests, requests);
 }
 
+async function runFlowAuditForwardingTest() {
+  const entries = [];
+  const secrets = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, error, details = {}) {
+      entries.push({ source, event, details, error });
+    },
+    addSecrets(values) {
+      secrets.push(...values);
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent?.({
+      event: "status",
+      status: "input_progress",
+      field: "password",
+      step: "owner_fallback_started",
+      route: "owner",
+    });
+    await options.onEvent?.({
+      event: "diagnostic",
+      kind: "python_exception",
+      failureStage: "password_input",
+      errorType: "RuntimeError",
+      message: "synthetic failure",
+      traceback: "Traceback (most recent call last)",
+    });
+    await options.prepare2FA();
+    await options.get2FACode({ generation: 1, rejectPrevious: false });
+    return successfulResult();
+  });
+
+  await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+
+  assert.deepEqual(secrets, ["123456"]);
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.step === "owner_fallback_started"
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "diagnostic" &&
+        entry.details.failureStage === "password_input"
+    )
+  );
+}
+
 async function runSupervisedCollectorTimeoutTest() {
   const previous = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
   const supervised = createRuntime(async () => successfulResult());
@@ -550,6 +606,7 @@ if (focusedTest) {
 
 await runTwoFactorLifecycleTest();
 await runTwoGenerationForwardingTest();
+await runFlowAuditForwardingTest();
 await runSupervisedCollectorTimeoutTest();
 await runFixedTwoFactorStatusPromptsTest();
 await runFailureDisposalTest();

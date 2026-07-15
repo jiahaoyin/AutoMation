@@ -17,6 +17,7 @@ import re
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable, TextIO
 from urllib.parse import urljoin, urlsplit
@@ -118,6 +119,7 @@ BROWSER_STARTUP_STAGES = {
 }
 browser_startup_stage = "not_started"
 browser_stage_file: Path | None = None
+diagnostic_secrets: list[str] = []
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
@@ -128,6 +130,98 @@ BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
 
 def emit(event: dict[str, Any]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def configure_diagnostic_secrets(*values: str) -> None:
+    diagnostic_secrets.clear()
+    diagnostic_secrets.extend(
+        sorted({str(value) for value in values if str(value)}, key=len, reverse=True)
+    )
+
+
+def add_diagnostic_secret(value: str) -> None:
+    normalized = str(value)
+    if not normalized or normalized in diagnostic_secrets:
+        return
+    diagnostic_secrets.append(normalized)
+    diagnostic_secrets.sort(key=len, reverse=True)
+
+
+def sanitize_diagnostic_text(value: Any) -> str:
+    text = str(value)
+    for secret in diagnostic_secrets:
+        text = text.replace(secret, "[REDACTED_SECRET]")
+
+    def redact_url(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            parsed = urlsplit(candidate)
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            sanitized = f"{parsed.scheme}://{host}{parsed.path}"
+            if parsed.query or parsed.fragment:
+                sanitized += "?[REDACTED_QUERY]"
+            return sanitized
+        except (TypeError, ValueError):
+            base = re.split(r"[?#]", candidate, maxsplit=1)[0]
+            base = re.sub(r"^(https?://)[^/@\s]+@", r"\1", base, flags=re.IGNORECASE)
+            return base + ("?[REDACTED_QUERY]" if re.search(r"[?#]", candidate) else "")
+
+    text = re.sub(
+        r"\bhttps?://[^\s\"'<>?#]+(?:\?[^\s\"'<>#]*)?(?:#[^\s\"'<>]*)?",
+        redact_url,
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[REDACTED_EMAIL]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b[0-9]{3}[\s-]+[0-9]{3}\b", "[REDACTED_OTP]", text)
+    text = re.sub(r"\b[0-9]{6}\b", "[REDACTED_OTP]", text)
+    return text[: 64 * 1024] + ("\n[TRUNCATED]" if len(text) > 64 * 1024 else "")
+
+
+def emit_input_progress(label: str, step: str, route: str | None = None) -> None:
+    field = {
+        "email": "email",
+        "password": "password",
+        "2FA code": "twofa_code",
+        "2FA digit": "twofa_digit",
+    }.get(label, "unknown")
+    event = {
+        "event": "status",
+        "status": "input_progress",
+        "field": field,
+        "step": step,
+    }
+    if route in ("root", "owner"):
+        event["route"] = route
+    emit(event)
+
+
+def emit_remember_progress(step: str, route: str | None = None) -> None:
+    event = {
+        "event": "status",
+        "status": "remember_progress",
+        "step": step,
+    }
+    if route in ("root", "owner"):
+        event["route"] = route
+    emit(event)
+
+
+def classify_input_read(readable: bool, actual: Any, expected: str) -> str:
+    if not readable:
+        return "unreadable"
+    if str(actual) == expected:
+        return "matched"
+    if str(actual) == "":
+        return "empty"
+    return "mismatch"
 
 
 def configure_browser_stage_file(report_dir: Path) -> None:
@@ -148,6 +242,7 @@ def set_browser_startup_stage(stage: str) -> None:
     if stage not in BROWSER_STARTUP_STAGES:
         raise RuntimeError("browser startup stage is invalid")
     browser_startup_stage = stage
+    emit({"event": "status", "status": "browser_stage", "stage": stage})
     if browser_stage_file is None:
         return
     temporary = browser_stage_file.with_name(
@@ -495,6 +590,17 @@ def require_keyboard_target_ready(element: Any) -> None:
         raise RuntimeError("ruyiPage input target focus was not confirmed")
 
 
+def require_password_compatibility_target(scope: Any, element: Any) -> None:
+    validate_apple_scope(scope)
+    require_keyboard_target_ready(element)
+    try:
+        input_type = str(element.attr("type") or "").strip().lower()
+    except Exception as exc:
+        raise RuntimeError("password input target type was not confirmed") from exc
+    if input_type != "password":
+        raise RuntimeError("password input target type was not confirmed")
+
+
 def element_uses_rendered_text(element: Any) -> bool:
     try:
         input_type = str(element.attr("type") or "").strip().lower()
@@ -594,50 +700,92 @@ def input_and_verify(
     root_page: Any | None = None,
 ) -> Any:
     root_page = root_page or scope
-    saw_readable_mismatch = False
-    action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
-    action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
-    pause(120, 320)
-    require_keyboard_target_ready(field)
-    action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
-    pause(280, 680)
-    readable, actual = read_element_input_value(field)
-    if readable and str(actual) == value:
-        return action_scope
-    saw_readable_mismatch = readable
-
-    if scope is not root_page and action_scope is root_page:
-        action_scope = focus_keyboard_target_in_owner_context(
-            scope,
-            field,
-            pause=pause,
-        )
+    saw_readable_nonempty_mismatch = False
+    action_scope: Any | None = None
+    route: str | None = None
+    readable = False
+    actual: Any = None
+    try:
+        emit_input_progress(label, "focus_started")
+        action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
+        route = "root" if action_scope is root_page else "owner"
+        emit_input_progress(label, "focus_confirmed", route)
         action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+        emit_input_progress(label, "keyboard_cleared", route)
         pause(120, 320)
         require_keyboard_target_ready(field)
         action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
+        emit_input_progress(label, "keyboard_typed", route)
         pause(280, 680)
         readable, actual = read_element_input_value(field)
+        read_state = classify_input_read(readable, actual, value)
+        emit_input_progress(label, f"value_{read_state}", route)
         if readable and str(actual) == value:
+            emit_input_progress(label, "verified", route)
             return action_scope
-        saw_readable_mismatch = saw_readable_mismatch or readable
+        saw_readable_nonempty_mismatch = readable and str(actual) != ""
 
-    if action_scope is scope:
-        pause(180, 420)
-        require_keyboard_target_ready(field)
-        action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
-        pause(120, 320)
-        require_keyboard_target_ready(field)
-        field.input(value, clear=False)
-        pause(280, 680)
-        readable, actual = read_element_input_value(field)
-    if not readable:
-        if label == "password" and not saw_readable_mismatch:
+        if scope is not root_page and action_scope is root_page:
+            emit_input_progress(label, "owner_fallback_started", "owner")
+            action_scope = focus_keyboard_target_in_owner_context(
+                scope,
+                field,
+                pause=pause,
+            )
+            route = "owner"
+            emit_input_progress(label, "owner_focus_confirmed", route)
+            action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+            emit_input_progress(label, "owner_keyboard_cleared", route)
+            pause(120, 320)
+            require_keyboard_target_ready(field)
+            action_scope.actions.type(value, interval=random.randint(55, 145)).perform()
+            emit_input_progress(label, "owner_keyboard_typed", route)
+            pause(280, 680)
+            readable, actual = read_element_input_value(field)
+            read_state = classify_input_read(readable, actual, value)
+            emit_input_progress(label, f"owner_value_{read_state}", route)
+            if readable and str(actual) == value:
+                emit_input_progress(label, "verified", route)
+                return action_scope
+            saw_readable_nonempty_mismatch = (
+                saw_readable_nonempty_mismatch
+                or (readable and str(actual) != "")
+            )
+
+        if action_scope is scope:
+            emit_input_progress(label, "element_fallback_started", route)
+            pause(180, 420)
+            require_keyboard_target_ready(field)
+            action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+            pause(120, 320)
+            require_keyboard_target_ready(field)
+            field.input(value, clear=False)
+            emit_input_progress(label, "element_typed", route)
+            pause(280, 680)
+            readable, actual = read_element_input_value(field)
+            read_state = classify_input_read(readable, actual, value)
+            emit_input_progress(label, f"element_value_{read_state}", route)
+        if not readable:
+            if label == "password" and not saw_readable_nonempty_mismatch:
+                require_password_compatibility_target(scope, field)
+                emit_input_progress(label, "password_compatibility_continue", route)
+                return action_scope
+            raise RuntimeError(f"{label} input verification failed")
+        if (
+            label == "password"
+            and str(actual) == ""
+            and not saw_readable_nonempty_mismatch
+        ):
+            require_password_compatibility_target(scope, field)
+            emit_input_progress(label, "password_compatibility_continue", route)
             return action_scope
-        raise RuntimeError(f"{label} input verification failed")
-    if str(actual) != value:
-        raise RuntimeError(f"{label} input verification failed")
-    return action_scope
+        if str(actual) != value:
+            raise RuntimeError(f"{label} input verification failed")
+        emit_input_progress(label, "verified", route)
+        return action_scope
+    except Exception:
+        emit_input_progress(label, "failed", route)
+        raise
 
 
 def submit_with_enter(
@@ -678,16 +826,19 @@ def ensure_remember_checked(
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
     state_found = False
+    emit_remember_progress("search_started")
     for state_selector, click_selectors in REMEMBER_SELECTORS:
-        for scope in iter_page_scopes(page):
-            fields = safe_elements(scope, state_selector)
+        for scope, root in current_element_search_roots(page):
+            fields = safe_elements(root, state_selector, timeout_s=0)
             if not fields:
                 continue
             state_found = True
             field = fields[0]
             validate_apple_scope(scope)
+            emit_remember_progress("target_found")
             try:
                 if field.states.is_checked:
+                    emit_remember_progress("already_checked")
                     return True
             except Exception:
                 pass
@@ -697,32 +848,60 @@ def ensure_remember_checked(
                 for click_selector in click_selectors:
                     candidates = [
                         element
-                        for element in safe_elements(scope, click_selector)
+                        for element in safe_elements(
+                            root,
+                            click_selector,
+                            timeout_s=0,
+                        )
                         if element_is_interactable(element)
                     ]
                     if candidates:
                         click_target = candidates[0]
                         break
             if click_target is None:
+                emit_remember_progress("target_not_interactable")
                 continue
 
             if scope is page:
                 action_scope = scope
                 action_target = click_target
+                route = "root"
             else:
                 action_scope = page
                 action_target = prepare_frame_input_target(page, scope, click_target)
+                route = "root"
+            emit_remember_progress("click_started", route)
             human_click(action_scope, action_target, pause=pause)
             pause(180, 420)
             try:
                 checked = bool(field.states.is_checked)
             except Exception:
                 checked = False
+            if checked:
+                emit_remember_progress("checked", route)
+            if (
+                not checked
+                and scope is not page
+                and element_is_interactable(click_target)
+            ):
+                validate_apple_scope(scope)
+                emit_remember_progress("owner_fallback_started", "owner")
+                human_click(scope, click_target, pause=pause)
+                pause(180, 420)
+                try:
+                    checked = bool(field.states.is_checked)
+                except Exception:
+                    checked = False
+                if checked:
+                    emit_remember_progress("checked", "owner")
             if not checked:
+                emit_remember_progress("failed", route)
                 raise RuntimeError("remember-account checkbox did not become checked")
             return True
     if state_found:
+        emit_remember_progress("failed")
         raise RuntimeError("remember-account checkbox is not interactable")
+    emit_remember_progress("not_found")
     raise RuntimeError("remember-account checkbox not found")
 
 
@@ -1700,6 +1879,7 @@ def browser_flow(args: argparse.Namespace) -> int:
     configure_browser_stage_file(report_dir)
     set_browser_startup_stage("not_started")
     apple_id, password = load_browser_credentials()
+    configure_diagnostic_secrets(apple_id, password)
     broker_mode = browser_broker_mode_enabled()
     if broker_mode:
         set_browser_startup_stage("credentials_received")
@@ -1852,6 +2032,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                         read_command(),
                         generation,
                     )
+                    add_diagnostic_secret(code)
                     set_browser_startup_stage("twofa_input")
                     fields = wait_for_otp_target(page)
                     fill_security_code(page, code, Keys, fields=fields)
@@ -1975,7 +2156,17 @@ def main(argv: list[str]) -> int:
 def run_cli(argv: list[str]) -> int:
     try:
         return main(argv)
-    except Exception:
+    except Exception as error:
+        emit(
+            {
+                "event": "diagnostic",
+                "kind": "python_exception",
+                "failureStage": browser_startup_stage,
+                "errorType": sanitize_diagnostic_text(type(error).__name__),
+                "message": sanitize_diagnostic_text(error),
+                "traceback": sanitize_diagnostic_text(traceback.format_exc()),
+            }
+        )
         result = {
             "event": "result",
             "success": False,
@@ -1986,6 +2177,8 @@ def run_cli(argv: list[str]) -> int:
         emit(result)
         print(TOP_LEVEL_FAILURE_REASON, file=sys.stderr, flush=True)
         return 1
+    finally:
+        configure_diagnostic_secrets()
 
 
 if __name__ == "__main__":

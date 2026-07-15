@@ -24,6 +24,7 @@ import {
   writeReport,
 } from "./lib/report.js";
 import { ensureEnvironment } from "./lib/env-setup.js";
+import { createFlowAudit } from "./lib/flow-audit.js";
 
 const skipMac = process.argv.includes("--skip-mac");
 const skipBrowser = process.argv.includes("--skip-browser");
@@ -46,6 +47,18 @@ async function main() {
 
   const creds = await confirmOrPromptAppleCredentials();
   const reportDir = createReportDir("apple-id-flow");
+  const flowAudit = createFlowAudit(reportDir, {
+    secrets: [creds.appleId, creds.password],
+    onWriteFailure() {
+      console.warn("[报告] 统一诊断日志写入失败");
+    },
+  });
+  console.log(`[报告] 统一诊断日志: ${flowAudit.path}`);
+  flowAudit.write("flow", "started", {
+    skipMac,
+    skipBrowser,
+    skipSetup,
+  });
   const report = {
     runAt: new Date().toISOString(),
     appleId: maskAppleId(creds.appleId),
@@ -56,8 +69,11 @@ async function main() {
   try {
     if (!skipMac) {
       try {
+        flowAudit.write("mac_settings", "started");
         report.phases.macSettings = await runMacSettingsLoginPhase(creds);
+        flowAudit.write("mac_settings", "completed", { success: true });
       } catch (e) {
+        flowAudit.writeError("mac_settings", "failed", e);
         report.phases.macSettings = {
           success: false,
           error: "Mac Settings phase failed",
@@ -67,15 +83,22 @@ async function main() {
     } else {
       console.log("[Mac 设置] --skip-mac：跳过系统设置登录阶段\n");
       report.phases.macSettings = { skipped: true };
+      flowAudit.write("mac_settings", "skipped");
     }
 
     if (!skipBrowser) {
       try {
+        flowAudit.write("account_browser", "started");
         report.phases.accountBrowser = await runAccountBrowserPhase({
           creds,
           reportDir,
+          flowAudit,
         });
+        flowAudit.write("account_browser", "completed", { success: true });
       } catch (e) {
+        flowAudit.writeError("account_browser", "failed", e, {
+          failureCode: readBrowserFailureCode(e),
+        });
         report.phases.accountBrowser = {
           success: false,
           error: "Account browser phase failed",
@@ -86,23 +109,33 @@ async function main() {
     } else {
       console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
       report.phases.accountBrowser = { skipped: true };
+      flowAudit.write("account_browser", "skipped");
     }
 
     reportFile = writeReport(reportDir, report);
+    flowAudit.write("flow", "report_written", { file: "report.json" });
     if (report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true) {
       writeAccountHomeAcceptanceMarker();
       console.log("[验收] REAL_ACCOUNT_HOME_CONFIRMED");
     }
+    flowAudit.write("flow", "completed", { success: true });
   } catch (e) {
     report.error = "Apple ID flow failed";
     reportFile = writeReport(reportDir, report);
+    flowAudit.writeError("flow", "failed", e, {
+      reportFile: "report.json",
+    });
     console.error(`\n[报告] 失败报告已保存: ${reportFile}`);
+    console.error(`[报告] 统一诊断日志: ${flowAudit.path}`);
     throw e;
+  } finally {
+    flowAudit.close();
   }
 
   console.log("\n═══════════════════════════════════════════");
   console.log(" 完成");
   console.log(` 报告: ${reportFile}`);
+  console.log(` 日志: ${flowAudit.path}`);
   console.log(` 截图: ${reportDir}/screenshots/`);
   console.log("═══════════════════════════════════════════\n");
 }
