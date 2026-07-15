@@ -587,6 +587,7 @@ def input_and_verify(
     root_page: Any | None = None,
 ) -> Any:
     root_page = root_page or scope
+    saw_readable_mismatch = False
     action_scope = focus_keyboard_target(root_page, scope, field, pause=pause)
     action_scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
     pause(120, 320)
@@ -596,6 +597,7 @@ def input_and_verify(
     readable, actual = read_element_input_value(field)
     if readable and str(actual) == value:
         return action_scope
+    saw_readable_mismatch = readable
 
     if scope is not root_page and action_scope is root_page:
         action_scope = focus_keyboard_target_in_owner_context(
@@ -611,6 +613,7 @@ def input_and_verify(
         readable, actual = read_element_input_value(field)
         if readable and str(actual) == value:
             return action_scope
+        saw_readable_mismatch = saw_readable_mismatch or readable
 
     if action_scope is scope:
         pause(180, 420)
@@ -621,7 +624,11 @@ def input_and_verify(
         field.input(value, clear=False)
         pause(280, 680)
         readable, actual = read_element_input_value(field)
-    if not readable or str(actual) != value:
+    if not readable:
+        if label == "password" and not saw_readable_mismatch:
+            return action_scope
+        raise RuntimeError(f"{label} input verification failed")
+    if str(actual) != value:
         raise RuntimeError(f"{label} input verification failed")
     return action_scope
 

@@ -792,6 +792,64 @@ class InputTests(unittest.TestCase):
                 pause=lambda *_: None,
             )
 
+    def test_password_accepts_historical_unreadable_value_after_trusted_input(self):
+        password = FakeElement(attrs={"type": "password"})
+        page = FakePage({"css:input[type='password']": [password]})
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            return_value=(False, None),
+        ):
+            action_scope = input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(password.value, "secret")
+        self.assertEqual(password.inputs, [("secret", False)])
+
+    def test_non_password_input_still_rejects_an_unreadable_value(self):
+        email = FakeElement(attrs={"type": "email"})
+        page = FakePage({"css:input[type='email']": [email]})
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            return_value=(False, None),
+        ), self.assertRaisesRegex(RuntimeError, "email input verification failed"):
+            input_and_verify(
+                page,
+                email,
+                "person@example.com",
+                "email",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+    def test_password_still_rejects_a_readable_wrong_value(self):
+        password = FakeElement(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [password]},
+            actions=FakeActions(apply_typed_text=False),
+        )
+
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=[(True, "wrong"), (False, None)],
+        ), self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                page,
+                password,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
     def test_password_submit_refocuses_field_after_remember_checkbox_click(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin?state=test"
         password = FakeElement(
