@@ -131,13 +131,13 @@ async function runTwoFactorLifecycleTest() {
   assert.equal(result.browserLogin.backend, "ruyipage");
 }
 
-async function runProductionSettingsOnlyConfigurationTest() {
+async function runProductionPopupPrimaryConfigurationTest() {
   const harness = createRuntime(async (options) => {
     await options.prepare2FA();
     assert.equal(
       await options.get2FACode({ generation: 1, rejectPrevious: false }),
       "123456",
-      "the Settings-only collector code must be forwarded to ruyiPage"
+      "the popup-primary collector code must be forwarded to ruyiPage"
     );
     return successfulResult();
   });
@@ -147,13 +147,11 @@ async function runProductionSettingsOnlyConfigurationTest() {
     {
       settingsOnly: harness.collectorOptions?.settingsOnly,
       settingsFallback: harness.collectorOptions?.settingsFallback,
-      settingsFallbackAfterMs: harness.collectorOptions?.settingsFallbackAfterMs,
       manualFallback: harness.collectorOptions?.manualFallback,
     },
     {
-      settingsOnly: true,
+      settingsOnly: false,
       settingsFallback: true,
-      settingsFallbackAfterMs: 0,
       manualFallback: true,
     }
   );
@@ -1030,7 +1028,7 @@ const focusedTests = {
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
   "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
-  "settings-only": runProductionSettingsOnlyConfigurationTest,
+  "popup-primary": runProductionPopupPrimaryConfigurationTest,
   generations: runTwoGenerationForwardingTest,
   "flow-audit-forwarding": runFlowAuditForwardingTest,
   "password-bidi-progress": runPasswordBidiInputProgressTest,
@@ -1055,7 +1053,7 @@ if (focusedTest) {
 }
 
 await runTwoFactorLifecycleTest();
-await runProductionSettingsOnlyConfigurationTest();
+await runProductionPopupPrimaryConfigurationTest();
 await runTwoGenerationForwardingTest();
 await runFlowAuditForwardingTest();
 await runPasswordBidiInputProgressTest();

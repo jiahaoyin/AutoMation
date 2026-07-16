@@ -824,7 +824,7 @@ async function auditLabelsUseExplicitAllowListsTest() {
 }
 
 async function popupReaderReceivesCodeOnlyOptionsTest() {
-  const { clock, native, collector } = createHarness();
+  const { clock, native, collector, audits } = createHarness();
   await collector.prepare();
   native.setPopup("343434");
   await clock.advance(20);
@@ -837,6 +837,16 @@ async function popupReaderReceivesCodeOnlyOptionsTest() {
   assert.equal("requireFormattedRaw" in options, false);
   assert.equal("debugDir" in options, false);
   assert.equal("raw" in options, false);
+  assert.equal(
+    audits.some(
+      (entry) =>
+        entry.phase === "popup_code_read" &&
+        entry.outcome === "candidate_ready" &&
+        entry.reason === "code_available"
+    ),
+    true,
+    "a verified popup candidate must not be logged as an empty OCR result"
+  );
   await collector.dispose();
 }
 

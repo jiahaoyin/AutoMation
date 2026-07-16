@@ -228,6 +228,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "close_pending",
     "probe_or_provider_failed",
     "ax_ocr_no_code",
+    "code_available",
     "ocr_permission_missing",
     "settings_start_failed",
     "settings_timeout",
@@ -1065,7 +1066,9 @@ export function createMac2FACollector(options = {}) {
       outcome: code ? "candidate_ready" : "unavailable",
       capability: result?.capability ?? "available",
       reason:
-        result?.capability === "permission_missing"
+        code
+          ? "code_available"
+          : result?.capability === "permission_missing"
           ? "ocr_permission_missing"
           : result?.capability === "accessibility_missing"
             ? "accessibility_denied"

@@ -484,9 +484,11 @@ export async function runAccountBrowserPhase(
   const collector = createCollector({
     timeoutMs: TWO_FACTOR_TIMEOUT_MS,
     reportDir,
-    settingsOnly: true,
+    // A browser-triggered Apple verification dialog is the primary source.
+    // System Settings stays armed as a delayed fallback instead of suppressing
+    // a code that the popup watcher has already verified.
+    settingsOnly: false,
     settingsFallback: true,
-    settingsFallbackAfterMs: 0,
     manualFallback: true,
     onStatus(event) {
       writeFlowAudit(flowAudit, "two_factor", "status", event);
