@@ -70,7 +70,7 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 3. 检查 Node 18+；缺失时下载 nodejs.org 官方二进制到 `.runtime/node`。
 4. 使用已检测或刚安装的 Python 创建 `.runtime/ruyipage-venv`。
 5. 在隔离虚拟环境中执行 `python -m pip install --upgrade ruyiPage==1.2.45`。
-6. 检查 Firefox、编译 Swift AX/2FA helper，并引导辅助功能授权。Screen Recording 是 Vision OCR 的可选能力，缺失不导致安装失败。
+6. 检查 Firefox，编译 Swift AX/2FA helper，并在安装结束前确认辅助功能和 Vision OCR 的「屏幕与系统音频录制」权限。OCR helper 或该权限缺失时安装失败，避免后续在 2FA 页面才发现无法自动取码。
 
 项目显式使用本机 Firefox，因此不额外执行 `python -m ruyipage install` 下载配套 runtime。
 日常执行 `./run.sh` 不使用提权安装入口，也不会重复请求管理员密码。
@@ -91,7 +91,7 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 - 浏览器 Accessibility 使用 `mac-2fa-popup-read.swift` 的 `AXIsProcessTrusted()` / `AXIsProcessTrustedWithOptions(...)` 原生 preflight/prompt；旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 仍要求实际运行主体获得「辅助功能」；本地通常是 Terminal / iTerm，受监督验收会明确提示 Codex / 原生 helper，但不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有 macOS 系统设置登录阶段需要「自动化」权限，即允许当前终端 App 控制“系统设置”。
-- Vision OCR 使用「屏幕与系统音频录制」权限。未授权时固定降级为 `permission_missing`，AX、系统设置和隐藏手输仍工作；首次实际 OCR 回退会请求一次原生授权。若 macOS 要求重新启动运行主体，请按提示重新打开当前终端或 Codex。普通运行复用 `install.sh` 写入 `scripts/bin` 的 native helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径被 macOS 当作新的 TCC 客户端。
+- Vision OCR 使用「屏幕与系统音频录制」权限，并且是自动取码的必需条件。`install.sh` 编译 exact helper 后立刻请求并确认；`run.sh` 在 Firefox 启动前再次校验。未授权时固定输出 `screen_recording_missing` 并停止，账号密码不会提交。若 macOS 要求重新启动运行主体，请按提示重新打开当前终端或 Codex。普通运行复用 `install.sh` 写入 `scripts/bin` 的 native helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径被 macOS 当作新的 TCC 客户端。
 
 切换账号时优先使用 `fresh`，避免身份和 Cookie 串用。
 
@@ -139,7 +139,7 @@ npm run test:account-browser-flow
 6. popup 早到时被 watcher 缓存；第一次 `getCode` 活跃后，系统设置在 `preparedAt + 8s` 门槛自动进入双重认证取码，两个来源仍同时有效。
 7. Settings 最多两次、每次不超过 60 秒且中间退避 5 秒；从第一次 acquisition 起 90 秒后的 TTY 手输不回显，240 秒后所有来源停止并完成 runner cleanup。
 8. Allow 自动最多两次；未确认后提示人工点击，监听和 Settings 不停止。
-9. 全窗 OCR 只接受 `NNN NNN`；中心连续六位需同一 window ID 两次独立捕获一致。Screen Recording 缺失时安装和 AX/Settings/手输路径不失败。
+9. 全窗 OCR 只接受 `NNN NNN`；中心连续六位需同一 window ID 两次独立捕获一致。Screen Recording 缺失时安装和 Firefox 登录都不启动，直到授权完成。
 10. 验证码只写入已识别的单框或六格控件。已验证的 popup 码不能因原生弹窗关闭失败而被扣留；关闭属于尽力清理并保留固定状态。
 11. 第一代只有在可信 Apple 页明确 OTP 错误/无效/过期时才可被第二代替换；旧码不再复用。captcha、锁定和未知错误停止。
 12. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
@@ -164,7 +164,7 @@ Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试�
 | 记住账号控件失败 | 查看固定失败报告与脱敏状态；敏感认证页不保存全页截图，不得改成盲点或盲输 |
 | 2FA 输入框未识别 | 查看固定失败原因和 `2fa-audit.jsonl` 的安全状态，补充 ruyiPage selector；不得改成无焦点输入 |
 | macOS 取码超时 | 确认系统设置已登录同账号、终端已获辅助功能；按 audit 的固定 phase/reason 区分 popup、OCR、settings、manual。`--skip-mac` 不需要 Automation |
-| OCR capability 为 `permission_missing` | AX/Settings/手输可继续；如需 OCR，在下次运行前授权「屏幕与系统音频录制」并重开终端 |
+| OCR capability 为 `permission_missing` | 这是硬门槛；在「隐私与安全性 -> 屏幕与系统音频录制」授权实际运行主体，按 macOS 提示重开终端或 Codex 后重新运行 `./install.sh` |
 | Mac 设置登录提示 Automation 未授权 | 仅完整流程/`--skip-browser` 需要；在「隐私与安全性 → 自动化」允许当前终端控制“系统设置” |
 | 姓名或生日为空 | 查看 `03-account-manage.png`，调整 ruyiPage 页面解析标签 |
 
@@ -201,7 +201,7 @@ npm run test:ruyipage-flow
 ./run.sh --skip-mac
 ```
 
-验收覆盖英文、简中、繁中，Screen Recording 有/无权限，AX 命中和 OCR fallback，
+验收覆盖英文、简中、繁中，Screen Recording 已授权以及未授权时 Firefox 不启动，AX 命中和 OCR fallback，
 Allow 自动两次后人工接管，Settings 两次与取消/迟到清理，以及从首次 acquisition
 起算的 90 秒 TTY 手输和 240 秒截止。
 另以 `./run.sh` 验证 Mac 设置登录阶段的 Automation 权限。检查终端、

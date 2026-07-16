@@ -27,6 +27,7 @@ for (const source of [rootInstall, generatedInstall]) {
   assert.doesNotMatch(source, /command -v swiftc/);
   assert.match(source, /"mac-2fa-click-allow"/);
   assert.match(source, /"mac-2fa-popup-ocr"[\s\S]*?-framework ScreenCaptureKit/);
+  assert.match(source, /node scripts\/preflight-2fa-permissions\.mjs --all/);
   assert.match(source, /readonly OPTIONAL_SWIFT_HELPERS=/);
   assert.match(source, /\/usr\/bin\/xcode-select --install/);
   assert.match(source, /readonly SWIFTC_INSTALL_MAX_ATTEMPTS=[1-9][0-9]*/);
@@ -185,6 +186,13 @@ assert.doesNotMatch(
 const ensureSwiftcFunction = shellFunction(rootInstall, "ensure_swiftc");
 assert.ok(ensureSwiftcFunction, "ensure_swiftc shell function is required");
 const swiftcUsableFunction = shellFunction(rootInstall, "swiftc_usable") ?? "";
+const swiftCompileEnvironmentDetector =
+  shellFunction(rootInstall, "swift_compile_error_is_environmental") ?? "";
+assert.match(
+  swiftCompileEnvironmentDetector,
+  /no such module '\(AppKit\|ApplicationServices\|Vision\|CoreGraphics\|ScreenCaptureKit\)'/,
+  "the install repair path must recognize all required OCR framework modules"
+);
 const harnessEnsureSwiftc = `${swiftcUsableFunction}\n${timeoutFunction}\n${cltInstallFunction}\n${cltRequestFunction}\n${ensureSwiftcFunction}`
   .replace(
     "if [[ -x /usr/bin/xcode-select ]]; then",
@@ -285,16 +293,17 @@ const swiftHelpers = [
   "mac-2fa-popup-ocr",
   "mac-2fa-click-allow",
 ];
-const requiredSwiftHelpers = ["mac-2fa-popup-read", "mac-2fa-click-allow"];
+const requiredSwiftHelpers = [
+  "mac-2fa-popup-read",
+  "mac-2fa-click-allow",
+  "mac-settings-2fa-code",
+  "mac-2fa-popup-ocr",
+];
 const optionalSwiftHelpers = swiftHelpers.filter(
   (helper) => !requiredSwiftHelpers.includes(helper)
 );
 assert.deepEqual(readonlyArray(rootInstall, "REQUIRED_SWIFT_HELPERS"), requiredSwiftHelpers);
-assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), [
-  "mac-settings-2fa-code",
-  "mac-2fa-popup-ocr",
-  "mac-settings-ax-fill",
-]);
+assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), ["mac-settings-ax-fill"]);
 const installCompileFunctions = [
   "swift_product_is_executable",
   "cleanup_swift_helper_temp_dir",

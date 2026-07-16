@@ -17,10 +17,10 @@ SWIFTC_BIN=""
 readonly REQUIRED_SWIFT_HELPERS=(
   "mac-2fa-popup-read"
   "mac-2fa-click-allow"
-)
-readonly OPTIONAL_SWIFT_HELPERS=(
   "mac-settings-2fa-code"
   "mac-2fa-popup-ocr"
+)
+readonly OPTIONAL_SWIFT_HELPERS=(
   "mac-settings-ax-fill"
 )
 readonly COMPILED_SWIFT_HELPERS=(
@@ -123,7 +123,7 @@ print_swift_compile_log() {
 swift_compile_error_is_environmental() {
   local compile_log="$1"
   /usr/bin/grep -Eiq \
-    "invalid active developer path|unable to find utility|unable to find sdk|SDK .* cannot be located|no such module 'AppKit'|no such module 'ApplicationServices'|unable to load standard library|xcrun: error|license" \
+    "invalid active developer path|unable to find utility|unable to find sdk|SDK .* cannot be located|no such module '(AppKit|ApplicationServices|Vision|CoreGraphics|ScreenCaptureKit)'|unable to load standard library|xcrun: error|license" \
     "$compile_log"
 }
 
@@ -210,41 +210,36 @@ compile_swift_helpers() {
     return 1
   }
 
-  if ! compile_swift_helper "$temp_dir" "mac-2fa-popup-read" \
-      -framework ApplicationServices -framework AppKit ||
-    ! compile_swift_helper "$temp_dir" "mac-2fa-click-allow" \
-      -framework ApplicationServices -framework AppKit; then
-    cleanup_swift_helper_temp_dir "$temp_dir"
-    return 1
-  fi
+  local required_helper
+  for required_helper in "${REQUIRED_SWIFT_HELPERS[@]}"; do
+    case "$required_helper" in
+      mac-2fa-popup-read|mac-2fa-click-allow|mac-settings-2fa-code)
+        if ! compile_swift_helper "$temp_dir" "$required_helper" \
+            -framework ApplicationServices -framework AppKit; then
+          cleanup_swift_helper_temp_dir "$temp_dir"
+          return 1
+        fi
+        ;;
+      mac-2fa-popup-ocr)
+        if ! compile_swift_helper "$temp_dir" "$required_helper" \
+            -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
+            -framework ScreenCaptureKit; then
+          cleanup_swift_helper_temp_dir "$temp_dir"
+          return 1
+        fi
+        ;;
+      *)
+        echo "错误: 未知必需 Swift helper: ${required_helper}" >&2
+        cleanup_swift_helper_temp_dir "$temp_dir"
+        return 1
+        ;;
+    esac
+  done
 
   local optional_helper
   local optional_compiled=()
   for optional_helper in "${OPTIONAL_SWIFT_HELPERS[@]}"; do
     case "$optional_helper" in
-      mac-settings-2fa-code)
-        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
-          compile_swift_helper "$temp_dir" "$optional_helper" \
-            --optional \
-            -framework ApplicationServices -framework AppKit; then
-          optional_compiled+=("$optional_helper")
-        else
-          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。跳过系统设置备用取码；网页登录、弹窗取码和手动兜底仍可继续。" >&2
-          /bin/rm -f -- "$temp_dir/${optional_helper}"
-        fi
-        ;;
-      mac-2fa-popup-ocr)
-        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
-          compile_swift_helper "$temp_dir" "$optional_helper" \
-            --optional \
-            -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
-            -framework ScreenCaptureKit; then
-          optional_compiled+=("$optional_helper")
-        else
-          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。跳过 Vision OCR 备用取码；AX 弹窗取码、系统设置取码和手动兜底仍可继续。" >&2
-          /bin/rm -f -- "$temp_dir/${optional_helper}"
-        fi
-        ;;
       mac-settings-ax-fill)
         if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
           compile_swift_helper "$temp_dir" "$optional_helper" \
@@ -299,4 +294,6 @@ validate_required_swift_sources
 compile_swift_helpers
 validate_required_swift_artifacts
 
-exec node scripts/setup-environment.mjs --install-ruyipage "$@"
+node scripts/setup-environment.mjs --install-ruyipage "$@"
+echo "==> 确认 2FA 自动取码权限"
+node scripts/preflight-2fa-permissions.mjs --all

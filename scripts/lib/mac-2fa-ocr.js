@@ -272,6 +272,51 @@ export async function get2FAOcrCapability(options = {}) {
   return capability;
 }
 
+function requiredOcrPermissionError(capability) {
+  const error = new Error("Screen Recording permission is required for the 2FA OCR helper");
+  error.code =
+    capability === "permission_missing"
+      ? "2FA_OCR_PERMISSION_DENIED"
+      : "2FA_OCR_HELPER_UNAVAILABLE";
+  error.capability = capability;
+  return error;
+}
+
+/**
+ * Prompt and verify Screen Recording for the exact OCR helper before browser
+ * work begins. The first capability call may request macOS permission; later
+ * calls only recheck until the user decision is visible to TCC.
+ */
+export async function ensure2FAOcrScreenRecording(options = {}) {
+  const timeoutMs = Math.max(0, Number(options.timeoutMs) || 120_000);
+  const pollMs = Math.max(250, Number(options.pollMs) || PERMISSION_RECHECK_INTERVAL_MS);
+  const now = typeof options.now === "function" ? options.now : Date.now;
+  const wait =
+    typeof options.wait === "function"
+      ? options.wait
+      : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
+  const deadline = Number(now()) + timeoutMs;
+  const capabilityCache = options.capabilityCache ?? {};
+  let requestPermission = true;
+
+  while (true) {
+    const capability = await get2FAOcrCapability({
+      ...options,
+      capabilityCache,
+      requestPermission,
+    });
+    if (capability === "available") return { granted: true };
+    if (capability !== "permission_missing") {
+      throw requiredOcrPermissionError(capability);
+    }
+
+    const remainingMs = Math.max(0, Number(deadline) - Number(now()));
+    if (remainingMs <= 0) throw requiredOcrPermissionError(capability);
+    await wait(Math.min(pollMs, remainingMs));
+    requestPermission = false;
+  }
+}
+
 function unavailableOcrResult(capability) {
   return { code: null, source: "vision", capability };
 }

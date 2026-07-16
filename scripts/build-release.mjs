@@ -207,7 +207,7 @@ function buildReadme(destRoot) {
 - **Python**：\`./install.sh\` 会自动检测 Python 3.10+；缺失时请求管理员授权，核对 Python.org Python 3.12.10 universal2 PKG 的固定 SHA-256 与 Python Software Foundation Developer ID 签名，再把 ruyiPage 安装到项目内 \`.runtime/ruyipage-venv\`
 - **Firefox**（[mozilla.org/firefox](https://www.mozilla.org/firefox/) 手动安装）
 - **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时会请求当前运行主体的系统授权（本地通常为 Terminal / iTerm；受监督验收会提示 Codex / 原生 helper）
-- **屏幕与系统音频录制**：Vision OCR 的可选增强；首次实际 2FA OCR 回退会请求一次原生授权，拒绝后仍继续 AX、系统设置与隐藏终端手输路线
+- **屏幕与系统音频录制**：Vision OCR 自动取码的必需权限；install.sh 会在编译 exact native helper 后请求并确认，run.sh 会在 Firefox 启动前复核。未授权时浏览器不会启动或提交账号密码
 
 ## 快速开始
 
@@ -237,9 +237,9 @@ cd apple-id-automation-${VERSION}
 
 | 命令 | 说明 |
 |------|------|
-| \`./install.sh\` | 前置管理员授权；自动安装缺失的 Python/Node、ruyiPage，并配置辅助功能 |
+| \`./install.sh\` | 前置管理员授权；自动安装缺失的 Python/Node、ruyiPage，并确认辅助功能与屏幕录制 |
 | \`./run.sh\` | 完整流程；**终端输入**账号密码并备份至 \`.env\` |
-| \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器）；仍需辅助功能，不要求自动化 |
+| \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器）；仍需辅助功能和屏幕录制，不要求自动化 |
 | \`./run.sh --skip-browser\` | 仅 Mac 设置登录 |
 | \`npm run check\` | 环境自检 |
 | \`npm run check:automation\` | 检测终端对「系统设置」的自动化权限 |
@@ -272,7 +272,8 @@ cd apple-id-automation-${VERSION}
 - **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
 - **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
-- **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
+- **屏幕录制未授权**：在「隐私与安全性 -> 屏幕与系统音频录制」允许实际运行主体；按 macOS 提示重开终端或 Codex 后重新运行 \`./install.sh\`
+- **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能和屏幕录制权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
 - **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
 
 ## 安全

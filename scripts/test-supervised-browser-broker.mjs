@@ -23,8 +23,10 @@ import {
   listenBrowserBrokerSocket,
   prepareBrowserBrokerFilesystem,
   productionEnvironment,
+  resolveSupervisedHelperDirectory,
   resolveBrowserBrokerPaths,
   startBrowserBroker,
+  validateSupervisedHelperDirectory,
   validateBrowserBrokerExecutable,
   validateBrowserBrokerPathScope,
 } from "./supervised-terminal-bridge.mjs";
@@ -34,6 +36,15 @@ const PRODUCTION_DIR =
   "/Users/admin/.codex-orchestrator/runs/test/mac/round-01/supervised-control/production";
 const NONCE = "0123456789abcdef0123456789abcdef";
 const EXPECTED_HEAD = "0123456789abcdef0123456789abcdef01234567";
+const WINDOWS_HOME = "C:\\Users\\admin";
+const STABLE_HELPER_DIR = `${WINDOWS_HOME}\\.apple-automation\\supervised-helpers`;
+
+assert.equal(resolveSupervisedHelperDirectory(WINDOWS_HOME), STABLE_HELPER_DIR);
+assert.equal(validateSupervisedHelperDirectory(STABLE_HELPER_DIR, WINDOWS_HOME), STABLE_HELPER_DIR);
+assert.throws(
+  () => validateSupervisedHelperDirectory(`${WINDOWS_HOME}\\round\\helpers`, WINDOWS_HOME),
+  /helper directory is invalid/
+);
 
 function fakeStats(type, mode, dev = 1, ino = 1) {
   return {
@@ -271,7 +282,7 @@ assert.equal("APPLE_PASSWORD" in brokerEnv, false);
 const productionEnv = productionEnvironment(
   {
     ...context,
-    helperDir: "/private/round/control/helpers",
+    helperDir: "/Users/admin/.apple-automation/supervised-helpers",
     mode: SUPERVISED_ACCOUNT_MODE,
   },
   paths
@@ -301,7 +312,7 @@ assert.match(settingsSmokePermissionProfile, /filesystem = \{ .* = "write" \}/);
 
 const settingsSmokeProductionEnv = productionEnvironment({
   ...context,
-  helperDir: "/private/round/control/helpers",
+  helperDir: "/Users/admin/.apple-automation/supervised-helpers",
   mode: SUPERVISED_SETTINGS_SMOKE_MODE,
 });
 assert.equal(

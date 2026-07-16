@@ -206,6 +206,20 @@ assert.equal(
   true
 );
 assert.equal(nativeHelperReadyProtocol.productionStage, "accessibility_preflight");
+assert.equal(
+  nativeHelperReadyProtocol.processStdoutLine("[2FA] status:screen_recording_ready"),
+  true
+);
+assert.equal(
+  nativeHelperReadyProtocol.productionStage,
+  "accessibility_preflight",
+  "OCR preflight must not be mistaken for a pending 2FA code provider"
+);
+assert.equal(
+  nativeHelperReadyProtocol.processStdoutLine("[2FA] status:screen_recording_missing"),
+  true
+);
+assert.equal(nativeHelperReadyProtocol.productionStage, "accessibility_missing");
 const popupFallbackProtocol = createProductionProtocolState();
 assert.equal(
   popupFallbackProtocol.processStdoutLine("[2FA] status:popup_accessibility"),
@@ -262,6 +276,10 @@ assert.equal(
 assert.equal(
   supervisedTwoFaStatusMessage("popup_scanning"),
   "[mac:supervised] 网页已请求验证码；正在对受限 Apple 原生窗口进行持续读码"
+);
+assert.equal(
+  supervisedTwoFaStatusMessage("screen_recording_missing"),
+  "[mac:supervised] 屏幕录制 OCR 尚未获授权，浏览器尚未启动；请允许后重新运行"
 );
 assert.equal(
   supervisedTwoFaWinnerMessage("winner:popup"),
@@ -1929,7 +1947,8 @@ for (const requiredText of [
   `SUPERVISED_TOKEN='${SUPERVISED_TOKEN}'`,
   'SUPERVISED_CONTROL_DIR="$REMOTE_ROUND_DIR/supervised-control"',
   'SUPERVISED_PRODUCTION_DIR="$SUPERVISED_CONTROL_DIR/production"',
-  'SUPERVISED_HELPER_DIR="$HOME/.apple-automation/supervised-helpers"',
+  'SUPERVISED_HELPER_ROOT="$HOME/.apple-automation"',
+  'SUPERVISED_HELPER_DIR="$SUPERVISED_HELPER_ROOT/supervised-helpers"',
   'SUPERVISED_TRIGGER="$RUN_TMP_DIR/supervised-trigger.json"',
   'SUPERVISED_CANCEL="$RUN_TMP_DIR/supervised-cancel.json"',
   'SUPERVISED_OUTER_CANCEL="$SUPERVISED_CONTROL_DIR/outer-cancel.json"',
@@ -1974,6 +1993,8 @@ for (const helper of [
 }
 assert.match(supervisedRemoteScript, /\[\[ -L "\$SUPERVISED_HELPER_DIR" \]\]/);
 assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_DIR" && ! -d "\$SUPERVISED_HELPER_DIR" \]\]/);
+assert.match(supervisedRemoteScript, /\[\[ -L "\$SUPERVISED_HELPER_ROOT" \]\]/);
+assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_ROOT" && ! -d "\$SUPERVISED_HELPER_ROOT" \]\]/);
 assert.match(supervisedRemoteScript, /\[\[ -x "\$output" && "\$output" -nt "\$source" \]\]/);
 assert.match(supervisedRemoteScript, /\.\$1\.tmp\.\$\$/);
 assert.match(supervisedRemoteScript, /swiftc -module-cache-path "\$SWIFT_MODULE_CACHE" -O -o "\$temporary"/);

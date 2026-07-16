@@ -104,7 +104,7 @@ fi
 
 if [[ "${skip_browser}" != "1" ]]; then
   launcher_stage launcher_preflight_started
-  node scripts/preflight-2fa-permissions.mjs --quiet --settings-only
+  node scripts/preflight-2fa-permissions.mjs --quiet --all
   launcher_stage launcher_preflight_ready
 else
   launcher_stage launcher_preflight_skipped

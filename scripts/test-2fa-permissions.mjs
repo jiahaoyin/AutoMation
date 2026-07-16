@@ -39,7 +39,36 @@ assert.match(
   preflightEntrySource,
   /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityGranted\(\{\s*compileIfNeeded:\s*false\s*\}\)[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*compileIfNeeded:\s*false[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight\(\{[\s\S]*compileIfNeeded:\s*false/
 );
-const settingsOnlyStart = preflightEntrySource.indexOf("if (settingsOnly) {");
+const settingsOnlyStart = preflightEntrySource.indexOf("if (settingsOnly || allHelpers) {");
+assert.match(
+  preflightEntrySource,
+  /const allHelpers = process\.argv\.includes\("--all"\);/
+);
+assert.match(
+  preflightEntrySource,
+  /if \(settingsOnly \|\| allHelpers\) \{[\s\S]{0,900}if \(settingsOnly\) return;/,
+  "the combined preflight must prepare the Settings helper without skipping popup permission checks"
+);
+assert.match(
+  preflightEntrySource,
+  /import \{ ensure2FAOcrScreenRecording \} from "\.\/lib\/mac-2fa-ocr\.js";/,
+  "the combined preflight must use the exact OCR helper for the Screen Recording prompt"
+);
+assert.match(
+  preflightEntrySource,
+  /async function preflightOcrPermission\(\)[\s\S]{0,520}await ensure2FAOcrScreenRecording\(\{[\s\S]{0,260}timeoutMs:[\s\S]{0,260}pollMs:/,
+  "Screen Recording must be confirmed by the OCR helper before browser work begins"
+);
+assert.match(
+  preflightEntrySource,
+  /await run2FAPermissionPreflight\([\s\S]{0,220}if \(allHelpers\) await preflightOcrPermission\(\);/,
+  "the --all path must request OCR permission after the mandatory AX helpers are ready"
+);
+assert.match(
+  preflightEntrySource,
+  /allHelpers && activePreflightHelper === "ocr"[\s\S]{0,260}screen_recording_missing[\s\S]{0,180}process\.exitCode\s*=\s*1/,
+  "a missing Screen Recording permission must stop --all before Firefox launches"
+);
 const firstNonSettingsBranch = preflightEntrySource.indexOf(
   "\n  if (supervised) {",
   settingsOnlyStart
@@ -84,10 +113,22 @@ assert.match(
 );
 assert.match(
   preflightEntrySource,
-  /if \(settingsOnly\) \{[\s\S]{0,320}isAccessibilityDeniedError\(e\)[\s\S]{0,260}process\.exitCode\s*=\s*1/,
+  /if \(settingsOnly \|\| activePreflightHelper === "settings"\) \{[\s\S]{0,320}isAccessibilityDeniedError\(e\)[\s\S]{0,260}process\.exitCode\s*=\s*1/,
   "a denied Settings helper permission must remain fatal before ruyiPage starts"
 );
+assert.match(
+  preflightEntrySource,
+  /allHelpers && activePreflightHelper === "popup"[\s\S]{0,280}popup_accessibility_missing[\s\S]{0,180}process\.exitCode\s*=\s*1/,
+  "a popup-helper denial in --all mode must not be mislabeled as a Settings failure"
+);
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
+
+const rootRunSh = fs.readFileSync(new URL("../run.sh", import.meta.url), "utf8");
+assert.match(
+  rootRunSh,
+  /node scripts\/preflight-2fa-permissions\.mjs --quiet --all/,
+  "run.sh must preflight both popup and Settings native helpers before Firefox launches"
+);
 
 function exportedFunctionSource(source, name) {
   const start = source.indexOf(`export async function ${name}`);

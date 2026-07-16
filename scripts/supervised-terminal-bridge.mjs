@@ -95,6 +95,12 @@ const SUPERVISED_TWO_FA_STATUS_MESSAGES = Object.freeze({
     "[mac:supervised] 原生弹窗验证码已读取，正在后台清理弹窗并继续网页登录",
   popup_scanning:
     "[mac:supervised] 网页已请求验证码；正在对受限 Apple 原生窗口进行持续读码",
+  screen_recording_ready:
+    "[mac:supervised] 屏幕录制 OCR 权限已就绪，可作为原生弹窗读码回退",
+  screen_recording_missing:
+    "[mac:supervised] 屏幕录制 OCR 尚未获授权，浏览器尚未启动；请允许后重新运行",
+  screen_recording_unavailable:
+    "[mac:supervised] 屏幕录制 OCR helper 暂不可用，浏览器尚未启动；请先运行 install.sh 修复环境",
 });
 const SUPERVISED_TWO_FA_WINNER_MESSAGES = Object.freeze({
   "winner:popup":
@@ -248,6 +254,15 @@ export function createProductionProtocolState() {
         productionStage = "two_fa_code_unavailable";
         return true;
       }
+      if (status === "screen_recording_ready") return true;
+      if (status === "screen_recording_missing") {
+        productionStage = "accessibility_missing";
+        return true;
+      }
+      if (status === "screen_recording_unavailable") {
+        productionStage = "accessibility_preflight";
+        return true;
+      }
       if (TWO_FA_PENDING_STATUSES.has(status)) {
         if (status === "settings_start") {
           recordSettingsRequestCreated(settingsProviderAttempt + 1);
@@ -366,6 +381,20 @@ function pathIsWithin(parentPath, candidatePath) {
     relative !== ".." &&
     !relative.startsWith(`..${path.sep}`)
   );
+}
+
+export function resolveSupervisedHelperDirectory(homeDirectory) {
+  const home = requireAbsolutePath(homeDirectory, "home directory");
+  return path.join(home, ".apple-automation", "supervised-helpers");
+}
+
+export function validateSupervisedHelperDirectory(helperDirectory, homeDirectory) {
+  const helperDir = requireAbsolutePath(helperDirectory, "helper directory");
+  const expected = resolveSupervisedHelperDirectory(homeDirectory);
+  if (helperDir !== expected) {
+    throw new Error("helper directory is invalid");
+  }
+  return helperDir;
 }
 
 function posixPathIsWithin(parentPath, candidatePath) {
@@ -817,6 +846,7 @@ function fixedGit(repo, args) {
 }
 
 function validateEnvironment(env) {
+  const home = requireAbsolutePath(env.HOME, "home directory");
   const repo = requireAbsolutePath(env.APPLE_AUTOMATION_REPO, "repository");
   const controlDir = requireAbsolutePath(
     env.APPLE_AUTOMATION_SUPERVISED_CONTROL_DIR,
@@ -837,7 +867,10 @@ function validateEnvironment(env) {
     env.APPLE_AUTOMATION_SUPERVISED_PRODUCTION_DIR,
     "production directory"
   );
-  const helperDir = requireAbsolutePath(env.APPLE_AUTOMATION_HELPER_DIR, "helper directory");
+  const helperDir = validateSupervisedHelperDirectory(
+    env.APPLE_AUTOMATION_HELPER_DIR,
+    home
+  );
   const nonce = env.APPLE_AUTOMATION_SUPERVISED_TOKEN ?? "";
   const mode = env[SUPERVISED_MODE_ENV_KEY] ?? "";
   const expectedHead = env.APPLE_AUTOMATION_EXPECTED_HEAD ?? "";
@@ -856,15 +889,13 @@ function validateEnvironment(env) {
     [outerCancelPath, controlDir, "outer cancel marker"],
     [attestationPath, controlDir, "attestation"],
     [productionDir, controlDir, "production directory"],
-    [helperDir, controlDir, "helper directory"],
   ]) {
     if (!pathIsWithin(parent, candidate)) throw new Error(`${label} is out of scope`);
   }
   if (
     pathIsWithin(writableTmp, controlDir) ||
     pathIsWithin(writableTmp, attestationPath) ||
-    pathIsWithin(writableTmp, productionDir) ||
-    pathIsWithin(writableTmp, helperDir)
+    pathIsWithin(writableTmp, productionDir)
   ) {
     throw new Error("protected supervised path is writable by the model");
   }
@@ -873,6 +904,7 @@ function validateEnvironment(env) {
     [controlDir, "control directory"],
     [writableTmp, "writable tmp"],
     [productionDir, "production directory"],
+    [path.dirname(helperDir), "helper root"],
     [helperDir, "helper directory"],
   ]) {
     const stats = fs.lstatSync(directory);
@@ -892,6 +924,7 @@ function validateEnvironment(env) {
     throw new Error("production environment policy is invalid");
   }
   return {
+    home,
     repo,
     controlDir,
     writableTmp,

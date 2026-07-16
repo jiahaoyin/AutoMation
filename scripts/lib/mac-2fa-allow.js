@@ -482,9 +482,8 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
         now,
         deadlineMs: budget.deadline,
         compileIfNeeded: false,
-        // Ask once at the real 2FA boundary. OCR remains optional, but a missing
-        // Screen Recording grant should surface a native macOS prompt instead of
-        // silently turning into an empty OCR result.
+        // The launcher already requires Screen Recording. Recheck once here in
+        // case macOS changes its TCC decision between preflight and capture.
         requestPermission: true,
       });
     } catch (error) {

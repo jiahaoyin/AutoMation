@@ -1461,21 +1461,30 @@ async function generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest() 
   const first = collector.getCode({ generation: 1 });
   await clock.advance(1);
   assert.equal(native.stats.settingsStarts, 1);
+  let firstReturned = false;
+  first.then(() => {
+    firstReturned = true;
+  });
   native.setPopup("111111");
   await clock.advance(1);
-  assert.equal(await first, "111111");
   assert.equal(
     native.settingsRequests[0].cancelCalls,
     1,
     "generation 1 winner must start cancellation before returning"
   );
-  assert.equal(native.stats.settingsForceStops, 0, "generation 1 cleanup must still be pending");
+  assert.equal(firstReturned, false, "generation 1 must wait for its native helper cleanup");
+  await clock.advance(50);
+  assert.equal(native.stats.settingsForceStops, 1);
+  assert.equal(firstReturned, false, "force-stop cleanup must receive its bounded grace");
+  await clock.advance(50);
+  assert.equal(await first, "111111");
 
   const second = collector.getCode({ generation: 2, rejectPrevious: true });
   await clock.advance(1);
   assert.equal(native.stats.settingsStarts, 2, "generation 2 must own a fresh Settings request");
   native.setPopup("222222");
   await clock.advance(1);
+  await clock.advance(100);
   assert.equal(await second, "222222");
   await clock.flush();
   assert.equal(
@@ -1485,11 +1494,10 @@ async function generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest() 
   );
   assert.equal(native.stats.settingsCancels, 2, "both generations must run separate cancellation");
 
-  await clock.advance(50);
   assert.equal(
     native.stats.settingsForceStops,
     2,
-    "generation 2 cleanup must run even while generation 1 cleanup is unfinished"
+    "each generation must force-stop an unresponsive Settings helper before returning"
   );
   const dispose = collector.dispose();
   await clock.advance(100);
@@ -1955,60 +1963,52 @@ async function cancelledSettingsDoesNotRetryTest() {
   await rejected;
 }
 
-async function settingsAccessibilityRecoveryRestartsImmediatelyTest() {
-  const authorization = deferred();
-  const authorizationCalls = [];
+async function settingsAccessibilityDeniedNeverUsesPopupAuthorizationTest() {
   const { clock, native, collector, audits, statuses } = createHarness({
     settingsFallbackAfterMs: 20,
-    accessibilityProvider(options) {
-      authorizationCalls.push(options);
-      return authorization.promise;
+    accessibilityProvider() {
+      assert.fail("Settings denial must never invoke the popup helper authorization path");
     },
   });
   await collector.prepare();
-  const codePromise = collector.getCode();
+  const codePromise = collector.getCode({ generation: 1 });
 
   await clock.advance(20);
   native.settingsRequests[0].reject(accessibilityDeniedError());
   await clock.flush();
 
   assert.equal(native.stats.settingsStarts, 1);
-  assert.equal(native.stats.accessibilityStarts, 1);
-  assert.equal(authorizationCalls.length, 1);
-  assert.equal(authorizationCalls[0].signal.aborted, false);
-  assert.equal(authorizationCalls[0].timeoutMs, 29_980);
+  assert.equal(native.stats.accessibilityStarts, 0);
   assert.equal(
-    statuses.some(
-      ({ status, source, attempt }) =>
-        status === "settings_accessibility" && source === "settings" && attempt === 1
+    statuses.some(({ status }) => status === "settings_accessibility"),
+    false,
+    "normal popup-first collection must not report a different helper authorization wait"
+  );
+  assert.equal(
+    audits.some(
+      ({ phase, reason }) =>
+        phase === "settings_provider_failed" && reason === "accessibility_denied"
     ),
     true
   );
 
-  authorization.resolve({ granted: true });
-  await clock.flush();
-  assert.equal(native.stats.settingsStarts, 2, "authorization must retry without a 5 second delay");
-
+  await clock.advance(4_999);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 2, "Settings must use its bounded five-second retry");
   native.settingsRequests[1].resolve({ code: "606060" });
   await clock.flush();
   assert.equal(await codePromise, "606060");
-  assert.equal(
-    audits.some(
-      ({ phase, outcome }) => phase === "settings_accessibility" && outcome === "granted"
-    ),
-    true
-  );
   await collector.dispose();
 }
 
-async function synchronousSettingsAccessibilityFailureRecoversTest() {
-  const authorization = deferred();
-  const { clock, native, collector, statuses } = createHarness({
+async function synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest() {
+  const { clock, native, collector } = createHarness({
     settingsFallbackAfterMs: 20,
     settingsStartFailures: 1,
     settingsStartError: accessibilityDeniedError(),
     accessibilityProvider() {
-      return authorization.promise;
+      assert.fail("A synchronous Settings denial must not prompt the popup helper");
     },
   });
   await collector.prepare();
@@ -2017,135 +2017,41 @@ async function synchronousSettingsAccessibilityFailureRecoversTest() {
   await clock.advance(20);
   await clock.flush();
   assert.equal(native.stats.settingsStarts, 1);
-  assert.equal(native.stats.accessibilityStarts, 1);
-  assert.equal(
-    statuses.some(({ status }) => status === "settings_accessibility"),
-    true,
-    "a synchronous helper access failure must request Accessibility recovery"
-  );
-
-  authorization.resolve({ granted: true });
-  await clock.flush();
-  assert.equal(native.stats.settingsStarts, 2, "authorized recovery must retry Settings immediately");
+  assert.equal(native.stats.accessibilityStarts, 0);
+  await clock.advance(4_999);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 2);
   native.settingsRequests[0].resolve({ code: "616161" });
   await clock.flush();
   assert.equal(await codePromise, "616161");
   await collector.dispose();
 }
 
-async function settingsAccessibilityDisposePreventsRestartTest() {
-  const authorization = deferred();
-  let authorizationSignal = null;
+async function popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest() {
   const { clock, native, collector } = createHarness({
     settingsFallbackAfterMs: 20,
-    accessibilityProvider({ signal }) {
-      authorizationSignal = signal;
-      return authorization.promise;
+    accessibilityProvider() {
+      assert.fail("Settings denial must not invoke the popup helper authorization path");
     },
   });
   await collector.prepare();
-  const codePromise = collector.getCode();
-  const rejected = assert.rejects(codePromise, /disposed/i);
+  const codePromise = collector.getCode({ generation: 1 });
 
   await clock.advance(20);
   native.settingsRequests[0].reject(accessibilityDeniedError());
   await clock.flush();
-  assert.equal(native.stats.accessibilityStarts, 1);
-
-  await collector.dispose();
-  assert.equal(authorizationSignal.aborted, true);
-  authorization.resolve({ granted: true });
-  await clock.flush();
-  assert.equal(native.stats.settingsStarts, 1);
-  await rejected;
-}
-
-async function settingsAccessibilityWinnerPreventsRestartTest() {
-  const authorization = deferred();
-  let authorizationSignal = null;
-  const { clock, native, collector } = createHarness({
-    settingsFallbackAfterMs: 20,
-    accessibilityProvider({ signal }) {
-      authorizationSignal = signal;
-      return authorization.promise;
-    },
-  });
-  await collector.prepare();
-  const codePromise = collector.getCode();
-
-  await clock.advance(20);
-  native.settingsRequests[0].reject(accessibilityDeniedError());
-  await clock.flush();
-  native.setPopup("717171");
+  native.setPopup("707070");
   await clock.advance(20);
 
-  assert.equal(await codePromise, "717171");
-  assert.equal(authorizationSignal.aborted, true);
-  authorization.resolve({ granted: true });
-  await clock.flush();
-  assert.equal(native.stats.settingsStarts, 1);
-  await collector.dispose();
-}
-
-async function settingsAccessibilityDeadlinePreventsRestartTest() {
-  const authorization = deferred();
-  let authorizationSignal = null;
-  const { clock, native, collector } = createHarness({
-    timeoutMs: 100,
-    settingsFallbackAfterMs: 20,
-    accessibilityProvider({ signal }) {
-      authorizationSignal = signal;
-      return authorization.promise;
-    },
-  });
-  await collector.prepare();
-  const codePromise = collector.getCode();
-  const timedOut = assert.rejects(codePromise, /超时/);
-
-  await clock.advance(20);
-  native.settingsRequests[0].reject(accessibilityDeniedError());
-  await clock.flush();
-  await clock.advance(80);
-  await timedOut;
-
-  assert.equal(authorizationSignal.aborted, true);
-  authorization.resolve({ granted: true });
-  await clock.flush();
-  assert.equal(native.stats.settingsStarts, 1);
-  await collector.dispose();
-}
-
-async function settingsAccessibilityFailureIsFixedAndBoundedTest() {
-  const secret = "private authorization failure 123456";
-  const { clock, native, collector, audits, statuses } = createHarness({
-    settingsFallbackAfterMs: 20,
-    async accessibilityProvider() {
-      throw new Error(secret);
-    },
-  });
-  await collector.prepare();
-  const codePromise = collector.getCode();
-
-  await clock.advance(20);
-  native.settingsRequests[0].reject(accessibilityDeniedError());
-  await clock.flush();
-  assert.equal(native.stats.accessibilityStarts, 1);
-  assert.equal(native.stats.settingsStarts, 1);
-
-  native.setPopup("818181");
-  await clock.advance(20);
-  assert.equal(await codePromise, "818181");
-  const serialized = JSON.stringify({ audits, statuses });
-  assert.equal(serialized.includes(secret), false);
+  assert.equal(await codePromise, "707070");
+  await clock.advance(5_000);
   assert.equal(
-    audits.some(
-      ({ phase, reason, outcome }) =>
-        phase === "settings_accessibility" &&
-        reason === "accessibility_unavailable" &&
-        outcome === "unavailable"
-    ),
-    true
+    native.stats.settingsStarts,
+    1,
+    "a popup winner must cancel the retry delay before a second Settings helper starts"
   );
+  assert.equal(native.stats.accessibilityStarts, 0);
   await collector.dispose();
 }
 
@@ -2294,7 +2200,7 @@ async function automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest() {
   await collector.dispose();
 }
 
-async function popupWinnerDoesNotWaitForSettingsCleanupTest() {
+async function popupWinnerWaitsForBoundedSettingsCleanupTest() {
   const { clock, native, collector, statuses } = createHarness({
     settingsFallbackAfterMs: 0,
     settingsCancelSettles: false,
@@ -2307,17 +2213,29 @@ async function popupWinnerDoesNotWaitForSettingsCleanupTest() {
   await clock.advance(10);
   assert.equal(native.stats.settingsStarts, 1);
 
+  let returned = false;
+  codePromise.then(() => {
+    returned = true;
+  });
   native.setPopup("876543");
   await clock.advance(10);
   assert.equal(
-    await codePromise,
-    "876543",
-    "a popup winner must be delivered before bounded Settings cleanup completes"
+    returned,
+    false,
+    "a popup winner must not return while the Settings helper can still cover Firefox"
   );
   assert.equal(native.stats.settingsForceStops, 0);
 
-  await clock.advance(100);
+  await clock.advance(49);
+  assert.equal(returned, false);
+  assert.equal(native.stats.settingsForceStops, 0);
+  await clock.advance(1);
   assert.equal(native.stats.settingsForceStops, 1);
+  assert.equal(returned, false, "force-stop cleanup gets its own bounded grace");
+  await clock.advance(49);
+  assert.equal(returned, false);
+  await clock.advance(1);
+  assert.equal(await codePromise, "876543");
   assert.equal(
     statuses.some(({ status }) => status === "settings_failed"),
     false,
@@ -2340,11 +2258,16 @@ async function popupWinnerSuppressesLateSettingsFailureStatusTest() {
 
   native.setPopup("876543");
   await clock.advance(10);
-  assert.equal(await codePromise, "876543");
+  let returned = false;
+  codePromise.then(() => {
+    returned = true;
+  });
+  assert.equal(returned, false, "delivery must wait for loser cleanup");
 
   const lateError = new Error("private late Settings failure 123456");
   native.settingsRequests[0].reject(lateError);
   await clock.flush();
+  assert.equal(await codePromise, "876543");
 
   assert.equal(
     statuses.some(({ status }) => status === "settings_failed"),
@@ -2864,14 +2787,14 @@ async function popupForcesUnresponsiveSettingsCleanupTest() {
   native.setPopup("121212");
   await clock.advance(20);
   assert.equal(native.stats.settingsCancels, 1);
-  assert.equal(returned, true, "popup delivery must not wait for Settings cancellation");
-  assert.equal(await codePromise, "121212");
+  assert.equal(returned, false, "popup delivery must wait while Settings can cover Firefox");
 
   await clock.advance(39);
   assert.equal(native.stats.settingsForceStops, 0);
-  assert.equal(returned, true);
+  assert.equal(returned, false);
   await clock.advance(1);
   assert.equal(native.stats.settingsForceStops, 1);
+  assert.equal(await codePromise, "121212");
   await collector.dispose();
 }
 
@@ -2890,15 +2813,15 @@ async function popupWaitsAfterForceStopForBoundedCloseTest() {
   await clock.advance(20);
   native.setPopup("232323");
   await clock.advance(20);
-  assert.equal(returned, true, "popup delivery must not wait for force-stop cleanup");
-  assert.equal(await codePromise, "232323");
+  assert.equal(returned, false, "popup delivery must wait for force-stop cleanup");
 
   await clock.advance(50);
   assert.equal(native.stats.settingsForceStops, 1);
-  assert.equal(returned, true);
+  assert.equal(returned, false);
   await clock.advance(39);
-  assert.equal(returned, true);
+  assert.equal(returned, false);
   await clock.advance(1);
+  assert.equal(await codePromise, "232323");
   await collector.dispose();
 }
 
@@ -3141,18 +3064,15 @@ const focusedTests = {
   "settings-only-manual": settingsOnlyManualFallbackStartsAtNinetySecondsTest,
   "settings-only-accessibility-manual": settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest,
   "settings-only-generation": settingsOnlyGenerationTwoRejectsPreviousCodeTest,
-  "settings-accessibility": settingsAccessibilityRecoveryRestartsImmediatelyTest,
-  "settings-sync-accessibility": synchronousSettingsAccessibilityFailureRecoversTest,
-  "settings-accessibility-dispose": settingsAccessibilityDisposePreventsRestartTest,
-  "settings-accessibility-winner": settingsAccessibilityWinnerPreventsRestartTest,
-  "settings-accessibility-deadline": settingsAccessibilityDeadlinePreventsRestartTest,
-  "settings-accessibility-failure": settingsAccessibilityFailureIsFixedAndBoundedTest,
+  "settings-accessibility": settingsAccessibilityDeniedNeverUsesPopupAuthorizationTest,
+  "settings-sync-accessibility": synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest,
+  "settings-accessibility-popup-winner": popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest,
   "allow-budget": allowBudgetStopsAtTwoAndReportsManualOnceTest,
   "manual-start": manualFallbackStartsAtNinetySecondsTest,
   "manual-window": manualFallbackReservesNinetySecondInputWindowTest,
   "manual-auto": automaticWinnerAbortsManualFallbackTest,
   "manual-auto-order": automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest,
-  "popup-settings-cleanup": popupWinnerDoesNotWaitForSettingsCleanupTest,
+  "popup-settings-cleanup": popupWinnerWaitsForBoundedSettingsCleanupTest,
   "popup-settings-late-failure": popupWinnerSuppressesLateSettingsFailureStatusTest,
   "manual-settings": manualWinnerCancelsActiveSettingsTest,
   "settings-manual": settingsWinnerAbortsManualFallbackTest,
@@ -3221,18 +3141,15 @@ await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
   await settingsFixedFailureReasonIsPreservedTest();
   await settingsNeverStartsThirdAttemptTest();
   await cancelledSettingsDoesNotRetryTest();
-  await settingsAccessibilityRecoveryRestartsImmediatelyTest();
-  await synchronousSettingsAccessibilityFailureRecoversTest();
-  await settingsAccessibilityDisposePreventsRestartTest();
-  await settingsAccessibilityWinnerPreventsRestartTest();
-  await settingsAccessibilityDeadlinePreventsRestartTest();
-  await settingsAccessibilityFailureIsFixedAndBoundedTest();
+  await settingsAccessibilityDeniedNeverUsesPopupAuthorizationTest();
+  await synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest();
+  await popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest();
   await allowBudgetStopsAtTwoAndReportsManualOnceTest();
   await manualFallbackStartsAtNinetySecondsTest();
   await manualFallbackReservesNinetySecondInputWindowTest();
   await automaticWinnerAbortsManualFallbackTest();
   await automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest();
-  await popupWinnerDoesNotWaitForSettingsCleanupTest();
+  await popupWinnerWaitsForBoundedSettingsCleanupTest();
   await popupWinnerSuppressesLateSettingsFailureStatusTest();
   await manualWinnerCancelsActiveSettingsTest();
   await settingsWinnerAbortsManualFallbackTest();

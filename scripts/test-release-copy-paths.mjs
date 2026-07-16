@@ -200,12 +200,10 @@ assert.doesNotMatch(
 const requiredSwiftHelpers = [
   "mac-2fa-popup-read",
   "mac-2fa-click-allow",
-];
-const optionalSwiftHelpers = [
   "mac-settings-2fa-code",
   "mac-2fa-popup-ocr",
-  "mac-settings-ax-fill",
 ];
+const optionalSwiftHelpers = ["mac-settings-ax-fill"];
 const compiledSwiftHelpers = [
   ...requiredSwiftHelpers,
   ...optionalSwiftHelpers,
@@ -322,13 +320,23 @@ assert.deepEqual(
   `install contract is incomplete:\n${installContractViolations.join("\n")}`
 );
 
+assert.match(
+  generatedInstallSh,
+  /for required_helper in "\$\{REQUIRED_SWIFT_HELPERS\[@\]\}"; do[\s\S]*compile_swift_helper "\$temp_dir" "\$required_helper"/,
+  "every required Swift helper must be compiled before installation continues"
+);
 for (const helper of requiredSwiftHelpers) {
   assert.match(
     generatedInstallSh,
-    new RegExp(`compile_swift_helper "\\$temp_dir" "${helper}"`),
-    `${helper} must be compiled by the release install script`
+    new RegExp(`"${helper}"`),
+    `${helper} must remain in the required Swift helper contract`
   );
 }
+assert.match(
+  generatedInstallSh,
+  /mac-2fa-popup-ocr\)[\s\S]{0,360}-framework Vision -framework CoreGraphics[\s\S]{0,120}-framework ScreenCaptureKit/,
+  "the required OCR helper must compile with the ScreenCaptureKit framework"
+);
 for (const helper of optionalSwiftHelpers) {
   assert.match(
     generatedInstallSh,
@@ -338,6 +346,11 @@ for (const helper of optionalSwiftHelpers) {
 }
 assert.doesNotMatch(generatedInstallSh, /cliclick/);
 assert.match(generatedInstallSh, /setup-environment\.mjs --install-ruyipage/);
+assert.match(
+  generatedInstallSh,
+  /setup-environment\.mjs --install-ruyipage[\s\S]*node scripts\/preflight-2fa-permissions\.mjs --all/,
+  "install must confirm the required 2FA permissions after building the exact native helpers"
+);
 assert.match(generatedInstallSh, /bootstrap_macos_install_runtime/);
 const generatedRunSh = renderRunSh();
 assert.match(generatedRunSh, /--skip-browser/);
@@ -414,14 +427,14 @@ assert.match(
   /if \[\[ "\$\{skip_mac\}" == "1" \]\]; then[\s\S]*setup_args\+=\(--skip-automation\)[\s\S]*fi/,
   "release run.sh must skip Mac-login Automation checks for --skip-mac"
 );
-assert.match(generatedRunSh, /preflight-2fa-permissions\.mjs --quiet/);
+assert.match(generatedRunSh, /preflight-2fa-permissions\.mjs --quiet --all/);
 assert.match(generatedRunSh, /bootstrap_macos_runtime/);
 assert.doesNotMatch(generatedRunSh, /bootstrap_macos_install_runtime/);
 assert.doesNotMatch(generatedRunSh, /source\s+(?:["']?)\.env|set\s+-a/);
 assert.match(generatedRunSh, /credentials\.js loads \.env as data/);
 assert.match(
   generatedRunSh,
-  /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/,
+  /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet --all[\s\S]*fi/,
   "release run.sh must skip browser-only permission checks for --skip-browser"
 );
 
@@ -460,7 +473,7 @@ assert.doesNotMatch(rootRunSh, /source\s+(?:["']?)\.env|set\s+-a/);
 assert.match(rootRunSh, /credentials\.js loads \.env as data/);
 assert.match(
   rootRunSh,
-  /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet[\s\S]*fi/
+  /if \[\[ "\$\{skip_browser\}" != "1" \]\]; then[\s\S]*preflight-2fa-permissions\.mjs --quiet --all[\s\S]*fi/
 );
 
 const setupEnvironment = fs.readFileSync(
@@ -509,10 +522,10 @@ assert.doesNotMatch(
   /2FA 超时[^\n]*辅助功能\/自动化权限/,
   "release README must not require Automation for browser 2FA"
 );
-assert.doesNotMatch(
+assert.match(
   releaseBuilder,
-  /Screen Recording[^\n]*(?:必须|硬失败)|(?:必须|硬失败)[^\n]*Screen Recording/i,
-  "release README must not make Screen Recording an installation hard failure"
+  /屏幕与系统音频录制[^\n]*必需权限[\s\S]{0,360}Firefox 启动前复核/,
+  "release README must document Screen Recording as an install and pre-browser hard gate"
 );
 assert.match(
   releaseBuilder,

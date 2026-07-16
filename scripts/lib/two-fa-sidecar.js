@@ -405,9 +405,7 @@ export function createMac2FACollector(options = {}) {
   let settingsAttempt = 0;
   let lastSettingsCandidateAt = null;
   const settingsCancelPromises = new WeakMap();
-  let settingsAccessibilityAttempted = false;
-  let settingsAccessibilityController = null;
-  let settingsAccessibilityOutcome = null;
+  let settingsAccessibilityStatusSent = false;
   let activeAcquisition = null;
   const winnerCleanupPromises = new Map();
   let settledWinner = null;
@@ -1277,87 +1275,6 @@ export function createMac2FACollector(options = {}) {
     return preparePromise;
   };
 
-  const cancelSettingsAccessibility = (
-    controller = settingsAccessibilityController,
-    outcome = settingsAccessibilityOutcome
-  ) => {
-    controller?.abort();
-    outcome?.resolve({ kind: "cancelled" });
-  };
-
-  const recoverSettingsAccessibility = async (acquisition, attempt) => {
-    if (settingsAccessibilityAttempted) return "unavailable";
-    settingsAccessibilityAttempted = true;
-
-    const remainingMs = acquisition.deadline - runtime.now();
-    if (remainingMs <= 0 || disposed || acquisition.winner.settled) return "cancelled";
-
-    status("settings_accessibility", {
-      attempt,
-      source: "settings",
-      remainingSec: remainingSeconds(acquisition.deadline),
-    });
-    audit({
-      phase: "settings_accessibility",
-      reason: "accessibility_denied",
-      outcome: "prompting",
-      elapsedSincePrepareMs: elapsedSincePrepare(),
-    });
-
-    const controller = new AbortController();
-    const outcomeGate = createDeferred();
-    settingsAccessibilityController = controller;
-    settingsAccessibilityOutcome = outcomeGate;
-
-    const deadlineDelay = scheduleDelay(remainingMs);
-    deadlineDelay.promise.then((elapsed) => {
-      if (!elapsed) return;
-      controller.abort();
-      outcomeGate.resolve({ kind: "cancelled" });
-    });
-
-    void Promise.resolve()
-      .then(() =>
-        runtime.ensureAccessibility({
-          quiet: false,
-          timeoutMs: remainingMs,
-          signal: controller.signal,
-        })
-      )
-      .then(
-        (result) =>
-          outcomeGate.resolve({
-            kind: result?.granted === true ? "granted" : "unavailable",
-          }),
-        () => outcomeGate.resolve({ kind: "unavailable" })
-      );
-
-    const outcome = await outcomeGate.promise;
-    deadlineDelay.cancel();
-    if (settingsAccessibilityController === controller) {
-      settingsAccessibilityController = null;
-    }
-    if (settingsAccessibilityOutcome === outcomeGate) {
-      settingsAccessibilityOutcome = null;
-    }
-
-    if (outcome.kind === "granted") {
-      audit({
-        phase: "settings_accessibility",
-        outcome: "granted",
-        elapsedSincePrepareMs: elapsedSincePrepare(),
-      });
-    } else if (outcome.kind === "unavailable") {
-      audit({
-        phase: "settings_accessibility",
-        reason: "accessibility_unavailable",
-        outcome: "unavailable",
-        elapsedSincePrepareMs: elapsedSincePrepare(),
-      });
-    }
-    return outcome.kind;
-  };
-
   const startSettingsProvider = async (acquisition) => {
     if (!config.settingsFallback || settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
     const now = runtime.now();
@@ -1487,8 +1404,8 @@ export function createMac2FACollector(options = {}) {
         });
       }
 
-      if (accessibilityDenied && config.settingsOnly && !settingsAccessibilityAttempted) {
-        settingsAccessibilityAttempted = true;
+      if (accessibilityDenied && config.settingsOnly && !settingsAccessibilityStatusSent) {
+        settingsAccessibilityStatusSent = true;
         status("settings_accessibility", {
           attempt,
           source: "settings",
@@ -1497,16 +1414,14 @@ export function createMac2FACollector(options = {}) {
         audit({
           phase: "settings_accessibility",
           reason: "accessibility_denied",
-          outcome: "settings_helper_prompt_exhausted",
+          outcome: "unavailable",
           elapsedSincePrepareMs: elapsedSincePrepare(),
         });
       }
 
-      if (accessibilityDenied && !config.settingsOnly && !settingsAccessibilityAttempted) {
-        const recovery = await recoverSettingsAccessibility(acquisition, attempt);
-        if (recovery === "granted") continue;
-        return;
-      }
+      // mac-settings-2fa-code owns its own AX prompt. A popup-reader grant
+      // cannot authorize that separate helper, so keep the bounded retry race
+      // alive instead of waiting on the wrong TCC client.
 
       if (outcome.kind === "cancelled" || disposed || acquisition.winner.settled) return;
       if (settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
@@ -1530,20 +1445,11 @@ export function createMac2FACollector(options = {}) {
 
   const cancelSettingsProvider = async (reason) => {
     const startDelay = settingsStartDelay;
-    const accessibilityController = settingsAccessibilityController;
-    const accessibilityOutcome = settingsAccessibilityOutcome;
     const request = settingsRequest;
     const completion = settingsCompletion;
     const outcomeGate = settingsOutcome;
     if (settingsStartDelay === startDelay) settingsStartDelay = null;
-    if (settingsAccessibilityController === accessibilityController) {
-      settingsAccessibilityController = null;
-    }
-    if (settingsAccessibilityOutcome === accessibilityOutcome) {
-      settingsAccessibilityOutcome = null;
-    }
     startDelay?.cancel();
-    cancelSettingsAccessibility(accessibilityController, accessibilityOutcome);
     if (!request || !completion) return;
     const existing = settingsCancelPromises.get(request);
     if (existing) return existing;
@@ -1691,7 +1597,7 @@ export function createMac2FACollector(options = {}) {
     if (existing) return existing;
     const cleanup = stopAcquisitionLosers(winnerSource, reason)
       .catch(() => {
-        /* Provider cleanup is best-effort and must never delay code delivery. */
+        /* Cleanup failure must not prevent the verified code from being delivered. */
       });
     let trackedCleanup;
     trackedCleanup = cleanup.finally(() => {
@@ -1719,7 +1625,7 @@ export function createMac2FACollector(options = {}) {
     resetPendingPopupClose();
     if (config.settingsOnly) {
       settingsAttempt = 0;
-      settingsAccessibilityAttempted = false;
+      settingsAccessibilityStatusSent = false;
     }
   };
 
@@ -1816,7 +1722,7 @@ export function createMac2FACollector(options = {}) {
         cleanupOnly = true;
         pendingAllowAttempt = null;
       }
-      void startWinnerCleanup(
+      const winnerCleanup = startWinnerCleanup(
         acquisition.generation,
         candidate.source,
         `${candidate.source}_won`
@@ -1831,6 +1737,10 @@ export function createMac2FACollector(options = {}) {
         source: candidate.source,
         remainingSec: remainingSeconds(acquisition.deadline),
       });
+      // A native Settings helper can still cover Firefox after a popup reader
+      // wins.  Its cancellation is bounded (cancel grace plus force-stop
+      // grace), so settle it before returning a code to the ruyiPage caller.
+      await winnerCleanup;
       lastReturnedCode = candidate.code;
       return candidate.code;
     } finally {

@@ -1219,6 +1219,63 @@ test("OCR permission request adds the explicit native prompt flag once", async (
   assert.deepEqual(calls, [["--preflight-screen-capture", "--prompt-screen-capture"]]);
 });
 
+test("required OCR permission waits for the native grant before continuing", async () => {
+  assert.equal(typeof ocrModule.ensure2FAOcrScreenRecording, "function");
+  const calls = [];
+  let nowMs = 0;
+  const result = await ocrModule.ensure2FAOcrScreenRecording({
+    timeoutMs: 5_000,
+    pollMs: 2_000,
+    now: () => nowMs,
+    async wait(delayMs) {
+      nowMs += delayMs;
+    },
+    capabilityCache: {},
+    isHelperAvailable: () => true,
+    async execFileAsync(_binary, args) {
+      calls.push([...args]);
+      return {
+        stdout:
+          calls.length === 1
+            ? '{"ok":true,"capability":"permission_missing","message":"preflight"}\n'
+            : '{"ok":true,"capability":"available","message":"preflight"}\n',
+        stderr: "",
+      };
+    },
+  });
+
+  assert.deepEqual(result, { granted: true });
+  assert.deepEqual(calls, [
+    ["--preflight-screen-capture", "--prompt-screen-capture"],
+    ["--preflight-screen-capture"],
+  ]);
+});
+
+test("required OCR permission fails closed after its bounded wait", async () => {
+  let nowMs = 0;
+  await assert.rejects(
+    ocrModule.ensure2FAOcrScreenRecording({
+      timeoutMs: 2_500,
+      pollMs: 2_000,
+      now: () => nowMs,
+      async wait(delayMs) {
+        nowMs += delayMs;
+      },
+      capabilityCache: {},
+      isHelperAvailable: () => true,
+      async execFileAsync() {
+        return {
+          stdout: '{"ok":true,"capability":"permission_missing","message":"preflight"}\n',
+          stderr: "",
+        };
+      },
+    }),
+    (error) =>
+      error?.code === "2FA_OCR_PERMISSION_DENIED" &&
+      error?.capability === "permission_missing"
+  );
+});
+
 test("OCR permission prompt caches a timed-out helper and rechecks without prompting", async () => {
   const calls = [];
   const capabilityCache = {};

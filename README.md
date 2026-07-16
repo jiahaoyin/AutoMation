@@ -30,16 +30,16 @@ SHA-256 和 Python Software Foundation Developer ID 签名，再从 root 私有�
 - 当前运行主体的「辅助功能」权限（`install.sh` 会引导；本地通常为 Terminal / iTerm，受监督验收为 Codex / 原生 helper）
 
 Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recording）
-权限，但这是**可选增强**。未授权不会导致 `install.sh` 失败；AX 弹窗读取、
-系统设置取码和隐藏终端手输仍可继续工作。首次实际进入 2FA 且需要 OCR 回退时，
-项目会请求一次 macOS 原生授权；拒绝或未完成授权时会继续其他取码路线。若系统要求
-重启运行主体，请按提示重新打开当前终端或 Codex 后再运行 `./run.sh`。
+权限，这是自动取码的**必需权限**。`install.sh` 会在编译 exact native helper 后
+立即请求并确认授权；`run.sh` 也会在 Firefox 启动前再次确认。未授权、helper 不可用
+或授权状态未生效时流程会在提交账号密码前停止，不会降级为静默跳过 OCR。若系统要求
+重启运行主体，请按提示重新打开当前终端或 Codex 后重新运行 `./install.sh`。
 
 ## 命令
 
 | 命令 | 说明 |
 |------|------|
-| `./install.sh` | 前置授权；自动安装 Python/Node、ruyiPage 与辅助功能检测 |
+| `./install.sh` | 前置授权；自动安装 Python/Node、ruyiPage，并确认辅助功能与屏幕录制 |
 | `./run.sh` | 完整流程 |
 | `./run.sh --skip-mac` | 仅浏览器 |
 | `./run.sh --skip-browser` | 仅系统设置 |
@@ -136,7 +136,7 @@ TCC 或 macOS 15 原生 UI 已验收。
 - 浏览器 2FA 的「辅助功能」检查和提示由现有 `mac-2fa-popup-read.swift` 通过 `AXIsProcessTrusted()`、`AXIsProcessTrustedWithOptions(...)` 及 `--preflight-accessibility` / `--prompt-accessibility` 原生完成。旧 AppleScript 2FA/Accessibility 权限探针已移除。
 - `./run.sh --skip-mac` 只要求实际运行主体获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；本地通常是 Terminal / iTerm，受监督验收会明确提示 Codex / 原生 helper；不要求 Terminal 控制 System Events 或“系统设置”。
 - 只有执行 macOS“系统设置登录 Apple Account”阶段时，才要求「自动化」中允许当前终端 App 控制“系统设置”。
-- Screen Recording 仅供 Vision OCR 使用。缺失时 capability 固定为 `permission_missing`，不会阻断安装；首次实际 OCR 回退会请求一次原生屏幕录制授权，AX、Settings 和隐藏终端手输仍可工作。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
+- Screen Recording 是 Vision OCR 自动取码的硬门槛。`install.sh` 编译 `mac-2fa-popup-ocr` 后会请求并确认「屏幕与系统音频录制」；`run.sh` 在 Firefox 启动前再次校验。缺失时固定为 `screen_recording_missing` 并停止，不会提交账号密码。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
 - 权限变更后应按 macOS 提示退出并重新打开终端，再开始下一次运行。
 
 ## macOS 15 验收
@@ -163,7 +163,7 @@ npm run test:ruyipage-flow
 ./run.sh --skip-mac
 ```
 
-真机还必须分别验证 Screen Recording 已授权/未授权、英文/简中/繁中 popup、
+真机还必须验证 Screen Recording 已授权以及未授权时 Firefox 不启动、英文/简中/繁中 popup、
 Allow 两次上限与手动接管、Settings 两次重试、从首次 acquisition 起算的 90 秒
 隐藏手输和 240 秒截止，以及取消/迟到弹窗清理。终端、`report.json` 和
 `2fa-audit.jsonl` 不得出现 OTP、原始
