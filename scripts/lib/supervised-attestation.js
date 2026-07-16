@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 export const SUPERVISED_ATTESTATION_VERSION = 1;
 export const SUPERVISED_COMMAND_ID = "run-sh-skip-mac";
 export const SUPERVISED_COMMAND = "./run.sh --skip-mac";
+export const SUPERVISED_SETTINGS_SMOKE_COMMAND =
+  "node scripts/supervised-settings-2fa-smoke.mjs";
 export const SUPERVISED_SUCCESS_MARKER = "[验收] REAL_ACCOUNT_HOME_CONFIRMED";
 export const SUPERVISED_ACCEPTANCE_VALUE = "REAL_ACCOUNT_HOME_CONFIRMED";
 export const SUPERVISED_ACCOUNT_MODE = "account";
@@ -17,6 +19,28 @@ export const SUPERVISED_SETTINGS_SMOKE_SUCCESS_MARKER =
 export const SUPERVISED_SETTINGS_SMOKE_ACCEPTANCE_VALUE =
   "SETTINGS_2FA_TWICE_CONFIRMED";
 
+export function supervisedProductionCommandForMode(mode) {
+  if (!SUPERVISED_MODES.has(mode)) throw new Error("supervised mode is invalid");
+  return mode === SUPERVISED_SETTINGS_SMOKE_MODE
+    ? SUPERVISED_SETTINGS_SMOKE_COMMAND
+    : SUPERVISED_COMMAND;
+}
+
+export function supervisedProductionCommandArgumentsForMode(mode) {
+  if (mode === SUPERVISED_SETTINGS_SMOKE_MODE) {
+    return ["node", "scripts/supervised-settings-2fa-smoke.mjs"];
+  }
+  if (mode === SUPERVISED_ACCOUNT_MODE) return ["./run.sh", "--skip-mac"];
+  throw new Error("supervised mode is invalid");
+}
+
+export function supervisedProductionCommandSha256ForMode(mode) {
+  return crypto
+    .createHash("sha256")
+    .update(supervisedProductionCommandForMode(mode), "utf8")
+    .digest("hex");
+}
+
 export function supervisedSuccessMarkerForMode(mode) {
   if (!SUPERVISED_MODES.has(mode)) throw new Error("supervised mode is invalid");
   return mode === SUPERVISED_SETTINGS_SMOKE_MODE
@@ -30,10 +54,9 @@ export function supervisedAcceptanceValueForMode(mode) {
     ? SUPERVISED_SETTINGS_SMOKE_ACCEPTANCE_VALUE
     : SUPERVISED_ACCEPTANCE_VALUE;
 }
-export const SUPERVISED_COMMAND_SHA256 = crypto
-  .createHash("sha256")
-  .update(SUPERVISED_COMMAND, "utf8")
-  .digest("hex");
+export const SUPERVISED_COMMAND_SHA256 = supervisedProductionCommandSha256ForMode(
+  SUPERVISED_ACCOUNT_MODE
+);
 
 export const SUPERVISED_PRODUCTION_ENV_KEYS = Object.freeze([
   "PATH",
@@ -286,6 +309,10 @@ const ATTESTATION_KEYS = new Set([
 ]);
 
 export function createSupervisedAttestation(values = {}) {
+  const mode = values.mode ?? SUPERVISED_ACCOUNT_MODE;
+  const commandMode = SUPERVISED_MODES.has(mode)
+    ? mode
+    : SUPERVISED_ACCOUNT_MODE;
   return {
     version: SUPERVISED_ATTESTATION_VERSION,
     nonce: values.nonce ?? "",
@@ -293,8 +320,8 @@ export function createSupervisedAttestation(values = {}) {
     observedHeadBefore: values.observedHeadBefore ?? null,
     observedHeadAfter: values.observedHeadAfter ?? null,
     commandId: SUPERVISED_COMMAND_ID,
-    commandSha256: SUPERVISED_COMMAND_SHA256,
-    mode: values.mode ?? SUPERVISED_ACCOUNT_MODE,
+    commandSha256: supervisedProductionCommandSha256ForMode(commandMode),
+    mode,
     status: values.status ?? "pending",
     exitCode: values.exitCode ?? null,
     markerConfirmed: values.markerConfirmed === true,
@@ -339,7 +366,10 @@ export function validateSupervisedAttestation(value, expected = {}) {
     if (value[key] !== null && !isHead(value[key])) errors.push(`attestation ${key} is invalid`);
   }
   if (value.commandId !== SUPERVISED_COMMAND_ID) errors.push("attestation command id is invalid");
-  if (value.commandSha256 !== SUPERVISED_COMMAND_SHA256) {
+  if (
+    SUPERVISED_MODES.has(value.mode) &&
+    value.commandSha256 !== supervisedProductionCommandSha256ForMode(value.mode)
+  ) {
     errors.push("attestation command digest is invalid");
   }
   if (!SUPERVISED_MODES.has(value.mode)) {

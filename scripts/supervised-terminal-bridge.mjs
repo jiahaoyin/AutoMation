@@ -24,6 +24,7 @@ import {
   createSupervisedProductionPermissionProfile,
   createSupervisedAttestation,
   supervisedAcceptanceValueForMode,
+  supervisedProductionCommandArgumentsForMode,
   supervisedSuccessMarkerForMode,
 } from "./lib/supervised-attestation.js";
 import {
@@ -2786,8 +2787,7 @@ export async function runSupervisedTerminalBridge(options = {}) {
       "--include-managed-config",
       "-C",
       context.repo,
-      "./run.sh",
-      "--skip-mac",
+      ...supervisedProductionCommandArgumentsForMode(context.mode),
     ];
     const supervisorScript = buildProductionProcessSupervisorScript();
     const launchHead = git(context.repo, ["rev-parse", "HEAD"]);

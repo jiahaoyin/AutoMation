@@ -31,6 +31,9 @@ import {
   createMacVerificationPermissionProfile,
   createSupervisedAttestation,
   parseSupervisedAttestation,
+  supervisedProductionCommandArgumentsForMode,
+  supervisedProductionCommandForMode,
+  supervisedProductionCommandSha256ForMode,
 } from "./lib/supervised-attestation.js";
 import {
   DEFAULT_RUYIPAGE_BACKEND_TIMEOUT_MS,
@@ -2294,9 +2297,21 @@ unterminatedSupervisorProtocol.push(
   Buffer.from("target-launch\ntarget-identity-ready\ntarget-exit:0\nmonitor-exit:0")
 );
 assert.equal(unterminatedSupervisorProtocol.finish().complete, false);
+assert.deepEqual(
+  supervisedProductionCommandArgumentsForMode(SUPERVISED_ACCOUNT_MODE),
+  ["./run.sh", "--skip-mac"]
+);
+assert.deepEqual(
+  supervisedProductionCommandArgumentsForMode(SUPERVISED_SETTINGS_SMOKE_MODE),
+  ["node", "scripts/supervised-settings-2fa-smoke.mjs"]
+);
+assert.equal(
+  supervisedProductionCommandForMode(SUPERVISED_SETTINGS_SMOKE_MODE),
+  "node scripts/supervised-settings-2fa-smoke.mjs"
+);
 assert.match(
   supervisedTerminalBridgeSource,
-  /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*"\.\/run\.sh",\s*"--skip-mac",\s*\]/
+  /const productionArgs = \[\s*"sandbox",[\s\S]*?"-P",\s*"supervised_production",[\s\S]*?"--include-managed-config",[\s\S]*?"-C",\s*context\.repo,\s*\.\.\.supervisedProductionCommandArgumentsForMode\(context\.mode\),\s*\]/
 );
 const browserBrokerStartIndex = supervisedTerminalBridgeSource.indexOf(
   "await startBroker(browserBroker, bridgeIdentity)"
@@ -2387,8 +2402,17 @@ assert.match(
 );
 assert.equal(
   (supervisedTerminalBridgeSource.match(/"\.\/run\.sh"/g) ?? []).length,
+  0,
+  "the bridge must not hardcode the account-only production entrypoint"
+);
+assert.equal(
+  (
+    supervisedTerminalBridgeSource.match(
+      /supervisedProductionCommandArgumentsForMode\(context\.mode\)/g
+    ) ?? []
+  ).length,
   1,
-  "the bridge must contain one fixed production entrypoint"
+  "the bridge must select exactly one trusted entrypoint for the active mode"
 );
 assert.doesNotMatch(supervisedTerminalBridgeSource, /shell:\s*true|["']-lc["']/);
 assert.match(
@@ -2947,6 +2971,7 @@ function acceptedSupervisedAttestation(overrides = {}) {
       exitCode: 0,
       markerConfirmed: true,
       failureClass: "NONE",
+      mode: overrides.mode ?? SUPERVISED_ACCOUNT_MODE,
     }),
     ...overrides,
   };
@@ -2987,6 +3012,14 @@ assert.deepEqual(
 const acceptedSettingsSmokeAttestationForParsing = acceptedSupervisedAttestation({
   mode: SUPERVISED_SETTINGS_SMOKE_MODE,
 });
+assert.equal(
+  acceptedSettingsSmokeAttestationForParsing.commandSha256,
+  supervisedProductionCommandSha256ForMode(SUPERVISED_SETTINGS_SMOKE_MODE)
+);
+assert.notEqual(
+  acceptedSettingsSmokeAttestationForParsing.commandSha256,
+  SUPERVISED_COMMAND_SHA256
+);
 assert.deepEqual(
   parseSupervisedAttestation(
     attestationArtifact(acceptedSettingsSmokeAttestationForParsing),

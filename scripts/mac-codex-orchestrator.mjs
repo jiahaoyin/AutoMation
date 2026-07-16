@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 import {
   SUPERVISED_ACCOUNT_MODE,
   SUPERVISED_COMMAND_ID,
-  SUPERVISED_COMMAND_SHA256,
   SUPERVISED_MODE_ENV_KEY,
   SUPERVISED_MODES,
   SUPERVISED_PRODUCTION_ENV_POLICY,
@@ -17,6 +16,7 @@ import {
   createSupervisedProductionPermissionProfile,
   createSupervisedAttestation,
   parseSupervisedAttestation,
+  supervisedProductionCommandSha256ForMode,
   supervisedSuccessMarkerForMode,
 } from "./lib/supervised-attestation.js";
 
@@ -307,6 +307,8 @@ export function buildRemoteScript(options) {
     supervisedMode === SUPERVISED_SETTINGS_SMOKE_MODE
       ? ".settings-2fa-twice-confirmed"
       : ".account-home-confirmed";
+  const supervisedProductionCommandSha256 =
+    supervisedProductionCommandSha256ForMode(supervisedMode);
   const supervisedDeadlineBudgetMs = Math.min(
     900_000,
     effectiveTimeoutMs - 30_000
@@ -399,7 +401,7 @@ export function buildRemoteScript(options) {
         '  local observed_after_json="null"',
         '  local temporary_attestation="$SUPERVISED_ATTESTATION.tmp.$$"',
         '  if [[ "$observed_after" != "null" ]]; then observed_after_json="\\\"$observed_after\\\""; fi',
-        `  print -r -- '{"version":1,"nonce":"'$SUPERVISED_TOKEN'","expectedHead":"'$EXPECTED_HEAD'","observedHeadBefore":"'$EXPECTED_HEAD'","observedHeadAfter":'"$observed_after_json"',"commandId":"${SUPERVISED_COMMAND_ID}","commandSha256":"${SUPERVISED_COMMAND_SHA256}","mode":"'$SUPERVISED_MODE'","status":"'"$attestation_status"'","exitCode":'"$exit_code"',"markerConfirmed":'"$marker"',"failureClass":"'"$failure"'"}' >| "$temporary_attestation"`,
+        `  print -r -- '{"version":1,"nonce":"'$SUPERVISED_TOKEN'","expectedHead":"'$EXPECTED_HEAD'","observedHeadBefore":"'$EXPECTED_HEAD'","observedHeadAfter":'"$observed_after_json"',"commandId":"${SUPERVISED_COMMAND_ID}","commandSha256":"${supervisedProductionCommandSha256}","mode":"'$SUPERVISED_MODE'","status":"'"$attestation_status"'","exitCode":'"$exit_code"',"markerConfirmed":'"$marker"',"failureClass":"'"$failure"'"}' >| "$temporary_attestation"`,
         '  /bin/chmod 600 "$temporary_attestation"',
         '  /bin/mv -f "$temporary_attestation" "$SUPERVISED_ATTESTATION"',
         '}',
