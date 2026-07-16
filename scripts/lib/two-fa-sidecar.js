@@ -187,6 +187,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_code_buffered",
     "popup_code_read",
     "popup_ocr_scan",
+    "popup_accessibility",
     "popup_provider_error",
     "prepare_2fa",
     "settings_provider_start",
@@ -426,6 +427,8 @@ export function createMac2FACollector(options = {}) {
   let ocrPermissionStatusSent = false;
   let ocrHelperUnavailableStatusSent = false;
   let popupAccessibilityStatusSent = false;
+  let popupAccessibilityAttempted = false;
+  let popupAccessibilityController = null;
   let popupScanningStatusSent = false;
   const popupCloseControllers = new Set();
   const popupReadControllers = new Set();
@@ -494,6 +497,79 @@ export function createMac2FACollector(options = {}) {
     } catch {
       return false;
     }
+  };
+
+  const abortPopupAccessibilityPrompt = () => {
+    const controller = popupAccessibilityController;
+    popupAccessibilityController = null;
+    controller?.abort();
+  };
+
+  // Trigger the exact helper's TCC prompt only after the browser has asked for
+  // a code. It must never delay password submission or stop OCR fallbacks.
+  const startPopupAccessibilityPrompt = (deadline) => {
+    if (
+      disposed ||
+      popupAccessibilityAttempted ||
+      runtime.platform !== "darwin" ||
+      !Number.isFinite(deadline)
+    ) {
+      return;
+    }
+    const remainingMs = Math.max(0, deadline - runtime.now());
+    if (remainingMs <= 0) return;
+
+    popupAccessibilityAttempted = true;
+    if (!popupAccessibilityStatusSent) {
+      popupAccessibilityStatusSent = true;
+      status("popup_accessibility", {
+        source: "popup",
+        remainingSec: remainingSeconds(deadline),
+      });
+    }
+    audit({
+      phase: "popup_accessibility",
+      reason: "accessibility_denied",
+      outcome: "prompting",
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+
+    const controller = new AbortController();
+    popupAccessibilityController = controller;
+    void Promise.resolve()
+      .then(() =>
+        runtime.ensureAccessibility({
+          quiet: false,
+          timeoutMs: Math.min(180_000, remainingMs),
+          signal: controller.signal,
+        })
+      )
+      .then(
+        (result) => {
+          if (disposed || controller.signal.aborted) return;
+          const granted = result?.granted === true;
+          audit({
+            phase: "popup_accessibility",
+            ...(granted ? {} : { reason: "accessibility_unavailable" }),
+            outcome: granted ? "granted" : "unavailable",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+        },
+        () => {
+          if (disposed || controller.signal.aborted) return;
+          audit({
+            phase: "popup_accessibility",
+            reason: "accessibility_unavailable",
+            outcome: "unavailable",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+        }
+      )
+      .finally(() => {
+        if (popupAccessibilityController === controller) {
+          popupAccessibilityController = null;
+        }
+      });
   };
 
   const observeProbeState = (state) => {
@@ -786,6 +862,10 @@ export function createMac2FACollector(options = {}) {
     const action = observeProbeState(state);
     if (signal?.aborted || disposed || generation !== popupGeneration) return;
     if (!cleanupOnly && activeWinnerSettled()) return;
+
+    if (action === "accessibility_unavailable" && activeAcquisition) {
+      startPopupAccessibilityPrompt(activeAcquisition.deadline);
+    }
 
     // The System Settings Apple Account sheet can be visible while AX reports
     // an idle tree on macOS 15. Once the browser has explicitly requested a
@@ -1589,6 +1669,7 @@ export function createMac2FACollector(options = {}) {
 
   const stopAcquisitionLosers = async (winnerSource, reason) => {
     const providerPromise = settingsProviderPromise;
+    abortPopupAccessibilityPrompt();
     settingsStartDelay?.cancel();
     manualStartDelay?.cancel();
     const settingsCancellation =
@@ -1704,6 +1785,9 @@ export function createMac2FACollector(options = {}) {
       return true;
     };
     activeAcquisition = acquisition;
+    if (lastProbeState === "accessibility_unavailable") {
+      startPopupAccessibilityPrompt(acquisition.deadline);
+    }
     if (!config.settingsOnly) {
       popupReady.promise.then((candidate) => acquisition.offer(candidate));
       if (popupCandidate?.generation === generation) acquisition.offer(popupCandidate);
@@ -1773,6 +1857,7 @@ export function createMac2FACollector(options = {}) {
   const dispose = () => {
     if (disposePromise) return disposePromise;
     disposed = true;
+    abortPopupAccessibilityPrompt();
     abortPopupCloseTasks();
     abortPopupReadTasks();
     popupWatcherController?.abort();

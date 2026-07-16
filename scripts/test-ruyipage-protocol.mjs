@@ -682,10 +682,17 @@ async function runNodeRunnerBrowserBrokerSelfTest() {
           socket.receive(`${JSON.stringify({ event: "ready", mode: "broker" })}\n`);
           socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
         } else if (command.type === "2fa_prepared") {
+          socket.receive(
+            `${JSON.stringify({ event: "2fa_command_ack", command: "2fa_prepared" })}\n`
+          );
           socket.receive(`${JSON.stringify({ event: "need_2fa", generation: 1 })}\n`);
         } else if (command.type === "2fa_code") {
           socket.endFromPeer(
             `${JSON.stringify({
+              event: "2fa_command_ack",
+              command: "2fa_code",
+              generation: command.generation,
+            })}\n${JSON.stringify({
               event: "result",
               success: command.code === SECRET_FIXTURES.verificationCode,
               receivedGeneration: command.generation,
@@ -786,15 +793,18 @@ async function runNodeRunnerBrowserBrokerEofSelfTest() {
 }
 
 async function runNodeRunnerBrowserBrokerEofDuringPreparationTest() {
-  let prepareStarted;
-  const preparationStarted = new Promise((resolve) => {
-    prepareStarted = resolve;
+  let preparedCommandSeen;
+  const preparedCommand = new Promise((resolve) => {
+    preparedCommandSeen = resolve;
   });
   const socket = new ControlledBrokerSocket({
     onWrite(chunk) {
       const frame = JSON.parse(chunk.toString("utf8"));
       if (frame.type === "credentials") {
         socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      } else if (frame.type === "2fa_prepared") {
+        preparedCommandSeen();
+        setTimeout(() => socket.endFromPeer(), 0);
       }
     },
   });
@@ -815,24 +825,20 @@ async function runNodeRunnerBrowserBrokerEofDuringPreparationTest() {
     runner.run({
       creds: FIXTURE_CREDS,
       reportDir: "data/reports/protocol-test",
-      async prepare2FA() {
-        prepareStarted();
-        return new Promise(() => {});
-      },
+      async prepare2FA() {},
       async get2FACode() {
         return SECRET_FIXTURES.verificationCode;
       },
     })
   );
   await withRejectGuard(
-    preparationStarted,
+    preparedCommand,
     500,
-    "browser broker did not request 2FA preparation"
+    "browser broker did not receive the preparation command"
   );
-  socket.endFromPeer();
 
   await assert.rejects(
-    withRejectGuard(outcome, 1_000, "runner hung after broker EOF during preparation"),
+    withRejectGuard(outcome, 1_000, "runner hung awaiting preparation acknowledgement"),
     (error) => {
       assert.equal(error.message, "ruyipage browser broker socket closed");
       return true;
@@ -840,8 +846,8 @@ async function runNodeRunnerBrowserBrokerEofDuringPreparationTest() {
   );
   assert.equal(
     parseOutboundFrames(socket).some((frame) => frame.type === "2fa_prepared"),
-    false,
-    "a closed broker must not receive a preparation acknowledgement"
+    true,
+    "the test must exercise a post-write EOF rather than callback cancellation"
   );
 }
 
@@ -856,7 +862,12 @@ async function runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest() {
       if (frame.type === "credentials") {
         socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
       } else if (frame.type === "2fa_prepared") {
+        socket.receive(
+          `${JSON.stringify({ event: "2fa_command_ack", command: "2fa_prepared" })}\n`
+        );
         socket.receive(`${JSON.stringify({ event: "need_2fa", generation: 1 })}\n`);
+      } else if (frame.type === "2fa_code") {
+        setTimeout(() => socket.endFromPeer(), 0);
       }
     },
   });
@@ -880,7 +891,6 @@ async function runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest() {
       async prepare2FA() {},
       async get2FACode() {
         codeRequested();
-        socket.endFromPeer();
         return SECRET_FIXTURES.verificationCode;
       },
     })
@@ -888,7 +898,7 @@ async function runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest() {
   await withRejectGuard(requestedCode, 500, "browser broker did not request a 2FA code");
 
   await assert.rejects(
-    withRejectGuard(outcome, 1_000, "runner hung after broker EOF during code delivery"),
+    withRejectGuard(outcome, 1_000, "runner hung awaiting verification-code acknowledgement"),
     (error) => {
       assert.equal(error.message, "ruyipage browser broker socket closed");
       return true;
@@ -896,8 +906,150 @@ async function runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest() {
   );
   assert.equal(
     parseOutboundFrames(socket).some((frame) => frame.type === "2fa_code"),
-    false,
-    "a closed broker must not receive a verification-code frame"
+    true,
+    "the test must exercise a post-write EOF rather than provider cancellation"
+  );
+}
+
+async function runNodeRunnerBrowserBrokerCommandAckTimeoutTest() {
+  const socket = new ControlledBrokerSocket({
+    onWrite(chunk) {
+      const frame = JSON.parse(chunk.toString("utf8"));
+      if (frame.type === "credentials") {
+        socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      }
+    },
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      commandAckTimeoutMs: 20,
+      createConnection() {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    },
+  });
+
+  await withBrowserBrokerEnvironment(() =>
+    assert.rejects(
+      withRejectGuard(
+        runner.run({
+          creds: FIXTURE_CREDS,
+          reportDir: "data/reports/protocol-test",
+          async prepare2FA() {},
+        }),
+        1_000,
+        "runner hung awaiting a missing broker acknowledgement"
+      ),
+      (error) => {
+        assert.equal(
+          error.message,
+          "ruyipage browser broker command acknowledgement timed out"
+        );
+        return true;
+      }
+    )
+  );
+}
+
+async function runNodeRunnerBrowserBrokerCommandAckTimeoutIsCappedTest() {
+  const socket = new ControlledBrokerSocket({
+    onWrite(chunk) {
+      const frame = JSON.parse(chunk.toString("utf8"));
+      if (frame.type === "credentials") {
+        socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      }
+    },
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 20_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      commandAckTimeoutMs: 60_000,
+      createConnection() {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    },
+  });
+
+  await withBrowserBrokerEnvironment(() =>
+    assert.rejects(
+      withRejectGuard(
+        runner.run({
+          creds: FIXTURE_CREDS,
+          reportDir: "data/reports/protocol-test",
+          async prepare2FA() {},
+        }),
+        6_500,
+        "broker acknowledgement timeout exceeded its five-second ceiling"
+      ),
+      (error) => {
+        assert.equal(
+          error.message,
+          "ruyipage browser broker command acknowledgement timed out"
+        );
+        return true;
+      }
+    )
+  );
+}
+
+async function runNodeRunnerBrowserBrokerInvalidCommandAckTest() {
+  const socket = new ControlledBrokerSocket({
+    onWrite(chunk) {
+      const frame = JSON.parse(chunk.toString("utf8"));
+      if (frame.type === "credentials") {
+        socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      } else if (frame.type === "2fa_prepared") {
+        socket.receive(
+          `${JSON.stringify({
+            event: "2fa_command_ack",
+            command: "2fa_code",
+            generation: 1,
+          })}\n`
+        );
+      }
+    },
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      createConnection() {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    },
+  });
+
+  await withBrowserBrokerEnvironment(() =>
+    assert.rejects(
+      withRejectGuard(
+        runner.run({
+          creds: FIXTURE_CREDS,
+          reportDir: "data/reports/protocol-test",
+          async prepare2FA() {},
+        }),
+        1_000,
+        "runner hung after an invalid broker acknowledgement"
+      ),
+      (error) => {
+        assert.equal(
+          error.message,
+          "ruyipage browser broker command acknowledgement invalid"
+        );
+        return true;
+      }
+    )
   );
 }
 
@@ -2603,6 +2755,9 @@ const focusedTests = {
   "broker-eof": runNodeRunnerBrowserBrokerEofSelfTest,
   "broker-eof-prepare": runNodeRunnerBrowserBrokerEofDuringPreparationTest,
   "broker-eof-code": runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest,
+  "broker-ack-timeout": runNodeRunnerBrowserBrokerCommandAckTimeoutTest,
+  "broker-ack-timeout-cap": runNodeRunnerBrowserBrokerCommandAckTimeoutIsCappedTest,
+  "broker-ack-invalid": runNodeRunnerBrowserBrokerInvalidCommandAckTest,
   "live-descendant": runChildStopperLiveDescendantSelfTest,
   "cleanup-timeout": runChildStopperCleanupDeadlineSelfTest,
   "identity-change": runChildStopperIdentityChangeSelfTest,
@@ -2646,6 +2801,9 @@ await runNodeRunnerBrowserBrokerSelfTest();
 await runNodeRunnerBrowserBrokerEofSelfTest();
 await runNodeRunnerBrowserBrokerEofDuringPreparationTest();
 await runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest();
+await runNodeRunnerBrowserBrokerCommandAckTimeoutTest();
+await runNodeRunnerBrowserBrokerCommandAckTimeoutIsCappedTest();
+await runNodeRunnerBrowserBrokerInvalidCommandAckTest();
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();

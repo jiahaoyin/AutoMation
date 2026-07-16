@@ -24,11 +24,14 @@ const RUYIPAGE_LAUNCH_GATE_NAME = ".ruyipage-launch.ready";
 const RUYIPAGE_LAUNCH_CANCEL_NAME = ".ruyipage-launch.cancel";
 export const RUYIPAGE_SUPERVISOR_COMMAND_ID = "ruyipage-supervisor-v1";
 const DEFAULT_BROWSER_BROKER_CONNECT_TIMEOUT_MS = 60_000;
+const DEFAULT_BROWSER_BROKER_COMMAND_ACK_TIMEOUT_MS = 5_000;
 const BROWSER_BROKER_ERRORS = Object.freeze({
   eof: "ruyipage browser broker socket closed",
   connect: "ruyipage browser broker socket connection failed",
   connectTimeout: "ruyipage browser broker socket connection timed out",
   io: "ruyipage browser broker socket I/O failed",
+  commandAck: "ruyipage browser broker command acknowledgement invalid",
+  commandAckTimeout: "ruyipage browser broker command acknowledgement timed out",
 });
 const RUYIPAGE_LIFECYCLE_STATES = new Set([
   "preparing",
@@ -833,6 +836,17 @@ async function runRuyiPageBackend({
   const brokerSocketPath =
     process.env.APPLE_AUTOMATION_BROWSER_BROKER_SOCKET?.trim();
   const usesBrowserBroker = Boolean(brokerSocketPath);
+  const requestedBrowserBrokerCommandAckTimeoutMs =
+    browserBrokerTransportOptions.commandAckTimeoutMs;
+  const browserBrokerCommandAckTimeoutMs =
+    Number.isFinite(requestedBrowserBrokerCommandAckTimeoutMs) &&
+    requestedBrowserBrokerCommandAckTimeoutMs > 0
+      ? Math.min(
+          timeoutMs,
+          DEFAULT_BROWSER_BROKER_COMMAND_ACK_TIMEOUT_MS,
+          requestedBrowserBrokerCommandAckTimeoutMs
+        )
+      : Math.min(timeoutMs, DEFAULT_BROWSER_BROKER_COMMAND_ACK_TIMEOUT_MS);
   const usesProcessStateSupervisor =
     !usesBrowserBroker &&
     process.platform !== "win32" &&
@@ -1097,6 +1111,60 @@ async function runRuyiPageBackend({
     }
     return new Error(`ruyipage backend exited ${outcome?.exitCode ?? "unknown"}`);
   };
+  const pendingBrowserBrokerAcks = new Map();
+  const browserBrokerAckKey = (command) => {
+    if (command?.type === "2fa_prepared") return "2fa_prepared";
+    if (
+      command?.type === "2fa_code" &&
+      Number.isInteger(command.generation) &&
+      command.generation >= 1 &&
+      command.generation <= 2
+    ) {
+      return `2fa_code:${command.generation}`;
+    }
+    return null;
+  };
+  const createBrowserBrokerAck = (command) => {
+    if (!usesBrowserBroker) return null;
+    const key = browserBrokerAckKey(command);
+    if (!key || pendingBrowserBrokerAcks.has(key)) {
+      throw new Error(BROWSER_BROKER_ERRORS.commandAck);
+    }
+    let resolveAck;
+    const promise = new Promise((resolve) => {
+      resolveAck = resolve;
+    });
+    const ack = { key, promise, resolve: resolveAck };
+    pendingBrowserBrokerAcks.set(key, ack);
+    return ack;
+  };
+  const acknowledgeBrowserBrokerCommand = (event) => {
+    if (event?.event !== "2fa_command_ack") return false;
+    if (!usesBrowserBroker || !event || typeof event !== "object") {
+      throw new Error(BROWSER_BROKER_ERRORS.commandAck);
+    }
+    const command = event.command;
+    let key = null;
+    if (
+      command === "2fa_prepared" &&
+      Object.keys(event).sort().join(",") === "command,event"
+    ) {
+      key = "2fa_prepared";
+    } else if (
+      command === "2fa_code" &&
+      Number.isInteger(event.generation) &&
+      event.generation >= 1 &&
+      event.generation <= 2 &&
+      Object.keys(event).sort().join(",") === "command,event,generation"
+    ) {
+      key = `2fa_code:${event.generation}`;
+    }
+    const ack = key ? pendingBrowserBrokerAcks.get(key) : null;
+    if (!ack) throw new Error(BROWSER_BROKER_ERRORS.commandAck);
+    pendingBrowserBrokerAcks.delete(key);
+    ack.resolve();
+    return true;
+  };
   const whileChildAlive = async (operation) => {
     if (childEnded) throw terminalError(await childOutcome);
     return Promise.race([
@@ -1108,6 +1176,24 @@ async function runRuyiPageBackend({
         throw terminalError();
       }),
     ]);
+  };
+  const waitForBrowserBrokerAck = async (ack) => {
+    if (!ack) return;
+    let timer;
+    try {
+      await whileChildAlive(
+        () =>
+          new Promise((resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(BROWSER_BROKER_ERRORS.commandAckTimeout)),
+              browserBrokerCommandAckTimeoutMs
+            );
+            ack.promise.then(resolve, reject);
+          })
+      );
+    } finally {
+      clearTimeout(timer);
+    }
   };
   const callExternal = (operation, failureMessage) =>
     Promise.resolve()
@@ -1167,42 +1253,45 @@ async function runRuyiPageBackend({
       clearTimeout(handlerTimer);
     }
   };
-  const writeCommand = async (command) => {
-    // A broker peer can close while an external 2FA callback resolves. Yield
-    // one I/O turn so its terminal event wins before attempting a JSONL write.
-    await new Promise((resolve) => setImmediate(resolve));
-    if (childEnded) throw terminalError(await childOutcome);
-    return whileChildAlive(
-      () =>
-        new Promise((resolve, reject) => {
-          const stdin = child.stdin;
-          let settled = false;
-          const settleWrite = (error = null) => {
-            if (settled) return;
-            settled = true;
-            stdinWriteRejectors.delete(settleWrite);
-            if (error) reject(error);
-            else resolve();
-          };
-          if (stdinFailure) {
-            settleWrite(stdinFailure);
-            return;
-          }
-          if (!stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
-            settleWrite(failStdin());
-            return;
-          }
-          stdinWriteRejectors.add(settleWrite);
-          try {
-            stdin.write(`${JSON.stringify(command)}\n`, (error) => {
-              if (error) failStdin();
-              else settleWrite();
-            });
-          } catch {
-            failStdin();
-          }
-        })
-    );
+  const writeCommand = async (command, requireBrowserBrokerAck = false) => {
+    const ack = requireBrowserBrokerAck ? createBrowserBrokerAck(command) : null;
+    try {
+      if (childEnded) throw terminalError(await childOutcome);
+      await whileChildAlive(
+        () =>
+          new Promise((resolve, reject) => {
+            const stdin = child.stdin;
+            let settled = false;
+            const settleWrite = (error = null) => {
+              if (settled) return;
+              settled = true;
+              stdinWriteRejectors.delete(settleWrite);
+              if (error) reject(error);
+              else resolve();
+            };
+            if (stdinFailure) {
+              settleWrite(stdinFailure);
+              return;
+            }
+            if (!stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+              settleWrite(failStdin());
+              return;
+            }
+            stdinWriteRejectors.add(settleWrite);
+            try {
+              stdin.write(`${JSON.stringify(command)}\n`, (error) => {
+                if (error) failStdin();
+                else settleWrite();
+              });
+            } catch {
+              failStdin();
+            }
+          })
+      );
+      await waitForBrowserBrokerAck(ack);
+    } finally {
+      if (ack) pendingBrowserBrokerAcks.delete(ack.key);
+    }
   };
   const timer = setTimeout(() => {
     timedOut = true;
@@ -1214,8 +1303,7 @@ async function runRuyiPageBackend({
 
   child.stderr.resume();
 
-  const processLine = async (line) => {
-    const event = parseJsonLine(line);
+  const processEvent = async (event) => {
     await callOnEvent(event);
     if (event?.event === "prepare_2fa") {
       if (twoFaPrepared) {
@@ -1228,7 +1316,7 @@ async function runRuyiPageBackend({
         callExternal(prepare2FA, "ruyipage 2FA preparation failed")
       );
       twoFaPrepared = true;
-      await writeCommand({ type: "2fa_prepared" });
+      await writeCommand({ type: "2fa_prepared" }, usesBrowserBroker);
     } else if (event?.event === "need_2fa") {
       if (!twoFaPrepared) {
         throw new Error("ruyipage backend requested a 2FA code before preparation");
@@ -1253,18 +1341,27 @@ async function runRuyiPageBackend({
           "ruyipage 2FA code provider failed"
         )
       );
-      await writeCommand({ type: "2fa_code", generation, code });
+      await writeCommand({ type: "2fa_code", generation, code }, usesBrowserBroker);
     }
     if (event?.event === "result") finalResult = event;
   };
+  const recordProcessingFailure = (error) => {
+    processingError ??= error;
+    if (!childEnded) stopper.stop();
+  };
   const enqueueLine = (line) => {
     if (!line.trim()) return;
+    let event;
+    try {
+      event = parseJsonLine(line);
+      if (acknowledgeBrowserBrokerCommand(event)) return;
+    } catch (error) {
+      recordProcessingFailure(error);
+      return;
+    }
     processing = processing
-      .then(() => processLine(line))
-      .catch((error) => {
-        processingError ??= error;
-        if (!childEnded) stopper.stop();
-      });
+      .then(() => processEvent(event))
+      .catch(recordProcessingFailure);
   };
 
   child.stdout.on("data", (buf) => {

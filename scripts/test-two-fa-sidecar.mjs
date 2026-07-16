@@ -506,6 +506,54 @@ async function initialPopupProbeFailureDoesNotAbortPreparationTest() {
   await collector.dispose();
 }
 
+async function popupAccessibilityPromptStartsWithoutBlockingCodeAcquisitionTest() {
+  const authorization = deferred();
+  let authorizationSignal = null;
+  const { clock, native, collector, audits, statuses } = createHarness({
+    settingsFallback: false,
+    manualFallback: false,
+    probeCapability: "accessibility_unavailable",
+    accessibilityProvider({ signal }) {
+      authorizationSignal = signal;
+      return authorization.promise;
+    },
+  });
+
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(10);
+
+  assert.equal(native.stats.accessibilityStarts, 1);
+  assert.equal(authorizationSignal?.aborted, false);
+  assert.equal(
+    statuses.some(({ status, source }) => status === "popup_accessibility" && source === "popup"),
+    true,
+    "missing popup AX permission must be surfaced at the actual 2FA boundary"
+  );
+  assert.equal(
+    audits.some(
+      ({ phase, reason, outcome }) =>
+        phase === "popup_accessibility" &&
+        reason === "accessibility_denied" &&
+        outcome === "prompting"
+    ),
+    true,
+    "the authorization request must be recorded without native dialog text"
+  );
+
+  native.setPopup("232323");
+  await clock.advance(10);
+  assert.equal(await codePromise, "232323");
+  assert.equal(
+    authorizationSignal?.aborted,
+    true,
+    "a popup winner must cancel the background authorization wait"
+  );
+  authorization.resolve({ granted: true });
+  await clock.flush();
+  await collector.dispose();
+}
+
 async function collectorCarriesPreparationBoundaryIntoAllowFlowTest() {
   const { clock, native, collector } = createHarness();
   await collector.prepare();
@@ -3056,6 +3104,7 @@ async function disposalClosesVisiblePopupTest() {
 const focusedTests = {
   "report-dir": readOnlyCwdDoesNotAffectHarnessReportsTest,
   "initial-probe-failure": initialPopupProbeFailureDoesNotAbortPreparationTest,
+  "popup-accessibility-prompt": popupAccessibilityPromptStartsWithoutBlockingCodeAcquisitionTest,
   "allow-remains": allowAttemptRemainingVisibleIsNotConfirmedTest,
   "allow-transition": allowIsConfirmedOnlyAfterStableStateTransitionTest,
   "preexisting-allow": preexistingAllowIsNeverAutomaticallyClickedTest,
@@ -3131,6 +3180,7 @@ if (focusedTest) {
   await readOnlyCwdDoesNotAffectHarnessReportsTest();
   await bufferEarlyPopupTest();
   await initialPopupProbeFailureDoesNotAbortPreparationTest();
+  await popupAccessibilityPromptStartsWithoutBlockingCodeAcquisitionTest();
   await collectorCarriesPreparationBoundaryIntoAllowFlowTest();
   await preexistingAllowIsNeverAutomaticallyClickedTest();
   await preexistingAllowCodeIsDismissedRejectedAndGateStaysClosedTest();

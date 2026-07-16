@@ -115,6 +115,33 @@ class TwoFactorPreparationTests(unittest.TestCase):
 
         emit_event.assert_called_once_with({"event": "prepare_2fa"})
 
+    def test_broker_mode_emits_fixed_command_acknowledgements(self):
+        with patch("apple_account_flow.emit") as emit_event, patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_prepared"},
+        ), patch("apple_account_flow.browser_broker_mode_enabled", return_value=True):
+            request_two_factor_preparation()
+            self.assertEqual(
+                account_flow.validate_two_factor_code_command(
+                    {"type": "2fa_code", "generation": 1, "code": "123456"},
+                    1,
+                ),
+                "123456",
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in emit_event.call_args_list],
+            [
+                {"event": "prepare_2fa"},
+                {"event": "2fa_command_ack", "command": "2fa_prepared"},
+                {
+                    "event": "2fa_command_ack",
+                    "command": "2fa_code",
+                    "generation": 1,
+                },
+            ],
+        )
+
     def test_rejects_unexpected_preparation_command(self):
         with patch("apple_account_flow.emit"), patch(
             "apple_account_flow.read_command",

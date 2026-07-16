@@ -654,6 +654,11 @@ function runBrowserFailureClassificationTest() {
       "broker_connect_timeout",
     ],
     ["ruyipage browser broker socket I/O failed", "broker_io"],
+    ["ruyipage browser broker command acknowledgement invalid", "broker_ack"],
+    [
+      "ruyipage browser broker command acknowledgement timed out",
+      "broker_ack",
+    ],
     ["ruyipage backend failed", "backend_failed"],
     ["ruyipage backend exited 1", "backend_exit"],
     ["ruyipage backend timed out after 720000ms", "backend_timeout"],

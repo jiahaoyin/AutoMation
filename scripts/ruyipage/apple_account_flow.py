@@ -289,11 +289,24 @@ def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
     return json.loads(line)
 
 
+def emit_two_factor_command_ack(
+    command: str,
+    generation: int | None = None,
+) -> None:
+    if not browser_broker_mode_enabled():
+        return
+    event: dict[str, Any] = {"event": "2fa_command_ack", "command": command}
+    if generation is not None:
+        event["generation"] = generation
+    emit(event)
+
+
 def request_two_factor_preparation() -> None:
     emit({"event": "prepare_2fa"})
     command = read_command()
     if not isinstance(command, dict) or command.get("type") != "2fa_prepared":
         raise RuntimeError("2FA preparation acknowledgement was not received")
+    emit_two_factor_command_ack("2fa_prepared")
 
 
 def validate_otp_generation(generation: Any) -> int:
@@ -314,6 +327,7 @@ def validate_two_factor_code_command(command: Any, expected_generation: int) -> 
     code = command.get("code")
     if not isinstance(code, str) or re.fullmatch(r"[0-9]{6}", code) is None:
         raise RuntimeError("2FA code must contain exactly six digits")
+    emit_two_factor_command_ack("2fa_code", generation)
     return code
 
 
