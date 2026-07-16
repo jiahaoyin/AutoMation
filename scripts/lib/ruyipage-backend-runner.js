@@ -1092,6 +1092,9 @@ async function runRuyiPageBackend({
       return new Error(`ruyipage backend timed out after ${timeoutMs}ms`);
     }
     if (outcome?.error) return outcome.error;
+    if (usesBrowserBroker && outcome?.exitCode === 0 && !finalResult) {
+      return new Error(BROWSER_BROKER_ERRORS.eof);
+    }
     return new Error(`ruyipage backend exited ${outcome?.exitCode ?? "unknown"}`);
   };
   const whileChildAlive = async (operation) => {
@@ -1164,8 +1167,12 @@ async function runRuyiPageBackend({
       clearTimeout(handlerTimer);
     }
   };
-  const writeCommand = (command) =>
-    whileChildAlive(
+  const writeCommand = async (command) => {
+    // A broker peer can close while an external 2FA callback resolves. Yield
+    // one I/O turn so its terminal event wins before attempting a JSONL write.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (childEnded) throw terminalError(await childOutcome);
+    return whileChildAlive(
       () =>
         new Promise((resolve, reject) => {
           const stdin = child.stdin;
@@ -1196,6 +1203,7 @@ async function runRuyiPageBackend({
           }
         })
     );
+  };
   const timer = setTimeout(() => {
     timedOut = true;
     acceptingStdout = false;

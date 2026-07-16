@@ -1107,32 +1107,59 @@ def submit_element_with_enter(
     pause: Callable[[int, int], None] = human_pause,
     min_ms: int = 350,
     max_ms: int = 800,
+    password_value: str | None = None,
 ) -> None:
-    try:
-        action_scope = focus_keyboard_target(root_page, scope, element, pause=pause)
-    except RuntimeError as error:
-        if str(error) != FOCUS_NOT_CONFIRMED_REASON:
-            raise
+    candidate_scope = scope
+    candidate_element = element
+    for attempt in range(2):
         try:
-            input_type = str(element.attr("type") or "").strip().lower()
-        except Exception:
-            raise error
-        if input_type != "password":
-            raise error
-        require_password_bidi_input_target(scope, element)
-        emit_input_progress("password", "submit_owner_focus_unconfirmed", "owner")
-        pause(min_ms, max_ms)
-        scope.actions.press(keys.ENTER).perform()
-        emit_input_progress("password", "submit_owner_enter_sent", "owner")
+            action_scope = focus_keyboard_target(
+                root_page,
+                candidate_scope,
+                candidate_element,
+                pause=pause,
+            )
+        except RuntimeError as error:
+            if str(error) != FOCUS_NOT_CONFIRMED_REASON or attempt != 0:
+                raise
+            try:
+                input_type = str(candidate_element.attr("type") or "").strip().lower()
+            except Exception:
+                raise error
+            if input_type != "password" or not password_value:
+                emit_input_progress("password", "submit_focus_unconfirmed", "owner")
+                raise error
+
+            # The 2FA prepare acknowledgement can outlive an Apple iframe
+            # refresh. Rediscover and revalidate before sending any key.
+            candidate_scope, candidate_element = wait_for_element(
+                root_page,
+                PASSWORD_SELECTORS,
+                timeout_s=15,
+            )
+            input_and_verify(
+                candidate_scope,
+                candidate_element,
+                password_value,
+                "password",
+                keys,
+                pause=pause,
+                root_page=root_page,
+            )
+            emit_input_progress("password", "submit_target_refreshed", "owner")
+            continue
+
+        submit_with_enter(
+            action_scope,
+            candidate_element,
+            keys,
+            pause=pause,
+            min_ms=min_ms,
+            max_ms=max_ms,
+        )
         return
-    submit_with_enter(
-        action_scope,
-        element,
-        keys,
-        pause=pause,
-        min_ms=min_ms,
-        max_ms=max_ms,
-    )
+
+    raise RuntimeError(FOCUS_NOT_CONFIRMED_REASON)
 
 
 def ensure_remember_checked(
@@ -2397,6 +2424,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     Keys,
                     min_ms=420,
                     max_ms=900,
+                    password_value=password,
                 )
 
             set_browser_startup_stage("twofa_page_wait")

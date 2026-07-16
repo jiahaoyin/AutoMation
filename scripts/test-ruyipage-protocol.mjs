@@ -785,6 +785,122 @@ async function runNodeRunnerBrowserBrokerEofSelfTest() {
   );
 }
 
+async function runNodeRunnerBrowserBrokerEofDuringPreparationTest() {
+  let prepareStarted;
+  const preparationStarted = new Promise((resolve) => {
+    prepareStarted = resolve;
+  });
+  const socket = new ControlledBrokerSocket({
+    onWrite(chunk) {
+      const frame = JSON.parse(chunk.toString("utf8"));
+      if (frame.type === "credentials") {
+        socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      }
+    },
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      createConnection() {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    },
+  });
+
+  const outcome = withBrowserBrokerEnvironment(() =>
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      async prepare2FA() {
+        prepareStarted();
+        return new Promise(() => {});
+      },
+      async get2FACode() {
+        return SECRET_FIXTURES.verificationCode;
+      },
+    })
+  );
+  await withRejectGuard(
+    preparationStarted,
+    500,
+    "browser broker did not request 2FA preparation"
+  );
+  socket.endFromPeer();
+
+  await assert.rejects(
+    withRejectGuard(outcome, 1_000, "runner hung after broker EOF during preparation"),
+    (error) => {
+      assert.equal(error.message, "ruyipage browser broker socket closed");
+      return true;
+    }
+  );
+  assert.equal(
+    parseOutboundFrames(socket).some((frame) => frame.type === "2fa_prepared"),
+    false,
+    "a closed broker must not receive a preparation acknowledgement"
+  );
+}
+
+async function runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest() {
+  let codeRequested;
+  const requestedCode = new Promise((resolve) => {
+    codeRequested = resolve;
+  });
+  const socket = new ControlledBrokerSocket({
+    onWrite(chunk) {
+      const frame = JSON.parse(chunk.toString("utf8"));
+      if (frame.type === "credentials") {
+        socket.receive(`${JSON.stringify({ event: "prepare_2fa" })}\n`);
+      } else if (frame.type === "2fa_prepared") {
+        socket.receive(`${JSON.stringify({ event: "need_2fa", generation: 1 })}\n`);
+      }
+    },
+  });
+  const runner = createRuyiPageBackendRunner({
+    python: path.join(root, "broker-mode-must-not-spawn-python"),
+    timeoutMs: 2_000,
+    killGraceMs: 50,
+    browserBrokerTransportOptions: {
+      connectTimeoutMs: 200,
+      createConnection() {
+        queueMicrotask(() => socket.emit("connect"));
+        return socket;
+      },
+    },
+  });
+
+  const outcome = withBrowserBrokerEnvironment(() =>
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      async prepare2FA() {},
+      async get2FACode() {
+        codeRequested();
+        socket.endFromPeer();
+        return SECRET_FIXTURES.verificationCode;
+      },
+    })
+  );
+  await withRejectGuard(requestedCode, 500, "browser broker did not request a 2FA code");
+
+  await assert.rejects(
+    withRejectGuard(outcome, 1_000, "runner hung after broker EOF during code delivery"),
+    (error) => {
+      assert.equal(error.message, "ruyipage browser broker socket closed");
+      return true;
+    }
+  );
+  assert.equal(
+    parseOutboundFrames(socket).some((frame) => frame.type === "2fa_code"),
+    false,
+    "a closed broker must not receive a verification-code frame"
+  );
+}
+
 function runBackendTimeoutConfigTest() {
   assert.deepEqual(resolveBackendTimeouts({}), {
     timeoutMs: 720_000,
@@ -2485,6 +2601,8 @@ const focusedTests = {
   "broker-facade-eof": runBrowserBrokerEofSelfTest,
   "broker-runner": runNodeRunnerBrowserBrokerSelfTest,
   "broker-eof": runNodeRunnerBrowserBrokerEofSelfTest,
+  "broker-eof-prepare": runNodeRunnerBrowserBrokerEofDuringPreparationTest,
+  "broker-eof-code": runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest,
   "live-descendant": runChildStopperLiveDescendantSelfTest,
   "cleanup-timeout": runChildStopperCleanupDeadlineSelfTest,
   "identity-change": runChildStopperIdentityChangeSelfTest,
@@ -2526,6 +2644,8 @@ await runBrowserBrokerWriteFailureSelfTest();
 await runBrowserBrokerEofSelfTest();
 await runNodeRunnerBrowserBrokerSelfTest();
 await runNodeRunnerBrowserBrokerEofSelfTest();
+await runNodeRunnerBrowserBrokerEofDuringPreparationTest();
+await runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest();
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();

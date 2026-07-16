@@ -483,6 +483,29 @@ async function bufferEarlyPopupTest() {
   assert.equal(clock.timers.size, 0);
 }
 
+async function initialPopupProbeFailureDoesNotAbortPreparationTest() {
+  const { clock, native, collector, audits } = createHarness({
+    settingsFallback: false,
+    manualFallback: false,
+  });
+  native.queueProbeResults(new Error("private initial probe failure"));
+
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+  native.setPopup("121212");
+  await clock.advance(30);
+
+  assert.equal(await codePromise, "121212");
+  assert.equal(
+    audits.some(
+      (entry) => entry.phase === "popup_probe_failure" && entry.state === "probe_error"
+    ),
+    true,
+    "an initial native probe failure must be audited without disabling the watcher"
+  );
+  await collector.dispose();
+}
+
 async function collectorCarriesPreparationBoundaryIntoAllowFlowTest() {
   const { clock, native, collector } = createHarness();
   await collector.prepare();
@@ -1115,7 +1138,7 @@ async function cancelledProbeErrorOcrCannotPublishLateCodeTest() {
 }
 
 async function unavailableOcrDoesNotEmitPermissionStatusTest() {
-  const { clock, native, collector, statuses } = createHarness({
+  const { clock, native, collector, statuses, audits } = createHarness({
     timeoutMs: 240_000,
     settingsFallback: false,
     manualFallback: false,
@@ -1130,6 +1153,20 @@ async function unavailableOcrDoesNotEmitPermissionStatusTest() {
   assert.equal(
     statuses.some(({ status }) => status === "ocr_permission_missing"),
     false
+  );
+  assert.deepEqual(
+    statuses.filter(({ status }) => status === "ocr_helper_unavailable"),
+    [{ status: "ocr_helper_unavailable", source: "popup", remainingSec: 240 }]
+  );
+  assert.equal(
+    audits.some(
+      (entry) =>
+        entry.phase === "popup_code_read" &&
+        entry.capability === "unavailable" &&
+        entry.reason === "ocr_helper_unavailable"
+    ),
+    true,
+    "a missing OCR helper must not be misreported as an empty code scan"
   );
   await collector.dispose();
   await rejected;
@@ -3018,6 +3055,7 @@ async function disposalClosesVisiblePopupTest() {
 
 const focusedTests = {
   "report-dir": readOnlyCwdDoesNotAffectHarnessReportsTest,
+  "initial-probe-failure": initialPopupProbeFailureDoesNotAbortPreparationTest,
   "allow-remains": allowAttemptRemainingVisibleIsNotConfirmedTest,
   "allow-transition": allowIsConfirmedOnlyAfterStableStateTransitionTest,
   "preexisting-allow": preexistingAllowIsNeverAutomaticallyClickedTest,
@@ -3092,6 +3130,7 @@ if (focusedTest) {
 } else {
   await readOnlyCwdDoesNotAffectHarnessReportsTest();
   await bufferEarlyPopupTest();
+  await initialPopupProbeFailureDoesNotAbortPreparationTest();
   await collectorCarriesPreparationBoundaryIntoAllowFlowTest();
   await preexistingAllowIsNeverAutomaticallyClickedTest();
   await preexistingAllowCodeIsDismissedRejectedAndGateStaysClosedTest();

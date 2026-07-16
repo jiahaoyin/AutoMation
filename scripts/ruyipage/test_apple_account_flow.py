@@ -973,7 +973,7 @@ class InputTests(unittest.TestCase):
             ],
         )
 
-    def test_password_submit_uses_owner_enter_when_focus_probe_is_unavailable(self):
+    def test_password_submit_never_sends_enter_when_focus_probe_is_unavailable(self):
         auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
         iframe = FakeElement(attrs={"src": auth_url})
         password = FakeElement(attrs={"type": "password"}, focused=False)
@@ -988,7 +988,9 @@ class InputTests(unittest.TestCase):
             parent=root,
         )
 
-        with patch("apple_account_flow.emit") as emit_event:
+        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError, "focus was not confirmed"
+        ):
             submit_element_with_enter(
                 root,
                 frame,
@@ -997,10 +999,59 @@ class InputTests(unittest.TestCase):
                 pause=lambda *_: None,
             )
 
-        self.assertEqual(frame.actions.calls[-2:], [("press", "ENTER"), ("perform",)])
+        self.assertNotIn(("press", "ENTER"), frame.actions.calls)
         self.assertEqual(
             [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
-            ["submit_owner_focus_unconfirmed", "submit_owner_enter_sent"],
+            ["submit_focus_unconfirmed"],
+        )
+
+    def test_password_submit_refreshes_target_before_enter_after_focus_loss(self):
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(attrs={"src": auth_url})
+        stale = FakeElement(attrs={"type": "password"}, focused=False)
+        fresh = FakeElement(attrs={"type": "password"})
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(),
+        )
+        frame = FakePage(
+            {"css:input[type='password']": [fresh]},
+            state={"href": auth_url},
+            parent=root,
+        )
+
+        with patch(
+            "apple_account_flow.wait_for_element", return_value=(frame, fresh)
+        ) as rediscover, patch(
+            "apple_account_flow.input_and_verify", return_value=frame
+        ) as retype, patch("apple_account_flow.emit") as emit_event:
+            submit_element_with_enter(
+                root,
+                frame,
+                stale,
+                FakeKeys,
+                pause=lambda *_: None,
+                password_value="secret",
+            )
+
+        rediscover.assert_called_once_with(
+            root, account_flow.PASSWORD_SELECTORS, timeout_s=15
+        )
+        retype.assert_called_once_with(
+            frame,
+            fresh,
+            "secret",
+            "password",
+            FakeKeys,
+            pause=unittest.mock.ANY,
+            root_page=root,
+        )
+        enter_index = root.actions.calls.index(("press", "ENTER"))
+        self.assertEqual(root.actions.calls[enter_index + 1], ("perform",))
+        self.assertEqual(
+            [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
+            ["submit_target_refreshed"],
         )
 
     def test_otp_digit_uses_owner_bidi_input_after_focus_is_lost(self):

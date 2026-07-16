@@ -26,6 +26,7 @@ const STATUS_NAMES = new Set([
   "manual_code",
   "manual_unavailable",
   "ocr_permission_missing",
+  "ocr_helper_unavailable",
   "popup_accessibility",
   "popup_scanning",
   "popup_close_pending",
@@ -229,6 +230,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "probe_or_provider_failed",
     "ax_ocr_no_code",
     "code_available",
+    "ocr_helper_unavailable",
     "ocr_permission_missing",
     "settings_start_failed",
     "settings_timeout",
@@ -422,6 +424,7 @@ export function createMac2FACollector(options = {}) {
   let manualAllowStatusSent = false;
   let manualUnavailableStatusSent = false;
   let ocrPermissionStatusSent = false;
+  let ocrHelperUnavailableStatusSent = false;
   let popupAccessibilityStatusSent = false;
   let popupScanningStatusSent = false;
   const popupCloseControllers = new Set();
@@ -1058,6 +1061,13 @@ export function createMac2FACollector(options = {}) {
         remainingSec: remainingSeconds(),
       });
     }
+    if (result?.capability === "unavailable" && !ocrHelperUnavailableStatusSent) {
+      ocrHelperUnavailableStatusSent = true;
+      status("ocr_helper_unavailable", {
+        source: "popup",
+        remainingSec: remainingSeconds(),
+      });
+    }
     const readerRejected = result?.rejected === true;
     const code = readerRejected ? null : normalizeSixDigitCode(result?.code);
     audit({
@@ -1072,6 +1082,8 @@ export function createMac2FACollector(options = {}) {
           ? "ocr_permission_missing"
           : result?.capability === "accessibility_missing"
             ? "accessibility_denied"
+            : result?.capability === "unavailable"
+              ? "ocr_helper_unavailable"
             : "ax_ocr_no_code",
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
@@ -1132,6 +1144,7 @@ export function createMac2FACollector(options = {}) {
       }
 
       let stale = { count: 0, codes: [] };
+      let initialProbeState = null;
       if (!config.settingsOnly) {
         stale = await runtime.dismissStale2FAPopups(6, {
           compileIfNeeded: false,
@@ -1142,13 +1155,17 @@ export function createMac2FACollector(options = {}) {
           if (code) rejectedCodes.add(code);
         }
 
-        const visible = await runtime.probe2FAState(2);
+        try {
+          initialProbeState = await runtime.probe2FAState(2);
+        } catch {
+          initialProbeState = { action: "probe_error" };
+        }
         throwIfDisposedDuringPreparation();
-        if (visible?.action === "has_allow_dialog") {
+        if (initialProbeState?.action === "has_allow_dialog") {
           preexistingAllowGate = true;
           preexistingAllowIdleHits = 0;
-        } else if (visible?.action === "has_code_dialog") {
-          const visibleCode = normalizeSixDigitCode(visible.code);
+        } else if (initialProbeState?.action === "has_code_dialog") {
+          const visibleCode = normalizeSixDigitCode(initialProbeState.code);
           if (visibleCode) rejectedCodes.add(visibleCode);
           const dismissed = await runtime.runPopupPhase("dismiss_stale", 2, {
             compileIfNeeded: false,
@@ -1169,6 +1186,9 @@ export function createMac2FACollector(options = {}) {
         elapsedSincePrepareMs: 0,
       });
       if (!config.settingsOnly) {
+        if (initialProbeState?.action === "probe_error") {
+          observeProbeState(initialProbeState);
+        }
         popupWatcherController = new AbortController();
         popupWatcherPromise = watchPopup(popupWatcherController.signal);
       }
