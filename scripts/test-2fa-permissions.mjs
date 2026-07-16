@@ -40,15 +40,33 @@ assert.match(
   /APPLE_AUTOMATION_SUPERVISED_GUI[\s\S]*permission_preflight_start[\s\S]*isAccessibilityGranted\(\{\s*compileIfNeeded:\s*false\s*\}\)[\s\S]*permission_preflight_prompted[\s\S]*triggerAccessibilityPrompt\(\{[\s\S]*waitTimeoutMs:[\s\S]*SUPERVISED_ACCESSIBILITY_WAIT_MS[\s\S]*compileIfNeeded:\s*false[\s\S]*\}\)[\s\S]*permission_preflight_ready[\s\S]*permission_preflight_missing[\s\S]*return;[\s\S]*run2FAPermissionPreflight\(\{[\s\S]*compileIfNeeded:\s*false/
 );
 const settingsOnlyStart = preflightEntrySource.indexOf("if (settingsOnly) {");
-const firstNonSettingsBranch = preflightEntrySource.indexOf("if (supervised)", settingsOnlyStart);
+const firstNonSettingsBranch = preflightEntrySource.indexOf(
+  "\n  if (supervised) {",
+  settingsOnlyStart
+);
 const settingsOnlyBranch = preflightEntrySource.slice(
   settingsOnlyStart,
   firstNonSettingsBranch
 );
 assert.match(
   settingsOnlyBranch,
-  /is2FASettingsHelperAvailable\(\{\s*compileIfNeeded:\s*true\s*\}\)/,
+  /is2FASettingsHelperAvailable\(\{\s*compileIfNeeded:\s*true,\s*compileTimeoutMs:\s*timeoutMs,\s*\}\)/,
   "the production Settings-only preflight must prepare the same helper before the browser reaches 2FA"
+);
+assert.match(
+  settingsOnlyBranch,
+  /await ensure2FASettingsAccessibility\(\{\s*timeoutMs,\s*verbose:\s*!quiet,\s*\}\)/,
+  "the production Settings-only preflight must prompt the exact Settings helper before browser login"
+);
+assert.match(
+  settingsOnlyBranch,
+  /SETTINGS_ACCESSIBILITY_WAIT_MS/,
+  "the Settings helper permission prompt must have a bounded normal-run wait"
+);
+assert.match(
+  settingsOnlyBranch,
+  /status:settings_accessibility_ready/,
+  "supervised Settings-only preflight must report a fixed granted state"
 );
 assert.match(
   settingsOnlyBranch,
@@ -63,6 +81,11 @@ assert.match(
   preflightEntrySource,
   /e\?\.code\s*===\s*"2FA_SETTINGS_HELPER_UNAVAILABLE"[\s\S]{0,220}process\.exitCode\s*=\s*1/,
   "a missing helper must remain fatal in supervised mode so run.sh cannot start the browser"
+);
+assert.match(
+  preflightEntrySource,
+  /if \(settingsOnly\) \{[\s\S]{0,320}isAccessibilityDeniedError\(e\)[\s\S]{0,260}process\.exitCode\s*=\s*1/,
+  "a denied Settings helper permission must remain fatal before ruyiPage starts"
 );
 assert.match(accessibilitySource, /error\.code = "2FA_ACCESSIBILITY_DENIED"/);
 

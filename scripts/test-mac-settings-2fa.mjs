@@ -4,7 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { start2FASettingsCodeRequest } from "./lib/mac-settings-2fa.js";
+import {
+  ensure2FASettingsAccessibility,
+  start2FASettingsCodeRequest,
+} from "./lib/mac-settings-2fa.js";
 import * as settingsModule from "./lib/mac-settings-2fa.js";
 import { isAccessibilityDeniedError } from "./lib/accessibility.js";
 
@@ -675,9 +678,9 @@ function runStaleBinaryCompileFailureTest() {
       sourcePath,
       binaryPath,
       compileIfNeeded: true,
-      spawnSync(command, args) {
+      spawnSync(command, args, options) {
         const outputPath = args[args.indexOf("-o") + 1];
-        compilerCalls.push({ command, args: [...args], outputPath });
+        compilerCalls.push({ command, args: [...args], outputPath, options });
         fs.writeFileSync(outputPath, "partial-output\n", { mode: 0o755 });
         return { status: 1, stdout: "", stderr: "compile failed" };
       },
@@ -687,6 +690,7 @@ function runStaleBinaryCompileFailureTest() {
     assert.equal(compilerCalls.length, 1, "settings helper must attempt recompilation");
     assert.equal(compilerCalls[0].command, "/usr/bin/xcrun");
     assert.equal(compilerCalls[0].args[0], "swiftc");
+    assert.equal(compilerCalls[0].options.timeout, 120_000);
     assert.notEqual(compilerCalls[0].outputPath, binaryPath, "settings helper must compile to a temporary path");
     assert.equal(fs.existsSync(compilerCalls[0].outputPath), false, "failed output must be removed");
 
@@ -695,9 +699,9 @@ function runStaleBinaryCompileFailureTest() {
       sourcePath,
       binaryPath,
       compileIfNeeded: true,
-      spawnSync(command, args) {
+      spawnSync(command, args, options) {
         const outputPath = args[args.indexOf("-o") + 1];
-        compilerCalls.push({ command, args: [...args], outputPath });
+        compilerCalls.push({ command, args: [...args], outputPath, options });
         fs.writeFileSync(outputPath, "new-binary\n", { mode: 0o755 });
         return { status: 0, stdout: "", stderr: "" };
       },
@@ -706,6 +710,7 @@ function runStaleBinaryCompileFailureTest() {
     assert.equal(fs.readFileSync(binaryPath, "utf8"), "new-binary\n");
     assert.equal(compilerCalls[1].command, "/usr/bin/xcrun");
     assert.equal(compilerCalls[1].args[0], "swiftc");
+    assert.equal(compilerCalls[1].options.timeout, 120_000);
     assert.notEqual(compilerCalls[1].outputPath, binaryPath, "settings helper replacement must be atomic");
   } finally {
     for (const entry of fs.readdirSync(fixtureDir)) {
@@ -888,6 +893,39 @@ async function runSuccessTest() {
     assert.equal(fs.existsSync(harness.cancelFile()), false);
   } finally {
     if (fs.existsSync(screenshotDir)) fs.rmdirSync(screenshotDir);
+    harness.cleanup();
+  }
+}
+
+async function runSettingsAccessibilityPreflightTest() {
+  const harness = createHarness();
+  try {
+    const result = ensure2FASettingsAccessibility({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    assert.equal(harness.spawnCall.args[0], "--preflight-accessibility");
+    assert.equal(harness.spawnCall.args[1], "--timeout");
+    assert.equal(harness.spawnCall.args[2], "90");
+
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          ok: true,
+          reason: "accessibility_ready",
+          message: "ready",
+          code: null,
+          raw: SECRET_TEXT,
+        }) + "\n"
+      )
+    );
+    harness.child.emit("close", 0, null);
+
+    assert.deepEqual(await result, { granted: true });
+    assert.equal(fs.existsSync(harness.cancelFile()), false);
+  } finally {
     harness.cleanup();
   }
 }
@@ -1646,6 +1684,18 @@ function runAccessibilityPromptSourceContractTest() {
     source.slice(accessibilityGate, ownerAttempts),
     /emit\(Output\(ok: false, code: nil, message: "Accessibility permission unavailable"/
   );
+  const preflightFlag = source.indexOf('args[i] == "--preflight-accessibility"');
+  const preflightSuccess = source.indexOf("if preflightAccessibilityOnly {");
+  assert.ok(
+    preflightFlag >= 0 &&
+      preflightSuccess > accessibilityGate &&
+      preflightSuccess < ownerAttempts,
+    "the Settings helper accessibility preflight must return before Settings AX discovery"
+  );
+  assert.match(
+    source.slice(preflightSuccess, ownerAttempts),
+    /OutputReason\.accessibilityReady\.rawValue/
+  );
 
   const originalPath = source.slice(ownerAttempts);
   assert.match(originalPath, /openAppleAccountSettings\(deadline: deadline\)/);
@@ -2321,6 +2371,7 @@ function runManualSettingsPrivacyContractTest() {
 }
 
 await runSuccessTest();
+await runSettingsAccessibilityPreflightTest();
 await runFixedSuccessStateTest();
 await runSequentialSettingsCodeRequestsTest();
 await runSensitiveOutputSanitizationTest();

@@ -16,6 +16,7 @@ struct Output: Codable {
 enum OutputReason: String {
     case ok
     case cancelled
+    case accessibilityReady = "accessibility_ready"
     case accessibilityUnavailable = "accessibility_unavailable"
     case twoFactorNotFound = "two_factor_not_found"
     case verificationAlertNotOpened = "verification_alert_not_opened"
@@ -2067,8 +2068,14 @@ func prepareVerificationCodeAlert(
 
 var timeoutSec = 90
 var i = 1
+var preflightAccessibilityOnly = false
 let args = CommandLine.arguments
 while i < args.count {
+    if args[i] == "--preflight-accessibility" {
+        preflightAccessibilityOnly = true
+        i += 1
+        continue
+    }
     if args[i] == "--timeout", i + 1 < args.count {
         timeoutSec = Int(args[i + 1]) ?? timeoutSec
         i += 2
@@ -2086,6 +2093,10 @@ let deadline = Date().addingTimeInterval(TimeInterval(max(0, timeoutSec)))
 guard waitForAccessibilityPermission(deadline: deadline) else {
     logStep(0, "Accessibility permission unavailable")
     emit(Output(ok: false, code: nil, message: "Accessibility permission unavailable", reason: OutputReason.accessibilityUnavailable.rawValue))
+}
+
+if preflightAccessibilityOnly {
+    emit(Output(ok: true, code: nil, message: "Accessibility ready", reason: OutputReason.accessibilityReady.rawValue))
 }
 
 for uiOwnerAttempt in 1...2 {

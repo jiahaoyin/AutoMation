@@ -18,7 +18,9 @@ const BIN = resolveNativeHelperPath(
   "mac-settings-2fa-code"
 );
 const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
+const SETTINGS_HELPER_COMPILE_TIMEOUT_MS = 120_000;
 const HELPER_SUCCESS_REASON = "ok";
+const HELPER_ACCESSIBILITY_READY_REASON = "accessibility_ready";
 const HELPER_FAILURES = Object.freeze({
   cancelled: ["2FA_SETTINGS_CANCELLED", "2FA settings request was cancelled"],
   accessibility_unavailable: [
@@ -71,6 +73,9 @@ export function compile2FASettingsHelper(options = {}) {
   const sourcePath = options.sourcePath ?? SWIFT_SRC;
   const binaryPath = options.binaryPath ?? BIN;
   const runCompiler = options.spawnSync ?? spawnSync;
+  const compileTimeoutMs = Number.isFinite(options.compileTimeoutMs)
+    ? Math.max(1_000, options.compileTimeoutMs)
+    : SETTINGS_HELPER_COMPILE_TIMEOUT_MS;
   if (platform !== "darwin") return { ok: false, reason: "non-darwin" };
   if (!fs.existsSync(sourcePath)) return { ok: false, reason: "missing swift source" };
 
@@ -90,7 +95,7 @@ export function compile2FASettingsHelper(options = {}) {
         "-framework",
         "AppKit",
       ],
-      { encoding: "utf-8" }
+      { encoding: "utf-8", timeout: compileTimeoutMs }
     );
     if (r.status !== 0 || !binaryIsExecutable(temporaryBin, options)) {
       if (!quiet) console.warn("[2FA] Swift settings helper compilation failed");
@@ -171,6 +176,7 @@ function resolveHelperPath(runtime) {
  *   verbose?: boolean,
  *   reportDir?: string,
  *   cancelFile?: string,
+ *   preflightAccessibility?: boolean,
  *   runtime?: { platform?: string, helperPath?: string, sourcePath?: string, binaryPath?: string, spawn?: typeof spawn, spawnSync?: typeof spawnSync, compileIfNeeded?: boolean }
  * }} [opts]
  * @returns {{
@@ -202,6 +208,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
   }
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
+  const preflightAccessibility = opts.preflightAccessibility === true;
   const markerDir = opts.reportDir || os.tmpdir();
   fs.mkdirSync(markerDir, { recursive: true });
   const cancelFile =
@@ -209,7 +216,13 @@ export function start2FASettingsCodeRequest(opts = {}) {
     path.join(markerDir, `.2fa-settings-cancel-${process.pid}-${randomUUID()}`);
   removeCancelFile(cancelFile);
 
-  const args = ["--timeout", String(timeoutSec), "--cancel-file", cancelFile];
+  const args = [
+    ...(preflightAccessibility ? ["--preflight-accessibility"] : []),
+    "--timeout",
+    String(timeoutSec),
+    "--cancel-file",
+    cancelFile,
+  ];
 
   const spawnProcess = runtime.spawn ?? spawn;
   let child;
@@ -367,6 +380,26 @@ export function start2FASettingsCodeRequest(opts = {}) {
       );
       return;
     }
+    if (preflightAccessibility) {
+      if (
+        parsed?.ok !== true ||
+        parsed?.reason !== HELPER_ACCESSIBILITY_READY_REASON ||
+        parsed.code != null
+      ) {
+        finish(
+          annotateHelperError(
+            codedSettingsError(
+              `2FA settings helper failed${suffix}`,
+              "2FA_SETTINGS_HELPER_EXIT"
+            ),
+            parsed
+          )
+        );
+        return;
+      }
+      finish(null, { granted: true });
+      return;
+    }
     if (
       parsed?.ok !== true ||
       parsed?.reason !== HELPER_SUCCESS_REASON ||
@@ -451,4 +484,18 @@ export function start2FASettingsCodeRequest(opts = {}) {
  */
 export async function fetch2FACodeFromSystemSettings(opts = {}) {
   return start2FASettingsCodeRequest(opts).promise;
+}
+
+/**
+ * Prompt and verify Accessibility for the exact System Settings helper that
+ * will later navigate to and read the verification-code alert.
+ *
+ * @param {{ timeoutMs?: number, verbose?: boolean, runtime?: object }} [opts]
+ * @returns {Promise<{ granted: true }>}
+ */
+export async function ensure2FASettingsAccessibility(opts = {}) {
+  return start2FASettingsCodeRequest({
+    ...opts,
+    preflightAccessibility: true,
+  }).promise;
 }

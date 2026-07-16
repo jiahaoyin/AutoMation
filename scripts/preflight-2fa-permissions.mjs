@@ -11,13 +11,17 @@ import {
   run2FAPermissionPreflight,
   triggerAccessibilityPrompt,
 } from "./lib/accessibility.js";
-import { is2FASettingsHelperAvailable } from "./lib/mac-settings-2fa.js";
+import {
+  ensure2FASettingsAccessibility,
+  is2FASettingsHelperAvailable,
+} from "./lib/mac-settings-2fa.js";
 
 const quiet = process.argv.includes("--quiet");
 const supervised = process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
 const settingsOnly = process.argv.includes("--settings-only");
 const SUPERVISED_ACCESSIBILITY_WAIT_MS = 30_000;
 const SUPERVISED_ACCESSIBILITY_POLL_MS = 750;
+const SETTINGS_ACCESSIBILITY_WAIT_MS = 120_000;
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,14 +35,26 @@ function settingsHelperUnavailableError() {
 
 async function main() {
   if (settingsOnly) {
-    if (!is2FASettingsHelperAvailable({ compileIfNeeded: true })) {
+    const timeoutMs = supervised
+      ? SUPERVISED_ACCESSIBILITY_WAIT_MS
+      : SETTINGS_ACCESSIBILITY_WAIT_MS;
+    if (
+      !is2FASettingsHelperAvailable({
+        compileIfNeeded: true,
+        compileTimeoutMs: timeoutMs,
+      })
+    ) {
       throw settingsHelperUnavailableError();
     }
+    await ensure2FASettingsAccessibility({
+      timeoutMs,
+      verbose: !quiet,
+    });
     if (supervised) {
-      console.log("[2FA] status:settings_accessibility");
+      console.log("[2FA] status:settings_accessibility_ready");
     } else if (!quiet) {
       console.log(
-        "[2FA] System Settings helper is ready and will request its own Accessibility permission when a verification code is needed."
+        "[2FA] System Settings helper Accessibility permission is ready."
       );
     }
     return;
@@ -91,6 +107,13 @@ async function main() {
 main().catch((e) => {
   if (e?.code === "2FA_SETTINGS_HELPER_UNAVAILABLE") {
     console.error("[2FA] status:settings_helper_unavailable");
+    process.exitCode = 1;
+    return;
+  }
+  if (settingsOnly) {
+    console.error(
+      `[2FA] status:${isAccessibilityDeniedError(e) ? "settings_accessibility_missing" : "settings_accessibility_failed"}`
+    );
     process.exitCode = 1;
     return;
   }
