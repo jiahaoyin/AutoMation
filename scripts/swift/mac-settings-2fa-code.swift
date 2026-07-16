@@ -1364,8 +1364,8 @@ func waitForTwoFactorNavigationTarget(
         }
         if hasNavigableNamedElementInTrustedSettingsOwners(
             appElement: appElement,
-            names: twoFactor,
-            expectedPid: expectedPid
+            expectedPid: expectedPid,
+            names: twoFactor
         ) {
             return .twoFactorReady
         }
@@ -1981,8 +1981,8 @@ func prepareVerificationCodeAlert(
         logStep(3, "click Sign-In & Security")
         _ = clickNamedInTrustedSettingsOwners(
             appElement: appElement,
-            names: signInSecurity,
             expectedPid: expectedPid,
+            names: signInSecurity,
             deadline: deadline
         )
         switch waitForTwoFactorNavigationTarget(
@@ -2020,8 +2020,8 @@ func prepareVerificationCodeAlert(
             logStep(4, "click Two-Factor Authentication")
             _ = clickNamedInTrustedSettingsOwners(
                 appElement: appElement,
-                names: twoFactor,
                 expectedPid: expectedPid,
+                names: twoFactor,
                 deadline: deadline
             )
             guard waitForGetCodeButton(

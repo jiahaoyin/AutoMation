@@ -1817,15 +1817,24 @@ function runStrictVerificationCodeSourceContractTest() {
   const navigationWait = functionBody("waitForTwoFactorNavigationTarget");
   const getCodeWait = functionBody("waitForGetCodeButton");
   assert.match(navigationWait, /findGetCodeButton\(/);
-  assert.match(navigationWait, /hasNavigableNamedElementInTrustedSettingsOwners\(/);
+  assert.match(
+    navigationWait,
+    /hasNavigableNamedElementInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*twoFactor/
+  );
   assert.match(navigationWait, /cappedAt:\s*100/);
   assert.match(getCodeWait, /findGetCodeButton\(/);
   assert.match(getCodeWait, /cappedAt:\s*100/);
   assert.doesNotMatch(getCodeWait, /hasNavigableNamedElement\(/);
 
   const navigationPrepare = functionBody("prepareVerificationCodeAlert");
-  assert.match(navigationPrepare, /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,220}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*deadline/);
-  assert.match(navigationPrepare, /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,220}waitForGetCodeButton\([\s\S]{0,180}deadline:\s*deadline/);
+  assert.match(
+    navigationPrepare,
+    /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*(?:signInSecurity|twoFactor)[\s\S]{0,220}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*deadline/
+  );
+  assert.match(
+    navigationPrepare,
+    /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*(?:signInSecurity|twoFactor)[\s\S]{0,600}waitForGetCodeButton\([\s\S]{0,180}deadline:\s*deadline/
+  );
   assert.doesNotMatch(source, /boundedNavigationDeadline|navigationSettleTimeoutMs/);
 
   assert.match(source, /enum OutputReason: String/);
