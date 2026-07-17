@@ -82,6 +82,7 @@ cd apple-id-automation-latest/apple-id-automation-*/
 ## 文档
 
 - **[docs/PROJECT.md](docs/PROJECT.md)** — 架构、文件说明、故障排查（新会话必读）
+- **[docs/MAC_CODEX_HANDOFF.md](docs/MAC_CODEX_HANDOFF.md)** — Mac Codex 新会话交接、当前 2FA 状态与手工反馈流程
 - **[docs/WINDOWS_MAC_CODEX.md](docs/WINDOWS_MAC_CODEX.md)** — Windows 调度 Mac Codex 测试、证据回传与修复重测
 
 ## 浏览器后端
