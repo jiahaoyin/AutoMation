@@ -265,6 +265,7 @@ cd apple-id-automation-${VERSION}
 
 ## 故障排查
 
+- **安装 ruyiPage 时出现 PyPI TLS 证书错误**：\`install.sh\` 始终保持 HTTPS 证书校验；仅项目管理的 macOS 虚拟环境且 pip 支持 \`truststore\` 时优先使用系统信任库，显式 \`RUYIPAGE_PYTHON\` 不承诺该行为。如处于企业代理环境，请先将代理根证书安装到 macOS 系统钥匙串，再重新执行 \`./install.sh\`。
 - **辅助功能未授权**：运行 \`./install.sh\`，按 macOS 原生提示允许实际运行主体；受监督验收不是只勾选 Terminal
 - **系统设置填表失败（macOS 15）**：确认已打开 Apple Account 页；辅助功能已授权 Terminal
 - **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`npm run dump:mac-ui\` 查看 AX 树（v1.0.22 修复 tell 上下文 + 自动化预检）

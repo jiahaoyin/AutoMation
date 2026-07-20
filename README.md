@@ -35,6 +35,10 @@ Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recor
 或授权状态未生效时流程会在提交账号密码前停止，不会降级为静默跳过 OCR。若系统要求
 重启运行主体，请按提示重新打开当前终端或 Codex 后重新运行 `./install.sh`。
 
+## 安装故障排查
+
+- **安装 ruyiPage 时出现 PyPI TLS 证书错误**：`install.sh` 始终保持 HTTPS 证书校验；仅项目管理的 macOS 虚拟环境且 pip 支持 `truststore` 时优先使用系统信任库，显式 `RUYIPAGE_PYTHON` 不承诺该行为。如处于企业代理环境，请先将代理根证书安装到 macOS 系统钥匙串，再重新执行 `./install.sh`。
+
 ## 命令
 
 | 命令 | 说明 |

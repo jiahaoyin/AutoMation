@@ -8,6 +8,57 @@ const ROOT = path.resolve(__dirname, "../..");
 
 export const RUYIPAGE_PACKAGE_SPEC = "ruyiPage==1.2.45";
 
+const PIP_TLS_OVERRIDE_ENV_NAMES = new Set([
+  "CURL_CA_BUNDLE",
+  "PIP_CERT",
+  "PIP_NO_VERIFY_CERTS",
+  "PIP_TRUSTED_HOST",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_FILE",
+]);
+
+/**
+ * Build the pinned ruyiPage installation command.  Python.org's macOS
+ * runtime can otherwise miss roots trusted by the system Keychain, so the
+ * project-managed venv explicitly asks a compatible pip to use its
+ * truststore support. This keeps normal HTTPS certificate verification intact.
+ *
+ * @param {{
+ *   platform?: NodeJS.Platform|string,
+ *   managedVenv?: boolean,
+ *   truststoreSupported?: boolean
+ * }} [options]
+ */
+export function buildRuyiPagePipInstallArgs(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const managedVenv = options.managedVenv ?? false;
+  const truststoreSupported = options.truststoreSupported ?? false;
+  const args = ["-m", "pip", "install"];
+  if (platform === "darwin" && managedVenv && truststoreSupported) {
+    args.push("--use-feature=truststore");
+  }
+  args.push("--upgrade", RUYIPAGE_PACKAGE_SPEC);
+  return args;
+}
+
+export function isPipTruststoreSupported(versionText) {
+  const match = String(versionText).match(/\bpip\s+(\d+)\.(\d+)/i);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 22 || (major === 22 && minor >= 2);
+}
+
+export function buildVerifiedPipEnvironment(env = process.env) {
+  const verified = { ...env };
+  for (const name of Object.keys(verified)) {
+    if (PIP_TLS_OVERRIDE_ENV_NAMES.has(name.toUpperCase())) {
+      delete verified[name];
+    }
+  }
+  return verified;
+}
+
 function run(cmd, args, options = {}) {
   return spawnSync(cmd, args, {
     encoding: "utf-8",
@@ -134,30 +185,56 @@ function commandFailure(command, args, result) {
   return new Error(`${command} ${args.join(" ")} failed: ${detail}`);
 }
 
+function pipTruststoreSupported(python, runCommand, env) {
+  const result = runCommand(python, ["-m", "pip", "--version"], {
+    stdio: "pipe",
+    env,
+  });
+  return result.status === 0 && isPipTruststoreSupported(result.stdout || result.stderr || "");
+}
+
 /**
  * Install ruyiPage into an isolated project virtual environment unless
  * RUYIPAGE_PYTHON explicitly selects another Python environment.
- * @param {{ quiet?: boolean, env?: NodeJS.ProcessEnv|Record<string,string|undefined> }} [options]
+ * @param {{
+ *   quiet?: boolean,
+ *   env?: NodeJS.ProcessEnv|Record<string,string|undefined>,
+ *   platform?: NodeJS.Platform|string,
+ *   root?: string,
+ *   commandWorks?: (command: string) => boolean,
+ *   resolveBasePython?: (env: NodeJS.ProcessEnv|Record<string,string|undefined>) => string|null,
+ *   runCommand?: typeof run,
+ *   mkdirSync?: typeof fs.mkdirSync,
+ *   pipEnvironment?: NodeJS.ProcessEnv|Record<string,string|undefined>
+ * }} [options]
  */
 export function installRuyiPage(options = {}) {
   const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const root = options.root ?? ROOT;
+  const commandWorks = options.commandWorks ?? defaultCommandWorks;
+  const runCommand = options.runCommand ?? run;
+  const mkdirSync = options.mkdirSync ?? fs.mkdirSync;
+  const resolveBasePython = options.resolveBasePython ?? ((candidateEnv) =>
+    resolveBasePythonCommand(candidateEnv, { commandWorks })
+  );
   const requested = env.RUYIPAGE_PYTHON?.trim();
   let python = requested || null;
 
-  if (python && !defaultCommandWorks(python)) {
+  if (python && !commandWorks(python)) {
     throw new Error(`RUYIPAGE_PYTHON is missing or older than Python 3.10: ${python}`);
   }
 
   if (!python) {
-    const basePython = resolveBasePythonCommand(env);
+    const basePython = resolveBasePython(env);
     if (!basePython) throw new Error("python/python3 not found; install Python 3.10+ first");
 
-    const localPython = getLocalRuyiPagePython();
-    if (!defaultCommandWorks(localPython)) {
+    const localPython = getLocalRuyiPagePython(root, platform);
+    if (!commandWorks(localPython)) {
       const venvDir = path.dirname(path.dirname(localPython));
-      fs.mkdirSync(path.dirname(venvDir), { recursive: true });
+      mkdirSync(path.dirname(venvDir), { recursive: true });
       const args = ["-m", "venv", venvDir];
-      const result = run(basePython, args, {
+      const result = runCommand(basePython, args, {
         stdio: options.quiet ? "pipe" : "inherit",
       });
       if (result.status !== 0) throw commandFailure(basePython, args, result);
@@ -165,9 +242,14 @@ export function installRuyiPage(options = {}) {
     python = localPython;
   }
 
-  const args = ["-m", "pip", "install", "--upgrade", RUYIPAGE_PACKAGE_SPEC];
-  const result = run(python, args, {
+  const managedVenv = !requested;
+  const pipEnv = buildVerifiedPipEnvironment(options.pipEnvironment ?? process.env);
+  const truststoreSupported =
+    platform === "darwin" && managedVenv && pipTruststoreSupported(python, runCommand, pipEnv);
+  const args = buildRuyiPagePipInstallArgs({ platform, managedVenv, truststoreSupported });
+  const result = runCommand(python, args, {
     stdio: options.quiet ? "pipe" : "inherit",
+    env: pipEnv,
   });
   if (result.status !== 0) throw commandFailure(python, args, result);
   return { python };
