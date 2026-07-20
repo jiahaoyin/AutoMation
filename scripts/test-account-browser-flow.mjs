@@ -223,6 +223,18 @@ async function runFlowAuditForwardingTest() {
       stage: "twofa_input",
     });
     await options.onEvent?.({
+      event: "need_2fa",
+      generation: 1,
+      state: {
+        twofaVisible: true,
+        inputReady: false,
+        codeInputCount: 0,
+        elapsedMs: 1234,
+        href: SECRET_FIXTURE,
+        otp: SECRET_FIXTURE,
+      },
+    });
+    await options.onEvent?.({
       event: "runner_status",
       status: "twofa_code_delivery_sent",
       generation: 1,
@@ -261,6 +273,21 @@ async function runFlowAuditForwardingTest() {
         entry.details.route === "owner"
     )
   );
+  assert.deepEqual(
+    entries.find(
+      (entry) => entry.source === "ruyipage" && entry.event === "need_2fa"
+    )?.details,
+    {
+      generation: 1,
+      state: {
+        twofaVisible: true,
+        inputReady: false,
+        codeInputCount: 0,
+        elapsedMs: 1234,
+      },
+    }
+  );
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
   assert.ok(
     entries.some(
       (entry) =>
@@ -322,6 +349,49 @@ async function runFlowAuditForwardingTest() {
   );
 }
 
+async function runTwoFactorInputUnconfirmedDiagnosticTest() {
+  const entries = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, error, details = {}) {
+      entries.push({ source, event, details, hasError: Boolean(error) });
+    },
+    addSecrets() {},
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent?.({
+      event: "status",
+      status: "browser_stage",
+      stage: "twofa_input",
+    });
+    await options.onEvent?.({
+      event: "diagnostic",
+      kind: "python_exception",
+      failureStage: "twofa_input",
+      errorType: "RuntimeError",
+      errorClass: "twofa_input_unconfirmed",
+      hasTraceback: true,
+    });
+    return successfulResult();
+  });
+
+  await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "diagnostic" &&
+        entry.details.failureStage === "twofa_input" &&
+        entry.details.diagnosticErrorClass === "twofa_input_unconfirmed" &&
+        entry.details.diagnosticMessageClass === "unknown" &&
+        entry.details.hasTraceback === true
+    )
+  );
+}
+
 async function runTwoFactorHandoffFailureContextTest() {
   const entries = [];
   const flowAudit = {
@@ -377,6 +447,7 @@ async function runTwoFactorHandoffFailureContextTest() {
       event: "status",
       status: "browser_preserved",
       failureStage: "twofa_input",
+      preserved: true,
     });
     throw backendError;
   });
@@ -1197,6 +1268,7 @@ const focusedTests = {
   "popup-primary": runProductionPopupPrimaryConfigurationTest,
   generations: runTwoGenerationForwardingTest,
   "flow-audit-forwarding": runFlowAuditForwardingTest,
+  "twofa-input-unconfirmed": runTwoFactorInputUnconfirmedDiagnosticTest,
   "twofa-handoff-failure": runTwoFactorHandoffFailureContextTest,
   "password-bidi-progress": runPasswordBidiInputProgressTest,
   "prepared-accessibility": runPreparedAccessibilityCheckDoesNotBlockBrowserTest,
@@ -1224,6 +1296,7 @@ await runProductionPopupPrimaryConfigurationTest();
 await runTwoGenerationForwardingTest();
 await runBrowserFallbackEnvironmentSwitchesTest();
 await runFlowAuditForwardingTest();
+await runTwoFactorInputUnconfirmedDiagnosticTest();
 await runTwoFactorHandoffFailureContextTest();
 await runPasswordBidiInputProgressTest();
 await runCollectorTimeoutIsAlways240SecondsTest();

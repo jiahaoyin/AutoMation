@@ -1,5 +1,10 @@
 # ruyiPage 2FA State and Allow Confirmation Implementation Plan
 
+> **Status: Deprecated.** This historical plan contains the earlier Settings
+> timing/race wording. The active implementation contract is
+> [`docs/2FA_SERIAL_FALLBACK_PLAN.md`](../../2FA_SERIAL_FALLBACK_PLAN.md), which
+> requires popup-first collection with a serial Settings fallback.
+
 > **Execution:** Use subagents directly in the current checkout. Do not create worktrees. Follow TDD: each production behavior requires a focused failing test observed before implementation.
 
 **Goal:** Detect the visible Apple 2FA phase independently of its concrete OTP control, discover safe OTP targets through current ruyiPage page/frame/shadow scopes, and confirm macOS Allow results before treating a native action as successful.

@@ -90,6 +90,7 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
 const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_digit_input_verification_failed",
   "twofa_sequence_failed",
+  "twofa_input_unconfirmed",
   "twofa_input_missing",
   "twofa_input_target_count",
   "twofa_target_missing",
@@ -315,6 +316,22 @@ function sanitizeTwoFactorGeneration(value) {
   return value === 1 || value === 2 ? value : 0;
 }
 
+function sanitizeTwoFactorPageState(value) {
+  const state = value && typeof value === "object" ? value : {};
+  return {
+    twofaVisible: state.twofaVisible === true,
+    inputReady: state.inputReady === true,
+    codeInputCount:
+      state.codeInputCount === 1 || state.codeInputCount === 6
+        ? state.codeInputCount
+        : 0,
+    elapsedMs:
+      Number.isInteger(state.elapsedMs) && state.elapsedMs >= 0
+        ? Math.min(state.elapsedMs, 75_000)
+        : 0,
+  };
+}
+
 function sanitizeBackendExitCode(value) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
@@ -375,6 +392,9 @@ function classifyBackendDiagnosticMessage(value) {
   }
   if (normalized.includes("2fa code input was not detected")) {
     return "twofa_input_missing";
+  }
+  if (normalized.includes("2fa code input was not confirmed")) {
+    return "twofa_input_unconfirmed";
   }
   if (normalized.includes("2fa code input must resolve")) {
     return "twofa_input_target_count";
@@ -487,6 +507,7 @@ function auditRuyiPageEvent(flowAudit, event) {
     }
     if (event.status === "browser_preserved") {
       details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
+      details.preserved = event.preserved === true;
     }
     if (event.status === "twofa_progress") {
       details.phase = sanitizeTwoFactorProgressPhase(event.phase);
@@ -518,7 +539,8 @@ function auditRuyiPageEvent(flowAudit, event) {
   }
   if (event.event === "need_2fa") {
     writeFlowAudit(flowAudit, "ruyipage", "need_2fa", {
-      generation: event.generation,
+      generation: sanitizeTwoFactorGeneration(event.generation),
+      state: sanitizeTwoFactorPageState(event.state),
     });
     return;
   }
@@ -714,7 +736,11 @@ export async function runAccountBrowserPhase(
         } else if (twoFactorHandoffLine) {
           console.log(`[ruyipage] status:${twoFactorHandoffLine}`);
         } else if (event.event === "status" && event.status === "browser_preserved") {
-          console.warn("[ruyipage] 流程失败，Firefox 已保留供人工核对当前页面");
+          if (event.preserved === true) {
+            console.warn("[ruyipage] 流程失败，Firefox 已保留供人工核对当前页面");
+          } else {
+            console.warn("[ruyipage] Firefox 保留状态未确认，不作为可检查页面处理");
+          }
         } else if (
           event.event === "status" &&
           event.status === "browser_failure" &&

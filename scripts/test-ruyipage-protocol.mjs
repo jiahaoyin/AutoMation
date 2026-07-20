@@ -97,6 +97,72 @@ if (process.argv.includes("--failed-result-after-failure-events-child")) {
   await new Promise(() => {});
 }
 
+if (process.argv.includes("--twofa-input-unconfirmed-child")) {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const commands = input[Symbol.asyncIterator]();
+  const readCommand = async () => {
+    const next = await commands.next();
+    if (next.done) return null;
+    try {
+      return JSON.parse(next.value);
+    } catch {
+      return null;
+    }
+  };
+  const writeEvent = (event) =>
+    new Promise((resolve) => process.stdout.write(`${JSON.stringify(event)}\n`, resolve));
+
+  await writeEvent({ event: "ready", mode: "node-self-test" });
+  await writeEvent({ event: "prepare_2fa" });
+  if ((await readCommand())?.type !== "2fa_prepared") process.exit(3);
+  await writeEvent({
+    event: "status",
+    status: "browser_stage",
+    stage: "twofa_input",
+  });
+  await writeEvent({
+    event: "need_2fa",
+    generation: 1,
+    state: {
+      twofaVisible: true,
+      inputReady: true,
+      codeInputCount: 6,
+      elapsedMs: 500,
+    },
+  });
+  const command = await readCommand();
+  if (command?.type !== "2fa_code" || command.generation !== 1) process.exit(4);
+  await writeEvent({
+    event: "status",
+    status: "twofa_progress",
+    phase: "code_received",
+    generation: 1,
+  });
+  await writeEvent({
+    event: "status",
+    status: "twofa_progress",
+    phase: "handoff_failed",
+    generation: 1,
+  });
+  await writeEvent({
+    event: "status",
+    status: "browser_preserved",
+    failureStage: "twofa_input",
+    preserved: false,
+  });
+  await writeEvent({
+    event: "diagnostic",
+    kind: "python_exception",
+    failureStage: "twofa_input",
+    errorType: "RuntimeError",
+    errorClass: "twofa_input_unconfirmed",
+    hasTraceback: true,
+  });
+  await writeEvent({ event: "result", success: false, failureStage: "twofa_input" });
+  process.exit(1);
+  await new Promise(() => {});
+}
+
 if (process.argv.includes("--exit-after-prepare-2fa-child")) {
   process.stdout.write(`${JSON.stringify({ event: "prepare_2fa" })}\n`, () => {
     process.exit(0);
@@ -2115,6 +2181,111 @@ async function runNodeRunnerSelfTest() {
   assert.equal(result.credentialsInArgv, false);
 }
 
+async function runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--twofa-input-unconfirmed-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 100,
+  });
+  const events = [];
+  let failure = null;
+
+  await assert.rejects(
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      onEvent(event) {
+        events.push(event);
+      },
+      async prepare2FA() {},
+      async get2FACode(request) {
+        assert.deepEqual(request, { generation: 1, rejectPrevious: false });
+        return SECRET_FIXTURES.verificationCode;
+      },
+    }),
+    (error) => {
+      failure = error;
+      return error?.message === "ruyipage backend failed";
+    }
+  );
+
+  const handoff = events
+    .filter(
+      (event) =>
+        event.event === "need_2fa" ||
+        (event.event === "status" && event.status === "twofa_progress") ||
+        event.event === "diagnostic" ||
+        event.event === "result"
+    )
+    .map((event) => ({
+      event: event.event,
+      phase: event.phase ?? null,
+      generation: event.generation ?? null,
+      errorClass: event.errorClass ?? null,
+      success: event.success ?? null,
+    }));
+  assert.deepEqual(handoff, [
+    {
+      event: "need_2fa",
+      phase: null,
+      generation: 1,
+      errorClass: null,
+      success: null,
+    },
+    {
+      event: "status",
+      phase: "code_received",
+      generation: 1,
+      errorClass: null,
+      success: null,
+    },
+    {
+      event: "status",
+      phase: "handoff_failed",
+      generation: 1,
+      errorClass: null,
+      success: null,
+    },
+    {
+      event: "diagnostic",
+      phase: null,
+      generation: null,
+      errorClass: "twofa_input_unconfirmed",
+      success: null,
+    },
+    {
+      event: "result",
+      phase: null,
+      generation: null,
+      errorClass: null,
+      success: false,
+    },
+  ]);
+  assert.deepEqual(failure?.ruyiPageFailureContext, {
+    stage: "twofa_input",
+    twoFaPhase: "handoff_failed",
+    generation: 1,
+    codeDeliveryAttempted: true,
+    codeDeliverySent: true,
+    codeDeliveryAcknowledged: true,
+    codeDeliveryWriteStarted: true,
+    codeDeliveryWriteCompleted: true,
+    browserLaunchObserved: true,
+    browserPreserved: false,
+    directBrowserPreservationRequested: isDirectBrowserFailurePreservationEnabled(),
+    browserErrorClass: "twofa_input_unconfirmed",
+    backendExitCode: 1,
+    cleanupFailed: false,
+  });
+  assert.equal(
+    JSON.stringify({ events, failure }).includes(SECRET_FIXTURES.verificationCode),
+    false
+  );
+}
+
 function runPreservedBrowserCleanupPolicyTest() {
   assert.equal(
     isDirectBrowserFailurePreservationEnabled(
@@ -2963,6 +3134,7 @@ const focusedTests = {
   "supervisor-runtime-policy": runSupervisorRuntimePolicySelfTest,
   "preserved-browser-cleanup": runPreservedBrowserCleanupPolicyTest,
   "preserved-browser-backend-exit": runNodeRunnerPreservedBrowserStopsBackendSelfTest,
+  "twofa-input-unconfirmed": runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest,
 };
 
 const focusedTest = process.env.RUYIPAGE_PROTOCOL_FOCUSED_TEST;
@@ -3012,6 +3184,7 @@ await runNodeRunnerOnEventFailureSelfTest();
 runBackendTimeoutConfigTest();
 await runProtocolSelfTest();
 await runNodeRunnerSelfTest();
+await runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest();
 await runNodeRunnerDelayedResultOnEventSelfTest();
 await runNodeRunnerTerminalFailureEventsAfterExitSelfTest();
 await runNodeRunnerPreparationFailureSelfTest();

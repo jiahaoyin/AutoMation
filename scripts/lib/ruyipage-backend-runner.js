@@ -99,6 +99,7 @@ const RUYIPAGE_RUNNER_FAILURE_CODES = new Set([
 const RUYIPAGE_BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_digit_input_verification_failed",
   "twofa_sequence_failed",
+  "twofa_input_unconfirmed",
   "twofa_input_missing",
   "twofa_input_target_count",
   "twofa_target_missing",
@@ -1190,7 +1191,7 @@ async function runRuyiPageBackend({
         }
       } else if (event.status === "browser_preserved") {
         protocolContext.stage = sanitizeBackendStage(event.failureStage);
-        protocolContext.browserPreserved = true;
+        if (event.preserved === true) protocolContext.browserPreserved = true;
       }
     } else if (event.event === "need_2fa") {
       if (event.generation === 1 || event.generation === 2) {

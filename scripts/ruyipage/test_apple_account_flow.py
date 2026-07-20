@@ -189,10 +189,11 @@ class TwoFactorPreparationTests(unittest.TestCase):
 
 
 class FakeStates:
-    def __init__(self, checked=False, displayed=True, enabled=True):
+    def __init__(self, checked=False, displayed=True, enabled=True, alive=True):
         self.is_checked = checked
         self.is_displayed = displayed
         self.is_enabled = enabled
+        self.is_alive = alive
 
 
 class FakeScroll:
@@ -276,6 +277,9 @@ class FakeElement:
     def run_js(self, script):
         if not str(script).lstrip().startswith("function"):
             raise RuntimeError("FirefoxElement.run_js requires a function declaration")
+        if "ruyipage-otp-length-check" in script:
+            expected = re.search(r"value\.length === (\d+)", script)
+            return bool(expected and len(str(self.value)) == int(expected.group(1)))
         if "const expectedPrompt = 'trust'" in script:
             if self.prompt_semantics is not None:
                 return bool(self.prompt_semantics.get("trust"))
@@ -2656,6 +2660,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         class FailingPage:
             def __init__(self):
                 self.quit_calls = 0
+                self.states = FakeStates(alive=True)
 
             def get(self, _url):
                 raise RuntimeError("navigation failed")
@@ -2680,12 +2685,51 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         self.assertEqual(options.close_on_exit_values, [False])
         self.assertEqual(page.quit_calls, 0)
         self.assertIn(
-            {
-                "event": "status",
-                "status": "browser_preserved",
-                "failureStage": "login_navigation",
-            },
+                {
+                    "event": "status",
+                    "status": "browser_preserved",
+                    "failureStage": "login_navigation",
+                    "preserved": True,
+                },
             [call.args[0] for call in emit_event.call_args_list],
+        )
+
+    def test_direct_failure_does_not_claim_a_dead_browser_was_preserved(self):
+        class FakeFirefoxOptions:
+            def close_on_exit(self, _value):
+                return None
+
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        class FailingPage:
+            def __init__(self):
+                self.quit_calls = 0
+                self.states = FakeStates(alive=False)
+
+            def get(self, _url):
+                raise RuntimeError("navigation failed")
+
+            def quit(self):
+                self.quit_calls += 1
+
+        page = FailingPage()
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=True,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: page, FakeKeys),
+        ), patch("apple_account_flow.emit") as emit_event:
+            with self.assertRaisesRegex(RuntimeError, "navigation failed"):
+                browser_flow(args)
+
+        self.assertEqual(page.quit_calls, 1)
+        self.assertNotIn(
+            "browser_preserved",
+            [call.args[0].get("status") for call in emit_event.call_args_list],
         )
 
     def test_authentication_failure_does_not_persist_a_failure_screenshot(self):
@@ -3351,6 +3395,26 @@ class OtpTargetWaitTests(unittest.TestCase):
 
         self.assertEqual(account_flow.security_code_fields(page), [])
 
+    def test_security_code_fields_rejects_competing_single_and_six_cell_targets(self):
+        single = FakeElement(attrs={"autocomplete": "one-time-code"})
+        digits = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
+        frame = FakePage(
+            {"css:.form-security-code-inputs input": digits},
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "codeInputCount": 6,
+            },
+        )
+        page = FakePage(
+            {"css:input[autocomplete='one-time-code']": [single]},
+            frames=[frame],
+            state={"twofa": True, "codeInputCount": 1},
+        )
+        frame.parent = page
+
+        self.assertEqual(account_flow.security_code_fields(page), [])
+
     def test_wait_finds_semantic_role_textbox_in_shadow_root(self):
         field = FakeElement(attrs={"role": "textbox", "aria-label": "Verification code"})
         shadow_root = FakePage({"css:[role='textbox']": [field]})
@@ -3362,7 +3426,7 @@ class OtpTargetWaitTests(unittest.TestCase):
         fields = self.wait_for_target(page)
 
         self.assertEqual(fields, [(page, field)])
-        self.assertEqual(page.shadow_roots_calls, [("all", False)])
+        self.assertEqual(page.shadow_roots_calls, [("all", False), ("all", False)])
 
     def test_wait_rediscovers_frame_after_a_stale_iteration(self):
         field = FakeElement(
@@ -3391,7 +3455,7 @@ class OtpTargetWaitTests(unittest.TestCase):
 
         self.assertEqual(fields, [(frame, field)])
         self.assertGreaterEqual(page.get_frames_calls, 2)
-        self.assertEqual(frame.shadow_roots_calls, [("all", False)])
+        self.assertEqual(frame.shadow_roots_calls, [("all", False), ("all", False)])
 
     def test_shadow_enumeration_failure_keeps_ordinary_scope_available(self):
         field = FakeElement(attrs={"aria-label": "One-time verification code"})
@@ -3404,7 +3468,7 @@ class OtpTargetWaitTests(unittest.TestCase):
         fields = self.wait_for_target(page)
 
         self.assertEqual(fields, [(page, field)])
-        self.assertEqual(page.shadow_roots_calls, [("all", False)])
+        self.assertEqual(page.shadow_roots_calls, [("all", False), ("all", False)])
 
     def test_wait_rejects_a_strong_otp_field_in_a_non_apple_frame(self):
         field = FakeElement()
@@ -3854,7 +3918,11 @@ class SecurityCodeTests(unittest.TestCase):
             state={"twofa": True, "trusted": False, "error": False},
         )
 
-        fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=AssertionError("OTP entry must not read the code value"),
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(field.value, "123456")
         self.assertEqual(field.inputs, [])
@@ -3862,7 +3930,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertIn(("human_click", field), page.actions.calls)
         self.assertIn(("type", "123456", page.actions.calls[-2][2]), page.actions.calls)
 
-    def test_fills_six_role_textboxes_through_element_bidi_first(self):
+    def test_fills_six_role_textboxes_as_one_owner_context_sequence(self):
         fields = [
             FakeElement(
                 attrs={
@@ -3876,20 +3944,28 @@ class SecurityCodeTests(unittest.TestCase):
         shadow_root = FakePage({"css:[role='textbox']": fields})
         page = FakePage(
             shadow_roots=[shadow_root],
+            actions=FakeActions(auto_advance_targets=fields),
             state={"twofa": True, "trusted": False, "error": False},
         )
 
-        fill_security_code(page, "654321", FakeKeys, pause=lambda *_: None)
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=AssertionError("OTP entry must not read the code value"),
+        ):
+            fill_security_code(page, "654321", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual([field.value for field in fields], list("654321"))
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
-            [field.inputs for field in fields],
-            [[(digit, True)] for digit in "654321"],
+            [call[1] for call in page.actions.calls if call[0] == "type"],
+            ["654321"],
         )
-        self.assertTrue(all(field.clicks == 0 for field in fields))
-        self.assertEqual(page.actions.calls, [])
+        self.assertEqual(
+            [call[0] for call in page.actions.calls].count("combo"),
+            1,
+        )
 
-    def test_fills_six_visible_digit_fields_individually(self):
+    def test_fills_six_visible_digit_fields_as_one_frame_sequence(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3897,7 +3973,10 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=FakeActions(auto_advance_targets=fields),
+        )
         iframe = FakeElement(
             attrs={"src": frame.state["href"]},
             location={"x": 100, "y": 200},
@@ -3912,15 +3991,14 @@ class SecurityCodeTests(unittest.TestCase):
         fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
-            [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
+            [call[1] for call in frame.actions.calls if call[0] == "type"],
+            ["123456"],
         )
-        self.assertTrue(all(field.clicks == 0 for field in fields))
-        self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_empty_element_bidi_keeps_trusted_direct_inputs(self):
+    def test_six_digit_entry_uses_length_confirmation_not_sensitive_readback(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3947,30 +4025,26 @@ class SecurityCodeTests(unittest.TestCase):
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual(
-            [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
-        )
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
-            0,
+            1,
         )
         self.assertEqual(
             [call[1] for call in frame_actions.calls if call[0] == "type"],
-            [],
+            ["123456"],
         )
-        self.assertNotIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
-        self.assertNotIn(("press", FakeKeys.DELETE), frame_actions.calls)
+        self.assertIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
+        self.assertIn(("press", FakeKeys.DELETE), frame_actions.calls)
         self.assertEqual(page.actions.calls, [])
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertEqual(steps.count("element_bidi_limited_continue"), 7)
-        self.assertNotIn("sequence_focus_started", steps)
-        self.assertNotIn("sequence_cleared", steps)
-        self.assertNotIn("sequence_verified", steps)
-        self.assertNotIn("sequence_failed", steps)
+        self.assertIn("sequence_focus_started", steps)
+        self.assertIn("sequence_cleared", steps)
+        self.assertIn("sequence_typed", steps)
+        self.assertIn("aggregate_confirmed", steps)
 
-    def test_six_digit_limited_readback_never_replays_the_full_code(self):
+    def test_six_digit_length_confirmation_never_replays_the_full_code(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3997,21 +4071,15 @@ class SecurityCodeTests(unittest.TestCase):
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual(
-            [field.inputs for field in fields],
-            [[(digit, True)] for digit in "123456"],
-        )
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
             [call[1] for call in frame_actions.calls if call[0] == "type"],
-            [],
+            ["123456"],
         )
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertIn("element_bidi_limited_continue", steps)
-        self.assertNotIn("sequence_focus_started", steps)
-        self.assertNotIn("sequence_verified", steps)
-        self.assertNotIn("sequence_failed", steps)
+        self.assertIn("aggregate_confirmed", steps)
 
-    def test_six_digit_mismatched_element_bidi_switches_once_to_owner_sequence(self):
+    def test_six_digit_sequence_does_not_depend_on_per_cell_readback(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -4038,10 +4106,7 @@ class SecurityCodeTests(unittest.TestCase):
         ):
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual(
-            [field.inputs for field in fields],
-            [[("1", True)], [], [], [], [], []],
-        )
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
@@ -4053,7 +4118,7 @@ class SecurityCodeTests(unittest.TestCase):
         )
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_element_bidi_error_switches_to_owner_sequence(self):
+    def test_six_digit_sequence_avoids_per_cell_element_input(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -4080,7 +4145,7 @@ class SecurityCodeTests(unittest.TestCase):
         fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual([field.value for field in fields], list("123456"))
-        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
             1,
@@ -4090,7 +4155,7 @@ class SecurityCodeTests(unittest.TestCase):
             ["123456"],
         )
 
-    def test_six_digit_late_element_failure_never_replays_the_full_code(self):
+    def test_six_digit_sequence_isolated_from_a_later_cell_element_failure(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -4116,15 +4181,17 @@ class SecurityCodeTests(unittest.TestCase):
         )
         frame.parent = page
 
-        with self.assertRaisesRegex(RuntimeError, "2FA code sequence verification failed"):
-            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+        fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual(fields[0].inputs, [("1", True)])
-        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
-        self.assertEqual(frame_actions.calls, [])
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
+        self.assertEqual(
+            [call[1] for call in frame_actions.calls if call[0] == "type"],
+            ["123456"],
+        )
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_sequence_failure_stops_after_the_first_direct_cell(self):
+    def test_six_digit_sequence_stops_without_submit_when_length_confirmation_fails(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -4152,21 +4219,17 @@ class SecurityCodeTests(unittest.TestCase):
         frame.parent = page
 
         with patch(
-            "apple_account_flow.read_element_input_value",
-            side_effect=[(True, "wrong")] * 7,
+            "apple_account_flow.wait_for_otp_entry_confirmation",
+            side_effect=RuntimeError("synthetic length confirmation failure"),
         ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
             RuntimeError,
-            "2FA code sequence verification failed",
+            "2FA code input was not confirmed",
         ):
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertIn("sequence_failed", steps)
-        self.assertNotIn("sequence_verified", steps)
-        self.assertEqual(
-            [field.inputs for field in fields],
-            [[("1", True)], [], [], [], [], []],
-        )
+        self.assertIn("input_unconfirmed", steps)
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
             1,
@@ -4192,10 +4255,6 @@ class SecurityCodeTests(unittest.TestCase):
             for index in range(6)
         ]
 
-        def input_raises(*_args, **_kwargs):
-            raise RuntimeError(f"synthetic direct input failure {raw_dom} {url_query}")
-
-        fields[0].input = input_raises
         frame_actions = FakeActions(apply_typed_text=False)
         frame = FakePage(
             {"css:input[maxlength='1']": fields},
@@ -4213,11 +4272,11 @@ class SecurityCodeTests(unittest.TestCase):
         frame.parent = page
 
         with patch(
-            "apple_account_flow.read_element_input_value",
-            side_effect=[(True, "wrong")] * 6,
+            "apple_account_flow.wait_for_otp_entry_confirmation",
+            side_effect=RuntimeError(f"synthetic confirmation failure {raw_dom} {url_query}"),
         ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
             RuntimeError,
-            "2FA code sequence verification failed",
+            "2FA code input was not confirmed",
         ) as failure:
             fill_security_code(page, code, FakeKeys, pause=lambda *_: None)
 
@@ -4227,7 +4286,7 @@ class SecurityCodeTests(unittest.TestCase):
         for forbidden in (code, secret, raw_dom, url_query, "?otp="):
             self.assertNotIn(forbidden, rendered_events)
             self.assertNotIn(forbidden, str(failure.exception))
-        self.assertEqual([field.inputs for field in fields[1:]], [[], [], [], [], []])
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
             1,
@@ -4237,14 +4296,21 @@ class SecurityCodeTests(unittest.TestCase):
             [code],
         )
 
-    def test_digit_element_bidi_rechecks_scope_after_pause_and_input(self):
+    def test_six_digit_sequence_rechecks_owner_scope_before_keyboard_actions(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
         frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=FakeActions(auto_advance_targets=fields),
             state={
                 "href": "https://idmsa.apple.com/appleauth/auth/verify",
                 "twofa": True,
             }
         )
-        field = FakeElement(attrs={"maxlength": "1"})
+        page = FakePage(
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in", "twofa": False},
+        )
+        frame.parent = page
         calls = []
 
         def pause_once(*_args):
@@ -4252,31 +4318,11 @@ class SecurityCodeTests(unittest.TestCase):
             if len(calls) == 1:
                 frame.state["href"] = "https://evil.example/sign-in"
 
-        with self.assertRaisesRegex(RuntimeError, "trusted Apple frame chain"):
-            account_flow.input_otp_digit_with_element_bidi(
-                frame,
-                field,
-                "1",
-                pause=pause_once,
-            )
+        with self.assertRaisesRegex(RuntimeError, "2FA code input was not confirmed"):
+            fill_security_code(page, "123456", FakeKeys, pause=pause_once)
 
-        self.assertEqual(field.inputs, [])
-
-        frame.state["href"] = "https://idmsa.apple.com/appleauth/auth/verify"
-
-        def input_and_navigate(value, clear=True):
-            result = FakeElement.input(field, value, clear=clear)
-            frame.state["href"] = "https://evil.example/sign-in"
-            return result
-
-        field.input = input_and_navigate
-        with self.assertRaisesRegex(RuntimeError, "trusted Apple frame chain"):
-            account_flow.input_otp_digit_with_element_bidi(
-                frame,
-                field,
-                "1",
-                pause=lambda *_: None,
-            )
+        self.assertNotIn(("combo", (FakeKeys.COMMAND, "a")), frame.actions.calls)
+        self.assertEqual([call for call in frame.actions.calls if call[0] == "type"], [])
 
     def test_ignores_outer_single_character_noise_before_six_digit_frame(self):
         outer_noise = FakeElement()
@@ -4287,7 +4333,10 @@ class SecurityCodeTests(unittest.TestCase):
             )
             for index in range(6)
         ]
-        frame = FakePage({"css:input[maxlength='1']": fields})
+        frame = FakePage(
+            {"css:input[maxlength='1']": fields},
+            actions=FakeActions(auto_advance_targets=fields),
+        )
         iframe = FakeElement(
             attrs={"src": frame.state["href"]},
             location={"x": 100, "y": 200},
@@ -4308,10 +4357,14 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual([field.value for field in fields], list("123456"))
 
     def test_fills_one_time_code_field_as_a_single_value(self):
-        field = FakeElement()
+        field = FakeElement(attrs={"autocomplete": "one-time-code"})
         page = FakePage({"css:input[autocomplete='one-time-code']": [field]})
 
-        fill_security_code(page, "654321", FakeKeys, pause=lambda *_: None)
+        with patch(
+            "apple_account_flow.read_element_input_value",
+            side_effect=AssertionError("OTP entry must not read the code value"),
+        ):
+            fill_security_code(page, "654321", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(field.value, "654321")
         self.assertEqual(field.inputs, [])

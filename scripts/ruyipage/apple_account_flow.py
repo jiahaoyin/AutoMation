@@ -101,6 +101,8 @@ QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
 TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 12.0
+TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S = 5.0
+TWO_FACTOR_INPUT_UNCONFIRMED_REASON = "2FA code input was not confirmed"
 BROWSER_STARTUP_STAGES = {
     "not_started",
     "credentials_received",
@@ -217,6 +219,8 @@ def classify_browser_exception(error: Exception) -> str:
         return "twofa_digit_input_verification_failed"
     if "2fa code sequence verification failed" in message:
         return "twofa_sequence_failed"
+    if "2fa code input was not confirmed" in message:
+        return "twofa_input_unconfirmed"
     if "2fa code input was not detected" in message:
         return "twofa_input_missing"
     if "2fa code input must resolve" in message:
@@ -305,6 +309,14 @@ def preserve_browser_on_failure() -> bool:
     configured = os.environ.get(BROWSER_PRESERVE_ON_FAILURE_ENV, "1").strip().lower()
     enabled = configured not in {"0", "false", "no", "off"}
     return enabled and not browser_broker_mode_enabled()
+
+
+def browser_connection_is_alive(page: Any) -> bool:
+    """Confirm that ruyiPage can still reach the Firefox browsing context."""
+    try:
+        return bool(page.states.is_alive)
+    except Exception:
+        return False
 
 
 def classify_input_read(readable: bool, actual: Any, expected: str) -> str:
@@ -559,6 +571,21 @@ def wait_for_element(
     raise RuntimeError(f"page element did not appear: {', '.join(selectors)}")
 
 
+def wait_for_document_settle(
+    page: Any,
+    timeout_s: float = 12,
+    pause: Callable[[int, int], None] = human_pause,
+) -> None:
+    """Give an Apple form transition time to hydrate before locating its next field."""
+    try:
+        page.wait.doc_loaded(timeout=max(1, int(timeout_s)))
+    except Exception:
+        # Apple can swap an iframe without a top-level navigation. The
+        # following target wait remains the authoritative readiness check.
+        pass
+    pause(500, 1100)
+
+
 def normalized_apple_frame_url(url: str) -> str | None:
     parsed = parse_valid_apple_url(url)
     if parsed is None:
@@ -798,82 +825,69 @@ def input_otp_with_owner_bidi_fallback(
     return scope
 
 
-def input_otp_digit_with_element_bidi(
-    scope: Any,
-    field: Any,
-    value: str,
-    pause: Callable[[int, int], None] = human_pause,
-) -> str:
-    """Use the discovered digit cell directly when focus probing is flaky."""
-    require_otp_bidi_input_target(scope, field, "2FA digit")
-    emit_input_progress("2FA digit", "element_bidi_started", "owner")
-    pause(80, 180)
-    require_otp_bidi_input_target(scope, field, "2FA digit")
-    field.input(value, clear=True)
-    validate_two_factor_scope(scope)
-    emit_input_progress("2FA digit", "element_bidi_typed", "owner")
-    pause(120, 280)
-    readable, actual = read_element_input_value(field)
-    read_state = classify_input_read(readable, actual, value)
-    emit_input_progress("2FA digit", f"element_bidi_value_{read_state}", "owner")
-    if readable and str(actual) == value:
-        emit_input_progress("2FA digit", "verified", "owner")
-        return "verified"
-    if otp_input_readback_is_limited(readable, actual):
-        # This is still a trusted ruyiPage BiDi input. Apple can mask every
-        # accepted cell in a six-cell widget, so a keyboard replay here can
-        # shift or duplicate the code in an iframe-owned control.
-        validate_two_factor_scope(scope)
-        emit_input_progress("2FA digit", "element_bidi_limited_continue", "owner")
-        return "limited"
-    raise RuntimeError("2FA digit input verification failed")
+def otp_control_has_expected_value_length(field: Any, expected_length: int) -> bool:
+    """Query only the length of a live OTP control, never its sensitive value."""
+    if expected_length < 1:
+        return False
+    try:
+        return field.run_js(
+            """
+            function() {
+              /* ruyipage-otp-length-check */
+              const value = typeof this.value === 'string'
+                ? this.value
+                : (this.isContentEditable
+                  ? (this.innerText ?? this.textContent ?? '')
+                  : '');
+              return Boolean(this.isConnected && value.length === __EXPECTED_LENGTH__);
+            }
+            """.replace("__EXPECTED_LENGTH__", str(expected_length))
+        ) is True
+    except Exception:
+        return False
 
 
-def input_otp_digits_with_owner_actions(
+def otp_fields_have_expected_value_length(
     fields: list[tuple[Any, Any]],
-    digits: str,
-    keys: Any,
-    pause: Callable[[int, int], None] = human_pause,
+    expected_length: int,
 ) -> bool:
-    """Retry a six-cell OTP through the owning ruyiPage frame context.
-
-    Apple advances focus between its six cells itself. A single trusted BiDi
-    action in that owning frame avoids sending keystrokes through the parent
-    iframe context after a direct cell input has demonstrably failed.
-    """
-    if len(fields) != 6 or len(digits) != 6:
+    if len(fields) not in (1, 6):
         return False
     scope = fields[0][0]
     if any(candidate_scope is not scope for candidate_scope, _field in fields):
         return False
-    for _candidate_scope, field in fields:
-        require_otp_bidi_input_target(scope, field, "2FA digit")
-
     try:
-        emit_input_progress("2FA code", "sequence_focus_started", "owner")
-        human_click(scope, fields[0][1], pause=pause)
-        pause(180, 480)
-        require_keyboard_target_ready(fields[0][1])
-        # The first direct cell write may have reached Apple's widget even
-        # though Firefox cannot read it back. Reset that focused cell before
-        # the one permitted full-code sequence so characters cannot shift.
-        scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
-        emit_input_progress("2FA code", "sequence_cleared", "owner")
-        pause(120, 320)
-        require_keyboard_target_ready(fields[0][1])
-        scope.actions.type(digits, interval=random.randint(55, 145)).perform()
         validate_two_factor_scope(scope)
-        emit_input_progress("2FA code", "sequence_typed", "owner")
-        pause(280, 680)
     except Exception:
         return False
+    return all(
+        otp_control_has_expected_value_length(field, expected_length)
+        for _candidate_scope, field in fields
+    )
 
-    for (_candidate_scope, field), digit in zip(fields, digits):
-        readable, actual = read_element_input_value(field)
-        if not readable or str(actual) != digit:
-            return False
-    emit_input_progress("2FA code", "sequence_verified", "owner")
-    return True
+
+def input_otp_sequence_in_owner_context(
+    scope: Any,
+    first_field: Any,
+    value: str,
+    keys: Any,
+    pause: Callable[[int, int], None] = human_pause,
+) -> None:
+    """Enter an OTP through its owning ruyiPage frame without reading its value."""
+    validate_two_factor_scope(scope)
+    emit_input_progress("2FA code", "sequence_focus_started", "owner")
+    human_click(scope, first_field, pause=pause)
+    pause(180, 480)
+    validate_two_factor_scope(scope)
+    require_keyboard_target_ready(first_field)
+    scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
+    emit_input_progress("2FA code", "sequence_cleared", "owner")
+    pause(120, 320)
+    validate_two_factor_scope(scope)
+    require_keyboard_target_ready(first_field)
+    scope.actions.type(value, interval=random.randint(55, 145)).perform()
+    validate_two_factor_scope(scope)
+    emit_input_progress("2FA code", "sequence_typed", "owner")
 
 
 def input_with_owner_bidi_fallback(
@@ -1539,7 +1553,10 @@ def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
 
     all_candidates = unique_scoped_elements(all_candidates)
     six_digit_groups = [group for group in candidate_groups if len(group) == 6]
-    if len(six_digit_groups) == 1:
+    # A live Apple document can transiently expose both a single OTP control
+    # and the six-cell widget while it rehydrates. Refuse that global
+    # ambiguity rather than guessing which context should receive a code.
+    if len(all_candidates) == 6 and len(six_digit_groups) == 1:
         return six_digit_groups[0]
     return all_candidates if len(all_candidates) == 1 else []
 
@@ -1594,14 +1611,83 @@ def semantic_otp_elements(root: Any, selector: str) -> list[Any]:
 def wait_for_otp_target(
     page: Any,
     timeout_s: float = 30,
+    stable_observations: int = 2,
 ) -> list[tuple[Any, Any]]:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    required_observations = max(1, min(3, int(stable_observations)))
+    previous_signature: tuple[str, int] | None = None
+    stable_count = 0
+    while time.monotonic() < deadline:
         fields = security_code_fields(page)
-        if fields:
-            return fields
-        human_pause(300, 650)
+        if fields and len(fields) in (1, 6):
+            scope = fields[0][0]
+            if all(candidate_scope is scope for candidate_scope, _field in fields):
+                try:
+                    signature = (validate_two_factor_scope(scope), len(fields))
+                except Exception:
+                    signature = None
+                if signature is not None:
+                    stable_count = stable_count + 1 if signature == previous_signature else 1
+                    previous_signature = signature
+                    if stable_count >= required_observations:
+                        return fields
+                    human_pause(180, 420)
+                    continue
+        previous_signature = None
+        stable_count = 0
+        human_pause(260, 560)
     raise RuntimeError("2FA is visible but an interactable OTP target did not appear")
+
+
+def refresh_otp_target(
+    page: Any,
+    expected_count: int,
+    timeout_s: float = TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S,
+) -> list[tuple[Any, Any]]:
+    fields = wait_for_otp_target(page, timeout_s=timeout_s, stable_observations=1)
+    if len(fields) != expected_count:
+        raise RuntimeError("2FA code input target count changed during entry")
+    return fields
+
+
+def wait_for_otp_entry_confirmation(
+    page: Any,
+    expected_count: int,
+    timeout_s: float = TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S,
+) -> list[tuple[Any, Any]] | None:
+    """Confirm only OTP control state after trusted input, never the OTP value.
+
+    Apple can immediately advance away from the six-cell widget after the last
+    key.  Returning ``None`` records that expected automatic transition so the
+    caller can wait for the signed-in state instead of sending an extra Enter.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        fields = security_code_fields(page)
+        target_is_still_visible = False
+        if len(fields) == expected_count:
+            scope = fields[0][0]
+            if all(candidate_scope is scope for candidate_scope, _field in fields):
+                target_is_still_visible = True
+                try:
+                    validate_two_factor_scope(scope)
+                except Exception:
+                    pass
+                else:
+                    expected_length = 6 if expected_count == 1 else 1
+                    if otp_fields_have_expected_value_length(fields, expected_length):
+                        return fields
+
+        try:
+            state = detect_login_state(page)
+        except Exception:
+            state = {}
+        if not target_is_still_visible and (state.get("trusted") or (
+            state and not state.get("twofa") and not state.get("error")
+        )):
+            return None
+        human_pause(140, 300)
+    raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON)
 
 
 def fill_security_code(
@@ -1610,7 +1696,7 @@ def fill_security_code(
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
     fields: list[tuple[Any, Any]] | None = None,
-) -> None:
+) -> list[tuple[Any, Any]] | None:
     digits = "".join(ch for ch in str(code) if ch.isdigit())
     if len(digits) != 6:
         raise RuntimeError("2FA code must contain exactly six digits")
@@ -1623,64 +1709,56 @@ def fill_security_code(
 
     if len(fields) == 1:
         scope, field = fields[0]
-        input_and_verify(
-            scope,
-            field,
-            digits,
-            "2FA code",
-            keys,
-            pause=pause,
-            root_page=page,
-        )
-        return
+        try:
+            require_otp_bidi_input_target(scope, field, "2FA code")
+            input_otp_sequence_in_owner_context(scope, field, digits, keys, pause=pause)
+            confirmed_fields = wait_for_otp_entry_confirmation(page, expected_count=1)
+        except Exception as error:
+            emit_input_progress("2FA code", "input_unconfirmed", "owner")
+            raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON) from error
+        if confirmed_fields is None:
+            emit_input_progress("2FA code", "sequence_auto_submitted", "owner")
+        return confirmed_fields
 
+    expected_count = len(fields)
     sequence_scope = fields[0][0]
     if any(scope is not sequence_scope for scope, _field in fields):
         raise RuntimeError(
             "2FA code input must resolve to six targets in one trusted Apple frame"
         )
-    for _scope, field in fields:
-        require_otp_bidi_input_target(sequence_scope, field, "2FA digit")
+    # hsa2-sk7 moves the focus between its six cells itself. Issuing one trusted
+    # BiDi key sequence in the owner frame is critical: per-cell ``clear=True``
+    # can erase a preceding cell after Apple has advanced focus.
+    try:
+        current_fields = refresh_otp_target(page, expected_count=expected_count)
+        scope, first_field = current_fields[0]
+        if any(candidate_scope is not scope for candidate_scope, _field in current_fields):
+            raise RuntimeError("2FA code input must resolve to six targets in one trusted Apple frame")
+        for _candidate_scope, field in current_fields:
+            require_otp_bidi_input_target(scope, field, "2FA digit")
+        # Keep all input actions in the discovered owner frame. The page root
+        # cannot safely dispatch keyboard actions into a cross-origin iframe.
+        input_otp_sequence_in_owner_context(scope, first_field, digits, keys, pause=pause)
+    except Exception as error:
+        emit_input_progress("2FA code", "input_unconfirmed", "owner")
+        raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON) from error
 
-    direct_digits_entered = 0
-    limited_readback_seen = False
-    for (scope, field), digit in zip(fields, digits):
-        try:
-            direct_result = input_otp_digit_with_element_bidi(
-                scope,
-                field,
-                digit,
-                pause=pause,
-            )
-        except Exception:
-            direct_result = "failed"
-
-        if direct_result == "limited":
-            limited_readback_seen = True
-            direct_digits_entered += 1
-            pause(80, 220)
-            continue
-
-        if direct_result != "verified":
-            if direct_digits_entered == 0:
-                try:
-                    sequenced = input_otp_digits_with_owner_actions(
-                        fields,
-                        digits,
-                        keys,
-                        pause=pause,
-                    )
-                except Exception:
-                    sequenced = False
-                if sequenced:
-                    return
-            emit_input_progress("2FA code", "sequence_failed", "owner")
-            raise RuntimeError("2FA code sequence verification failed")
-        direct_digits_entered += 1
-        pause(80, 220)
-
-    if limited_readback_seen:
-        emit_input_progress("2FA code", "element_bidi_limited_continue", "owner")
+    try:
+        completed_fields = wait_for_otp_entry_confirmation(
+            page,
+            expected_count=expected_count,
+        )
+    except Exception as error:
+        emit_input_progress("2FA code", "input_unconfirmed", "owner")
+        raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON) from error
+    if completed_fields is None:
+        emit_input_progress("2FA code", "sequence_auto_submitted", "owner")
+        return None
+    if not otp_fields_have_expected_value_length(completed_fields, 1):
+        emit_input_progress("2FA code", "input_unconfirmed", "owner")
+        raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON)
+    emit_input_progress("2FA code", "aggregate_confirmed", "owner")
+    return completed_fields
 
 
 def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
@@ -2261,11 +2339,19 @@ def wait_for_2fa_or_session(page: Any, timeout_s: int = 75) -> dict[str, Any]:
             return last_state
         if last_state.get("twofa"):
             fields = security_code_fields(page)
-            last_state["twofaVisible"] = True
-            last_state["inputReady"] = bool(fields)
-            last_state["elapsedMs"] = elapsed_ms
             if fields:
+                last_state["twofaVisible"] = True
+                last_state["inputReady"] = True
+                last_state["elapsedMs"] = elapsed_ms
                 last_state["codeInputCount"] = len(fields)
+                return last_state
+            # The native code popup can appear before Apple hydrates the
+            # hsa2-sk7 fields.  Start popup-first collection now; the browser
+            # handoff will use wait_for_otp_target() after it receives a code.
+            last_state["twofaVisible"] = True
+            last_state["inputReady"] = False
+            last_state["elapsedMs"] = elapsed_ms
+            last_state["codeInputCount"] = 0
             return last_state
         fields = security_code_fields(page)
         if fields:
@@ -2682,6 +2768,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                         email,
                         Keys,
                     )
+                    wait_for_document_settle(page)
 
                 set_browser_startup_stage("password_wait")
                 password_scope, password_field = wait_for_element(
@@ -2712,6 +2799,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     max_ms=900,
                     password_value=password,
                 )
+                wait_for_document_settle(page)
 
             set_browser_startup_stage("twofa_page_wait")
             login_state = wait_for_2fa_or_session(page)
@@ -2758,16 +2846,23 @@ def browser_flow(args: argparse.Namespace) -> int:
                             target_count=len(fields),
                         )
                         emit_two_factor_progress("input_started", generation=generation)
-                        fill_security_code(page, code, Keys, fields=fields)
+                        confirmed_fields = fill_security_code(page, code, Keys, fields=fields)
                         emit_two_factor_progress("input_completed", generation=generation)
                         emit_two_factor_progress("submit_started", generation=generation)
                         submit_outcome: dict[str, str] = {}
-                        submitted = click_two_factor_submit(
-                            page,
-                            keys=Keys,
-                            fields=fields,
-                            submit_outcome=submit_outcome,
-                        )
+                        if confirmed_fields is None:
+                            # Apple accepted the final key and removed the OTP
+                            # widget before ruyiPage could re-read it.  Do not
+                            # send a second submit event into the new page.
+                            submitted = True
+                            submit_outcome["method"] = "automatic"
+                        else:
+                            submitted = click_two_factor_submit(
+                                page,
+                                keys=Keys,
+                                fields=confirmed_fields,
+                                submit_outcome=submit_outcome,
+                            )
                         emit_two_factor_progress(
                             "submit_sent",
                             generation=generation,
@@ -2867,7 +2962,7 @@ def browser_flow(args: argparse.Namespace) -> int:
         raise
     finally:
         had_error = sys.exc_info()[0] is not None
-        if had_error and preserve_on_failure:
+        if had_error and preserve_on_failure and browser_connection_is_alive(page):
             for screenshot_path in generated_screenshot_paths:
                 screenshot_path.unlink(missing_ok=True)
             emit(
@@ -2875,6 +2970,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     "event": "status",
                     "status": "browser_preserved",
                     "failureStage": browser_startup_stage,
+                    "preserved": True,
                 }
             )
         else:
