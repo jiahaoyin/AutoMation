@@ -103,6 +103,7 @@ const RUYIPAGE_BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_input_target_count",
   "twofa_target_missing",
   "twofa_focus_unconfirmed",
+  "twofa_submit_not_confirmed",
   "twofa_page_missing",
   "login_stopped_before_2fa",
   "account_session_unconfirmed_after_2fa",
@@ -138,8 +139,17 @@ function snapshotProtocolContext(context) {
     codeDeliveryAttempted: context.codeDeliveryAttempted === true,
     codeDeliverySent: context.codeDeliverySent === true,
     codeDeliveryAcknowledged: context.codeDeliveryAcknowledged === true,
+    codeDeliveryWriteStarted: context.codeDeliveryWriteStarted === true,
+    codeDeliveryWriteCompleted: context.codeDeliveryWriteCompleted === true,
+    browserLaunchObserved: context.browserLaunchObserved === true,
     browserPreserved: context.browserPreserved === true,
+    directBrowserPreservationRequested:
+      context.directBrowserPreservationRequested === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
+    backendExitCode:
+      Number.isInteger(context.backendExitCode) && context.backendExitCode >= 0
+        ? context.backendExitCode
+        : null,
     cleanupFailed: context.cleanupFailed === true,
   });
 }
@@ -148,10 +158,30 @@ export function shouldCleanUpRuyiPageProcessGroup({
   timedOut,
   terminationSignal,
   usesBrowserBroker,
+  strictProcessCleanup,
   browserPreserved,
+  directBrowserPreservationRequested,
 }) {
   if (timedOut === true || Boolean(terminationSignal)) return true;
-  return !(browserPreserved === true && usesBrowserBroker !== true);
+  if (usesBrowserBroker === true || strictProcessCleanup === true) return true;
+  return !(
+    browserPreserved === true || directBrowserPreservationRequested === true
+  );
+}
+
+export function isDirectBrowserFailurePreservationEnabled(
+  env = process.env,
+  usesBrowserBroker = false,
+  usesOuterProcessSupervisor = false,
+  hasProcessStateSupervisor = false
+) {
+  if (usesBrowserBroker || usesOuterProcessSupervisor || hasProcessStateSupervisor) {
+    return false;
+  }
+  const configured = String(env.BROWSER_PRESERVE_ON_FAILURE ?? "1")
+    .trim()
+    .toLowerCase();
+  return !["0", "false", "no", "off"].includes(configured);
 }
 
 function inferRunnerFailureCode(error, context) {
@@ -1043,15 +1073,22 @@ async function runRuyiPageBackend({
           requestedBrowserBrokerCommandAckTimeoutMs
         )
       : Math.min(timeoutMs, DEFAULT_BROWSER_BROKER_COMMAND_ACK_TIMEOUT_MS);
+  const usesOuterProcessSupervisor =
+    process.platform !== "win32" &&
+    processStatePath !== null &&
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+  const directBrowserFailurePreservationEnabled =
+    isDirectBrowserFailurePreservationEnabled(
+      process.env,
+      usesBrowserBroker,
+      usesOuterProcessSupervisor,
+      processStatePath !== null
+    );
   const usesProcessStateSupervisor =
     !usesBrowserBroker &&
     process.platform !== "win32" &&
     processStatePath !== null &&
     process.env.APPLE_AUTOMATION_SUPERVISED_GUI !== "1";
-  const usesOuterProcessSupervisor =
-    process.platform !== "win32" &&
-    processStatePath !== null &&
-    process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
   const usesLifecycleState = usesProcessStateSupervisor || usesOuterProcessSupervisor;
   const processNonce = usesLifecycleState
     ? String(process.env.APPLE_AUTOMATION_SUPERVISED_TOKEN ?? "")
@@ -1103,6 +1140,9 @@ async function runRuyiPageBackend({
           detached: process.platform !== "win32" && !usesOuterProcessSupervisor,
           env: {
             ...process.env,
+            ...(processStatePath !== null
+              ? { BROWSER_PRESERVE_ON_FAILURE: "0" }
+              : {}),
             APPLE_ID: creds.appleId,
             APPLE_PASSWORD: creds.password,
           },
@@ -1116,14 +1156,21 @@ async function runRuyiPageBackend({
     codeDeliveryAttempted: false,
     codeDeliverySent: false,
     codeDeliveryAcknowledged: false,
+    codeDeliveryWriteStarted: false,
+    codeDeliveryWriteCompleted: false,
+    browserLaunchObserved: false,
     browserPreserved: false,
+    directBrowserPreservationRequested: false,
     browserErrorClass: "unknown",
+    backendExitCode: null,
     cleanupFailed: false,
   };
   const updateProtocolContext = (event) => {
     if (!event || typeof event !== "object") return false;
     let directCodeDeliveryAcknowledged = false;
-    if (event.event === "status") {
+    if (event.event === "ready") {
+      protocolContext.browserLaunchObserved = true;
+    } else if (event.event === "status") {
       if (event.status === "browser_stage" || event.status === "browser_failure") {
         protocolContext.stage = sanitizeBackendStage(event.stage ?? event.failureStage);
       } else if (event.status === "twofa_progress") {
@@ -1153,6 +1200,8 @@ async function runRuyiPageBackend({
       protocolContext.codeDeliveryAttempted = false;
       protocolContext.codeDeliverySent = false;
       protocolContext.codeDeliveryAcknowledged = false;
+      protocolContext.codeDeliveryWriteStarted = false;
+      protocolContext.codeDeliveryWriteCompleted = false;
       protocolContext.browserErrorClass = "unknown";
     } else if (event.event === "diagnostic") {
       protocolContext.browserErrorClass = sanitizeBackendDiagnosticClass(event.errorClass);
@@ -1197,6 +1246,36 @@ async function runRuyiPageBackend({
         }
       : undefined,
   });
+  // Firefox may intentionally outlive a failed direct run. Its Python driver
+  // may not: this stopper signals only the child PID, never its process group.
+  const directBrowserBackendStopper = createChildStopper(child, {
+    ...childStopperOptions,
+    graceMs: Math.min(killGraceMs, MAX_KILL_GRACE_MS),
+    useProcessGroup: false,
+  });
+  let resolveDirectBrowserPreservation;
+  const directBrowserPreservationOutcome = new Promise((resolve) => {
+    resolveDirectBrowserPreservation = resolve;
+  });
+  const requestDirectBrowserPreservation = () => {
+    if (
+      !directBrowserFailurePreservationEnabled ||
+      !protocolContext.browserLaunchObserved ||
+      timedOut ||
+      terminationSignal
+    ) {
+      return false;
+    }
+    protocolContext.directBrowserPreservationRequested = true;
+    try {
+      const stdin = child.stdin;
+      if (stdin && !stdin.destroyed && !stdin.writableEnded) stdin.end();
+    } catch {
+      /* The browser may already have outlived the backend process. */
+    }
+    resolveDirectBrowserPreservation();
+    return true;
+  };
   let terminationSignal = null;
   let resolveTermination;
   const terminationOutcome = new Promise((resolve) => {
@@ -1227,7 +1306,7 @@ async function runRuyiPageBackend({
     processingError ??= annotateRunnerFailure(stdinFailure, protocolContext);
     for (const rejectWrite of stdinWriteRejectors) rejectWrite(stdinFailure);
     stdinWriteRejectors.clear();
-    if (!childEnded) stopper.stop();
+    if (!childEnded && !requestDirectBrowserPreservation()) stopper.stop();
     return stdinFailure;
   };
   if (!usesBrowserBroker) child.stdin?.on("error", failStdin);
@@ -1244,6 +1323,8 @@ async function runRuyiPageBackend({
     child.once("exit", (code) => {
       childEnded = true;
       exitCode = code;
+      protocolContext.backendExitCode = Number.isInteger(code) ? code : null;
+      directBrowserBackendStopper.cancelForce();
       resolve({ error: null, exitCode: code });
     });
   });
@@ -1251,7 +1332,9 @@ async function runRuyiPageBackend({
     child.once("close", (code) => {
       finishStdoutDecoding();
       exitCode = code;
+      protocolContext.backendExitCode = Number.isInteger(code) ? code : null;
       stopper.cancelForce();
+      directBrowserBackendStopper.cancelForce();
       resolve({ error: childError, exitCode: code });
     });
   });
@@ -1599,6 +1682,8 @@ async function runRuyiPageBackend({
       protocolContext.codeDeliveryAttempted = false;
       protocolContext.codeDeliverySent = false;
       protocolContext.codeDeliveryAcknowledged = false;
+      protocolContext.codeDeliveryWriteStarted = false;
+      protocolContext.codeDeliveryWriteCompleted = false;
       protocolContext.browserErrorClass = "unknown";
       const code = await whileChildAlive(() =>
         callExternal(
@@ -1612,7 +1697,9 @@ async function runRuyiPageBackend({
       );
       protocolContext.codeDeliveryAttempted = true;
       await reportRunnerStatus("twofa_code_delivery_started", generation);
+      protocolContext.codeDeliveryWriteStarted = true;
       await writeCommand({ type: "2fa_code", generation, code }, usesBrowserBroker);
+      protocolContext.codeDeliveryWriteCompleted = true;
       protocolContext.codeDeliverySent = true;
       await reportRunnerStatus("twofa_code_delivery_sent", generation);
       if (usesBrowserBroker) {
@@ -1624,7 +1711,7 @@ async function runRuyiPageBackend({
   };
   const recordProcessingFailure = (error) => {
     processingError ??= annotateRunnerFailure(error, protocolContext);
-    if (!childEnded) stopper.stop();
+    if (!childEnded && !requestDirectBrowserPreservation()) stopper.stop();
   };
   const enqueueLine = (line) => {
     if (!line.trim()) return;
@@ -1658,8 +1745,11 @@ async function runRuyiPageBackend({
       childCloseOutcome.then((value) => ({ type: "close", value })),
       backendTimeoutOutcome.then(() => ({ type: "timeout" })),
       terminationOutcome.then(() => ({ type: "termination" })),
+      directBrowserPreservationOutcome.then(() => ({ type: "preserved" })),
     ]);
     if (completion.type === "timeout" || completion.type === "termination") {
+      await processing;
+    } else if (completion.type === "preserved") {
       await processing;
     } else {
       outcome = completion.value;
@@ -1674,15 +1764,34 @@ async function runRuyiPageBackend({
     }
     let cleanupConfirmed = false;
     try {
+      if (
+        directBrowserFailurePreservationEnabled &&
+        protocolContext.browserLaunchObserved &&
+        !timedOut &&
+        !terminationSignal &&
+        (processingError || outcome?.error || finalResult?.success !== true)
+      ) {
+        protocolContext.directBrowserPreservationRequested = true;
+      }
       const shouldCleanUpProcessGroup = shouldCleanUpRuyiPageProcessGroup({
         timedOut,
         terminationSignal,
         usesBrowserBroker,
+        strictProcessCleanup:
+          usesProcessStateSupervisor || usesOuterProcessSupervisor,
         browserPreserved: protocolContext.browserPreserved,
+        directBrowserPreservationRequested:
+          protocolContext.directBrowserPreservationRequested,
       });
       if (shouldCleanUpProcessGroup) {
         if (!timedOut) stopper.stopIfProcessGroupAlive();
         await stopper.waitForCleanup();
+      } else if (
+        protocolContext.browserPreserved ||
+        protocolContext.directBrowserPreservationRequested
+      ) {
+        directBrowserBackendStopper.stop();
+        await directBrowserBackendStopper.waitForCleanup();
       }
       cleanupConfirmed = true;
     } catch (error) {

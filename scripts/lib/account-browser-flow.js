@@ -94,6 +94,7 @@ const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_input_target_count",
   "twofa_target_missing",
   "twofa_focus_unconfirmed",
+  "twofa_submit_not_confirmed",
   "twofa_page_missing",
   "login_stopped_before_2fa",
   "account_session_unconfirmed_after_2fa",
@@ -314,6 +315,10 @@ function sanitizeTwoFactorGeneration(value) {
   return value === 1 || value === 2 ? value : 0;
 }
 
+function sanitizeBackendExitCode(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
 function readRunnerFailureContext(error) {
   const context = error?.ruyiPageFailureContext;
   if (!context || typeof context !== "object") {
@@ -324,8 +329,13 @@ function readRunnerFailureContext(error) {
       codeDeliveryAttempted: false,
       codeDeliverySent: false,
       codeDeliveryAcknowledged: false,
+      codeDeliveryWriteStarted: false,
+      codeDeliveryWriteCompleted: false,
+      browserLaunchObserved: false,
       browserPreserved: false,
+      directBrowserPreservationRequested: false,
       browserErrorClass: "unknown",
+      backendExitCode: null,
       cleanupFailed: false,
     };
   }
@@ -336,8 +346,14 @@ function readRunnerFailureContext(error) {
     codeDeliveryAttempted: context.codeDeliveryAttempted === true,
     codeDeliverySent: context.codeDeliverySent === true,
     codeDeliveryAcknowledged: context.codeDeliveryAcknowledged === true,
+    codeDeliveryWriteStarted: context.codeDeliveryWriteStarted === true,
+    codeDeliveryWriteCompleted: context.codeDeliveryWriteCompleted === true,
+    browserLaunchObserved: context.browserLaunchObserved === true,
     browserPreserved: context.browserPreserved === true,
+    directBrowserPreservationRequested:
+      context.directBrowserPreservationRequested === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
+    backendExitCode: sanitizeBackendExitCode(context.backendExitCode),
     cleanupFailed: context.cleanupFailed === true,
   };
 }
@@ -374,6 +390,9 @@ function classifyBackendDiagnosticMessage(value) {
   }
   if (normalized.includes("account session was not confirmed after 2fa")) {
     return "account_session_unconfirmed_after_2fa";
+  }
+  if (normalized.includes("2fa submit")) {
+    return "twofa_submit_not_confirmed";
   }
   if (normalized.includes("personal information page did not confirm")) {
     return "account_home_unconfirmed";
@@ -766,8 +785,14 @@ export async function runAccountBrowserPhase(
       codeDeliveryAttempted: runnerContext.codeDeliveryAttempted,
       codeDeliverySent: runnerContext.codeDeliverySent,
       codeDeliveryAcknowledged: runnerContext.codeDeliveryAcknowledged,
+      codeDeliveryWriteStarted: runnerContext.codeDeliveryWriteStarted,
+      codeDeliveryWriteCompleted: runnerContext.codeDeliveryWriteCompleted,
+      browserLaunchObserved: runnerContext.browserLaunchObserved,
       browserPreserved: runnerContext.browserPreserved,
+      directBrowserPreservationRequested:
+        runnerContext.directBrowserPreservationRequested,
       browserErrorClass: runnerContext.browserErrorClass,
+      backendExitCode: runnerContext.backendExitCode,
       cleanupFailed: runnerContext.cleanupFailed,
     });
     throw annotateBrowserRunFailure(error, null, failureStage);

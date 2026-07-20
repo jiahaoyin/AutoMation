@@ -12,6 +12,7 @@ import {
   createBrowserBrokerChild,
   createChildStopper,
   createRuyiPageBackendRunner,
+  isDirectBrowserFailurePreservationEnabled,
   resolveBackendTimeouts,
   shouldCleanUpRuyiPageProcessGroup,
 } from "./lib/ruyipage-backend-runner.js";
@@ -316,6 +317,12 @@ if (process.argv.includes("--split-utf8-chunks-child")) {
       );
     }, 30);
   });
+  await new Promise(() => {});
+}
+
+if (process.argv.includes("--preserve-backend-child")) {
+  process.stdout.write(`${JSON.stringify({ event: "ready", mode: "ruyipage-only" })}\n`);
+  process.on("SIGINT", () => process.exit(0));
   await new Promise(() => {});
 }
 
@@ -1929,8 +1936,13 @@ async function runNodeRunnerSecondGenerationStateResetTest() {
     codeDeliveryAttempted: false,
     codeDeliverySent: false,
     codeDeliveryAcknowledged: false,
+    codeDeliveryWriteStarted: false,
+    codeDeliveryWriteCompleted: false,
+    browserLaunchObserved: true,
     browserPreserved: false,
+    directBrowserPreservationRequested: true,
     browserErrorClass: "unknown",
+    backendExitCode: null,
     cleanupFailed: false,
   });
 }
@@ -2105,6 +2117,16 @@ async function runNodeRunnerSelfTest() {
 
 function runPreservedBrowserCleanupPolicyTest() {
   assert.equal(
+    isDirectBrowserFailurePreservationEnabled(
+      { BROWSER_PRESERVE_ON_FAILURE: "1" },
+      false,
+      false,
+      true
+    ),
+    false,
+    "a process-state supervised run must never enable direct browser preservation"
+  );
+  assert.equal(
     shouldCleanUpRuyiPageProcessGroup({
       timedOut: false,
       terminationSignal: null,
@@ -2143,6 +2165,43 @@ function runPreservedBrowserCleanupPolicyTest() {
     }),
     true,
     "an externally interrupted run must still clean up its process group"
+  );
+}
+
+async function runNodeRunnerPreservedBrowserStopsBackendSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--preserve-backend-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 40,
+  });
+  const startedAt = Date.now();
+  let failure = null;
+  await assert.rejects(
+    withRejectGuard(
+      runner.run({
+        creds: FIXTURE_CREDS,
+        reportDir: "data/reports/protocol-test",
+        onEvent(event) {
+          if (event.event === "ready") throw new Error("test event handler failure");
+        },
+      }),
+      1_000,
+      "preserved browser path left the Python backend alive"
+    ),
+    (error) => {
+      failure = error;
+      return error?.ruyiPageFailureCode === "event_handler";
+    }
+  );
+  assert.ok(Date.now() - startedAt < 900, "preserved backend cleanup exceeded its bound");
+  assert.equal(failure?.ruyiPageFailureContext?.directBrowserPreservationRequested, true);
+  assert.equal(failure?.ruyiPageFailureContext?.cleanupFailed, false);
+  assert.equal(
+    failure?.ruyiPageFailureContext?.backendExitCode,
+    process.platform === "win32" ? null : 0
   );
 }
 
@@ -2903,6 +2962,7 @@ const focusedTests = {
   "supervisor-parent-exit": runSupervisorParentExitBeforeGateSelfTest,
   "supervisor-runtime-policy": runSupervisorRuntimePolicySelfTest,
   "preserved-browser-cleanup": runPreservedBrowserCleanupPolicyTest,
+  "preserved-browser-backend-exit": runNodeRunnerPreservedBrowserStopsBackendSelfTest,
 };
 
 const focusedTest = process.env.RUYIPAGE_PROTOCOL_FOCUSED_TEST;
@@ -2929,6 +2989,7 @@ await runNodeRunnerBrowserBrokerCommandAckTimeoutTest();
 await runNodeRunnerBrowserBrokerCommandAckTimeoutIsCappedTest();
 await runNodeRunnerBrowserBrokerInvalidCommandAckTest();
 runPreservedBrowserCleanupPolicyTest();
+await runNodeRunnerPreservedBrowserStopsBackendSelfTest();
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();

@@ -54,11 +54,13 @@ REMEMBER_SELECTORS = (
     ),
 )
 CODE_FIELD_SELECTORS = (
+    ("css:.form-security-code-inputs input", True),
     ("css:input[autocomplete='one-time-code']", True),
     ("css:.security-code-input input", True),
     ("css:input[inputmode='numeric'][maxlength='1']", False),
     ("css:input[maxlength='1']", False),
 )
+FORM_SECURITY_CODE_INPUT_SELECTOR = "css:.form-security-code-inputs input"
 OTP_SEMANTIC_RE = re.compile(
     r"one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證",
     re.IGNORECASE,
@@ -78,6 +80,11 @@ OTP_REJECTION_JS_PATTERN = (
 TRUST_BUTTON_RE = re.compile(r"^(trust(?: this browser)?|continue|信任(?:此浏览器)?|继续)$", re.IGNORECASE)
 REJECT_TRUST_RE = re.compile(r"don't trust|do not trust|not now|cancel|不信任|取消|暂不", re.IGNORECASE)
 TWO_FACTOR_SUBMIT_RE = re.compile(r"^(verify|continue|submit|next|验证|继续|提交|下一步)$", re.IGNORECASE)
+TWO_FACTOR_SUBMIT_SELECTORS = (
+    "css:button",
+    "css:input[type='submit']",
+    "css:[role='button']",
+)
 EDITABLE_TEXT_INPUT_TYPES = frozenset(
     {"text", "search", "tel", "url", "email", "password", "number"}
 )
@@ -93,6 +100,7 @@ SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
+TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 12.0
 BROWSER_STARTUP_STAGES = {
     "not_started",
     "credentials_received",
@@ -217,6 +225,8 @@ def classify_browser_exception(error: Exception) -> str:
         return "twofa_target_missing"
     if "input target focus was not confirmed" in message:
         return "twofa_focus_unconfirmed"
+    if "2fa submit" in message:
+        return "twofa_submit_not_confirmed"
     if "2fa code page did not appear" in message:
         return "twofa_page_missing"
     if "login stopped before 2fa" in message:
@@ -1383,7 +1393,7 @@ def detect_shadow_root_state(root: Any) -> dict[str, bool]:
                 .filter(visible)
                 .filter(isEditableTextInput);
               const semantics = (el) => /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
-                el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+                el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
                 el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
                 el.getAttribute('autocomplete'), el.getAttribute('placeholder')
               ].filter(Boolean).join(' '));
@@ -1494,21 +1504,16 @@ def security_code_fields(page: Any) -> list[tuple[Any, Any]]:
         role_textboxes: list[Any] = []
 
         for root in roots:
-            for selector in (
-                "css:input[autocomplete='one-time-code']",
-                "css:.security-code-input input",
-            ):
-                candidates.extend(editable_text_elements(root, selector))
+            for selector, direct_candidate in CODE_FIELD_SELECTORS:
+                matching_elements = editable_text_elements(root, selector)
+                if selector == FORM_SECURITY_CODE_INPUT_SELECTOR:
+                    if len(matching_elements) == 6:
+                        candidates.extend(matching_elements)
+                elif direct_candidate:
+                    candidates.extend(matching_elements)
+                else:
+                    digit_inputs.extend(matching_elements)
             candidates.extend(semantic_otp_elements(root, "css:input"))
-            digit_inputs.extend(
-                editable_text_elements(
-                    root,
-                    "css:input[inputmode='numeric'][maxlength='1']",
-                )
-            )
-            digit_inputs.extend(
-                editable_text_elements(root, "css:input[maxlength='1']")
-            )
             if two_factor_scope:
                 role_textboxes.extend(
                     editable_text_elements(root, "css:[role='textbox']")
@@ -1560,6 +1565,7 @@ def element_has_otp_semantics(element: Any) -> bool:
     for name in (
         "aria-label",
         "aria-describedby",
+        "aria-description",
         "name",
         "id",
         "class",
@@ -1686,7 +1692,7 @@ def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
       const container = this.closest([
         'form', '[role="dialog"]', '[aria-modal="true"]', 'fieldset',
         '.si-container', '.signin-container', '.auth-content',
-        '.security-code-input'
+        '.security-code-input', '.form-security-code-inputs', 'hsa2-sk7'
       ].join(', '));
       if (!container) return false;
       const visible = (el) => {
@@ -1708,7 +1714,7 @@ def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
       }
       const otpSemantics = (el) =>
         /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
-          el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+          el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
           el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
           el.getAttribute('autocomplete'), el.getAttribute('placeholder')
         ].filter(Boolean).join(' '));
@@ -1759,10 +1765,139 @@ def click_trust_browser(
     return False
 
 
+def two_factor_submit_label(element: Any) -> str:
+    try:
+        text = str(element.text or "").strip()
+    except Exception:
+        text = ""
+    if text:
+        return text
+    for name in ("value", "aria-label", "title"):
+        try:
+            value = element.attr(name)
+        except Exception:
+            continue
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def set_two_factor_submit_outcome(
+    outcome: dict[str, str] | None,
+    method: str,
+    failure: str | None = None,
+) -> None:
+    if outcome is None:
+        return
+    outcome.clear()
+    outcome["method"] = method
+    if failure is not None:
+        outcome["failure"] = failure
+
+
+def classify_two_factor_submit_failure(error: Exception) -> str:
+    message = str(error)
+    if message == FOCUS_NOT_CONFIRMED_REASON:
+        return "focus_unconfirmed"
+    if "trusted Apple frame chain" in message:
+        return "scope_invalid"
+    return "target_unavailable"
+
+
+def two_factor_auto_submission_started(
+    page: Any,
+    fields: list[tuple[Any, Any]] | None,
+    timeout_s: float,
+    pause: Callable[[int, int], None] = human_pause,
+) -> bool:
+    """Observe a brief confirmed auto-submit window before a fallback Enter.
+
+    ruyiPage can replace the Python wrapper for a still-visible iframe or input.
+    Object identity is therefore not evidence that Apple submitted the form.
+    """
+    if not fields:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            state = detect_login_state(page)
+        except Exception:
+            # A transient state probe must not suppress the only submit action.
+            # submit_two_factor_with_enter() will independently revalidate focus.
+            return False
+        if (
+            state.get("trusted")
+            or state.get("error")
+            or state.get("otpRejected")
+            or state.get("blocked")
+            or not state.get("twofa")
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        pause(90, 180)
+
+
+def submit_two_factor_with_enter(
+    page: Any,
+    fields: list[tuple[Any, Any]] | None,
+    keys: Any | None,
+    pause: Callable[[int, int], None] = human_pause,
+    outcome: dict[str, str] | None = None,
+) -> bool:
+    """Submit a visible Apple OTP widget without inventing a click target."""
+    if keys is None or not fields or len(fields) not in (1, 6):
+        set_two_factor_submit_outcome(outcome, "none", "target_missing")
+        return False
+    try:
+        refreshed_fields = security_code_fields(page)
+    except Exception:
+        refreshed_fields = []
+    if len(refreshed_fields) == len(fields):
+        # Use a current ruyiPage context if Firefox re-wrapped the iframe while
+        # Apple was deciding whether to auto-submit the sixth digit.
+        fields = refreshed_fields
+    scope, field = fields[-1]
+    if any(candidate_scope is not scope for candidate_scope, _field in fields):
+        set_two_factor_submit_outcome(outcome, "none", "scope_invalid")
+        return False
+    try:
+        validate_two_factor_scope(scope)
+        action_scope = focus_keyboard_target(
+            page,
+            scope,
+            field,
+            pause=pause,
+            two_factor_scope=True,
+        )
+        pause(180, 420)
+        # Focus can move while the humanized pause runs. Verify the exact
+        # owner-frame target immediately before dispatching Enter.
+        validate_two_factor_scope(scope)
+        require_keyboard_target_ready(field)
+        action_scope.actions.press(keys.ENTER).perform()
+        validate_two_factor_scope(scope)
+    except Exception as error:
+        set_two_factor_submit_outcome(
+            outcome,
+            "none",
+            classify_two_factor_submit_failure(error),
+        )
+        return False
+    set_two_factor_submit_outcome(outcome, "enter")
+    return True
+
+
 def click_two_factor_submit(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
+    *,
+    keys: Any | None = None,
+    fields: list[tuple[Any, Any]] | None = None,
+    submit_outcome: dict[str, str] | None = None,
+    auto_submit_wait_s: float = 0.6,
 ) -> bool:
+    set_two_factor_submit_outcome(submit_outcome, "none", "target_missing")
     for scope, root in current_element_search_roots(page):
         try:
             state = detect_scope_login_state(scope)
@@ -1770,21 +1905,34 @@ def click_two_factor_submit(
             continue
         if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
             continue
-        for button in safe_elements(root, "css:button"):
-            if not element_is_interactable(button):
-                continue
-            try:
-                text = str(button.text or "").strip()
-            except Exception:
-                continue
-            if REJECT_TRUST_RE.search(text) or not TWO_FACTOR_SUBMIT_RE.fullmatch(text):
-                continue
-            if not button_has_prompt_semantics(button, "twofa"):
-                continue
-            pause(280, 680)
-            human_click(scope, button, pause=pause)
-            return True
-    return False
+        for selector in TWO_FACTOR_SUBMIT_SELECTORS:
+            for button in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(button):
+                    continue
+                text = two_factor_submit_label(button)
+                if REJECT_TRUST_RE.search(text) or not TWO_FACTOR_SUBMIT_RE.fullmatch(text):
+                    continue
+                if not button_has_prompt_semantics(button, "twofa"):
+                    continue
+                pause(280, 680)
+                human_click(scope, button, pause=pause)
+                set_two_factor_submit_outcome(submit_outcome, "button")
+                return True
+    if two_factor_auto_submission_started(
+        page,
+        fields,
+        auto_submit_wait_s,
+        pause=pause,
+    ):
+        set_two_factor_submit_outcome(submit_outcome, "automatic")
+        return True
+    return submit_two_factor_with_enter(
+        page,
+        fields,
+        keys,
+        pause=pause,
+        outcome=submit_outcome,
+    )
 
 
 def detect_scope_login_state(scope: Any) -> dict[str, Any]:
@@ -1812,7 +1960,7 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             .filter(isEditableTextInput);
           const otpSemantics = (el) =>
             /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
-              el.getAttribute('aria-label'), el.getAttribute('aria-describedby'),
+              el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
               el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
               el.getAttribute('autocomplete'), el.getAttribute('placeholder')
             ].filter(Boolean).join(' '));
@@ -2136,14 +2284,34 @@ def wait_for_signed_in(
     timeout_s: int = 90,
     submitted: bool = False,
     otp_generation: int | None = None,
+    submission_method: str | None = None,
 ) -> dict[str, Any]:
     if otp_generation is not None:
         validate_otp_generation(otp_generation)
     deadline = time.monotonic() + timeout_s
+    submission_transition_deadline = (
+        min(deadline, time.monotonic() + TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S)
+        if submitted and submission_method in {"button", "enter", "automatic"}
+        else None
+    )
     last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last_state = detect_login_state(page)
-        last_state = settle_trust_state(page, last_state, deadline=deadline)
+        try:
+            last_state = detect_login_state(page)
+            last_state = settle_trust_state(page, last_state, deadline=deadline)
+        except RuntimeError as error:
+            if str(error) != "unable to inspect login page state through ruyiPage":
+                raise
+            # Firefox can retire the old frame before ruyiPage exposes the
+            # replacement. A single unreadable poll after OTP submission is
+            # not evidence that the browser flow failed.
+            if (
+                submission_transition_deadline is not None
+                and time.monotonic() >= submission_transition_deadline
+            ):
+                raise RuntimeError("2FA submit state could not be confirmed") from error
+            human_pause(350, 700)
+            continue
         if otp_generation is not None and not is_apple_url(
             str(last_state.get("href") or "")
         ):
@@ -2154,8 +2322,19 @@ def wait_for_signed_in(
             raise RuntimeError("2FA/login failed")
         if last_state.get("trusted"):
             return last_state
+        if (
+            last_state.get("twofa")
+            and submission_transition_deadline is not None
+            and time.monotonic() >= submission_transition_deadline
+        ):
+            raise RuntimeError("2FA submit did not transition")
         if last_state.get("twofa") and not submitted:
             submitted = click_two_factor_submit(page)
+            if submitted:
+                submission_transition_deadline = min(
+                    deadline,
+                    time.monotonic() + TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S,
+                )
         human_pause(600, 1100)
     raise RuntimeError("account session was not confirmed after 2FA")
 
@@ -2582,12 +2761,22 @@ def browser_flow(args: argparse.Namespace) -> int:
                         fill_security_code(page, code, Keys, fields=fields)
                         emit_two_factor_progress("input_completed", generation=generation)
                         emit_two_factor_progress("submit_started", generation=generation)
-                        submitted = click_two_factor_submit(page)
+                        submit_outcome: dict[str, str] = {}
+                        submitted = click_two_factor_submit(
+                            page,
+                            keys=Keys,
+                            fields=fields,
+                            submit_outcome=submit_outcome,
+                        )
                         emit_two_factor_progress(
                             "submit_sent",
                             generation=generation,
                             submitted=submitted,
                         )
+                        if not submitted:
+                            if submit_outcome.get("failure") == "focus_unconfirmed":
+                                raise RuntimeError(FOCUS_NOT_CONFIRMED_REASON)
+                            raise RuntimeError("2FA submit target was not confirmed")
                         human_pause(900, 1600)
                         emit_two_factor_progress(
                             "transition_waiting",
@@ -2598,6 +2787,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                             page,
                             submitted=submitted,
                             otp_generation=generation,
+                            submission_method=submit_outcome.get("method"),
                         )
                     except Exception:
                         emit_two_factor_progress("handoff_failed", generation=generation)

@@ -1863,7 +1863,7 @@ class BrowserFlowTests(unittest.TestCase):
             side_effect=fill_code,
         ), patch(
             "apple_account_flow.click_two_factor_submit",
-            return_value=False,
+            return_value=True,
         ), patch(
             "apple_account_flow.wait_for_signed_in",
             return_value={"trusted": True},
@@ -1924,7 +1924,7 @@ class BrowserFlowTests(unittest.TestCase):
         )
         self.assertTrue(all(event["generation"] == 1 for event in twofa_progress))
         self.assertEqual(twofa_progress[2]["targetCount"], 1)
-        self.assertIs(twofa_progress[6]["submitted"], False)
+        self.assertIs(twofa_progress[6]["submitted"], True)
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
@@ -2842,6 +2842,33 @@ class StrongTwoFactorClassifierTests(unittest.TestCase):
 
 
 class TwoFactorStateTests(unittest.TestCase):
+    def test_submitted_wait_retries_a_transient_unreadable_scope_before_confirming_session(self):
+        recovered_state = {
+            "href": "https://account.apple.com/account/manage",
+            "twofa": False,
+            "trusted": True,
+            "error": False,
+        }
+        with patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=[
+                RuntimeError("unable to inspect login page state through ruyiPage"),
+                recovered_state,
+            ],
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_signed_in(
+                FakePage(),
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="enter",
+            )
+
+        self.assertTrue(state["trusted"])
+
     def test_first_generation_requires_an_explicit_otp_rejection_for_retry(self):
         state = {
             "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
@@ -3287,6 +3314,43 @@ class OtpTargetWaitTests(unittest.TestCase):
 
         self.assertEqual(fields, [(page, field)])
 
+    def test_wait_prefers_apple_six_cell_container_with_aria_description(self):
+        fields = [
+            FakeElement(
+                attrs={
+                    "maxlength": "1",
+                    "aria-description": "Enter the verification code in each input field.",
+                }
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={
+                "twofa": True,
+                "codeInputCount": 6,
+                "trusted": False,
+                "error": False,
+            },
+        )
+
+        discovered = self.wait_for_target(page)
+
+        self.assertEqual(discovered, [(page, field) for field in fields])
+        self.assertIn(
+            ("css:.form-security-code-inputs input", 0),
+            page.eles_calls,
+        )
+
+    def test_form_security_code_container_rejects_a_single_generic_input(self):
+        field = FakeElement(attrs={"maxlength": "1"})
+        page = FakePage(
+            {"css:.form-security-code-inputs input": [field]},
+            state={"twofa": True, "codeInputCount": 1},
+        )
+
+        self.assertEqual(account_flow.security_code_fields(page), [])
+
     def test_wait_finds_semantic_role_textbox_in_shadow_root(self):
         field = FakeElement(attrs={"role": "textbox", "aria-label": "Verification code"})
         shadow_root = FakePage({"css:[role='textbox']": [field]})
@@ -3536,6 +3600,7 @@ class OtpTargetWaitTests(unittest.TestCase):
         marker_root = RadioOnlyShadowRoot()
         self.assertFalse(account_flow.shadow_root_has_two_factor_marker(marker_root))
         self.assertIn("isEditableTextInput", marker_root.script)
+        self.assertIn("aria-description", marker_root.script)
 
     def test_verification_method_radio_does_not_validate_submit_prompt(self):
         class RadioOnlyPromptButton:
@@ -3551,6 +3616,8 @@ class OtpTargetWaitTests(unittest.TestCase):
             account_flow.button_has_prompt_semantics(prompt_button, "twofa")
         )
         self.assertIn("isEditableTextInput", prompt_button.script)
+        self.assertIn("form-security-code-inputs", prompt_button.script)
+        self.assertIn("aria-description", prompt_button.script)
 
     def test_explicit_otp_semantics_remain_supported(self):
         values = (
@@ -3566,6 +3633,15 @@ class OtpTargetWaitTests(unittest.TestCase):
                 field = FakeElement(attrs={"aria-label": value})
 
                 self.assertTrue(account_flow.element_has_otp_semantics(field))
+
+    def test_aria_description_otp_semantics_are_supported(self):
+        field = FakeElement(
+            attrs={
+                "aria-description": "Enter the verification code in each input field.",
+            }
+        )
+
+        self.assertTrue(account_flow.element_has_otp_semantics(field))
 
     def test_wait_rejects_six_generic_role_textboxes_in_an_opaque_2fa_frame(self):
         fields = [
@@ -4382,6 +4458,219 @@ class TrustBrowserTests(unittest.TestCase):
 
         self.assertNotIn(("human_click", unrelated_continue), page.actions.calls)
         self.assertIn(("human_click", verify), page.actions.calls)
+
+    def test_two_factor_submit_clicks_input_submit_without_waiting(self):
+        verify = FakeElement(
+            attrs={"value": "Verify"},
+            prompt_semantics={"twofa": True},
+        )
+        page = FakePage(
+            {"css:input[type='submit']": [verify]},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+
+        self.assertTrue(click_two_factor_submit(page, pause=lambda *_: None))
+
+        self.assertIn(("css:button", 0), page.eles_calls)
+        self.assertIn(("css:input[type='submit']", 0), page.eles_calls)
+        self.assertIn(("human_click", verify), page.actions.calls)
+
+    def test_two_factor_submit_uses_enter_after_confirming_last_otp_focus(self):
+        fields = [
+            FakeElement(
+                attrs={
+                    "maxlength": "1",
+                    "aria-description": "Enter the verification code in each input field.",
+                }
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        scoped_fields = [(page, field) for field in fields]
+
+        self.assertTrue(
+            click_two_factor_submit(
+                page,
+                pause=lambda *_: None,
+                keys=FakeKeys,
+                fields=scoped_fields,
+                auto_submit_wait_s=0,
+            )
+        )
+
+        self.assertIn(("human_click", fields[-1]), page.actions.calls)
+        self.assertIn(("press", FakeKeys.ENTER), page.actions.calls)
+
+    def test_two_factor_submit_never_enters_without_confirmed_otp_focus(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"},
+                focused=False,
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+
+        self.assertFalse(
+            click_two_factor_submit(
+                page,
+                pause=lambda *_: None,
+                keys=FakeKeys,
+                fields=[(page, field) for field in fields],
+                auto_submit_wait_s=0,
+            )
+        )
+
+        self.assertNotIn(("press", FakeKeys.ENTER), page.actions.calls)
+
+    def test_two_factor_submit_observes_apple_auto_transition_before_enter(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"}
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        outcome = {}
+
+        def auto_transition(*_args):
+            page.state["twofa"] = False
+
+        self.assertTrue(
+            click_two_factor_submit(
+                page,
+                pause=auto_transition,
+                keys=FakeKeys,
+                fields=[(page, field) for field in fields],
+                submit_outcome=outcome,
+                auto_submit_wait_s=0.05,
+            )
+        )
+
+        self.assertEqual(outcome, {"method": "automatic"})
+        self.assertNotIn(("press", FakeKeys.ENTER), page.actions.calls)
+
+    def test_two_factor_submit_enters_after_the_otp_frame_is_rewrapped(self):
+        original_fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"}
+            )
+            for _ in range(6)
+        ]
+        refreshed_fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"}
+            )
+            for _ in range(6)
+        ]
+        original_frame = FakePage(
+            {"css:.form-security-code-inputs input": original_fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        refreshed_frame = FakePage(
+            {"css:.form-security-code-inputs input": refreshed_fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        iframe = FakeElement(attrs={"src": refreshed_frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[refreshed_frame],
+            actions=FakeActions(coordinate_target=refreshed_fields[-1]),
+            state={"twofa": False, "codeInputCount": 0},
+        )
+        original_frame.parent = page
+        refreshed_frame.parent = page
+        outcome = {}
+
+        self.assertTrue(
+            click_two_factor_submit(
+                page,
+                pause=lambda *_: None,
+                keys=FakeKeys,
+                fields=[(original_frame, field) for field in original_fields],
+                submit_outcome=outcome,
+                auto_submit_wait_s=0,
+            )
+        )
+
+        self.assertEqual(outcome, {"method": "enter"})
+        self.assertIs(page.actions.target, refreshed_fields[-1])
+        self.assertEqual(original_frame.actions.calls, [])
+        self.assertIn(("press", FakeKeys.ENTER), page.actions.calls)
+
+    def test_two_factor_submit_state_probe_error_does_not_suppress_enter(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"}
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        outcome = {}
+
+        with patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=RuntimeError("temporary state probe failure"),
+        ):
+            self.assertTrue(
+                click_two_factor_submit(
+                    page,
+                    pause=lambda *_: None,
+                    keys=FakeKeys,
+                    fields=[(page, field) for field in fields],
+                    submit_outcome=outcome,
+                    auto_submit_wait_s=0,
+                )
+            )
+
+        self.assertEqual(outcome, {"method": "enter"})
+        self.assertIn(("press", FakeKeys.ENTER), page.actions.calls)
+
+    def test_two_factor_submit_rechecks_focus_after_its_final_pause(self):
+        fields = [
+            FakeElement(
+                attrs={"maxlength": "1", "aria-description": "Verification code"}
+            )
+            for _ in range(6)
+        ]
+        page = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            state={"twofa": True, "codeInputCount": 6},
+        )
+        pauses = 0
+        outcome = {}
+
+        def lose_focus_after_final_pause(*_args):
+            nonlocal pauses
+            pauses += 1
+            if pauses == 3:
+                fields[-1].focused = False
+
+        self.assertFalse(
+            click_two_factor_submit(
+                page,
+                pause=lose_focus_after_final_pause,
+                keys=FakeKeys,
+                fields=[(page, field) for field in fields],
+                submit_outcome=outcome,
+                auto_submit_wait_s=0,
+            )
+        )
+
+        self.assertEqual(outcome, {"method": "none", "failure": "focus_unconfirmed"})
+        self.assertNotIn(("press", FakeKeys.ENTER), page.actions.calls)
 
     def test_two_factor_submit_clicks_frame_shadow_button_through_owner_scope(self):
         verify = FakeElement("Verify", prompt_semantics={"twofa": True})
