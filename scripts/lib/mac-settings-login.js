@@ -18,6 +18,8 @@ import {
   fillViaSwiftAx,
   isAxFillAvailable,
 } from "./mac-settings-ax-fill.js";
+import { completeSupervisedMacSettingsSmsVerification } from "./mac-settings-sms-verification.js";
+import { createSmsProviderCodePoller, resolveMacSettingsSmsProviderConfig } from "./mac-settings-sms-provider.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -190,9 +192,22 @@ export async function runMacSettingsLoginPhase(creds) {
   }
 
   await fillMacSettingsAppleLogin(creds);
-  console.log(
-    "\n[Mac 设置] 账号密码已提交。若出现手机验证码，请在系统界面人工输入。"
-  );
+  const hasSmsPhone = Boolean(process.env.APPLE_AUTOMATION_SMS_PHONE?.trim());
+  const hasSmsApiUrl = Boolean(process.env.APPLE_AUTOMATION_SMS_API_URL?.trim());
+  const supervisedSmsEnabled =
+    process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1" &&
+    (process.env.APPLE_AUTOMATION_SMS_ENABLED === "1" || hasSmsPhone || hasSmsApiUrl);
+  if (supervisedSmsEnabled) {
+    const config = await resolveMacSettingsSmsProviderConfig();
+    await completeSupervisedMacSettingsSmsVerification({
+      phoneNumber: config.phoneNumber,
+      codeProvider: createSmsProviderCodePoller(config),
+      supervised: true,
+    });
+    console.log("[Mac Settings] SMS verification code submitted.");
+  } else {
+    console.log("\n[Mac Settings] Credentials submitted. Complete SMS verification manually if shown.");
+  }
   await waitForMacSettingsLoginComplete();
   return { skipped: false, signedIn: true };
 }
