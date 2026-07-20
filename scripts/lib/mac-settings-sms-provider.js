@@ -82,18 +82,36 @@ export function extractSmsVerificationCode(body, suffix) {
   })();
   for (const item of strings) {
     const suffixes = messageSuffixes(item);
-    if (suffixes.size > 0 && (!suffixes.has(suffix) || suffixes.size !== 1)) continue;
+    if (suffixes.size !== 1 || !suffixes.has(suffix)) continue;
     const codes = [...item.matchAll(SIX_DIGIT_CODE_RE)].map((match) => match[1]);
     if (codes.length === 1) return codes[0];
   }
   return null;
 }
 
-async function readBoundedBody(response) {
+async function readBoundedBody(response, signal) {
   const length = Number(response.headers?.get?.("content-length"));
   if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) return null;
-  const body = await response.text();
-  return Buffer.byteLength(body, "utf8") <= MAX_RESPONSE_BYTES ? body : null;
+  if (!response.body?.getReader) return null;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    while (!signal?.aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+    if (signal?.aborted) return null;
+    return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+  } finally {
+    reader.releaseLock?.();
+  }
 }
 
 export function createSmsProviderCodePoller(config, options = {}) {
@@ -116,11 +134,11 @@ export function createSmsProviderCodePoller(config, options = {}) {
         let response;
         try {
           response = await request(providerUrl, { method: "GET", redirect: "error", signal: controller.signal, headers: { accept: "application/json, text/plain, text/html" } });
+          if (response?.ok) {
+            const code = extractSmsVerificationCode(await readBoundedBody(response, controller.signal), suffix);
+            if (code) return code;
+          }
         } finally { clearTimeout(timer); }
-        if (response?.ok) {
-          const code = extractSmsVerificationCode(await readBoundedBody(response), suffix);
-          if (code) return code;
-        }
       } catch {
         // Provider availability details and secret URL are intentionally not exposed.
       } finally { signal?.removeEventListener("abort", onAbort); }
