@@ -1,157 +1,163 @@
-# Apple ID Automation (macOS)
+﻿# Apple ID Automation (macOS)
 
-在 **macOS 15 Sequoia** 上自动化完成 Apple ID 登录与信息采集：
+鍦?**macOS 15 Sequoia** 涓婅嚜鍔ㄥ寲瀹屾垚 Apple ID 鐧诲綍涓庝俊鎭噰闆嗭細
 
-1. **系统设置** → Apple Account 自动填表（手机验证码人工）
-2. **Firefox** + ruyiPage → `account.apple.com` 登录与 2FA
-3. 采集**姓名、生日**，输出报告与截图
+1. **绯荤粺璁剧疆** 鈫?Apple Account 鑷姩濉〃锛堟墜鏈洪獙璇佺爜浜哄伐锛?
+2. **Firefox** + ruyiPage 鈫?`account.apple.com` 鐧诲綍涓?2FA
+3. 閲囬泦**濮撳悕銆佺敓鏃?*锛岃緭鍑烘姤鍛婁笌鎴浘
 
-与 [ChromeTest](https://github.com) 探针项目**完全独立**，本仓库单独维护。
+涓?[ChromeTest](https://github.com) 鎺㈤拡椤圭洰**瀹屽叏鐙珛**锛屾湰浠撳簱鍗曠嫭缁存姢銆?
 
-## 快速开始
+## 蹇€熷紑濮?
 
 ```bash
-./install.sh    # 前置管理员授权、Python/Node 自动安装、辅助功能引导
-./run.sh        # 终端输入账号密码 → 自动备份 .env → 执行流程
+./install.sh    # 鍓嶇疆绠＄悊鍛樻巿鏉冦€丳ython/Node 鑷姩瀹夎銆佽緟鍔╁姛鑳藉紩瀵?
+./run.sh        # 缁堢杈撳叆璐﹀彿瀵嗙爜 鈫?鑷姩澶囦唤 .env 鈫?鎵ц娴佺▼
 ```
 
-`./install.sh` 启动后会立即请求一次管理员密码授权。若没有 Python 3.10+，
-安装器会下载 Python.org 官方 Python 3.12.10 universal2 PKG，核对固定
-SHA-256 和 Python Software Foundation Developer ID 签名，再从 root 私有暂存
-目录完成系统安装并继续创建 `.runtime/ruyipage-venv`，无需重新运行脚本。
-管理员密码仅由系统 `/usr/bin/sudo` 读取；日常运行 `./run.sh` 不会请求管理员授权。
+`./install.sh` 鍚姩鍚庝細绔嬪嵆璇锋眰涓€娆＄鐞嗗憳瀵嗙爜鎺堟潈銆傝嫢娌℃湁 Python 3.10+锛?
+瀹夎鍣ㄤ細涓嬭浇 Python.org 瀹樻柟 Python 3.12.10 universal2 PKG锛屾牳瀵瑰浐瀹?
+SHA-256 鍜?Python Software Foundation Developer ID 绛惧悕锛屽啀浠?root 绉佹湁鏆傚瓨
+鐩綍瀹屾垚绯荤粺瀹夎骞剁户缁垱寤?`.runtime/ruyipage-venv`锛屾棤闇€閲嶆柊杩愯鑴氭湰銆?
+绠＄悊鍛樺瘑鐮佷粎鐢辩郴缁?`/usr/bin/sudo` 璇诲彇锛涙棩甯歌繍琛?`./run.sh` 涓嶄細璇锋眰绠＄悊鍛樻巿鏉冦€?
 
-## 环境
+## 鐜
 
-- macOS 15（推荐）
-- Node.js 18+（[nodejs.org](https://nodejs.org) 或 `install.sh` 下载官方包）
-- Python 3.10+（`install.sh` 自动检测；缺失时安装已验签的官方 Python 3.12.10）
-- Firefox（[mozilla.org/firefox](https://www.mozilla.org/firefox/)）
-- 当前运行主体的「辅助功能」权限（`install.sh` 会引导；本地通常为 Terminal / iTerm，受监督验收为 Codex / 原生 helper）
+- macOS 15锛堟帹鑽愶級
+- Node.js 18+锛圼nodejs.org](https://nodejs.org) 鎴?`install.sh` 涓嬭浇瀹樻柟鍖咃級
+- Python 3.10+锛坄install.sh` 鑷姩妫€娴嬶紱缂哄け鏃跺畨瑁呭凡楠岀鐨勫畼鏂?Python 3.12.10锛?
+- Firefox锛圼mozilla.org/firefox](https://www.mozilla.org/firefox/)锛?
+- 褰撳墠杩愯涓讳綋鐨勩€岃緟鍔╁姛鑳姐€嶆潈闄愶紙`install.sh` 浼氬紩瀵硷紱鏈湴閫氬父涓?Terminal / iTerm锛屽彈鐩戠潱楠屾敹涓?Codex / 鍘熺敓 helper锛?
 
-Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recording）
-权限，这是自动取码的**必需权限**。`install.sh` 会在编译 exact native helper 后
-立即请求并确认授权；`run.sh` 也会在 Firefox 启动前再次确认。未授权、helper 不可用
-或授权状态未生效时流程会在提交账号密码前停止，不会降级为静默跳过 OCR。若系统要求
-重启运行主体，请按提示重新打开当前终端或 Codex 后重新运行 `./install.sh`。
+Vision OCR 浣跨敤銆屽睆骞曚笌绯荤粺闊抽褰曞埗銆嶏紙Screen & System Audio Recording锛?
+鏉冮檺锛岃繖鏄嚜鍔ㄥ彇鐮佺殑**蹇呴渶鏉冮檺**銆俙install.sh` 浼氬湪缂栬瘧 exact native helper 鍚?
+绔嬪嵆璇锋眰骞剁‘璁ゆ巿鏉冿紱`run.sh` 涔熶細鍦?Firefox 鍚姩鍓嶅啀娆＄‘璁ゃ€傛湭鎺堟潈銆乭elper 涓嶅彲鐢?
+鎴栨巿鏉冪姸鎬佹湭鐢熸晥鏃舵祦绋嬩細鍦ㄦ彁浜よ处鍙峰瘑鐮佸墠鍋滄锛屼笉浼氶檷绾т负闈欓粯璺宠繃 OCR銆傝嫢绯荤粺瑕佹眰
+閲嶅惎杩愯涓讳綋锛岃鎸夋彁绀洪噸鏂版墦寮€褰撳墠缁堢鎴?Codex 鍚庨噸鏂拌繍琛?`./install.sh`銆?
 
-## 安装故障排查
+## 瀹夎鏁呴殰鎺掓煡
 
-- **安装 ruyiPage 时出现 PyPI TLS 证书错误**：`install.sh` 始终保持 HTTPS 证书校验；仅项目管理的 macOS 虚拟环境且 pip 支持 `truststore` 时优先使用系统信任库，显式 `RUYIPAGE_PYTHON` 不承诺该行为。如处于企业代理环境，请先将代理根证书安装到 macOS 系统钥匙串，再重新执行 `./install.sh`。
+- **瀹夎 ruyiPage 鏃跺嚭鐜?PyPI TLS 璇佷功閿欒**锛歚install.sh` 濮嬬粓淇濇寔 HTTPS 璇佷功鏍￠獙锛涗粎椤圭洰绠＄悊鐨?macOS 铏氭嫙鐜涓?pip 鏀寔 `truststore` 鏃朵紭鍏堜娇鐢ㄧ郴缁熶俊浠诲簱锛屾樉寮?`RUYIPAGE_PYTHON` 涓嶆壙璇鸿琛屼负銆傚澶勪簬浼佷笟浠ｇ悊鐜锛岃鍏堝皢浠ｇ悊鏍硅瘉涔﹀畨瑁呭埌 macOS 绯荤粺閽ュ寵涓诧紝鍐嶉噸鏂版墽琛?`./install.sh`銆?
 
-## 命令
+## 鍛戒护
 
-| 命令 | 说明 |
+| 鍛戒护 | 璇存槑 |
 |------|------|
-| `./install.sh` | 前置授权；自动安装 Python/Node、ruyiPage，并确认辅助功能与屏幕录制 |
-| `./run.sh` | 完整流程 |
-| `./run.sh --skip-mac` | 仅浏览器 |
-| `./run.sh --skip-browser` | 仅系统设置 |
-| `npm run check` | 环境自检 |
-| `npm run test:browser-backend` | 浏览器后端选择逻辑测试 |
-| `npm run test:ruyipage-protocol` | ruyipage JSONL 协议自测 |
-| `npm run test:ruyipage-flow` | ruyiPage Python 流程与安全边界测试 |
-| `npm run test:2fa-allow-unit` | Allow、popup AX/OCR 与隐私 source-contract 测试 |
-| `npm run test:2fa-sidecar` | popup 与系统设置双通道竞速测试 |
-| `npm run test:2fa-settings-unit` | 可取消系统设置 helper 生命周期测试 |
-| `npm run test:account-browser-flow` | 浏览器运行与 2FA collector 生命周期测试 |
-| `npm run test:python-bootstrap` | Python 自动安装与提权入口合同测试 |
-| `npm run package` | 本地打包 `dist/`（保留 zip） |
-| `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
+| `./install.sh` | 鍓嶇疆鎺堟潈锛涜嚜鍔ㄥ畨瑁?Python/Node銆乺uyiPage锛屽苟纭杈呭姪鍔熻兘涓庡睆骞曞綍鍒?|
+| `./run.sh` | 瀹屾暣娴佺▼ |
+| `./run.sh --skip-mac` | 浠呮祻瑙堝櫒 |
+| `./run.sh --skip-browser` | 浠呯郴缁熻缃?|
+| `npm run check` | 鐜鑷 |
+| `npm run test:browser-backend` | 娴忚鍣ㄥ悗绔€夋嫨閫昏緫娴嬭瘯 |
+| `npm run test:ruyipage-protocol` | ruyipage JSONL 鍗忚鑷祴 |
+| `npm run test:ruyipage-flow` | ruyiPage Python 娴佺▼涓庡畨鍏ㄨ竟鐣屾祴璇?|
+| `npm run test:2fa-allow-unit` | Allow銆乸opup AX/OCR 涓庨殣绉?source-contract 娴嬭瘯 |
+| `npm run test:2fa-sidecar` | popup 浼樺厛涓庣郴缁熻缃覆琛屽洖閫€娴嬭瘯 |
+| `npm run test:2fa-settings-unit` | 鍙彇娑堢郴缁熻缃?helper 鐢熷懡鍛ㄦ湡娴嬭瘯 |
+| `npm run test:account-browser-flow` | 娴忚鍣ㄨ繍琛屼笌 2FA collector 鐢熷懡鍛ㄦ湡娴嬭瘯 |
+| `npm run test:python-bootstrap` | Python 鑷姩瀹夎涓庢彁鏉冨叆鍙ｅ悎鍚屾祴璇?|
+| `npm run package` | 鏈湴鎵撳寘 `dist/`锛堜繚鐣?zip锛?|
+| `npm run release` | patch+1 鈫?鎵撳寘 鈫?涓婁紶 GitHub Releases 鈫?娓呯悊鏈湴 `dist/` |
 
-## 发布与分发
+## 鍙戝竷涓庡垎鍙?
 
-**本机发布**（打包上传至 GitHub Releases，本地不保留 zip）：
+**鏈満鍙戝竷**锛堟墦鍖呬笂浼犺嚦 GitHub Releases锛屾湰鍦颁笉淇濈暀 zip锛夛細
 
 ```bash
 npm run release
 ```
 
-**其他 Mac 拉取最新版**（无需 clone 仓库，下载解压即用）：
+**鍏朵粬 Mac 鎷夊彇鏈€鏂扮増**锛堟棤闇€ clone 浠撳簱锛屼笅杞借В鍘嬪嵆鐢級锛?
 
 ```bash
-# 方式一：一键脚本（推荐）
+# 鏂瑰紡涓€锛氫竴閿剼鏈紙鎺ㄨ崘锛?
 curl -fsSL https://raw.githubusercontent.com/jiahaoyin/Apple-AutoMation/main/scripts/fetch-latest.sh | bash
 
-# 方式二：已 clone 仓库时
+# 鏂瑰紡浜岋細宸?clone 浠撳簱鏃?
 ./scripts/fetch-latest.sh
 
-# 解压后进入目录
+# 瑙ｅ帇鍚庤繘鍏ョ洰褰?
 cd apple-id-automation-latest/apple-id-automation-*/
 ./install.sh && ./run.sh
 ```
 
-或手动下载：[GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases) 中的 `*-macos.zip`，解压后 `./install.sh && ./run.sh`。
+鎴栨墜鍔ㄤ笅杞斤細[GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases) 涓殑 `*-macos.zip`锛岃В鍘嬪悗 `./install.sh && ./run.sh`銆?
 
-## 文档
+## 鏂囨。
 
-- **[docs/PROJECT.md](docs/PROJECT.md)** — 架构、文件说明、故障排查（新会话必读）
-- **[docs/MAC_CODEX_HANDOFF.md](docs/MAC_CODEX_HANDOFF.md)** — Mac Codex 新会话交接、当前 2FA 状态与手工反馈流程
-- **[docs/WINDOWS_MAC_CODEX.md](docs/WINDOWS_MAC_CODEX.md)** — Windows 调度 Mac Codex 测试、证据回传与修复重测
+- **[docs/PROJECT.md](docs/PROJECT.md)** 鈥?鏋舵瀯銆佹枃浠惰鏄庛€佹晠闅滄帓鏌ワ紙鏂颁細璇濆繀璇伙級
+- **[docs/MAC_CODEX_HANDOFF.md](docs/MAC_CODEX_HANDOFF.md)** 鈥?Mac Codex 鏂颁細璇濅氦鎺ャ€佸綋鍓?2FA 鐘舵€佷笌鎵嬪伐鍙嶉娴佺▼
+- **[docs/WINDOWS_MAC_CODEX.md](docs/WINDOWS_MAC_CODEX.md)** 鈥?Windows 璋冨害 Mac Codex 娴嬭瘯銆佽瘉鎹洖浼犱笌淇閲嶆祴
 
-## 浏览器后端
+## 娴忚鍣ㄥ悗绔?
 
-浏览器启动、导航、页面读取、接管、输入、截图与关闭全部由 Python `ruyiPage` 完成。项目不再包含 Node BiDi 或其他页面自动化回退；ruyiPage 未就绪时会明确停止并提示运行 `./install.sh`。
+娴忚鍣ㄥ惎鍔ㄣ€佸鑸€侀〉闈㈣鍙栥€佹帴绠°€佽緭鍏ャ€佹埅鍥句笌鍏抽棴鍏ㄩ儴鐢?Python `ruyiPage` 瀹屾垚銆傞」鐩笉鍐嶅寘鍚?Node BiDi 鎴栧叾浠栭〉闈㈣嚜鍔ㄥ寲鍥為€€锛況uyiPage 鏈氨缁椂浼氭槑纭仠姝㈠苟鎻愮ず杩愯 `./install.sh`銆?
 
 ```bash
-BROWSER_BACKEND=ruyipage          # 唯一后端；auto 仅兼容旧 .env
-RUYIPAGE_PYTHON=python3           # 可选；默认使用 .runtime/ruyipage-venv
+BROWSER_BACKEND=ruyipage          # 鍞竴鍚庣锛沘uto 浠呭吋瀹规棫 .env
+RUYIPAGE_PYTHON=python3           # 鍙€夛紱榛樿浣跨敤 .runtime/ruyipage-venv
 BROWSER_PROFILE_MODE=persistent   # persistent | fresh
 RUYIPAGE_BACKEND_TIMEOUT_MS=720000
 RUYIPAGE_KILL_GRACE_MS=5000
-BROWSER_2FA_SETTINGS_AFTER_MS=8000
+BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
+# BROWSER_2FA_DEBUG_SHOW_CODE=1  # 榛樿鍏抽棴锛涗粎鐪熷疄 TTY銆侀潪鍙楃洃鐫ｆ湰鍦扮粓绔樉绀?OTP
 ```
 
-## 2FA 获取与恢复顺序
+## 2FA 鑾峰彇涓庢仮澶嶉『搴?
 
-ruyiPage 填好密码和“记住账号”后，会先通过 JSONL 要求 Node 清理旧验证码窗、记录 `preparedAt` 并启动 popup watcher；收到 `2fa_prepared` 后才提交密码。watcher 可以在网页发出 `need_2fa` 前缓存当前登录的 popup 验证码，但这时尚未启动完整取码竞速，也尚未开始 240 秒总期限。
+ruyiPage 濉ソ瀵嗙爜鍜屸€滆浣忚处鍙封€濆悗锛屼細鍏堥€氳繃 JSONL 瑕佹眰 Node 娓呯悊鏃ч獙璇佺爜绐椼€佽褰?`preparedAt` 骞跺惎鍔?popup watcher锛涙敹鍒?`2fa_prepared` 鍚庢墠鎻愪氦瀵嗙爜銆俙need_2fa` 涔嬪墠 watcher 鍙敤浜庡噯澶囥€佽瀵熷拰娓呯悊鏃х獥锛屼笉浼氭彁鍓嶇偣鍑?Allow銆佽鍙栧€欓€夌爜鎴栧惎鍔ㄧ郴缁熻缃€?
 
-第一次 `getCode` acquisition 才启动取码竞速和共享 240 秒期限；如网页明确拒绝第一代验证码，第二代沿用同一期限，不会重新计时。来源按以下顺序加入：
+绗竴娆?`getCode` acquisition 鎵嶅惎鍔ㄤ弗鏍间覆琛岀殑鍙栫爜閾惧拰鍏变韩 240 绉掓湡闄愶紱濡傜綉椤垫槑纭嫆缁濈涓€浠ｉ獙璇佺爜锛岀浜屼唬娌跨敤鍚屼竴鏈熼檺涓?Settings 鎬婚绠楋紝涓嶄細閲嶆柊璁℃椂銆傞『搴忓浐瀹氬涓嬶細
 
-1. popup watcher 先用 AX 从已验证的 Apple 系统弹窗读取 `NNN NNN`。AX 没有合法验证码时，才对同一个可信 Apple window ID 做内存 Vision OCR；若该 helper 未获 AX 授权，则仅在 `need_2fa` 后按 dedicated Apple authentication process 的 on-screen window ID 启动同一 OCR 兜底。全窗只接受 `NNN NNN`；只有中心裁剪可接受连续六位，而且必须在同一 window ID 的两次独立捕获中保持一致。OCR 不点击、不做全屏搜索、不写临时 PNG。
-2. 系统设置只在 `getCode` 已活跃后启动，并以 `preparedAt + 8s` 为门槛；如果门槛已过就立即加入，否则等待到门槛。最多两次，每次最多 60 秒，两次之间退避 5 秒；popup watcher 同时继续。
-3. 从第一次 acquisition 起 90 秒后，如果 stdin/stdout 都是 TTY 且手输未被明确禁用，则显示固定提示并隐藏读取六位验证码。手输默认启用；只有 `BROWSER_2FA_MANUAL_FALLBACK=0` 才禁用，配置示例中的 `=1` 是显式启用写法。
-4. 首个合法来源获胜；其余来源被取消并执行有界弹窗清理。第一次 acquisition 起 240 秒到期后，runner 清理 helper 与进程组并整体失败。
+1. 浠?ruyiPage 鍙戝嚭 `need_2fa` 璧凤紝popup watcher 鍏堝湪 30 绉掍富绐楀彛鍐呯敤 AX 浠庡凡楠岃瘉鐨?Apple 绯荤粺寮圭獥璇诲彇 `NNN NNN`銆侫X 娌℃湁鍚堟硶楠岃瘉鐮佹椂锛屾墠瀵瑰悓涓€涓彲淇?Apple window ID 鍋氬唴瀛?Vision OCR锛涜嫢璇?helper 鏈幏 AX 鎺堟潈锛屽垯浠呭湪 `need_2fa` 鍚庢寜 dedicated Apple authentication process 鐨?on-screen window ID 鍚姩鍚屼竴 OCR 鍏滃簳銆傚叏绐楀彧鎺ュ彈 `NNN NNN`锛涘彧鏈変腑蹇冭鍓彲鎺ュ彈杩炵画鍏綅锛岃€屼笖蹇呴』鍦ㄥ悓涓€ window ID 鐨勪袱娆＄嫭绔嬫崟鑾蜂腑淇濇寔涓€鑷淬€侽CR 涓嶇偣鍑汇€佷笉鍋氬叏灞忔悳绱€佷笉鍐欎复鏃?PNG銆?
+2. 鑷姩鎴栦汉宸ョ‘璁?Allow 鍚庯紝popup AX/OCR 鍐嶈幏寰楅澶?30 绉掔獥鍙ｃ€傚彧瑕佽涓婚樁娈靛彇寰楁湁鏁堟柊鐮侊紝绯荤粺璁剧疆鍜岄殣钘忔墜杈撻兘涓嶄細鍚姩锛岄獙璇佺爜浼氱珛鍗充氦缁?ruyiPage銆?
+3. popup 涓婚樁娈靛埌鏈熶粛鏃犳柊鐮侊紝鎵嶈繘鍏ョ郴缁熻缃洖閫€銆係ettings 鏈€澶氫袱娆★紝姣忔鏈€澶?60 绉掞紝涓ゆ涔嬮棿閫€閬?5 绉掞紱杩涘叆璇ラ樁娈靛悗涓嶅啀鎺ュ彈杩熷埌鐨?popup 鍊欓€夌爜銆?
+4. 浠呭湪 Settings 鐨勬湁鐣屽皾璇曠粨鏉熷悗锛屼笖浠庣涓€娆?acquisition 璧峰凡杩囪嚦灏?90 绉掋€乻tdin/stdout 閮芥槸 TTY銆佹墜杈撴湭琚槑纭鐢ㄦ椂锛屾墠鏄剧ず鍥哄畾鎻愮ず骞堕殣钘忚鍙栧叚浣嶉獙璇佺爜銆傛墜杈撻粯璁ゅ惎鐢紱鍙湁 `BROWSER_2FA_MANUAL_FALLBACK=0` 鎵嶇鐢紝閰嶇疆绀轰緥涓殑 `=1` 鏄樉寮忓惎鐢ㄥ啓娉曘€?
+5. 绗竴涓湪鍏跺綋鍓嶄覆琛岄樁娈靛唴鏍￠獙閫氳繃鐨勬柊鐮佺珛鍗充氦缁欑綉椤碉紱鍚庣画闃舵涓嶅啀鍚姩锛屽師鐢?helper 涓庡脊绐楀彧鍋氭湁鐣屽悗鍙版竻鐞嗐€傜涓€娆?acquisition 璧?240 绉掑埌鏈熷悗锛宺unner 娓呯悊 helper 涓庤繘绋嬬粍骞舵暣浣撳け璐ャ€?
 
-Allow 自动动作最多尝试两次。两次都未确认时，终端只提示用户手动点击
-“允许”；popup 监听、系统设置和后续手输来源不会因此停止。自动尝试只有在后续
-原生状态确认 Allow 消失或验证码窗出现后才算成功。
+Allow 鑷姩鍔ㄤ綔鏈€澶氬皾璇曚袱娆°€備袱娆￠兘鏈‘璁ゆ椂锛岀粓绔彧鎻愮ず鐢ㄦ埛鎵嬪姩鐐瑰嚮
+鈥滃厑璁糕€濓紱popup 涓婚樁娈典細缁х画绛夊緟锛岀洿鍒颁富绐楀彛鍒版湡鍚庢墠鎸変笂杩伴『搴忓洖閫€銆傝嚜鍔ㄥ皾璇曞彧鏈夊湪鍚庣画
+鍘熺敓鐘舵€佺‘璁?Allow 娑堝け鎴栭獙璇佺爜绐楀嚭鐜板悗鎵嶇畻鎴愬姛銆?
 
-popup 读到并校验六位验证码后会立即交给网页流程；关闭原生验证码窗只是尽力清理，
-关闭失败会保留固定审计状态和终端提示，不能再阻塞验证码提交。
+popup 璇诲埌骞舵牎楠屽叚浣嶉獙璇佺爜鍚庝細绔嬪嵆浜ょ粰缃戦〉娴佺▼锛涘叧闂師鐢熼獙璇佺爜绐楀彧鏄敖鍔涙竻鐞嗭紝
+鍏抽棴澶辫触浼氫繚鐣欏浐瀹氬璁＄姸鎬佸拰缁堢鎻愮ず锛屼笉鑳藉啀闃诲楠岃瘉鐮佹彁浜ゃ€?
 
-最终发布合同最多允许两代验证码。generation 已从 ruyiPage 事件经 runner 和
-`account-browser-flow` 透传到 collector。只有可信 Apple 页面明确显示英文、简中或
-繁中的验证码错误、无效或过期语义时，才可请求第二代；第一代立即进入全局拒绝
-集合，所有来源都不得再次返回。captcha、账号锁定或未知登录错误必须停止，不能借
-“换码”继续尝试。
+鏈€缁堝彂甯冨悎鍚屾渶澶氬厑璁镐袱浠ｉ獙璇佺爜銆俫eneration 宸蹭粠 ruyiPage 浜嬩欢缁?runner 鍜?
+`account-browser-flow` 閫忎紶鍒?collector銆傚彧鏈夊彲淇?Apple 椤甸潰鏄庣‘鏄剧ず鑻辨枃銆佺畝涓垨
+绻佷腑鐨勯獙璇佺爜閿欒銆佹棤鏁堟垨杩囨湡璇箟鏃讹紝鎵嶅彲璇锋眰绗簩浠ｏ紱绗簩浠ｉ噸鏂颁粠 popup 涓婚樁娈靛紑濮嬶紝
+浣嗘部鐢ㄧ涓€浠ｇ殑 240 绉掓湡闄愪笌 Settings 涓ゆ鎬婚绠椼€傜涓€浠ｇ珛鍗宠繘鍏ュ叏灞€鎷掔粷闆嗗悎锛屾墍鏈?
+鏉ユ簮閮戒笉寰楀啀娆¤繑鍥炪€俢aptcha銆佽处鍙烽攣瀹氭垨鏈煡鐧诲綍閿欒蹇呴』鍋滄锛屼笉鑳藉€熲€滄崲鐮佲€濈户缁皾璇曘€?
 
-sidecar `onStatus` 已接入外层终端，只显示固定阶段提示，包括 Settings 第 1/2 次、
-5 秒重试、手动 Allow、隐藏手输、OCR 权限缺失、获胜来源和 240 秒超时；不插入
-OTP、原始 AX/OCR/stderr 或完整 Apple ID。主控 fresh Windows 验证已通过 Python
-126/126、ruyipage flow、protocol、sidecar、account-browser-flow、Allow 61/61、
-permissions 和 release，四路最终专项复审均为 PASS。该证据覆盖逻辑与 source-contract，不代表 Swift 编译、
-TCC 或 macOS 15 原生 UI 已验收。
+sidecar `onStatus` 宸叉帴鍏ュ灞傜粓绔紝鍙樉绀哄浐瀹氶樁娈垫彁绀猴紝鍖呮嫭 popup 涓婚樁娈点€丼ettings
+绗?1/2 娆°€? 绉掗噸璇曘€佹墜鍔?Allow銆侀殣钘忔墜杈撱€丱CR 鏉冮檺缂哄け銆佽幏鑳滄潵婧愬拰 240 绉掕秴鏃躲€?
+榛樿涓嶆墦鍗?OTP銆備粎鏄惧紡璁剧疆 `BROWSER_2FA_DEBUG_SHOW_CODE=1`锛屼笖褰撳墠杈撳嚭鏄湡瀹?TTY銆?
+闈炲彈鐩戠潱浼氳瘽鏃讹紝鎵嶄細鎶婂叚鐮佹樉绀哄埌褰撳墠鏈湴缁堢锛涢噸瀹氬悜鎴栧彈鐩戠潱杩愯涓€寰嬩笉鏄剧ず銆傚疄鐜扮粷涓嶅緱
+鎶?OTP 鍐欏叆 `2fa-audit.jsonl`銆乣report.json`銆佹埅鍥炬垨閿欒鏂囨湰銆?
+姝ｅ父鐘舵€佷笉浼氭彃鍏ュ師濮?AX/OCR/stderr 鎴栧畬鏁?Apple ID銆備富鎺?fresh Windows 楠岃瘉宸查€氳繃 Python
+126/126銆乺uyipage flow銆乸rotocol銆乻idecar銆乤ccount-browser-flow銆丄llow 61/61銆?
+permissions 鍜?release锛屽洓璺渶缁堜笓椤瑰瀹″潎涓?PASS銆傝璇佹嵁瑕嗙洊閫昏緫涓?source-contract锛屼笉浠ｈ〃 Swift 缂栬瘧銆?
+TCC 鎴?macOS 15 鍘熺敓 UI 宸查獙鏀躲€?
 
-## 权限分层
+## 鏉冮檺鍒嗗眰
 
-- 浏览器 2FA 的「辅助功能」检查和提示由现有 `mac-2fa-popup-read.swift` 通过 `AXIsProcessTrusted()`、`AXIsProcessTrustedWithOptions(...)` 及 `--preflight-accessibility` / `--prompt-accessibility` 原生完成。旧 AppleScript 2FA/Accessibility 权限探针已移除。
-- `./run.sh --skip-mac` 只要求实际运行主体获得「辅助功能」权限，用于受限 Apple popup/Settings AX helper；本地通常是 Terminal / iTerm，受监督验收会明确提示 Codex / 原生 helper；不要求 Terminal 控制 System Events 或“系统设置”。
-- 只有执行 macOS“系统设置登录 Apple Account”阶段时，才要求「自动化」中允许当前终端 App 控制“系统设置”。
-- Screen Recording 是 Vision OCR 自动取码的硬门槛。`install.sh` 编译 `mac-2fa-popup-ocr` 后会请求并确认「屏幕与系统音频录制」；`run.sh` 在 Firefox 启动前再次校验。缺失时固定为 `screen_recording_missing` 并停止，不会提交账号密码。普通运行复用 `install.sh` 编译到 `scripts/bin` 的 helper；受监督验收使用固定的用户级 helper 缓存，只在源码变化时原子重编译，避免每轮随机路径触发新的 TCC 身份。
-- 权限变更后应按 macOS 提示退出并重新打开终端，再开始下一次运行。
+- 娴忚鍣?2FA 鐨勩€岃緟鍔╁姛鑳姐€嶆鏌ュ拰鎻愮ず鐢辩幇鏈?`mac-2fa-popup-read.swift` 閫氳繃 `AXIsProcessTrusted()`銆乣AXIsProcessTrustedWithOptions(...)` 鍙?`--preflight-accessibility` / `--prompt-accessibility` 鍘熺敓瀹屾垚銆傛棫 AppleScript 2FA/Accessibility 鏉冮檺鎺㈤拡宸茬Щ闄ゃ€?
+- `./run.sh --skip-mac` 鍙姹傚疄闄呰繍琛屼富浣撹幏寰椼€岃緟鍔╁姛鑳姐€嶆潈闄愶紝鐢ㄤ簬鍙楅檺 Apple popup/Settings AX helper锛涙湰鍦伴€氬父鏄?Terminal / iTerm锛屽彈鐩戠潱楠屾敹浼氭槑纭彁绀?Codex / 鍘熺敓 helper锛涗笉瑕佹眰 Terminal 鎺у埗 System Events 鎴栤€滅郴缁熻缃€濄€?
+- 鍙湁鎵ц macOS鈥滅郴缁熻缃櫥褰?Apple Account鈥濋樁娈垫椂锛屾墠瑕佹眰銆岃嚜鍔ㄥ寲銆嶄腑鍏佽褰撳墠缁堢 App 鎺у埗鈥滅郴缁熻缃€濄€?
+- Screen Recording 鏄?Vision OCR 鑷姩鍙栫爜鐨勭‖闂ㄦ銆俙install.sh` 缂栬瘧 `mac-2fa-popup-ocr` 鍚庝細璇锋眰骞剁‘璁ゃ€屽睆骞曚笌绯荤粺闊抽褰曞埗銆嶏紱`run.sh` 鍦?Firefox 鍚姩鍓嶅啀娆℃牎楠屻€傜己澶辨椂鍥哄畾涓?`screen_recording_missing` 骞跺仠姝紝涓嶄細鎻愪氦璐﹀彿瀵嗙爜銆傛櫘閫氳繍琛屽鐢?`install.sh` 缂栬瘧鍒?`scripts/bin` 鐨?helper锛涘彈鐩戠潱楠屾敹浣跨敤鍥哄畾鐨勭敤鎴风骇 helper 缂撳瓨锛屽彧鍦ㄦ簮鐮佸彉鍖栨椂鍘熷瓙閲嶇紪璇戯紝閬垮厤姣忚疆闅忔満璺緞瑙﹀彂鏂扮殑 TCC 韬唤銆?
+- 鏉冮檺鍙樻洿鍚庡簲鎸?macOS 鎻愮ず閫€鍑哄苟閲嶆柊鎵撳紑缁堢锛屽啀寮€濮嬩笅涓€娆¤繍琛屻€?
 
-## macOS 15 验收
+## macOS 15 楠屾敹
 
-Windows 只能验证 Node/Python 逻辑、协议、语法和 source-contract，不能替代 Swift
-编译或 macOS 15 原生 UI 验收。Mac 测试机拉取后运行：
+Windows 鍙兘楠岃瘉 Node/Python 閫昏緫銆佸崗璁€佽娉曞拰 source-contract锛屼笉鑳芥浛浠?Swift
+缂栬瘧鎴?macOS 15 鍘熺敓 UI 楠屾敹銆侻ac 娴嬭瘯鏈烘媺鍙栧悗杩愯锛?
 
 ```bash
 ./install.sh
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-ax-fill.swift
+/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-sms-verification.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-click-allow.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-read.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-ocr.swift
@@ -162,25 +168,31 @@ npm run test:2fa-allow-unit
 npm run test:2fa-sidecar
 npm run test:2fa-settings
 npm run test:2fa-settings-unit
+npm run test:mac-settings-sms-verification
 npm run test:account-browser-flow
 npm run test:ruyipage-protocol
 npm run test:ruyipage-flow
 ./run.sh --skip-mac
 ```
 
-真机还必须验证 Screen Recording 已授权以及未授权时 Firefox 不启动、英文/简中/繁中 popup、
-Allow 两次上限与手动接管、Settings 两次重试、从首次 acquisition 起算的 90 秒
-隐藏手输和 240 秒截止，以及取消/迟到弹窗清理。终端、`report.json` 和
-`2fa-audit.jsonl` 不得出现 OTP、原始
-AX/OCR/stderr、完整 Apple ID 或认证页面正文；认证失败不得保存全页截图，OCR
-不得留下图片文件。完整 macOS 设置登录另行使用 `./run.sh` 验证 Automation 权限。
+鐪熸満杩樺繀椤婚獙璇?Screen Recording 宸叉巿鏉冧互鍙婃湭鎺堟潈鏃?Firefox 涓嶅惎鍔ㄣ€佽嫳鏂?绠€涓?绻佷腑 popup銆?
+Allow 涓ゆ涓婇檺涓庢墜鍔ㄦ帴绠°€乣need_2fa` 璧?30 绉?popup 涓荤獥鍙ｃ€丄llow 鍚庨澶?30 绉掋€?
+Settings 涓ゆ涓茶鍥為€€銆丼ettings 缁撴潫鍚庝笖涓嶆棭浜庨娆?acquisition 90 绉掔殑闅愯棌鎵嬭緭銆?
+涓や唬鍏变韩 240 绉掓湡闄愪笌 Settings 鎬婚绠楋紝浠ュ強鍙栨秷/杩熷埌寮圭獥娓呯悊銆傜粓绔€乣report.json` 鍜?
+`2fa-audit.jsonl` 涓嶅緱鍑虹幇 OTP銆佸師濮?
+AX/OCR/stderr銆佸畬鏁?Apple ID 鎴栬璇侀〉闈㈡鏂囷紱璁よ瘉澶辫触涓嶅緱淇濆瓨鍏ㄩ〉鎴浘锛孫CR
+涓嶅緱鐣欎笅鍥剧墖鏂囦欢銆傚畬鏁?macOS 璁剧疆鐧诲綍鍙﹁浣跨敤 `./run.sh` 楠岃瘉 Automation 鏉冮檺銆?
 
-## 安全
+## 瀹夊叏
 
-- `.env` 含账号密码，**勿提交 git**
-- `data/` 含 Firefox Profile 与报告，注意保管
-- 敏感认证失败只保留固定失败原因和脱敏安全审计，不保存认证页全页截图
+- `.env` 鍚处鍙峰瘑鐮侊紝**鍕挎彁浜?git**
+- `data/` 鍚?Firefox Profile 涓庢姤鍛婏紝娉ㄦ剰淇濈
+- 鏁忔劅璁よ瘉澶辫触鍙繚鐣欏浐瀹氬け璐ュ師鍥犲拰鑴辨晱瀹夊叏瀹¤锛屼笉淇濆瓨璁よ瘉椤靛叏椤垫埅鍥?
 
-## 版本
+## 鐗堟湰
 
-当前 `package.json` 版本即发布版本；`npm run release` 默认 patch +1 后上传 GitHub Releases。
+褰撳墠 `package.json` 鐗堟湰鍗冲彂甯冪増鏈紱`npm run release` 榛樿 patch +1 鍚庝笂浼?GitHub Releases銆?
+
+## Supervised Mac Settings SMS verification
+
+In an explicitly supervised Mac GUI session, supply both APPLE_AUTOMATION_SMS_PHONE and APPLE_AUTOMATION_SMS_API_URL only through the runtime environment. The independent Mac Settings module matches the phone suffix, polls the private HTTPS SMS endpoint for up to two minutes, and writes a validated six-digit code through the native helper. It then provides five additional minutes of hidden terminal manual entry. Do not store the endpoint or token in .env, shell history, logs, reports, or screenshots. This does not alter browser 2FA.

@@ -9,7 +9,7 @@
 | macOS 系统设置登录 Apple ID | AppleScript / Swift AX | 手机验证码人工输入 |
 | 等待系统登录完成 | 状态轮询 | 必要时 Enter 确认 |
 | Firefox 登录 account.apple.com | **ruyiPage only** | 无 |
-| 浏览器 2FA | Apple popup AX/Vision OCR、系统设置与隐藏终端手输竞速 + ruyiPage 填码 | 必要时手动 Allow/手输 |
+| 浏览器 2FA | Apple popup AX/Vision OCR -> 系统设置 -> 隐藏终端手输的串行回退 + ruyiPage 填码 | 必要时手动 Allow/手输 |
 | 采集姓名、生日 | ruyiPage 页面读取 | 无 |
 
 浏览器启动、接管、导航、元素定位、页面读取、输入、截图和退出均由 ruyiPage 完成。Node 只负责编排 Python 子进程、macOS 取码和报告，不持有浏览器连接。
@@ -21,7 +21,7 @@
 3. 元素必须先被识别后才交互；2FA 未识别到单框或六格输入时拒绝盲打。
 4. 登录时必须确认“记住账号”已勾选；控件缺失或状态未生效即停止。
 5. 密码提交前必须完成 `prepare_2fa` 握手；旧码只按该边界判定，不能按 `need_2fa` 到达时间猜测。
-6. popup AX 优先；AX 无合法码才对可信 Apple window ID 做 Vision OCR。系统设置以 `preparedAt + 8s` 为门槛并只在 `getCode` 活跃后加入；手输和共享 240 秒期限从第一次 acquisition 起计时。
+6. popup AX 优先；AX 无合法码才对可信 Apple window ID 做 Vision OCR。自 `need_2fa` 起先给 popup 30 秒，确认 Allow 后再给 30 秒；未获新码才串行回退到 Settings，Settings 结束后且不早于首次 acquisition 90 秒才可手输。两代共享 240 秒期限与 Settings 总预算。
 7. 交互间使用有界随机停顿，避免固定节奏；超时均有上限。
 8. ruyiPage 或 Python 不可用时明确失败，不回退到 Node BiDi、JS 事件或其他页面自动化方案。
 9. 最多两代验证码；只有可信 Apple 页面明确显示英/简中/繁中的验证码错误、无效或过期时才换码。captcha、锁定和未知错误立即停止。
@@ -41,7 +41,7 @@
 ```
 
 账号通过子进程环境变量传入 Python，不出现在进程命令行参数中。密码也只通过环境变量传递。
-密码提交前 Python 发出 `prepare_2fa`；Node 清理准备边界之前的旧窗并启动持续 watcher，回传 `2fa_prepared` 后 Python 才提交。页面确认 2FA 后，Node 从 popup、可取消的系统设置 helper 和按条件启用的隐藏终端手输中取首个合法六位码。
+密码提交前 Python 发出 `prepare_2fa`；Node 清理准备边界之前的旧窗并启动持续 watcher，回传 `2fa_prepared` 后 Python 才提交。页面确认 2FA 后，Node 严格按 popup、可取消的系统设置 helper、隐藏终端手输的顺序取码；当前阶段取得合法六位码即交给 ruyiPage，后续阶段不再启动。
 
 popup 先尝试 AX 文本读取；只有 AX 没有合法码才启动 Vision OCR。AX 对当前 helper
 未授权时，OCR 仅在 `need_2fa` 后按 dedicated Apple authentication process 的 on-screen
@@ -50,16 +50,16 @@ window ID 运行；其余情况仍只捕获 AX 已验证 Apple 系统窗口的 w
 第二帧；空帧、不同码或窗口消失都会重置候选。OCR 不包含点击、全屏搜索或图片
 落盘。
 
-`prepare_2fa` 只清理旧窗、记录 `preparedAt` 并启动可提前缓存 popup 验证码的
-watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 240 秒期限；第二代
-沿用同一期限。系统设置只在 acquisition 活跃后运行，并以 `preparedAt + 8s` 为
-门槛：门槛已过则立即加入，否则等待到门槛。它最多运行两次，每次 60 秒，两次
-间隔 5 秒。
+`prepare_2fa` 只清理旧窗、记录 `preparedAt` 并启动 watcher；在 `need_2fa` 前不点击
+Allow、不读取候选码、不启动 Settings。第一次 `getCode` acquisition 才开始共享 240 秒
+期限：popup 主阶段从 `need_2fa` 起为 30 秒；确认 Allow 后，最后一次确认再延长 30 秒。
+窗口到期仍无新码才启动 Settings，最多两次、每次 60 秒、两次之间退避 5 秒；Settings
+阶段开始后不接受迟到 popup 候选码。
 
-从第一次 acquisition 起第 90 秒，stdin/stdout 均为 TTY 且手输未被明确禁用时，
-才隐藏读取手输验证码。手输默认启用，只有 `BROWSER_2FA_MANUAL_FALLBACK=0` 才
-禁用；文档配置示例使用 `=1` 表示显式启用。Allow 自动动作最多两次；之后提示
-用户手动点击，但 popup watcher、Settings 和手输来源继续运行。
+Settings 的有界尝试结束后，若从第一次 acquisition 起已过 90 秒、stdin/stdout 均为
+TTY 且手输未被明确禁用，才隐藏读取手输验证码。手输默认启用，只有
+`BROWSER_2FA_MANUAL_FALLBACK=0` 才禁用；文档配置示例使用 `=1` 表示显式启用。Allow
+自动动作最多两次；之后提示用户手动点击，但仍只在 popup 主阶段内继续等待。
 
 ## 4. 环境安装
 
@@ -81,10 +81,11 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 - `BROWSER_PROFILE_MODE=fresh`：每次在 `data/firefox-apple-automation-fresh/<run-id>` 创建隔离 Profile，适合切换身份。
 - `FIREFOX_PROFILE_DIR`：覆盖 Profile 根目录。
 - `RUYIPAGE_BACKEND_TIMEOUT_MS=720000`：浏览器阶段总预算 12 分钟，覆盖登录等待、macOS 2FA 取码和登录后采集。
-- `BROWSER_2FA_SETTINGS_AFTER_MS=8000`：设置 `preparedAt + 8s` 门槛；系统设置仅在 `getCode` 活跃后启动，门槛已过时立即并行取码。
+- `BROWSER_2FA_SETTINGS_AFTER_MS=30000`：从 `need_2fa` 起的 popup 主窗口；确认 Allow 后还会保留固定 30 秒 popup/OCR 宽限，之后才可启动 Settings。
 - `BROWSER_2FA_SETTINGS_FALLBACK=1`：默认启用系统设置来源；设为 `0` 才禁用。
-- `BROWSER_2FA_MANUAL_FALLBACK=1`：显式启用隐藏终端手输；该来源默认启用，只有设为 `0` 才禁用，非 TTY 时始终不可用。90 秒从第一次 `getCode` acquisition 起算。
+- `BROWSER_2FA_MANUAL_FALLBACK=1`：显式启用隐藏终端手输；该来源默认启用，只有设为 `0` 才禁用，非 TTY 时始终不可用。它只在 Settings 有界尝试结束后、且不早于第一次 `getCode` acquisition 90 秒启用。
 - `BROWSER_2FA_POLL_MS=800`：FollowUpUI 状态轮询间隔。
+- `BROWSER_2FA_DEBUG_SHOW_CODE=1`：默认关闭；仅在真实 TTY、非受监督会话中把已校验六码显示到当前本地终端，便于人工核验。重定向和受监督会话一律不显示。无论是否启用，OTP 都不得写入 audit、报告、截图或错误文本。
 
 权限分层：
 
@@ -106,7 +107,7 @@ watcher。第一次 `getCode` acquisition 才启动完整取码竞速和共享 2
 | `scripts/lib/ruyipage-runtime.js` | Python/ruyiPage 探测与隔离安装 |
 | `scripts/lib/firefox-runtime.js` | Firefox 路径和 Profile 路径策略；不启动浏览器 |
 | `scripts/lib/env-setup.js` | macOS 环境和权限探测 |
-| `scripts/lib/two-fa-sidecar.js` | macOS popup/系统设置/隐藏手输 collector 与 loser 清理 |
+| `scripts/lib/two-fa-sidecar.js` | macOS popup 优先、Settings 串行回退、隐藏手输最终兜底的 collector |
 | `scripts/lib/mac-settings-2fa.js` | 可取消的系统设置验证码 helper 子进程 |
 | `scripts/build-release.mjs` | 发布包复制清单与依赖校验 |
 
@@ -136,19 +137,21 @@ npm run test:account-browser-flow
 3. 登录页账号输入后进入密码步骤。
 4. “记住账号”被勾选；若无法确认，流程应报错停止。
 5. 终端在提交密码前显示预备 2FA 监听，且准备失败时密码不会提交。
-6. popup 早到时被 watcher 缓存；第一次 `getCode` 活跃后，系统设置在 `preparedAt + 8s` 门槛自动进入双重认证取码，两个来源仍同时有效。
-7. Settings 最多两次、每次不超过 60 秒且中间退避 5 秒；从第一次 acquisition 起 90 秒后的 TTY 手输不回显，240 秒后所有来源停止并完成 runner cleanup。
-8. Allow 自动最多两次；未确认后提示人工点击，监听和 Settings 不停止。
+6. `need_2fa` 后只启动 popup 主阶段；30 秒内若确认 Allow，再给 popup/OCR 额外 30 秒。该阶段取得新码时，Settings 和手输均不得启动。
+7. popup 窗口到期后才启动 Settings；最多两次、每次不超过 60 秒且中间退避 5 秒。Settings 结束后、从第一次 acquisition 起不早于 90 秒时，真实 TTY 才可隐藏手输；240 秒后停止并完成 runner cleanup。
+8. Allow 自动最多两次；未确认后提示人工点击，且只在 popup 主阶段继续等待，不提前启动 Settings 或手输。
 9. 全窗 OCR 只接受 `NNN NNN`；中心连续六位需同一 window ID 两次独立捕获一致。Screen Recording 缺失时安装和 Firefox 登录都不启动，直到授权完成。
 10. 验证码只写入已识别的单框或六格控件。已验证的 popup 码不能因原生弹窗关闭失败而被扣留；关闭属于尽力清理并保留固定状态。
-11. 第一代只有在可信 Apple 页明确 OTP 错误/无效/过期时才可被第二代替换；旧码不再复用。captcha、锁定和未知错误停止。
+11. 第一代只有在可信 Apple 页明确 OTP 错误/无效/过期时才可被第二代替换；第二代重新走 popup 主阶段，但沿用 240 秒期限与 Settings 两次总预算，旧码不再复用。captcha、锁定和未知错误停止。
 12. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-manage.png`。
 13. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，姓名/生日结果与页面一致。
 
 第 11 项已完成：ruyiPage、runner、`account-browser-flow` 和 collector 透传 generation，
 且只有可信 Apple 页明确英/简中/繁中 OTP 拒绝才进入第二代；第一代全局拒绝，
-captcha、锁定和未知错误停止。固定 `onStatus` 阶段提示、第一次 acquisition 起算的
-manual/240 秒期限以及 runner deadline cleanup 也已接入。
+第二代回到 popup 主阶段并共享期限与 Settings 预算，captcha、锁定和未知错误停止。
+固定 `onStatus` 阶段提示、Settings 结束后的 manual/240 秒期限以及 runner deadline
+cleanup 也已接入。OTP 默认不打印；仅显式设置 `BROWSER_2FA_DEBUG_SHOW_CODE=1` 且当前为
+真实 TTY、非受监督会话才可显示到当前本地终端，且绝不得写入 audit、报告、截图或错误文本。
 
 Windows 发布门槛包括 Python 126 项、ruyipage flow/protocol、sidecar、
 account-browser-flow、Allow 61 项、permissions、release 和 mac-codex contract；每个待发布
@@ -163,7 +166,7 @@ Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试�
 | Firefox 未找到 | 安装 Firefox 或设置 `FIREFOX_EXECUTABLE` |
 | 记住账号控件失败 | 查看固定失败报告与脱敏状态；敏感认证页不保存全页截图，不得改成盲点或盲输 |
 | 2FA 输入框未识别 | 查看固定失败原因和 `2fa-audit.jsonl` 的安全状态，补充 ruyiPage selector；不得改成无焦点输入 |
-| macOS 取码超时 | 确认系统设置已登录同账号、终端已获辅助功能；按 audit 的固定 phase/reason 区分 popup、OCR、settings、manual。`--skip-mac` 不需要 Automation |
+| macOS 取码超时 | 确认系统设置已登录同账号、终端已获辅助功能；按 audit 的固定 phase/reason 检查 popup 主阶段、OCR、Settings 串行回退和最终 manual。`--skip-mac` 不需要 Automation |
 | OCR capability 为 `permission_missing` | 这是硬门槛；在「隐私与安全性 -> 屏幕与系统音频录制」授权实际运行主体，按 macOS 提示重开终端或 Codex 后重新运行 `./install.sh` |
 | Mac 设置登录提示 Automation 未授权 | 仅完整流程/`--skip-browser` 需要；在「隐私与安全性 → 自动化」允许当前终端控制“系统设置” |
 | 姓名或生日为空 | 查看 `03-account-manage.png`，调整 ruyiPage 页面解析标签 |
@@ -202,8 +205,9 @@ npm run test:ruyipage-flow
 ```
 
 验收覆盖英文、简中、繁中，Screen Recording 已授权以及未授权时 Firefox 不启动，AX 命中和 OCR fallback，
-Allow 自动两次后人工接管，Settings 两次与取消/迟到清理，以及从首次 acquisition
-起算的 90 秒 TTY 手输和 240 秒截止。
+Allow 自动两次后人工接管，`need_2fa` 起 30 秒 popup 主窗口和 Allow 后额外 30 秒，
+Settings 两次串行回退与取消/迟到清理，以及 Settings 结束后、从首次 acquisition 起算的
+90 秒 TTY 手输、两代共享的 Settings 总预算和 240 秒截止。
 另以 `./run.sh` 验证 Mac 设置登录阶段的 Automation 权限。检查终端、
 `report.json`、`2fa-audit.jsonl` 和报告目录，确认无 OTP、raw AX/OCR/stderr、
 完整 Apple ID、认证全页截图或 OCR 图片残留。

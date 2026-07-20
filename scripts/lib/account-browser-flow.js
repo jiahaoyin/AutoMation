@@ -22,6 +22,8 @@ const ALLOWED_READY_MODES = new Set([
 const FIXED_ENVIRONMENT_WARNING = "[Firefox] 环境提示: browser environment warning";
 const TWO_FACTOR_TIMEOUT_MS = 240_000;
 const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
+  popup_primary: "[2FA] 优先等待 Apple 验证弹窗，暂不启动系统设置取码。",
+  settings_fallback: "[2FA] 弹窗未取得有效验证码，正在回退系统设置取码。",
   manual_unavailable:
     "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
   settings_accessibility:
@@ -415,8 +417,10 @@ function reportTwoFactorStatus(event) {
         "ocr_permission_missing",
         "ocr_helper_unavailable",
         "popup_accessibility",
+        "popup_primary",
         "popup_scanning",
         "popup_close_pending",
+        "settings_fallback",
         "timeout",
       ].includes(event.status)
     ) {
@@ -448,6 +452,19 @@ function reportTwoFactorStatus(event) {
   }
 }
 
+function reportLocalTwoFactorDebugCode(code, options = {}) {
+  const output = options.output ?? process.stdout;
+  const supervised = options.supervised ?? process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+  if (process.env.BROWSER_2FA_DEBUG_SHOW_CODE !== "1") return;
+  if (supervised || output?.isTTY !== true || typeof output?.write !== "function") return;
+  if (typeof code !== "string" || !/^[0-9]{6}$/.test(code)) return;
+  try {
+    output.write(`[2FA] 调试验证码（仅本次终端显示，不写入报告）: ${code}\n`);
+  } catch {
+    /* Debug display is optional and must never affect the login flow. */
+  }
+}
+
 /**
  * @param {object} params
  * @param {{ appleId: string, password: string }} params.creds
@@ -465,6 +482,7 @@ export async function runAccountBrowserPhase(
   const createRunner =
     runtime.createRuyiPageBackendRunner ?? createRuyiPageBackendRunner;
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
+  const debugOutput = runtime.stdout ?? process.stdout;
 
   const summary = getEnvironmentSummary();
   writeFlowAudit(flowAudit, "account_browser", "environment", {
@@ -493,12 +511,9 @@ export async function runAccountBrowserPhase(
   const collector = createCollector({
     timeoutMs: TWO_FACTOR_TIMEOUT_MS,
     reportDir,
-    // A browser-triggered Apple verification dialog is the primary source.
-    // System Settings stays armed as a delayed fallback instead of suppressing
-    // a code that the popup watcher has already verified.
+    // Keep the popup-first policy explicit. The collector resolves optional
+    // fallback switches from the environment so documented opt-outs work.
     settingsOnly: false,
-    settingsFallback: true,
-    manualFallback: true,
     onStatus(event) {
       writeFlowAudit(flowAudit, "two_factor", "status", event);
       reportTwoFactorStatus(event);
@@ -609,6 +624,7 @@ export async function runAccountBrowserPhase(
         writeFlowAudit(flowAudit, "two_factor", "code_acquired", {
           generation: request?.generation,
         });
+        reportLocalTwoFactorDebugCode(code, { output: debugOutput });
         return code;
       },
     });

@@ -117,8 +117,10 @@ for (const rel of [
   "scripts/swift/mac-2fa-click-allow.swift",
   "scripts/swift/mac-2fa-popup-read.swift",
   "scripts/swift/mac-2fa-popup-ocr.swift",
+  "scripts/lib/manual-verification-prompt.js",
   "scripts/lib/manual-2fa-prompt.js",
   "scripts/test-2fa-settings-code.mjs",
+  "scripts/test-mac-settings-sms-verification.mjs",
   "scripts/preflight-2fa-permissions.mjs",
   "scripts/bootstrap-macos.sh",
 ]) {
@@ -203,7 +205,10 @@ const requiredSwiftHelpers = [
   "mac-settings-2fa-code",
   "mac-2fa-popup-ocr",
 ];
-const optionalSwiftHelpers = ["mac-settings-ax-fill"];
+const optionalSwiftHelpers = [
+  "mac-settings-ax-fill",
+  "mac-settings-sms-verification",
+];
 const compiledSwiftHelpers = [
   ...requiredSwiftHelpers,
   ...optionalSwiftHelpers,
@@ -497,14 +502,14 @@ assert.match(
 );
 const envExample = fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8");
 assert.match(envExample, /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/);
-assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
+assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
 assert.match(envExample, /BROWSER_2FA_MANUAL_FALLBACK=1/);
 assert.match(envExample, /BROWSER_2FA_POLL_MS=800/);
 assert.doesNotMatch(envExample, /BROWSER_2FA_POPUP_WAIT_MS/);
 
 const releaseBuilder = fs.readFileSync(new URL("./build-release.mjs", import.meta.url), "utf-8");
-assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=8000/);
+assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
 assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
 assert.match(releaseBuilder, /BROWSER_2FA_MANUAL_FALLBACK=1/);
 assert.match(
@@ -531,6 +536,11 @@ assert.match(
   releaseBuilder,
   /"test:2fa-settings":\s*"node scripts\/test-2fa-settings-code\.mjs"/,
   "release package must expose the safe Settings smoke command"
+);
+assert.match(
+  releaseBuilder,
+  /"test:mac-settings-sms-verification":\s*"node scripts\/test-mac-settings-sms-verification\.mjs"/,
+  "release package must expose the supervised SMS verification contract test"
 );
 assert.match(releaseBuilder, /BROWSER_2FA_POLL_MS=800/);
 assert.doesNotMatch(releaseBuilder, /BROWSER_2FA_POPUP_WAIT_MS/);

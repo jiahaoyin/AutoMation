@@ -31,6 +31,7 @@ function createRuntime(runBackend, options = {}) {
   let collectorOptions = null;
   let collectorCount = 0;
   const runtime = {
+    stdout: options.stdout,
     getBrowserEnvironmentSummary() {
       return {
         backend: "ruyipage",
@@ -151,8 +152,8 @@ async function runProductionPopupPrimaryConfigurationTest() {
     },
     {
       settingsOnly: false,
-      settingsFallback: true,
-      manualFallback: true,
+      settingsFallback: undefined,
+      manualFallback: undefined,
     }
   );
 }
@@ -170,6 +171,98 @@ async function runTwoGenerationForwardingTest() {
 
   await runAccountBrowserPhase(params, harness.runtime);
   assert.deepEqual(harness.codeRequests, requests);
+}
+
+async function runExplicitLocalDebugCodeDisplayTest() {
+  const previous = process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
+  const auditEntries = [];
+  const secrets = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    addSecrets(values) {
+      secrets.push(...values);
+    },
+  };
+  try {
+    process.env.BROWSER_2FA_DEBUG_SHOW_CODE = "1";
+    const debugOutput = {
+      isTTY: true,
+      writes: [],
+      write(value) {
+        this.writes.push(String(value));
+      },
+    };
+    const harness = createRuntime(async (options) => {
+      assert.equal(await options.get2FACode({ generation: 2, rejectPrevious: true }), "654321");
+      return successfulResult();
+    }, { stdout: debugOutput });
+    const logs = await captureConsole("log", () =>
+      runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
+    );
+    assert.equal(logs.some((line) => line.includes("654321")), false);
+    assert.deepEqual(debugOutput.writes, ["[2FA] 调试验证码（仅本次终端显示，不写入报告）: 654321\n"]);
+    assert.deepEqual(secrets, ["654321"]);
+    assert.equal(JSON.stringify(auditEntries).includes("654321"), false);
+  } finally {
+    if (previous === undefined) delete process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
+    else process.env.BROWSER_2FA_DEBUG_SHOW_CODE = previous;
+  }
+}
+
+async function runDebugCodeNeverWritesToNonTtyOrSupervisedOutputTest() {
+  const previousDebug = process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
+  const previousSupervised = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+  const createOutput = (isTTY) => ({
+    isTTY,
+    writes: [],
+    write(value) {
+      this.writes.push(String(value));
+    },
+  });
+  try {
+    process.env.BROWSER_2FA_DEBUG_SHOW_CODE = "1";
+    for (const supervised of [false, true]) {
+      if (supervised) process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
+      else delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+      for (const isTTY of [false, true]) {
+        const output = createOutput(isTTY);
+        const harness = createRuntime(async (options) => {
+          await options.get2FACode({ generation: 1, rejectPrevious: false });
+          return successfulResult();
+        }, { stdout: output });
+        await runAccountBrowserPhase(params, harness.runtime);
+        assert.deepEqual(
+          output.writes.filter((value) => value.includes("123456")),
+          supervised || !isTTY ? [] : ["[2FA] 调试验证码（仅本次终端显示，不写入报告）: 123456\n"]
+        );
+      }
+    }
+  } finally {
+    if (previousDebug === undefined) delete process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
+    else process.env.BROWSER_2FA_DEBUG_SHOW_CODE = previousDebug;
+    if (previousSupervised === undefined) delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
+    else process.env.APPLE_AUTOMATION_SUPERVISED_GUI = previousSupervised;
+  }
+}
+
+async function runBrowserFallbackEnvironmentSwitchesTest() {
+  const previousSettings = process.env.BROWSER_2FA_SETTINGS_FALLBACK;
+  const previousManual = process.env.BROWSER_2FA_MANUAL_FALLBACK;
+  try {
+    process.env.BROWSER_2FA_SETTINGS_FALLBACK = "0";
+    process.env.BROWSER_2FA_MANUAL_FALLBACK = "0";
+    const harness = createRuntime(async () => successfulResult());
+    await runAccountBrowserPhase(params, harness.runtime);
+    assert.equal(harness.collectorOptions?.settingsFallback, undefined);
+    assert.equal(harness.collectorOptions?.manualFallback, undefined);
+  } finally {
+    if (previousSettings === undefined) delete process.env.BROWSER_2FA_SETTINGS_FALLBACK;
+    else process.env.BROWSER_2FA_SETTINGS_FALLBACK = previousSettings;
+    if (previousManual === undefined) delete process.env.BROWSER_2FA_MANUAL_FALLBACK;
+    else process.env.BROWSER_2FA_MANUAL_FALLBACK = previousManual;
+  }
 }
 
 async function runFlowAuditForwardingTest() {
@@ -464,6 +557,8 @@ async function runPreparedAccessibilityCheckDoesNotBlockBrowserTest() {
 
 async function runFixedTwoFactorStatusPromptsTest() {
   const harness = createRuntime(async () => {
+    harness.emitStatus({ status: "popup_primary", source: "popup", remainingSec: 240 });
+    harness.emitStatus({ status: "settings_fallback", source: "settings", remainingSec: 210 });
     harness.emitStatus({
       status: "settings_start",
       attempt: 1,
@@ -525,6 +620,8 @@ async function runFixedTwoFactorStatusPromptsTest() {
   );
   const statusLogs = logs.filter((line) => line.startsWith("[2FA]"));
   assert.deepEqual(statusLogs, [
+    "[2FA] 优先等待 Apple 验证弹窗，暂不启动系统设置取码。",
+    "[2FA] 弹窗未取得有效验证码，正在回退系统设置取码。",
     "[2FA] 正在尝试通过系统设置获取验证码（第 1/2 次）；如出现 macOS 辅助功能提示，请允许系统设置取码 helper。",
     "[2FA] 正在尝试通过系统设置获取验证码（第 2/2 次）...",
     "[2FA] 系统设置取码失败，5 秒后进行第 2/2 次尝试...",
@@ -599,6 +696,8 @@ async function runSupervisedSettingsStatusWhitelistTest() {
         source: "settings",
         reason: SECRET_FIXTURE,
       });
+      harness.emitStatus({ status: "popup_primary", source: "popup", secret: SECRET_FIXTURE });
+      harness.emitStatus({ status: "settings_fallback", source: "settings", secret: SECRET_FIXTURE });
       harness.emitStatus({ status: "popup_scanning", source: "popup", secret: SECRET_FIXTURE });
       harness.emitStatus({ status: "winner", source: "popup", otp: SECRET_FIXTURE });
       harness.emitStatus({ status: "winner", source: "settings", otp: SECRET_FIXTURE });
@@ -612,6 +711,8 @@ async function runSupervisedSettingsStatusWhitelistTest() {
       "[2FA] status:settings_accessibility",
       "[2FA] status:settings_retry",
       "[2FA] status:settings_failed",
+      "[2FA] status:popup_primary",
+      "[2FA] status:settings_fallback",
       "[2FA] status:popup_scanning",
       "[2FA] status:winner:popup",
       "[2FA] status:winner:settings",
@@ -1060,6 +1161,9 @@ if (focusedTest) {
 await runTwoFactorLifecycleTest();
 await runProductionPopupPrimaryConfigurationTest();
 await runTwoGenerationForwardingTest();
+await runExplicitLocalDebugCodeDisplayTest();
+await runDebugCodeNeverWritesToNonTtyOrSupervisedOutputTest();
+await runBrowserFallbackEnvironmentSwitchesTest();
 await runFlowAuditForwardingTest();
 await runPasswordBidiInputProgressTest();
 await runCollectorTimeoutIsAlways240SecondsTest();

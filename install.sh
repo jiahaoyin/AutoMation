@@ -22,6 +22,7 @@ readonly REQUIRED_SWIFT_HELPERS=(
 )
 readonly OPTIONAL_SWIFT_HELPERS=(
   "mac-settings-ax-fill"
+  "mac-settings-sms-verification"
 )
 readonly COMPILED_SWIFT_HELPERS=(
   "${REQUIRED_SWIFT_HELPERS[@]}"
@@ -240,7 +241,7 @@ compile_swift_helpers() {
   local optional_compiled=()
   for optional_helper in "${OPTIONAL_SWIFT_HELPERS[@]}"; do
     case "$optional_helper" in
-      mac-settings-ax-fill)
+      mac-settings-ax-fill|mac-settings-sms-verification)
         if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
           compile_swift_helper "$temp_dir" "$optional_helper" \
             --optional \

@@ -120,6 +120,7 @@ function createNativeHarness(
     popupCapability = null,
     popupReadResults = [],
     probeCapability = null,
+    probe2FAState: customProbe2FAState = null,
     initialAllowVisible = false,
     accessibilityProvider = null,
   } = {}
@@ -159,8 +160,9 @@ function createNativeHarness(
       stats.stalePopupCleanupCalls += 1;
       return { count: staleCodes.length, codes: [...staleCodes] };
     },
-    async probe2FAState() {
+    async probe2FAState(timeoutSec, options) {
       stats.probeCalls += 1;
+      if (customProbe2FAState) return customProbe2FAState(timeoutSec, options);
       if (probeCapability) return { action: probeCapability, code: null };
       if (probeResults.length > 0) {
         const result = probeResults.shift();
@@ -351,6 +353,7 @@ function createHarness(options = {}) {
   const clock = new ManualClock();
   const native = createNativeHarness(clock, options);
   const audits = [];
+  const diagnostics = [];
   const statuses = [];
   const reportDir = fs.mkdtempSync(
     path.join(os.tmpdir(), HARNESS_REPORT_PREFIX)
@@ -361,6 +364,7 @@ function createHarness(options = {}) {
       reportDir,
       timeoutMs: options.timeoutMs ?? 30_000,
       settingsFallbackAfterMs: options.settingsFallbackAfterMs ?? 8_000,
+      popupPostAllowGraceMs: options.popupPostAllowGraceMs,
       settingsFallback: options.settingsFallback,
       settingsOnly: options.settingsOnly,
       pollIntervalMs: options.pollIntervalMs ?? 10,
@@ -373,6 +377,10 @@ function createHarness(options = {}) {
       onAudit(entry) {
         audits.push(entry);
         options.onAudit?.(entry);
+      },
+      onDiagnostic(entry) {
+        diagnostics.push(entry);
+        options.onDiagnostic?.(entry);
       },
       onStatus(status) {
         statuses.push(status);
@@ -394,7 +402,7 @@ function createHarness(options = {}) {
     return disposePromise;
   };
 
-  return { clock, native, collector, audits, statuses, reportDir };
+  return { clock, native, collector, audits, diagnostics, statuses, reportDir };
 }
 
 function pathIsWithin(parentPath, candidatePath) {
@@ -473,10 +481,11 @@ async function readOnlyCwdDoesNotAffectHarnessReportsTest() {
 async function bufferEarlyPopupTest() {
   const { clock, native, collector } = createHarness();
   await collector.prepare();
+  const codePromise = collector.getCode();
   native.setPopup("123456");
-  await clock.advance(20);
+  await clock.advance(100);
 
-  assert.equal(await collector.getCode(), "123456");
+  assert.equal(await codePromise, "123456");
   assert.equal(native.stats.settingsStarts, 0);
   assert.equal(native.stats.popupWinnerClosures, 1);
   await collector.dispose();
@@ -560,12 +569,17 @@ async function collectorCarriesPreparationBoundaryIntoAllowFlowTest() {
   native.setAllowVisible(true);
   await clock.advance(10);
 
+  assert.equal(native.stats.allowAttempts.length, 0, "prepare must not click Allow before need_2fa");
+  const codePromise = collector.getCode();
+  await clock.advance(10);
   assert.equal(native.stats.allowAttempts.length, 1);
   assert.equal("confirmClick" in native.stats.allowAttempts[0].options, false);
   assert.equal(native.stats.allowAttempts[0].options.maxStrategies, 1);
   assert.equal(native.stats.allowAttempts[0].options.strategyOffset, 0);
   assert.equal(native.stats.fullAllowWaits, 0);
+  const rejected = assert.rejects(codePromise, /disposed/i);
   await collector.dispose();
+  await rejected;
 }
 
 async function preexistingAllowIsNeverAutomaticallyClickedTest() {
@@ -640,6 +654,7 @@ async function newAllowAfterPreexistingGateClearUsesAutomaticBudgetTest() {
     manualFallback: false,
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
   await clock.advance(20);
   assert.equal(native.stats.allowAttempts.length, 0);
 
@@ -663,7 +678,9 @@ async function newAllowAfterPreexistingGateClearUsesAutomaticBudgetTest() {
     [0, 1],
     "a new Allow may use both automatic attempts only after an idle clear state"
   );
+  const rejected = assert.rejects(codePromise, /disposed/i);
   await collector.dispose();
+  await rejected;
 }
 
 async function allowAttemptRemainingVisibleIsNotConfirmedTest() {
@@ -671,6 +688,8 @@ async function allowAttemptRemainingVisibleIsNotConfirmedTest() {
     allowAttemptOutcome: "remain",
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
+  void codePromise.catch(() => {});
   native.setAllowVisible(true);
 
   await clock.advance(20);
@@ -698,18 +717,427 @@ async function allowAttemptRemainingVisibleIsNotConfirmedTest() {
   await collector.dispose();
 }
 
+async function failedAutomaticAllowDoesNotExtendPopupPrimaryWindowTest() {
+  const { clock, native, collector, audits } = createHarness({
+    allowAttemptOutcome: "remain",
+    settingsFallbackAfterMs: 30,
+    popupPostAllowGraceMs: 30,
+    manualFallback: false,
+    pollIntervalMs: 10,
+  });
+  await collector.prepare();
+  native.setAllowVisible(true);
+  const codePromise = collector.getCode({ generation: 1 });
+  native.setAllowVisible(true);
+  await clock.advance(49);
+  assert.equal(native.stats.settingsStarts, 0);
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "generation 2 must retain the fresh-code Settings retry backoff"
+  );
+  await clock.advance(4_979);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "an unconfirmed automatic Allow must receive only bounded confirmation polls"
+  );
+  assert.equal(
+    audits.some((entry) => entry.phase === "popup_allow" && entry.confirmed === true),
+    false,
+    "an Allow that remains visible must never be audited as confirmed"
+  );
+  native.settingsRequests[0].resolve({ code: "135790" });
+  await clock.flush();
+  assert.equal(await codePromise, "135790");
+  await collector.dispose();
+}
+
+async function allowConfirmationGraceIsBoundedForLargePollIntervalTest() {
+  const watcherProbe = deferred();
+  const { clock, native, collector } = createHarness({
+    allowAttemptOutcome: "remain",
+    settingsFallbackAfterMs: 30,
+    manualFallback: false,
+    pollIntervalMs: 100_000,
+  });
+  native.queueProbeResults({ action: "idle" }, watcherProbe.promise);
+  await collector.prepare();
+  await clock.flush();
+  const codePromise = collector.getCode({ generation: 1 });
+  native.setAllowVisible(true);
+  watcherProbe.resolve({ action: "has_allow_dialog" });
+  await clock.flush();
+  const probesBeforeFallback = native.stats.probeCalls;
+
+  await clock.advance(2_029);
+  assert.equal(native.stats.settingsStarts, 0);
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "an oversized poll interval must not extend the bounded Allow confirmation window"
+  );
+  assert.ok(
+    native.stats.probeCalls >= probesBeforeFallback + 3,
+    "the bounded confirmation window must perform three AX probes instead of only sleeping"
+  );
+  native.settingsRequests[0].resolve({ code: "246810" });
+  await clock.flush();
+  assert.equal(await codePromise, "246810");
+  await collector.dispose();
+}
+
+async function generationOneWakesPopupWatcherForLargePollIntervalTest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 30,
+    manualFallback: false,
+    pollIntervalMs: 100_000,
+  });
+  await collector.prepare();
+  await clock.flush();
+
+  native.setPopup("864209");
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(0);
+
+  assert.equal(
+    await codePromise,
+    "864209",
+    "need_2fa must wake a sleeping popup watcher instead of waiting for its long poll interval"
+  );
+  assert.equal(native.stats.settingsStarts, 0, "a prompt popup code must win before Settings starts");
+  await collector.dispose();
+}
+
+async function uncooperativePopupProbeNeverOverlapsConfirmationProbeTest() {
+  const stuckProbe = deferred();
+  const watcherAllow = deferred();
+  const watcherStarted = deferred();
+  let probeCount = 0;
+  let activeProbeCount = 0;
+  let maximumConcurrentProbes = 0;
+  let stuckSignal = null;
+  const settleProbe = (result) => {
+    activeProbeCount -= 1;
+    return result;
+  };
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 10,
+    manualFallback: false,
+    pollIntervalMs: 1,
+    probe2FAState(_timeoutSec, options = {}) {
+      probeCount += 1;
+      activeProbeCount += 1;
+      maximumConcurrentProbes = Math.max(maximumConcurrentProbes, activeProbeCount);
+      if (probeCount === 1) return Promise.resolve({ action: "idle" }).then(settleProbe);
+      if (probeCount === 2) {
+        watcherStarted.resolve();
+        return watcherAllow.promise.then(settleProbe);
+      }
+      if (probeCount === 3) {
+        stuckSignal = options.signal;
+        return stuckProbe.promise.then(settleProbe);
+      }
+      return Promise.resolve({ action: "idle" }).then(settleProbe);
+    },
+  });
+  await collector.prepare();
+  await watcherStarted.promise;
+  native.setAllowVisible(true);
+  const codePromise = collector.getCode({ generation: 1 });
+  watcherAllow.resolve({ action: "has_allow_dialog" });
+  await clock.flush();
+  await clock.advance(1);
+
+  assert.equal(probeCount, 3, "the watcher must hold one probe when fallback begins");
+  assert.equal(activeProbeCount, 1);
+  await clock.advance(1_009);
+  assert.equal(stuckSignal?.aborted, true, "fallback must abort the older watcher probe");
+  assert.equal(
+    maximumConcurrentProbes,
+    1,
+    "an uncooperative AX probe must prevent any overlapping confirmation probe"
+  );
+  assert.equal(probeCount, 3, "fallback must use Settings instead of starting another AX probe");
+  assert.equal(native.stats.settingsStarts, 1);
+
+  native.settingsRequests[0].resolve({ code: "975310" });
+  await clock.flush();
+  assert.equal(await codePromise, "975310");
+
+  // Let the deliberately uncooperative helper settle so disposal can clean up
+  // the watcher without leaving a harness report directory behind.
+  stuckProbe.resolve({ action: "idle" });
+  await clock.flush();
+  await collector.dispose();
+}
+
+async function disposeDoesNotWaitForUncooperativePopupProbeTest() {
+  const stuckProbe = deferred();
+  const watcherStarted = deferred();
+  let probeCount = 0;
+  let watcherSignal = null;
+  const { clock, collector, audits } = createHarness({
+    pollIntervalMs: 1,
+    probe2FAState(_timeoutSec, options = {}) {
+      probeCount += 1;
+      if (probeCount === 1) return { action: "idle" };
+      if (probeCount === 2) {
+        watcherSignal = options.signal;
+        watcherStarted.resolve();
+        return stuckProbe.promise;
+      }
+      return { action: "idle" };
+    },
+  });
+  await collector.prepare();
+  await watcherStarted.promise;
+
+  let disposed = false;
+  const disposePromise = collector.dispose().then(() => {
+    disposed = true;
+  });
+  await clock.flush();
+  assert.equal(watcherSignal?.aborted, true);
+  await clock.advance(49);
+  assert.equal(disposed, false);
+  await clock.advance(1);
+  await disposePromise;
+
+  assert.equal(disposed, true, "an uncooperative popup probe must not hang disposal");
+  assert.equal(probeCount, 2, "dispose must not start a second AX probe after watcher timeout");
+  assert.equal(
+    audits.some(
+      (entry) =>
+        entry.phase === "popup_dispose_cleanup_failed" &&
+        entry.reason === "watcher_shutdown_timeout"
+    ),
+    true
+  );
+
+  stuckProbe.resolve({ action: "idle" });
+  await clock.flush();
+}
+
+async function generationTwoWaitsForStalePopupProbeBeforeRestartingTest() {
+  const staleProbe = deferred();
+  const staleProbeStarted = deferred();
+  let probeCount = 0;
+  let staleSignal = null;
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 20,
+    manualFallback: false,
+    pollIntervalMs: 1,
+    probe2FAState(_timeoutSec, options = {}) {
+      probeCount += 1;
+      if (probeCount === 1) return { action: "idle" };
+      if (probeCount === 2) {
+        staleSignal = options.signal;
+        staleProbeStarted.resolve();
+        return staleProbe.promise;
+      }
+      return { action: "has_code_dialog", code: "222222" };
+    },
+  });
+  await collector.prepare();
+  await staleProbeStarted.promise;
+
+  const first = collector.getCode({ generation: 1 });
+  await clock.advance(20);
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(await first, "111111");
+
+  const second = collector.getCode({ generation: 2, rejectPrevious: true });
+  await clock.advance(19);
+  assert.equal(staleSignal?.aborted, true, "generation 2 must cancel generation 1 popup work");
+  assert.equal(native.stats.settingsStarts, 1, "Settings must retain generation 2 popup-primary");
+  assert.equal(probeCount, 2, "generation 2 must not overlap an uncooperative AX probe");
+
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "generation 2 must retain the fresh-code Settings retry backoff"
+  );
+  await clock.advance(4_979);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    2,
+      "Settings must start when generation 2 popup-primary expires despite the stale probe"
+  );
+  native.settingsRequests[1].resolve({ code: "222222" });
+  await clock.flush();
+  assert.equal(await second, "222222");
+  staleProbe.resolve({ action: "idle" });
+  await clock.flush();
+  await collector.dispose();
+}
+
+async function generationTwoStaleProbeStillReachesSerialSettingsFallbackTest() {
+  const staleProbe = deferred();
+  const staleProbeStarted = deferred();
+  let probeCount = 0;
+  let activeProbeCount = 0;
+  let maximumConcurrentProbes = 0;
+  let staleSignal = null;
+  const settleProbe = (result) => {
+    activeProbeCount -= 1;
+    return result;
+  };
+  const { clock, native, collector } = createHarness({
+    timeoutMs: 240_000,
+    settingsFallbackAfterMs: 20,
+    manualFallback: false,
+    pollIntervalMs: 1,
+    probe2FAState(_timeoutSec, options = {}) {
+      probeCount += 1;
+      activeProbeCount += 1;
+      maximumConcurrentProbes = Math.max(maximumConcurrentProbes, activeProbeCount);
+      if (probeCount === 1) return Promise.resolve({ action: "idle" }).then(settleProbe);
+      if (probeCount === 2) {
+        staleSignal = options.signal;
+        staleProbeStarted.resolve();
+        return staleProbe.promise.then(settleProbe);
+      }
+      return Promise.resolve({ action: "idle" }).then(settleProbe);
+    },
+  });
+  await collector.prepare();
+  await staleProbeStarted.promise;
+
+  const first = collector.getCode({ generation: 1 });
+  await clock.advance(20);
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(await first, "111111");
+
+  const second = collector.getCode({ generation: 2, rejectPrevious: true });
+  await clock.advance(19);
+  assert.equal(native.stats.settingsStarts, 1, "generation 2 must retain its popup-primary window");
+  assert.equal(staleSignal?.aborted, true, "generation 2 must cancel the stale popup probe");
+  assert.equal(probeCount, 2, "generation 2 must not overlap the stale AX probe");
+
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "generation 2 must retain the fresh-code Settings retry backoff"
+  );
+  await clock.advance(4_979);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(1);
+  assert.equal(
+    native.stats.settingsStarts,
+    2,
+    "Settings must begin when generation 2 popup-primary expires, not at the shared deadline"
+  );
+  assert.equal(maximumConcurrentProbes, 1, "only one AX probe may run while Settings starts");
+  native.settingsRequests[1].resolve({ code: "222222" });
+  await clock.flush();
+  assert.equal(await second, "222222");
+  assert.equal(probeCount, 2, "Settings winner must not restart popup probing");
+
+  let disposed = false;
+  const disposePromise = collector.dispose().then(() => {
+    disposed = true;
+  });
+  await clock.flush();
+  await clock.advance(49);
+  assert.equal(disposed, false, "dispose must wait only for its bounded popup cleanup grace");
+  await clock.advance(1);
+  await disposePromise;
+  assert.equal(disposed, true, "an Abort-ignoring stale probe must not hang disposal");
+  assert.equal(clock.timers.size, 0);
+
+  staleProbe.resolve({ action: "idle" });
+  await clock.flush();
+}
+
+async function generationTwoStaleProbeCannotStarveManualFallbackTest() {
+  const staleProbe = deferred();
+  const staleProbeStarted = deferred();
+  const manual = createManualProviderHarness();
+  let probeCount = 0;
+  let activeProbeCount = 0;
+  let maximumConcurrentProbes = 0;
+  const settleProbe = (result) => {
+    activeProbeCount -= 1;
+    return result;
+  };
+  const { clock, native, collector } = createHarness({
+    timeoutMs: 240_000,
+    settingsFallbackAfterMs: 20,
+    manualFallback: true,
+    manualCodeProvider: manual.provider,
+    isTTY: true,
+    pollIntervalMs: 1,
+    probe2FAState() {
+      probeCount += 1;
+      activeProbeCount += 1;
+      maximumConcurrentProbes = Math.max(maximumConcurrentProbes, activeProbeCount);
+      if (probeCount === 1) return Promise.resolve({ action: "idle" }).then(settleProbe);
+      if (probeCount === 2) {
+        staleProbeStarted.resolve();
+        return staleProbe.promise.then(settleProbe);
+      }
+      return Promise.resolve({ action: "idle" }).then(settleProbe);
+    },
+  });
+  await collector.prepare();
+  await staleProbeStarted.promise;
+
+  const first = collector.getCode({ generation: 1 });
+  await clock.advance(20);
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "111111" });
+  await clock.flush();
+  assert.equal(await first, "111111");
+
+  const second = collector.getCode({ generation: 2, rejectPrevious: true });
+  await clock.advance(20);
+  assert.equal(native.stats.settingsStarts, 1);
+  await clock.advance(4_980);
+  assert.equal(native.stats.settingsStarts, 2);
+  native.settingsRequests[1].reject(new Error("second Settings failure"));
+  await clock.flush();
+
+  await clock.advance(84_980);
+  assert.equal(manual.calls.length, 1, "terminal fallback must start after both bounded Settings attempts");
+  assert.equal(probeCount, 2, "a stale AX probe must not restart during serial fallback");
+  assert.equal(maximumConcurrentProbes, 1, "serial fallback must never overlap AX probes");
+  manual.calls[0].resolve("333333");
+  await clock.flush();
+  assert.equal(await second, "333333");
+
+  staleProbe.resolve({ action: "has_code_dialog", code: "444444" });
+  await clock.flush();
+  assert.equal(probeCount, 2, "a late stale probe must not start a replacement AX probe");
+  await collector.dispose();
+}
+
 async function allowIsConfirmedOnlyAfterStableStateTransitionTest() {
   const { clock, native, collector, audits } = createHarness({
     allowAttemptOutcome: "disappear",
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
+  void codePromise.catch(() => {});
   native.setAllowVisible(true);
 
-  await clock.advance(10);
+  await clock.advance(0);
   assert.equal(
     audits.some((entry) => entry.phase === "popup_allow"),
     false,
-    "the raw action result must remain attempted until a later probe"
+    "the immediate raw Allow action must remain attempted until a later probe"
   );
 
   await clock.advance(10);
@@ -734,8 +1162,10 @@ async function probeErrorsResetAllowDisappearanceAndAuditSafelyTest() {
     auditThrottleMs: 30,
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
+  void codePromise.catch(() => {});
   native.setAllowVisible(true);
-  await clock.advance(10);
+  await clock.advance(0);
   assert.equal(native.stats.allowAttempts.length, 1);
 
   native.queueProbeResults(
@@ -791,8 +1221,10 @@ async function unknownMalformedAndThrownProbesNeverConfirmAllowTest() {
     auditThrottleMs: 100,
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
+  void codePromise.catch(() => {});
   native.setAllowVisible(true);
-  await clock.advance(10);
+  await clock.advance(0);
   assert.equal(native.stats.allowAttempts.length, 1);
 
   native.queueProbeResults(
@@ -848,9 +1280,10 @@ async function auditIsThrottledAndSanitizedTest() {
   assert.ok(idleAudits.length >= 2, "idle state needs bounded diagnostic evidence");
   assert.ok(idleAudits.length <= 4, "idle polling must be throttled");
 
+  const codePromise = collector.getCode();
   native.setPopup("123456", "123 456 password=TOP-SECRET full page body");
   await clock.advance(20);
-  assert.equal(await collector.getCode(), "123456");
+  assert.equal(await codePromise, "123456");
 
   const serialized = JSON.stringify(audits);
   assert.match(serialized, /popup_code_buffered/);
@@ -867,11 +1300,12 @@ async function auditLabelsUseExplicitAllowListsTest() {
     popupSource: "person@example.com",
   });
   await injected.collector.prepare();
+  const injectedCode = injected.collector.getCode();
   injected.native.setAllowVisible(true);
   await injected.clock.advance(10);
   injected.native.setPopup("343434");
   await injected.clock.advance(20);
-  assert.equal(await injected.collector.getCode(), "343434");
+  assert.equal(await injectedCode, "343434");
 
   const allowAudit = injected.audits.find((entry) => entry.phase === "popup_allow");
   const popupAudit = injected.audits.find((entry) => entry.phase === "popup_code_buffered");
@@ -897,9 +1331,10 @@ async function auditLabelsUseExplicitAllowListsTest() {
 async function popupReaderReceivesCodeOnlyOptionsTest() {
   const { clock, native, collector, audits } = createHarness();
   await collector.prepare();
+  const codePromise = collector.getCode();
   native.setPopup("343434");
   await clock.advance(20);
-  assert.equal(await collector.getCode(), "343434");
+  assert.equal(await codePromise, "343434");
 
   assert.ok(native.stats.popupReads.length >= 1);
   const options = native.stats.popupReads[0].options;
@@ -941,7 +1376,7 @@ async function rejectedPopupReaderResultIsDismissedWithoutWinningTest() {
   await clock.advance(10);
   await clock.flush();
 
-  assert.equal(native.stats.popupReads.length, 1);
+  assert.ok(native.stats.popupReads.length >= 1, "the rejected dialog must be read");
   assert.equal(native.stats.cleanupDismissals, 1, "rejected reader output must dismiss stale UI");
   assert.equal(delivered, false, "a rejected reader result must not settle the winner");
   assert.equal(statuses.some(({ status }) => status === "winner"), false);
@@ -1309,6 +1744,7 @@ async function latePopupReaderAtDeadlineCannotWinTest() {
 async function winnerUsesStatusWithoutDynamicConsoleTest() {
   const { clock, native, collector, statuses } = createHarness();
   await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
   native.setPopup("404040");
   await clock.advance(20);
 
@@ -1316,7 +1752,7 @@ async function winnerUsesStatusWithoutDynamicConsoleTest() {
   const logs = [];
   console.log = (...args) => logs.push(args.map(String).join(" "));
   try {
-    assert.equal(await collector.getCode({ generation: 1 }), "404040");
+    assert.equal(await codePromise, "404040");
   } finally {
     console.log = original;
   }
@@ -1337,7 +1773,7 @@ async function lateNeedStartsSettingsImmediatelyTest() {
   assert.equal(native.stats.settingsStarts, 0);
 
   const codePromise = collector.getCode();
-  assert.equal(native.stats.settingsStarts, 1, "late need must not wait another grace period");
+  assert.equal(native.stats.settingsStarts, 0, "popup-primary must start its full window at need_2fa");
   assert.ok(
     audits.some(
       (entry) =>
@@ -1347,6 +1783,10 @@ async function lateNeedStartsSettingsImmediatelyTest() {
     "late acquisition must be visible in sanitized audit"
   );
 
+  await clock.advance(7_999);
+  assert.equal(native.stats.settingsStarts, 0, "Settings must stay idle until popup-primary expires");
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 1);
   native.settingsRequests[0].resolve({
     code: "654321",
     raw: "654 321",
@@ -1355,6 +1795,127 @@ async function lateNeedStartsSettingsImmediatelyTest() {
   await clock.flush();
   assert.equal(await codePromise, "654321");
   await collector.dispose();
+}
+
+async function popupAppearingAfterPreparationIsRetainedUntilNeed2FATest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallback: false,
+    manualFallback: false,
+    pollIntervalMs: 10,
+  });
+  await collector.prepare();
+  native.setPopup("616161");
+  await clock.advance(10);
+  assert.equal(
+    native.stats.cleanupDismissals,
+    0,
+    "a popup that appears after preparation must remain available for need_2fa"
+  );
+
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(10);
+  assert.equal(await codePromise, "616161");
+  await collector.dispose();
+}
+
+async function confirmedAllowExtendsPopupPrimaryWindowTest() {
+  const { clock, native, collector, audits } = createHarness({
+    settingsFallbackAfterMs: 30,
+    popupPostAllowGraceMs: 30,
+    manualFallback: false,
+    pollIntervalMs: 10,
+    popupReadResults: [{ code: null, source: "vision", capability: "available" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+
+  native.setAllowVisible(true);
+  await clock.advance(10);
+  native.setPopup("999999");
+  await clock.advance(10);
+  native.clearPopup();
+
+  await clock.advance(10);
+  assert.equal(
+    native.stats.settingsStarts,
+    0,
+    "a confirmed Allow must extend popup-primary beyond its original deadline"
+  );
+  await clock.advance(19);
+  assert.equal(native.stats.settingsStarts, 0, "Settings must wait through post-Allow grace");
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 1, "Settings may start only after post-Allow grace");
+  assert.equal(
+    audits.some((entry) => entry.phase === "popup_primary_start"),
+    true,
+    "popup-primary audit phase must remain allowlisted"
+  );
+  assert.equal(
+    audits.some((entry) => entry.phase === "popup_primary_exhausted"),
+    true,
+    "popup fallback audit phase must remain allowlisted"
+  );
+
+  native.settingsRequests[0].resolve({ code: "654321" });
+  await clock.flush();
+  assert.equal(await codePromise, "654321");
+  await collector.dispose();
+}
+
+async function manualAllowExtendsPopupPrimaryWindowTest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallbackAfterMs: 30,
+    popupPostAllowGraceMs: 30,
+    manualFallback: false,
+    pollIntervalMs: 10,
+    allowAttemptOutcome: "remain",
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+
+  native.setAllowVisible(true);
+  await clock.advance(20);
+  native.setAllowVisible(false);
+  await clock.advance(20);
+  assert.equal(
+    native.stats.settingsStarts,
+    0,
+    "manual Allow confirmation must extend popup-primary beyond the original window"
+  );
+  await clock.advance(29);
+  assert.equal(native.stats.settingsStarts, 0, "manual Allow grace must be fully honored");
+  await clock.advance(1);
+  assert.equal(native.stats.settingsStarts, 1);
+  native.settingsRequests[0].resolve({ code: "567890" });
+  await clock.flush();
+  assert.equal(await codePromise, "567890");
+  await collector.dispose();
+}
+
+async function disabledSettingsDoesNotLeavePopupEligibleAfterPrimaryWindowTest() {
+  const { clock, native, collector } = createHarness({
+    settingsFallback: false,
+    manualFallback: false,
+    settingsFallbackAfterMs: 20,
+    pollIntervalMs: 10,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(20);
+  native.setPopup("787878");
+  await clock.advance(20);
+  let settled = false;
+  codePromise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+  assert.equal(settled, false, "disabled Settings must not leave popup eligible after expiry");
+  await collector.dispose();
+  await assert.rejects(codePromise, /disposed/i);
 }
 
 async function popupCodePublishesBeforeDialogCleanupGraceTest() {
@@ -1370,7 +1931,7 @@ async function popupCodePublishesBeforeDialogCleanupGraceTest() {
     return code;
   });
   native.setPopup("343434");
-  await clock.advance(10);
+  await clock.advance(0);
   await clock.flush();
   assert.equal(returned, true, "verified popup delivery must not wait for cleanup grace");
   assert.equal(await codePromise, "343434");
@@ -1397,7 +1958,7 @@ async function manualPopupCloseCannotDiscardBufferedCodeTest() {
   });
   native.setPopup("454545");
 
-  await clock.advance(10);
+  await clock.advance(0);
   assert.equal(deliveries, 1, "the verified candidate must publish before a user can close it");
   assert.equal(await codePromise, "454545");
   native.clearPopup();
@@ -1433,9 +1994,7 @@ async function popupDeliveryGraceNeverExceedsConfiguredMaximumTest() {
   assert.equal(await codePromise, "454545");
   assert.equal(native.stats.cleanupDismissals, 0, "fallback must wait for the configured grace");
 
-  await clock.advance(799);
-  assert.equal(native.stats.cleanupDismissals, 0, "the fallback must not start before the cap");
-  await clock.advance(1);
+  await clock.advance(800);
   assert.equal(
     native.stats.cleanupDismissals,
     1,
@@ -1449,58 +2008,41 @@ async function popupDeliveryGraceNeverExceedsConfiguredMaximumTest() {
 }
 
 async function generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest() {
+  const popupCloseWait = deferred();
   const { clock, native, collector } = createHarness({
-    settingsFallbackAfterMs: 0,
-    settingsCancelSettles: false,
-    settingsForceStopSettles: false,
     manualFallback: false,
-    popupDeliveryGraceMs: 0,
+    settingsFallback: false,
+    popupCloseWait,
+    popupDeliveryGraceMs: 800,
     pollIntervalMs: 1,
   });
   await collector.prepare();
   const first = collector.getCode({ generation: 1 });
-  await clock.advance(1);
-  assert.equal(native.stats.settingsStarts, 1);
   let firstReturned = false;
   first.then(() => {
     firstReturned = true;
   });
   native.setPopup("111111");
   await clock.advance(1);
-  assert.equal(
-    native.settingsRequests[0].cancelCalls,
-    1,
-    "generation 1 winner must start cancellation before returning"
-  );
-  assert.equal(firstReturned, false, "generation 1 must wait for its native helper cleanup");
-  await clock.advance(50);
-  assert.equal(native.stats.settingsForceStops, 1);
-  assert.equal(firstReturned, false, "force-stop cleanup must receive its bounded grace");
-  await clock.advance(50);
+  assert.equal(firstReturned, true, "popup delivery must not wait for native dialog cleanup");
   assert.equal(await first, "111111");
+  assert.equal(native.stats.settingsStarts, 0, "popup-primary must not start Settings");
 
   const second = collector.getCode({ generation: 2, rejectPrevious: true });
   await clock.advance(1);
-  assert.equal(native.stats.settingsStarts, 2, "generation 2 must own a fresh Settings request");
+  assert.equal(
+    native.stats.popupCloseSignals[0]?.aborted,
+    true,
+    "generation 2 must stop generation 1 popup cleanup before reading a fresh dialog"
+  );
   native.setPopup("222222");
   await clock.advance(1);
-  await clock.advance(100);
   assert.equal(await second, "222222");
   await clock.flush();
-  assert.equal(
-    native.settingsRequests[1].cancelCalls,
-    1,
-    "generation 2 winner must cancel its own Settings loser"
-  );
-  assert.equal(native.stats.settingsCancels, 2, "both generations must run separate cancellation");
-
-  assert.equal(
-    native.stats.settingsForceStops,
-    2,
-    "each generation must force-stop an unresponsive Settings helper before returning"
-  );
+  assert.equal(native.stats.settingsStarts, 0, "generation 2 must re-enter popup-primary first");
+  popupCloseWait.resolve();
   const dispose = collector.dispose();
-  await clock.advance(100);
+  await clock.flush();
   await dispose;
   assert.equal(clock.timers.size, 0, "generation-scoped cleanup must not leak timers");
 }
@@ -1510,10 +2052,11 @@ async function popupCodeFallsBackToGenericDialogCleanupTest() {
     popupPrimaryCloseSucceeds: false,
   });
   await collector.prepare();
+  const codePromise = collector.getCode();
   native.setPopup("565656");
   await clock.advance(20);
 
-  assert.equal(await collector.getCode(), "565656");
+  assert.equal(await codePromise, "565656");
   assert.equal(native.stats.popupWinnerClosures, 0);
   assert.equal(native.stats.cleanupDismissals, 1);
   await collector.dispose();
@@ -1526,13 +2069,12 @@ async function popupCodeIsPublishedWhenDialogCleanupFailsTest() {
     popupDeliveryGraceMs: 0,
   });
   await collector.prepare();
-  native.setPopup("676767");
-
   let deliveries = 0;
   const codePromise = collector.getCode().then((code) => {
     deliveries += 1;
     return code;
   });
+  native.setPopup("676767");
   await clock.advance(10);
   await clock.flush();
   assert.equal(deliveries, 1, "a failed close must still deliver the verified OTP once");
@@ -1572,7 +2114,6 @@ async function popupCodeWinsAfterAllDialogCleanupPathsFailTest() {
   await clock.advance(40);
   assert.equal(native.stats.popupReads.length, 1, "close retries must reuse one candidate");
   assert.equal(native.stats.popupWinnerClosures, 0);
-  assert.equal(native.stats.cleanupDismissals, 0);
   assert.equal(
     audits.filter((entry) => entry.phase === "popup_winner_close_pending").length,
     1,
@@ -1739,11 +2280,13 @@ async function settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest
 
   await clock.advance(5_000);
   assert.equal(native.stats.settingsStarts, 2, "Settings remains eligible for its bounded retry");
+  native.settingsRequests[1].reject(accessibilityDeniedError());
+  await clock.flush();
   await clock.advance(85_000);
   assert.equal(
     manual.calls.length,
     1,
-    "the hidden terminal fallback must not wait for a stalled Settings request"
+    "the hidden terminal fallback must start only after Settings exhausts its budget"
   );
   manual.calls[0].resolve("864209");
   await clock.flush();
@@ -1764,22 +2307,20 @@ async function settingsOnlyGenerationTwoRejectsPreviousCodeTest() {
   await clock.flush();
   assert.equal(await first, "111111");
 
-  let secondSettled = false;
-  const second = collector
-    .getCode({ generation: 2, rejectPrevious: true })
-    .finally(() => {
-      secondSettled = true;
-    });
+  const second = collector.getCode({ generation: 2, rejectPrevious: true });
   await clock.advance(5_000);
-  assert.equal(native.stats.settingsStarts, 2, "generation 2 must request a fresh Settings code");
+  assert.equal(
+    native.stats.settingsStarts,
+    2,
+    "generation 2 may consume only the one remaining collector-wide Settings attempt"
+  );
   native.settingsRequests[1].resolve({ code: "111111" });
   await clock.flush();
-  assert.equal(secondSettled, false, "generation 2 must reject the previous code");
   await clock.advance(5_000);
-  assert.equal(native.stats.settingsStarts, 3, "generation 2 gets a second fresh Settings attempt");
-  native.settingsRequests[2].resolve({ code: "222222" });
-  await clock.flush();
-  assert.equal(await second, "222222");
+  assert.equal(native.stats.settingsStarts, 2, "generation 2 must not reset the Settings budget");
+  const rejected = assert.rejects(second, /disposed/i);
+  await collector.dispose();
+  await rejected;
   assert.deepEqual(popupHelperStats(native), {
     stalePopupCleanupCalls: 0,
     probeCalls: 0,
@@ -1923,6 +2464,53 @@ async function settingsFixedFailureReasonIsPreservedTest() {
   await assert.rejects(codePromise, /disposed/i);
 }
 
+async function diagnosticCallbackSanitizesSettingsFailureTest() {
+  const sensitiveValues = [
+    "TOP-SECRET-HELPER-STDERR",
+    "654321",
+    "AX OCR raw verification text",
+    "fake-account@example.invalid",
+    "nested-cause@example.invalid",
+  ];
+  const { clock, native, collector, diagnostics } = createHarness({
+    settingsFallbackAfterMs: 0,
+    manualFallback: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(0);
+
+  const error = new Error(sensitiveValues.join(" | "));
+  error.code = "2FA_SETTINGS_ALERT_NOT_OPENED";
+  error.hasHelperStderr = true;
+  error.stack = `Error: ${sensitiveValues.join(" | ")}`;
+  error.cause = new Error(`nested cause: ${sensitiveValues.at(-1)} OTP 123456`);
+  native.settingsRequests[0].reject(error);
+  await clock.flush();
+
+  assert.deepEqual(diagnostics, [
+    {
+      source: "settings",
+      phase: "settings_provider_failed",
+      error: { code: "2FA_PROVIDER_ERROR", hasHelperStderr: true },
+    },
+  ]);
+  assert.deepEqual(Object.keys(diagnostics[0]).sort(), ["error", "phase", "source"]);
+  assert.deepEqual(Object.keys(diagnostics[0].error).sort(), ["code", "hasHelperStderr"]);
+  const serialized = JSON.stringify(diagnostics);
+  for (const sensitiveValue of sensitiveValues) {
+    assert.equal(
+      serialized.includes(sensitiveValue),
+      false,
+      `onDiagnostic must not expose raw helper data: ${sensitiveValue}`
+    );
+  }
+
+  const rejected = assert.rejects(codePromise, /disposed/i);
+  await collector.dispose();
+  await rejected;
+}
+
 async function settingsNeverStartsThirdAttemptTest() {
   const { clock, native, collector } = createHarness({ timeoutMs: 240_000 });
   await collector.prepare();
@@ -2028,7 +2616,7 @@ async function synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest() {
   await collector.dispose();
 }
 
-async function popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest() {
+async function settingsFallbackSuppressesLatePopupCandidateTest() {
   const { clock, native, collector } = createHarness({
     settingsFallbackAfterMs: 20,
     accessibilityProvider() {
@@ -2039,18 +2627,23 @@ async function popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest() {
   const codePromise = collector.getCode({ generation: 1 });
 
   await clock.advance(20);
-  native.settingsRequests[0].reject(accessibilityDeniedError());
-  await clock.flush();
+  assert.equal(native.stats.settingsStarts, 1);
+  const popupReadsAtFallback = native.stats.popupReads.length;
   native.setPopup("707070");
   await clock.advance(20);
 
-  assert.equal(await codePromise, "707070");
-  await clock.advance(5_000);
   assert.equal(
-    native.stats.settingsStarts,
-    1,
-    "a popup winner must cancel the retry delay before a second Settings helper starts"
+    native.stats.popupReads.length,
+    popupReadsAtFallback,
+    "a late popup must not re-enter after the serial Settings fallback starts"
   );
+  native.settingsRequests[0].reject(accessibilityDeniedError());
+  await clock.flush();
+  await clock.advance(5_000);
+  assert.equal(native.stats.settingsStarts, 2);
+  native.settingsRequests[1].resolve({ code: "808080" });
+  await clock.flush();
+  assert.equal(await codePromise, "808080");
   assert.equal(native.stats.accessibilityStarts, 0);
   await collector.dispose();
 }
@@ -2065,7 +2658,7 @@ async function allowBudgetStopsAtTwoAndReportsManualOnceTest() {
   const codePromise = collector.getCode();
   const rejected = assert.rejects(codePromise, /disposed/i);
 
-  await clock.advance(8_100);
+  await clock.advance(30_100);
 
   assert.equal(native.stats.allowAttempts.length, 2);
   assert.ok(native.stats.probeCalls > native.stats.allowAttempts.length);
@@ -2148,7 +2741,7 @@ async function manualFallbackReservesNinetySecondInputWindowTest() {
   await collector.dispose();
 }
 
-async function automaticWinnerAbortsManualFallbackTest() {
+async function manualFallbackSuppressesLatePopupCandidateTest() {
   const manual = createManualProviderHarness();
   const { clock, native, collector } = createHarness({
     timeoutMs: 240_000,
@@ -2165,38 +2758,24 @@ async function automaticWinnerAbortsManualFallbackTest() {
 
   native.setPopup("234567");
   await clock.advance(2_000);
-  assert.equal(await codePromise, "234567");
-  assert.equal(manual.calls[0].aborted, true);
+  assert.equal(manual.calls[0].aborted, false);
+  manual.calls[0].resolve("345678");
+  await clock.flush();
+  assert.equal(await codePromise, "345678");
   await collector.dispose();
 }
 
-async function automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest() {
-  const manual = createManualProviderHarness();
+async function popupWinnerReturnsBeforeFallbackStartsTest() {
   const { clock, native, collector } = createHarness({
-    timeoutMs: 240_000,
-    manualFallback: true,
-    manualCodeProvider: manual.provider,
-    isTTY: true,
-    pollIntervalMs: 1_000,
-    settingsCancelSettles: false,
-    settingsForceStopSettles: false,
+    settingsFallbackAfterMs: 20,
+    manualFallback: false,
   });
   await collector.prepare();
   const codePromise = collector.getCode({ generation: 1 });
-  await clock.advance(90_000);
-  assert.equal(manual.calls.length, 1);
-  assert.equal(native.stats.settingsStarts, 1);
-
   native.setPopup("765432");
-  await clock.advance(2_000);
-  assert.equal(
-    manual.calls[0].aborted,
-    true,
-    "automatic winner must restore hidden input before waiting for Settings cleanup"
-  );
-
-  await clock.advance(100);
+  await clock.advance(10);
   assert.equal(await codePromise, "765432");
+  assert.equal(native.stats.settingsStarts, 0);
   await collector.dispose();
 }
 
@@ -2417,8 +2996,10 @@ async function nonTtyNeverStartsManualFallbackTest() {
   await clock.advance(120_000);
   assert.equal(manual.calls.length, 0);
   assert.deepEqual(
-    statuses.filter(({ status }) => status === "manual_unavailable"),
-    [{ status: "manual_unavailable", source: "manual", remainingSec: 240 }]
+    statuses
+      .filter(({ status }) => status === "manual_unavailable")
+      .map(({ status, source }) => ({ status, source })),
+    [{ status: "manual_unavailable", source: "manual" }]
   );
   assert.equal(
     audits.some(
@@ -2474,6 +3055,45 @@ async function manualFallbackEnvironmentToggleTest() {
   } finally {
     if (original == null) delete process.env.BROWSER_2FA_MANUAL_FALLBACK;
     else process.env.BROWSER_2FA_MANUAL_FALLBACK = original;
+  }
+}
+
+async function settingsFallbackEnvironmentToggleTest() {
+  const original = process.env.BROWSER_2FA_SETTINGS_FALLBACK;
+  try {
+    process.env.BROWSER_2FA_SETTINGS_FALLBACK = "0";
+    const disabled = createHarness({
+      timeoutMs: 240_000,
+      settingsFallbackAfterMs: 20,
+      manualFallback: false,
+      pollIntervalMs: 10,
+    });
+    await disabled.collector.prepare();
+    const disabledCode = disabled.collector.getCode({ generation: 1 });
+    await disabled.clock.advance(40);
+    assert.equal(disabled.native.stats.settingsStarts, 0);
+    const disabledRejected = assert.rejects(disabledCode, /disposed/i);
+    await disabled.collector.dispose();
+    await disabledRejected;
+
+    delete process.env.BROWSER_2FA_SETTINGS_FALLBACK;
+    const enabled = createHarness({
+      timeoutMs: 240_000,
+      settingsFallbackAfterMs: 20,
+      manualFallback: false,
+      pollIntervalMs: 10,
+    });
+    await enabled.collector.prepare();
+    const enabledCode = enabled.collector.getCode({ generation: 1 });
+    await enabled.clock.advance(20);
+    assert.equal(enabled.native.stats.settingsStarts, 1);
+    enabled.native.settingsRequests[0].resolve({ code: "246810" });
+    await enabled.clock.flush();
+    assert.equal(await enabledCode, "246810");
+    await enabled.collector.dispose();
+  } finally {
+    if (original == null) delete process.env.BROWSER_2FA_SETTINGS_FALLBACK;
+    else process.env.BROWSER_2FA_SETTINGS_FALLBACK = original;
   }
 }
 
@@ -2534,6 +3154,7 @@ async function disposeDoesNotWaitForNonCooperativeManualProviderTest() {
     disposed = true;
   });
   await clock.flush();
+  await clock.advance(0);
 
   assert.equal(signal.aborted, true);
   assert.equal(disposed, true, "a provider that ignores Abort must not hang disposal");
@@ -2574,9 +3195,10 @@ async function generationTwoRejectsAndCannotReusePreviousCodeTest() {
     pollIntervalMs: 100,
   });
   await collector.prepare();
+  const first = collector.getCode({ generation: 1, rejectPrevious: false });
   native.setPopup("111111");
   await clock.advance(200);
-  assert.equal(await collector.getCode({ generation: 1 }), "111111");
+  assert.equal(await first, "111111");
 
   let secondSettled = false;
   const second = collector
@@ -2615,7 +3237,6 @@ async function generationTwoSettingsWaitsBeforeRequestingFreshCodeTest() {
   await clock.flush();
   assert.equal(await first, "111111");
 
-  await clock.advance(2_000);
   let secondSettled = false;
   const second = collector
     .getCode({ generation: 2, rejectPrevious: true })
@@ -2625,19 +3246,15 @@ async function generationTwoSettingsWaitsBeforeRequestingFreshCodeTest() {
   await clock.flush();
   assert.equal(native.stats.settingsStarts, 1, "generation 2 must not request immediately");
 
-  await clock.advance(4_999);
-  assert.equal(native.stats.settingsStarts, 1, "generation 2 must keep the full retry delay");
-  await clock.advance(1);
-  assert.equal(native.stats.settingsStarts, 2, "generation 2 may request after five seconds");
-
-  native.settingsRequests[1].resolve({ code: "111111" });
-  await clock.flush();
-  assert.equal(secondSettled, false, "generation 2 must reject the previous Settings code");
-
   native.setPopup("222222");
   await clock.advance(200);
   assert.equal(await second, "222222");
-  assert.equal(native.stats.settingsStarts, 2, "Settings attempts must remain globally bounded");
+  assert.equal(secondSettled, true);
+  assert.equal(
+    native.stats.settingsStarts,
+    1,
+    "generation 2 popup success must prevent a second Settings request"
+  );
   await collector.dispose();
 }
 
@@ -2650,9 +3267,10 @@ async function generationSequenceIsStrictTest() {
   await collector.prepare();
   await assert.rejects(collector.getCode({ generation: 2 }), /generation/i);
 
+  const first = collector.getCode({ generation: 1 });
   native.setPopup("333333");
   await clock.advance(200);
-  assert.equal(await collector.getCode({ generation: 1 }), "333333");
+  assert.equal(await first, "333333");
   await assert.rejects(collector.getCode({ generation: 1 }), /generation/i);
   await assert.rejects(collector.getCode({ generation: 3 }), /generation/i);
   await collector.dispose();
@@ -2925,11 +3543,13 @@ async function disposeAbortsInFlightWatcherAllowTest() {
   });
 
   await collector.prepare();
-  await clock.flush();
-  assert.ok(allowSignal, "watcher must start the Allow helper");
+  const codePromise = collector.getCode({ generation: 1 });
+  await clock.advance(10);
+  assert.ok(allowSignal, "popup-primary watcher must start the Allow helper after need_2fa");
 
   await collector.dispose();
   assert.equal(allowSignal.aborted, true, "dispose must abort the Allow helper");
+  await assert.rejects(codePromise, /disposed/i);
   assert.equal(clock.timers.size, 0);
 }
 
@@ -3029,6 +3649,15 @@ const focusedTests = {
   "initial-probe-failure": initialPopupProbeFailureDoesNotAbortPreparationTest,
   "popup-accessibility-prompt": popupAccessibilityPromptStartsWithoutBlockingCodeAcquisitionTest,
   "allow-remains": allowAttemptRemainingVisibleIsNotConfirmedTest,
+  "allow-confirmation-bounded": allowConfirmationGraceIsBoundedForLargePollIntervalTest,
+  "generation-wake": generationOneWakesPopupWatcherForLargePollIntervalTest,
+  "allow-confirmation-no-overlap": uncooperativePopupProbeNeverOverlapsConfirmationProbeTest,
+  "popup-dispose-timeout": disposeDoesNotWaitForUncooperativePopupProbeTest,
+  "generation-stale-popup-probe": generationTwoWaitsForStalePopupProbeBeforeRestartingTest,
+  "generation-stale-popup-settings": generationTwoStaleProbeStillReachesSerialSettingsFallbackTest,
+  "generation-stale-popup-manual": generationTwoStaleProbeCannotStarveManualFallbackTest,
+  "allow-failed-window": failedAutomaticAllowDoesNotExtendPopupPrimaryWindowTest,
+  "manual-allow-grace": manualAllowExtendsPopupPrimaryWindowTest,
   "allow-transition": allowIsConfirmedOnlyAfterStableStateTransitionTest,
   "preexisting-allow": preexistingAllowIsNeverAutomaticallyClickedTest,
   "preexisting-code": preexistingAllowCodeIsDismissedRejectedAndGateStaysClosedTest,
@@ -3057,6 +3686,7 @@ const focusedTests = {
   "watcher-dispose": disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest,
   "watcher-allow-dispose": disposeAbortsInFlightWatcherAllowTest,
   "settings-start-failure": settingsStartFailureEmitsFixedStatusAfterAuditTest,
+  "diagnostic-sanitization": diagnosticCallbackSanitizesSettingsFailureTest,
   "settings-retry": settingsRetriesOnceAfterFiveSecondsTest,
   "settings-max": settingsNeverStartsThirdAttemptTest,
   "settings-cancel": cancelledSettingsDoesNotRetryTest,
@@ -3066,23 +3696,17 @@ const focusedTests = {
   "settings-only-generation": settingsOnlyGenerationTwoRejectsPreviousCodeTest,
   "settings-accessibility": settingsAccessibilityDeniedNeverUsesPopupAuthorizationTest,
   "settings-sync-accessibility": synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest,
-  "settings-accessibility-popup-winner": popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest,
+  "settings-fallback-late-popup": settingsFallbackSuppressesLatePopupCandidateTest,
   "allow-budget": allowBudgetStopsAtTwoAndReportsManualOnceTest,
   "manual-start": manualFallbackStartsAtNinetySecondsTest,
   "manual-window": manualFallbackReservesNinetySecondInputWindowTest,
-  "manual-auto": automaticWinnerAbortsManualFallbackTest,
-  "manual-auto-order": automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest,
-  "popup-settings-cleanup": popupWinnerWaitsForBoundedSettingsCleanupTest,
-  "popup-settings-late-failure": popupWinnerSuppressesLateSettingsFailureStatusTest,
-  "manual-settings": manualWinnerCancelsActiveSettingsTest,
-  "settings-manual": settingsWinnerAbortsManualFallbackTest,
-  "settings-winner-probe": settingsWinnerStopsInFlightPopupActionsTest,
-  "manual-winner-probe": manualWinnerStopsInFlightPopupActionsTest,
+  "manual-late-popup": manualFallbackSuppressesLatePopupCandidateTest,
+  "popup-fast-return": popupWinnerReturnsBeforeFallbackStartsTest,
   "manual-nontty": nonTtyNeverStartsManualFallbackTest,
   "manual-env": manualFallbackEnvironmentToggleTest,
+  "settings-env": settingsFallbackEnvironmentToggleTest,
   "manual-cleanup": timeoutAndDisposeAbortManualFallbackTest,
   "manual-noncooperative": disposeDoesNotWaitForNonCooperativeManualProviderTest,
-  "manual-provider-error": manualProviderFailureDoesNotStopPopupWinnerTest,
   generation: generationTwoRejectsAndCannotReusePreviousCodeTest,
   "generation-settings-retry": generationTwoSettingsWaitsBeforeRequestingFreshCodeTest,
   "generation-sequence": generationSequenceIsStrictTest,
@@ -3106,6 +3730,13 @@ if (focusedTest) {
   await preexistingAllowCodeIsDismissedRejectedAndGateStaysClosedTest();
   await newAllowAfterPreexistingGateClearUsesAutomaticBudgetTest();
   await allowAttemptRemainingVisibleIsNotConfirmedTest();
+  await failedAutomaticAllowDoesNotExtendPopupPrimaryWindowTest();
+  await allowConfirmationGraceIsBoundedForLargePollIntervalTest();
+  await generationOneWakesPopupWatcherForLargePollIntervalTest();
+  await uncooperativePopupProbeNeverOverlapsConfirmationProbeTest();
+  await disposeDoesNotWaitForUncooperativePopupProbeTest();
+  await generationTwoStaleProbeStillReachesSerialSettingsFallbackTest();
+  await generationTwoStaleProbeCannotStarveManualFallbackTest();
   await allowIsConfirmedOnlyAfterStableStateTransitionTest();
   await probeErrorsResetAllowDisappearanceAndAuditSafelyTest();
   await unknownMalformedAndThrownProbesNeverConfirmAllowTest();
@@ -3125,6 +3756,10 @@ if (focusedTest) {
   await latePopupReaderAtDeadlineCannotWinTest();
   await winnerUsesStatusWithoutDynamicConsoleTest();
   await lateNeedStartsSettingsImmediatelyTest();
+  await popupAppearingAfterPreparationIsRetainedUntilNeed2FATest();
+  await confirmedAllowExtendsPopupPrimaryWindowTest();
+  await manualAllowExtendsPopupPrimaryWindowTest();
+  await disabledSettingsDoesNotLeavePopupEligibleAfterPrimaryWindowTest();
   await popupCodePublishesBeforeDialogCleanupGraceTest();
   await manualPopupCloseCannotDiscardBufferedCodeTest();
   await popupDeliveryGraceNeverExceedsConfiguredMaximumTest();
@@ -3137,42 +3772,34 @@ await settingsOnlyManualFallbackStartsAtNinetySecondsTest();
 await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
   await settingsOnlyGenerationTwoRejectsPreviousCodeTest();
   await settingsStartFailureEmitsFixedStatusAfterAuditTest();
+  await diagnosticCallbackSanitizesSettingsFailureTest();
   await settingsRetriesOnceAfterFiveSecondsTest();
   await settingsFixedFailureReasonIsPreservedTest();
   await settingsNeverStartsThirdAttemptTest();
   await cancelledSettingsDoesNotRetryTest();
   await settingsAccessibilityDeniedNeverUsesPopupAuthorizationTest();
   await synchronousSettingsAccessibilityDeniedUsesBoundedRetryTest();
-  await popupWinnerCancelsSettingsRetryAfterAccessibilityDeniedTest();
+  await settingsFallbackSuppressesLatePopupCandidateTest();
   await allowBudgetStopsAtTwoAndReportsManualOnceTest();
   await manualFallbackStartsAtNinetySecondsTest();
   await manualFallbackReservesNinetySecondInputWindowTest();
-  await automaticWinnerAbortsManualFallbackTest();
-  await automaticWinnerAbortsManualBeforeSlowSettingsCleanupTest();
-  await popupWinnerWaitsForBoundedSettingsCleanupTest();
-  await popupWinnerSuppressesLateSettingsFailureStatusTest();
-  await manualWinnerCancelsActiveSettingsTest();
-  await settingsWinnerAbortsManualFallbackTest();
-  await settingsWinnerStopsInFlightPopupActionsTest();
-  await manualWinnerStopsInFlightPopupActionsTest();
+  await manualFallbackSuppressesLatePopupCandidateTest();
+  await popupWinnerReturnsBeforeFallbackStartsTest();
   await nonTtyNeverStartsManualFallbackTest();
   await manualFallbackEnvironmentToggleTest();
+  await settingsFallbackEnvironmentToggleTest();
   await timeoutAndDisposeAbortManualFallbackTest();
   await disposeDoesNotWaitForNonCooperativeManualProviderTest();
-  await manualProviderFailureDoesNotStopPopupWinnerTest();
   await generationTwoRejectsAndCannotReusePreviousCodeTest();
   await generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest();
+  await generationTwoWaitsForStalePopupProbeBeforeRestartingTest();
   await generationTwoSettingsWaitsBeforeRequestingFreshCodeTest();
   await generationSequenceIsStrictTest();
   await generationsShareOneDeadlineTest();
   await disposeCancelsSettingsRetryDelayTest();
   sidecarHasNoScreenshotOrAppleScriptAuditContractTest();
-  await latePopupBeatsSettingsTest();
   await settingsWinnerEnablesCleanupOnlyTest();
   await staleCodeIsRejectedTest();
-  await providerFailureFallsBackTest();
-  await popupForcesUnresponsiveSettingsCleanupTest();
-  await popupWaitsAfterForceStopForBoundedCloseTest();
   await disposalStopsAllWorkTest();
   await disposeDuringInFlightWatcherProbeStopsBeforeAllowActionTest();
   await disposeAbortsInFlightWatcherAllowTest();

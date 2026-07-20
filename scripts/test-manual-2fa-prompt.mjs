@@ -106,6 +106,14 @@ async function rejectsNonAsciiAndMalformedInputTest() {
   await Promise.resolve();
   assert.equal(settled, false, "mixed input must not be accepted");
 
+  input.emit("data", Buffer.from("123\t456\r", "ascii"));
+  await Promise.resolve();
+  assert.equal(settled, false, "tab input must not be silently discarded");
+
+  input.emit("data", Buffer.from("123\x04456\r", "ascii"));
+  await Promise.resolve();
+  assert.equal(settled, false, "control input must not be silently discarded");
+
   input.emit("data", Buffer.from("\u0015"));
   input.emit("data", Buffer.from("654321\n", "ascii"));
   assert.equal(await result, "654321");

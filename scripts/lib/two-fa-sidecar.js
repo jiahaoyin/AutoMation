@@ -13,6 +13,11 @@ const MAX_ALLOW_ATTEMPTS = 2;
 const MAX_SETTINGS_ATTEMPTS = 2;
 const SETTINGS_ATTEMPT_TIMEOUT_MS = 60_000;
 const SETTINGS_RETRY_DELAY_MS = 5_000;
+const POPUP_POST_ALLOW_GRACE_MS = 30_000;
+const ALLOW_CONFIRMATION_POLL_TICKS = 3;
+const MAX_ALLOW_CONFIRMATION_POLL_INTERVAL_MS = 1_000;
+const ALLOW_CONFIRMATION_PROBE_TIMEOUT_MS = 1_000;
+const POPUP_WATCHER_DISPOSE_GRACE_MS = 2_000;
 const MANUAL_FALLBACK_AFTER_MS = 90_000;
 const MIN_MANUAL_INPUT_WINDOW_MS = 90_000;
 const PREEXISTING_ALLOW_CLEAR_IDLE_HITS = 3;
@@ -28,8 +33,10 @@ const STATUS_NAMES = new Set([
   "ocr_permission_missing",
   "ocr_helper_unavailable",
   "popup_accessibility",
+  "popup_primary",
   "popup_scanning",
   "popup_close_pending",
+  "settings_fallback",
   "timeout",
   "winner",
 ]);
@@ -48,7 +55,11 @@ function resolveConfig(options) {
     settingsFallbackAfterMs: settingsOnly
       ? 0
       : options.settingsFallbackAfterMs ??
-        numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 8_000),
+        numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 30_000),
+    popupPostAllowGraceMs: Math.max(
+      0,
+      options.popupPostAllowGraceMs ?? POPUP_POST_ALLOW_GRACE_MS
+    ),
     settingsFallback: settingsOnly
       ? true
       : options.settingsFallback ?? process.env.BROWSER_2FA_SETTINGS_FALLBACK !== "0",
@@ -188,6 +199,8 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_code_read",
     "popup_ocr_scan",
     "popup_accessibility",
+    "popup_primary_start",
+    "popup_primary_exhausted",
     "popup_provider_error",
     "prepare_2fa",
     "settings_provider_start",
@@ -199,6 +212,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "settings_provider_force_stop",
     "settings_provider_force_stop_cleanup",
     "manual_provider_unavailable",
+    "manual_fallback_start",
     "2fa_acquisition_requested",
     "2fa_winner",
     "popup_dispose_cleanup",
@@ -253,6 +267,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_won",
     "collector_disposed",
     "dispose_probe_or_cleanup_failed",
+    "watcher_shutdown_timeout",
   ]),
   state: new Set([
     "idle",
@@ -335,6 +350,25 @@ function sanitizeAuditEntry(entry) {
   return sanitized;
 }
 
+const DIAGNOSTIC_SOURCES = new Set(["popup", "settings"]);
+const DIAGNOSTIC_PHASES = new Set([
+  "popup_code_read",
+  "settings_provider_failed",
+]);
+
+function sanitizeDiagnosticEntry(entry) {
+  return {
+    source: DIAGNOSTIC_SOURCES.has(entry?.source) ? entry.source : "unknown",
+    phase: DIAGNOSTIC_PHASES.has(entry?.phase) ? entry.phase : "unknown",
+    // Native helper exceptions can carry AX/OCR text, stderr, or account data.
+    // Keep diagnostics useful to the outer flow without exporting raw failures.
+    error: {
+      code: "2FA_PROVIDER_ERROR",
+      hasHelperStderr: entry?.error?.hasHelperStderr === true,
+    },
+  };
+}
+
 function normalizeProbeAction(action) {
   if (
     action === "idle" ||
@@ -349,13 +383,13 @@ function normalizeProbeAction(action) {
 }
 
 /**
- * Pre-arms native popup monitoring and races it with a cancellable System
- * Settings request after the configured grace period.
+ * Pre-arms native popup monitoring, then advances serially to a cancellable
+ * System Settings request only after popup-primary expires.
  *
  * @param {{
  *   auditThrottleMs?: number,
  *   onAudit?: (entry: object) => void,
- *   onDiagnostic?: (entry: { source: string, phase: string, error: unknown }) => void,
+ *   onDiagnostic?: (entry: { source: string, phase: string, error: { code: string, hasHelperStderr: boolean } }) => void,
  *   onStatus?: (status: object) => void,
  *   manualCodeProvider?: typeof promptForHidden2FACode,
  *   isTTY?: boolean,
@@ -389,8 +423,18 @@ export function createMac2FACollector(options = {}) {
   let disposePromise = null;
   let popupWatcherPromise = null;
   let popupWatcherController = null;
+  let popupWatcherDelay = null;
+  let popupWatcherRestartRequested = false;
   let popupCandidate = null;
   let popupGeneration = 1;
+  let popupPrimaryReadyAt = null;
+  let providerPhase = "prepared";
+  let lastPopupAllowAt = null;
+  let manualAllowAwaitingConfirmation = false;
+  let manualAllowDisappearanceHits = 0;
+  let popupFallbackConfirmationGraceUsed = false;
+  let popupConfirmationPolling = false;
+  let popupProbe = null;
   let cleanupOnly = false;
   let pendingPopupClose = null;
   let allowStrategy = "none";
@@ -466,7 +510,7 @@ export function createMac2FACollector(options = {}) {
 
   const diagnostic = (entry) => {
     try {
-      onDiagnostic?.(entry);
+      onDiagnostic?.(sanitizeDiagnosticEntry(entry));
     } catch {
       /* Diagnostics must not disrupt collection or winner selection. */
     }
@@ -495,6 +539,22 @@ export function createMac2FACollector(options = {}) {
     } catch {
       return false;
     }
+  };
+
+  const popupPrimaryActive = () =>
+    !disposed &&
+    !cleanupOnly &&
+    activeAcquisition != null &&
+    providerPhase === "popup" &&
+    !activeWinnerSettled();
+
+  const popupWatcherCanProbe = () => {
+    if (disposed) return false;
+    // A Settings winner may leave its native code dialog above Firefox. Keep
+    // the existing cleanup-only probe path for that one provider, while a
+    // manual winner never restarts AX work after the operator supplied a code.
+    if (cleanupOnly) return settledWinner?.source === "settings";
+    return activeAcquisition == null ? providerPhase === "prepared" : popupPrimaryActive();
   };
 
   const abortPopupAccessibilityPrompt = () => {
@@ -630,9 +690,21 @@ export function createMac2FACollector(options = {}) {
         ? {}
         : { throttleKey: `allow-result:${attempt.strategy}:${reason}` }
     );
-    if (!confirmed) return;
+    if (!confirmed) {
+      if (providerPhase === "popup" && allowAttempt >= MAX_ALLOW_ATTEMPTS) {
+        manualAllowAwaitingConfirmation = true;
+        manualAllowDisappearanceHits = 0;
+        if (!manualAllowStatusSent) {
+          manualAllowStatusSent = true;
+          status("manual_allow", { remainingSec: remainingSeconds() });
+        }
+      }
+      return;
+    }
+    if (providerPhase !== "popup") return;
 
     allowStrategy = attempt.strategy;
+    lastPopupAllowAt = runtime.now();
     audit({
       phase: "popup_allow",
       allowObserved: true,
@@ -640,6 +712,23 @@ export function createMac2FACollector(options = {}) {
       allowSource: attempt.source,
       confirmed: true,
       reason,
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+  };
+
+  const finishManualAllowConfirmation = () => {
+    if (!manualAllowAwaitingConfirmation || providerPhase !== "popup") return;
+    manualAllowAwaitingConfirmation = false;
+    manualAllowDisappearanceHits = 0;
+    allowStrategy = "manual";
+    lastPopupAllowAt = runtime.now();
+    audit({
+      phase: "popup_allow",
+      allowObserved: true,
+      allowStrategy,
+      allowSource: "popup",
+      confirmed: true,
+      reason: "allow_disappeared_stably",
       elapsedSincePrepareMs: elapsedSincePrepare(),
     });
   };
@@ -671,6 +760,32 @@ export function createMac2FACollector(options = {}) {
     return record;
   };
 
+  const awaitWithin = async (promise, timeoutMs) => {
+    const timeout = scheduleDelay(Math.max(0, timeoutMs));
+    const outcome = await Promise.race([
+      Promise.resolve(promise).then(
+        (value) => ({ kind: "fulfilled", value }),
+        (error) => ({ kind: "rejected", error })
+      ),
+      timeout.promise.then((elapsed) => ({ kind: elapsed ? "timeout" : "cancelled" })),
+    ]);
+    timeout.cancel();
+    return outcome;
+  };
+
+  const waitForPopupWatcherDelay = async (delayMs) => {
+    const delay = scheduleDelay(delayMs);
+    popupWatcherDelay = delay;
+    const elapsed = await delay.promise;
+    if (popupWatcherDelay === delay) popupWatcherDelay = null;
+    return elapsed;
+  };
+
+  const requestPopupWatcherRestart = () => {
+    popupWatcherRestartRequested = true;
+    popupWatcherDelay?.cancel();
+  };
+
   const cancelAllDelays = () => {
     for (const delay of [...delays]) delay.cancel();
   };
@@ -681,6 +796,10 @@ export function createMac2FACollector(options = {}) {
 
   const abortPopupReadTasks = () => {
     for (const controller of popupReadControllers) controller.abort();
+  };
+
+  const abortPopupProbe = () => {
+    popupProbe?.controller.abort();
   };
 
   const resetPendingPopupClose = () => {
@@ -808,7 +927,12 @@ export function createMac2FACollector(options = {}) {
   };
 
   const tryClosePendingPopup = (candidate, generation) => {
-    if (disposed || generation !== popupGeneration || activeWinnerSettled()) {
+    if (
+      disposed ||
+      generation !== popupGeneration ||
+      !popupPrimaryActive() ||
+      activeWinnerSettled()
+    ) {
       resetPendingPopupClose();
       return false;
     }
@@ -846,23 +970,103 @@ export function createMac2FACollector(options = {}) {
     resetPendingPopupClose();
   };
 
-  const pollPopupOnce = async (signal) => {
+  const pollPopupOnce = async (signal, record = null) => {
     if (signal?.aborted) return;
+    if (!popupWatcherCanProbe()) return;
     const generation = popupGeneration;
+    const acquisitionAtStart = record?.acquisition ?? activeAcquisition;
     let state;
     try {
+      if (record) record.nativeProbeStarted = true;
       state = await runtime.probe2FAState(2, { signal });
     } catch {
       state = { action: "probe_error" };
     }
-    if (signal?.aborted || disposed || generation !== popupGeneration) return;
+    if (
+      signal?.aborted ||
+      disposed ||
+      generation !== popupGeneration ||
+      acquisitionAtStart !== activeAcquisition ||
+      !popupWatcherCanProbe()
+    ) {
+      return;
+    }
     if (!cleanupOnly && activeWinnerSettled()) return;
     const action = observeProbeState(state);
-    if (signal?.aborted || disposed || generation !== popupGeneration) return;
+    if (
+      signal?.aborted ||
+      disposed ||
+      generation !== popupGeneration ||
+      acquisitionAtStart !== activeAcquisition ||
+      !popupWatcherCanProbe()
+    ) {
+      return;
+    }
     if (!cleanupOnly && activeWinnerSettled()) return;
+
+    // Preparation has already removed code dialogs that existed before the
+    // password submission boundary. A code dialog that appears after that
+    // point can be the current browser login popup even when ruyiPage has not
+    // emitted need_2fa yet. Leave it visible until popup-primary starts; do
+    // not click Allow, OCR-read, buffer, or dismiss it prematurely.
+    if (!cleanupOnly && !activeAcquisition) {
+      pendingAllowAttempt = null;
+      manualAllowAwaitingConfirmation = false;
+      manualAllowDisappearanceHits = 0;
+      resetPendingPopupClose();
+      if (preexistingAllowGate) {
+        if (action === "idle") {
+          preexistingAllowIdleHits += 1;
+          if (preexistingAllowIdleHits >= PREEXISTING_ALLOW_CLEAR_IDLE_HITS) {
+            preexistingAllowGate = false;
+            preexistingAllowIdleHits = 0;
+          }
+          return;
+        }
+        preexistingAllowIdleHits = 0;
+        if (action !== "has_code_dialog") return;
+        const stateCode = normalizeSixDigitCode(state?.code);
+        if (stateCode) rejectedCodes.add(stateCode);
+        const result = await runtime.runPopupPhase("dismiss_stale", 2, {
+          signal,
+          compileIfNeeded: false,
+        });
+        if (signal?.aborted || disposed || generation !== popupGeneration) return;
+        const dismissedCode = normalizeSixDigitCode(result?.code);
+        if (dismissedCode) rejectedCodes.add(dismissedCode);
+        audit({
+          phase: "dismiss_rejected_popup",
+          action: result?.action ?? "none",
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
+        return;
+      }
+      const stateCode = normalizeSixDigitCode(state?.code);
+      if (stateCode && rejectedCodes.has(stateCode)) {
+        await dismissRejectedPopup(stateCode, signal);
+      }
+      return;
+    }
 
     if (action === "accessibility_unavailable" && activeAcquisition) {
       startPopupAccessibilityPrompt(activeAcquisition.deadline);
+    }
+
+    if (manualAllowAwaitingConfirmation) {
+      if (action === "has_code_dialog") {
+        finishManualAllowConfirmation();
+      } else if (action === "idle") {
+        manualAllowDisappearanceHits += 1;
+        if (manualAllowDisappearanceHits >= 2) {
+          finishManualAllowConfirmation();
+        } else {
+          return;
+        }
+      } else if (action === "has_allow_dialog") {
+        manualAllowDisappearanceHits = 0;
+      } else {
+        manualAllowDisappearanceHits = 0;
+      }
     }
 
     // The System Settings Apple Account sheet can be visible while AX reports
@@ -992,6 +1196,8 @@ export function createMac2FACollector(options = {}) {
           manualAllowStatusSent = true;
           status("manual_allow", { remainingSec: remainingSeconds() });
         }
+        manualAllowAwaitingConfirmation = true;
+        manualAllowDisappearanceHits = 0;
         resetPendingPopupClose();
         return;
       }
@@ -1019,7 +1225,13 @@ export function createMac2FACollector(options = {}) {
             compileIfNeeded: false,
           }
         );
-        if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
+        if (
+          signal?.aborted ||
+          disposed ||
+          generation !== popupGeneration ||
+          !popupPrimaryActive() ||
+          activeWinnerSettled()
+        ) {
           return;
         }
       } catch {
@@ -1122,7 +1334,13 @@ export function createMac2FACollector(options = {}) {
       signal?.removeEventListener?.("abort", abortReader);
       popupReadControllers.delete(readerController);
     }
-    if (signal?.aborted || disposed || generation !== popupGeneration || activeWinnerSettled()) {
+    if (
+      signal?.aborted ||
+      disposed ||
+      generation !== popupGeneration ||
+      !popupPrimaryActive() ||
+      activeWinnerSettled()
+    ) {
       return;
     }
     if (result?.capability === "accessibility_missing" && !popupAccessibilityStatusSent) {
@@ -1189,10 +1407,137 @@ export function createMac2FACollector(options = {}) {
     await tryClosePendingPopup(candidate, generation);
   };
 
+  const startPopupProbe = (parentSignal) => {
+    if (popupProbe) return popupProbe;
+
+    const generation = popupGeneration;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (parentSignal?.aborted) controller.abort();
+    else parentSignal?.addEventListener?.("abort", abort, { once: true });
+
+    const record = {
+      controller,
+      generation,
+      acquisition: activeAcquisition,
+      nativeProbeStarted: false,
+      promise: null,
+    };
+    if (
+      activeAcquisition?.generation === generation &&
+      providerPhase === "popup" &&
+      popupPrimaryReadyAt == null
+    ) {
+      popupPrimaryReadyAt = runtime.now();
+    }
+    let probePromise;
+    try {
+      // Keep the watcher timing identical to calling pollPopupOnce() directly:
+      // a Promise.then() here delays the first AX probe by one microtask and
+      // can make it observe a later browser state.
+      probePromise = pollPopupOnce(controller.signal, record);
+    } catch (error) {
+      probePromise = Promise.reject(error);
+    }
+    record.promise = Promise.resolve(probePromise)
+      .finally(() => {
+        parentSignal?.removeEventListener?.("abort", abort);
+        if (popupProbe === record) popupProbe = null;
+      });
+    popupProbe = record;
+    return record;
+  };
+
+  const waitForPopupProbe = async (record, timeoutMs) => {
+    const outcome = await awaitWithin(record.promise, timeoutMs);
+    return outcome.kind === "fulfilled" || outcome.kind === "rejected";
+  };
+
+  const allowConfirmationNeedsPolling = (acquisition) =>
+    !disposed &&
+    !cleanupOnly &&
+    activeAcquisition === acquisition &&
+    !acquisition.winner.settled &&
+    providerPhase === "popup" &&
+    (pendingAllowAttempt != null || manualAllowAwaitingConfirmation);
+
+  const runBoundedAllowConfirmationPolls = async (acquisition) => {
+    const parentSignal = popupWatcherController?.signal;
+    const pollDelayMs = Math.min(
+      MAX_ALLOW_CONFIRMATION_POLL_INTERVAL_MS,
+      config.pollIntervalMs
+    );
+    popupConfirmationPolling = true;
+    try {
+      // The watcher may already be inside AX when popup-primary reaches its
+      // fallback boundary. Cancel it and only continue after it actually
+      // settles; an uncooperative helper must never be overlapped by another
+      // AX probe just to preserve a best-effort confirmation window.
+      if (popupProbe) {
+        const activeProbe = popupProbe;
+        abortPopupProbe();
+        const settled = await waitForPopupProbe(
+          activeProbe,
+          Math.min(
+            ALLOW_CONFIRMATION_PROBE_TIMEOUT_MS,
+            Math.max(0, acquisition.deadline - runtime.now())
+          )
+        );
+        if (!settled || !allowConfirmationNeedsPolling(acquisition)) return;
+      }
+
+      for (let tick = 0; tick < ALLOW_CONFIRMATION_POLL_TICKS; tick += 1) {
+        if (!allowConfirmationNeedsPolling(acquisition)) return;
+        const remainingMs = acquisition.deadline - runtime.now();
+        if (remainingMs <= 0) return;
+
+        // The first probe runs at the fallback boundary. It preserves a manual
+        // Allow transition that became visible in the same event-loop turn;
+        // only the remaining two probes wait for the short bounded interval.
+        if (tick > 0) {
+          const delay = scheduleDelay(Math.min(pollDelayMs, remainingMs));
+          const elapsed = await delay.promise;
+          if (!elapsed || !allowConfirmationNeedsPolling(acquisition)) return;
+        }
+
+        const probe = startPopupProbe(parentSignal);
+        const completed = await waitForPopupProbe(
+          probe,
+          Math.min(
+            ALLOW_CONFIRMATION_PROBE_TIMEOUT_MS,
+            Math.max(0, acquisition.deadline - runtime.now())
+          )
+        );
+        if (!completed) {
+          probe.controller.abort();
+          return;
+        }
+        if (!allowConfirmationNeedsPolling(acquisition)) return;
+      }
+    } finally {
+      popupConfirmationPolling = false;
+    }
+  };
+
   const watchPopup = async (signal) => {
     while (!disposed && !signal?.aborted) {
+      if (popupWatcherRestartRequested) popupWatcherRestartRequested = false;
+      if (!popupWatcherCanProbe()) {
+        const elapsed = await waitForPopupWatcherDelay(config.pollIntervalMs);
+        if (!elapsed && !popupWatcherRestartRequested) break;
+        if (signal?.aborted) break;
+        continue;
+      }
+      if (popupConfirmationPolling) {
+        const elapsed = await waitForPopupWatcherDelay(
+          Math.min(MAX_ALLOW_CONFIRMATION_POLL_INTERVAL_MS, config.pollIntervalMs)
+        );
+        if (!elapsed && !popupWatcherRestartRequested) break;
+        if (signal?.aborted) break;
+        continue;
+      }
       try {
-        await pollPopupOnce(signal);
+        await startPopupProbe(signal).promise;
       } catch {
         if (!disposed) {
           audit(
@@ -1206,8 +1551,10 @@ export function createMac2FACollector(options = {}) {
         }
       }
       if (disposed || signal?.aborted) break;
-      const delay = scheduleDelay(config.pollIntervalMs);
-      if (!(await delay.promise) || signal?.aborted) break;
+      if (popupWatcherRestartRequested) continue;
+      const elapsed = await waitForPopupWatcherDelay(config.pollIntervalMs);
+      if (!elapsed && !popupWatcherRestartRequested) break;
+      if (signal?.aborted) break;
     }
   };
 
@@ -1275,18 +1622,97 @@ export function createMac2FACollector(options = {}) {
     return preparePromise;
   };
 
+  const beginSettingsFallback = (acquisition) => {
+    if (config.settingsOnly) {
+      providerPhase = "settings";
+      return true;
+    }
+    if (
+      disposed ||
+      activeAcquisition !== acquisition ||
+      acquisition.winner.settled ||
+      popupCandidate?.generation === acquisition.generation
+    ) {
+      return false;
+    }
+    if (providerPhase === "settings") return true;
+    if (providerPhase !== "popup") return false;
+
+    // End popup-primary before starting Settings. A helper may ignore Abort,
+    // but its generation/phase checks fence late output and no new AX probe is
+    // allowed once the serial fallback has advanced.
+    abortPopupProbe();
+    providerPhase = "settings";
+    pendingAllowAttempt = null;
+    manualAllowAwaitingConfirmation = false;
+    manualAllowDisappearanceHits = 0;
+    popupConfirmationPolling = false;
+    resetPendingPopupClose();
+    abortPopupReadTasks();
+    abortPopupAccessibilityPrompt();
+    audit({
+      phase: "popup_primary_exhausted",
+      reason: "popup_primary_window_elapsed",
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+    status("settings_fallback", {
+      source: "settings",
+      remainingSec: remainingSeconds(acquisition.deadline),
+    });
+    return true;
+  };
+
+  const settingsPhaseCanContinue = (acquisition) =>
+    !disposed &&
+    activeAcquisition === acquisition &&
+    !acquisition.winner.settled &&
+    providerPhase === "settings";
+
   const startSettingsProvider = async (acquisition) => {
-    if (!config.settingsFallback || settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
-    const now = runtime.now();
     const generationRetryAt =
       acquisition.generation === 2 && lastSettingsCandidateAt != null
         ? Math.max(lastSettingsCandidateAt, acquisition.startedAt) + SETTINGS_RETRY_DELAY_MS
         : 0;
-    const waitMs = Math.max(
-      0,
-      Math.max(preparedAt + config.settingsFallbackAfterMs, generationRetryAt) - now
-    );
-    if (waitMs > 0) {
+    // Re-evaluate the popup deadline after each delay. An Allow confirmation
+    // can arrive while the original popup-primary window is still ticking and
+    // must grant a full post-Allow AX/OCR read window before Settings starts.
+    while (true) {
+      if (disposed || acquisition.winner.settled || activeAcquisition !== acquisition) return;
+      const now = runtime.now();
+      const popupStartedAt = config.settingsOnly ? acquisition.startedAt : popupPrimaryReadyAt;
+      if (!config.settingsOnly && popupStartedAt == null) {
+        const waitMs = Math.min(
+          MAX_ALLOW_CONFIRMATION_POLL_INTERVAL_MS,
+          Math.max(0, acquisition.deadline - now)
+        );
+        if (waitMs <= 0) return;
+        settingsStartDelay = scheduleDelay(waitMs);
+        const elapsed = await settingsStartDelay.promise;
+        settingsStartDelay = null;
+        if (!elapsed) return;
+        continue;
+      }
+      const popupFallbackAt = config.settingsOnly
+        ? acquisition.startedAt
+        : Math.max(
+            popupStartedAt + config.settingsFallbackAfterMs,
+            lastPopupAllowAt == null ? 0 : lastPopupAllowAt + config.popupPostAllowGraceMs
+          );
+      const waitMs = Math.max(0, Math.max(popupFallbackAt, generationRetryAt) - now);
+      if (waitMs <= 0) {
+        const needsAllowConfirmation =
+          !config.settingsOnly &&
+          providerPhase === "popup" &&
+          (pendingAllowAttempt != null || manualAllowAwaitingConfirmation);
+        if (!needsAllowConfirmation || popupFallbackConfirmationGraceUsed) break;
+
+        // A manual Allow can disappear at the same instant the popup-primary
+        // timer expires. Run three short, bounded AX polls before Settings so
+        // a real transition wins, without trusting an unbounded poll setting.
+        popupFallbackConfirmationGraceUsed = true;
+        await runBoundedAllowConfirmationPolls(acquisition);
+        continue;
+      }
       if (generationRetryAt > now) {
         status("settings_retry", {
           attempt: settingsAttempt + 1,
@@ -1298,9 +1724,13 @@ export function createMac2FACollector(options = {}) {
       const elapsed = await settingsStartDelay.promise;
       settingsStartDelay = null;
       if (!elapsed) return;
+      // A popup Allow may have moved the effective fallback deadline forward.
+      // Loop once more instead of allowing a stale timer to launch Settings.
     }
+    if (!beginSettingsFallback(acquisition)) return;
+    if (!config.settingsFallback || settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
     while (settingsAttempt < MAX_SETTINGS_ATTEMPTS) {
-      if (disposed || acquisition.winner.settled) return;
+      if (!settingsPhaseCanContinue(acquisition)) return;
       const remainingMs = acquisition.deadline - runtime.now();
       if (remainingMs <= 0) return;
 
@@ -1423,7 +1853,7 @@ export function createMac2FACollector(options = {}) {
       // cannot authorize that separate helper, so keep the bounded retry race
       // alive instead of waiting on the wrong TCC client.
 
-      if (outcome.kind === "cancelled" || disposed || acquisition.winner.settled) return;
+      if (outcome.kind === "cancelled" || !settingsPhaseCanContinue(acquisition)) return;
       if (settingsAttempt >= MAX_SETTINGS_ATTEMPTS) return;
 
       const retryWaitMs = Math.min(
@@ -1506,8 +1936,35 @@ export function createMac2FACollector(options = {}) {
     }
   };
 
+  const beginManualFallback = (acquisition) => {
+    if (
+      disposed ||
+      activeAcquisition !== acquisition ||
+      acquisition.winner.settled ||
+      providerPhase === "manual"
+    ) {
+      return providerPhase === "manual";
+    }
+    if (providerPhase !== "popup" && providerPhase !== "settings") return false;
+
+    providerPhase = "manual";
+    pendingAllowAttempt = null;
+    manualAllowAwaitingConfirmation = false;
+    manualAllowDisappearanceHits = 0;
+    popupConfirmationPolling = false;
+    resetPendingPopupClose();
+    abortPopupReadTasks();
+    abortPopupAccessibilityPrompt();
+    audit({
+      phase: "manual_fallback_start",
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+    return true;
+  };
+
   const startManualProvider = async (acquisition) => {
     if (!config.manualFallback) return;
+    if (disposed || acquisition.winner.settled || activeAcquisition !== acquisition) return;
     if (!isTTY) {
       if (!manualUnavailableStatusSent) {
         manualUnavailableStatusSent = true;
@@ -1541,6 +1998,7 @@ export function createMac2FACollector(options = {}) {
       if (!elapsed) return;
     }
     if (disposed || acquisition.winner.settled || activeAcquisition !== acquisition) return;
+    if (!beginManualFallback(acquisition)) return;
 
     const timeoutMs = acquisition.deadline - runtime.now();
     if (timeoutMs <= 0) return;
@@ -1609,7 +2067,23 @@ export function createMac2FACollector(options = {}) {
     return trackedCleanup;
   };
 
-  const initializeGeneration = (generation, rejectPrevious) => {
+  const initializeGeneration = (generation, rejectPrevious, startedAt) => {
+    providerPhase = config.settingsOnly ? "settings" : "popup";
+    // The popup-primary window belongs to the web request, not to a helper's
+    // process lifetime. A stale AX probe may ignore Abort, but it is fenced by
+    // generation and must not indefinitely block the serial Settings/manual
+    // fallback chain. New AX probes still remain single-flight until it exits.
+    popupPrimaryReadyAt = startedAt;
+    lastPopupAllowAt = null;
+    manualAllowAwaitingConfirmation = false;
+    manualAllowDisappearanceHits = 0;
+    popupFallbackConfirmationGraceUsed = false;
+    popupConfirmationPolling = false;
+    if (generation === 2) abortPopupProbe();
+    // A configured poll interval can be much longer than popup-primary. Every
+    // new browser code request must wake a sleeping watcher immediately so the
+    // AX/OCR primary path gets its full configured window.
+    requestPopupWatcherRestart();
     if (generation !== 2) return;
     abortPopupCloseTasks();
     abortPopupReadTasks();
@@ -1623,10 +2097,6 @@ export function createMac2FACollector(options = {}) {
     cleanupOnly = false;
     pendingAllowAttempt = null;
     resetPendingPopupClose();
-    if (config.settingsOnly) {
-      settingsAttempt = 0;
-      settingsAccessibilityStatusSent = false;
-    }
   };
 
   const acquireCode = async ({ generation, rejectPrevious }) => {
@@ -1643,7 +2113,7 @@ export function createMac2FACollector(options = {}) {
       sharedAcquisitionStartedAt = startedAt;
       sharedDeadline = sharedAcquisitionStartedAt + config.timeoutMs;
     }
-    initializeGeneration(generation, rejectPrevious);
+    initializeGeneration(generation, rejectPrevious, startedAt);
 
     audit({
       phase: "2fa_acquisition_requested",
@@ -1695,6 +2165,15 @@ export function createMac2FACollector(options = {}) {
       startPopupAccessibilityPrompt(acquisition.deadline);
     }
     if (!config.settingsOnly) {
+      status("popup_primary", {
+        source: "popup",
+        remainingSec: remainingSeconds(acquisition.deadline),
+      });
+      audit({
+        phase: "popup_primary_start",
+        generation,
+        elapsedSincePrepareMs: elapsedSincePrepare(),
+      });
       popupReady.promise.then((candidate) => acquisition.offer(candidate));
       if (popupCandidate?.generation === generation) acquisition.offer(popupCandidate);
     }
@@ -1711,7 +2190,11 @@ export function createMac2FACollector(options = {}) {
         elapsedSincePrepareMs: elapsedSincePrepare(),
       });
     });
-    void startManualProvider(acquisition);
+    void settingsProviderPromise
+      .then(() => startManualProvider(acquisition))
+      .catch(() => {
+        /* Manual fallback failures are intentionally kept out of provider diagnostics. */
+      });
 
     let candidate = null;
     try {
@@ -1737,10 +2220,11 @@ export function createMac2FACollector(options = {}) {
         source: candidate.source,
         remainingSec: remainingSeconds(acquisition.deadline),
       });
-      // A native Settings helper can still cover Firefox after a popup reader
-      // wins.  Its cancellation is bounded (cancel grace plus force-stop
-      // grace), so settle it before returning a code to the ruyiPage caller.
-      await winnerCleanup;
+      // Popup is the primary web-login source. Its verified code must reach
+      // ruyiPage immediately; native popup-close and any cancelled fallback
+      // cleanup remain best-effort background work.
+      if (candidate.source !== "popup") await winnerCleanup;
+      else void winnerCleanup;
       lastReturnedCode = candidate.code;
       return candidate.code;
     } finally {
@@ -1767,9 +2251,11 @@ export function createMac2FACollector(options = {}) {
   const dispose = () => {
     if (disposePromise) return disposePromise;
     disposed = true;
+    const popupProbeAtDispose = popupProbe?.nativeProbeStarted ? popupProbe : null;
     abortPopupAccessibilityPrompt();
     abortPopupCloseTasks();
     abortPopupReadTasks();
+    abortPopupProbe();
     popupWatcherController?.abort();
     manualAbortController?.abort();
     activeAcquisition?.winner.reject(new Error("2FA collector was disposed"));
@@ -1794,26 +2280,62 @@ export function createMac2FACollector(options = {}) {
           /* fixed audit state already recorded */
         }
       }
-      if (popupWatcherPromise) await popupWatcherPromise;
-      if (prepared && runtime.platform === "darwin" && !config.settingsOnly) {
-        try {
-          const state = await runtime.probe2FAState(2);
-          if (state?.action === "has_code_dialog") {
-            const result = await runtime.runPopupPhase("dismiss_stale", 2, {
-              compileIfNeeded: false,
-            });
-            audit({
-              phase: "popup_dispose_cleanup",
-              action: result?.action ?? "none",
-              elapsedSincePrepareMs: elapsedSincePrepare(),
-            });
-          }
-        } catch {
+      const popupDisposeGraceMs = Math.min(
+        POPUP_WATCHER_DISPOSE_GRACE_MS,
+        Math.max(0, config.cleanupGraceMs)
+      );
+      let popupProbeSettled = true;
+      if (popupProbeAtDispose) {
+        const probeOutcome = await awaitWithin(popupProbeAtDispose.promise, popupDisposeGraceMs);
+        popupProbeSettled =
+          probeOutcome.kind === "fulfilled" || probeOutcome.kind === "rejected";
+        if (!popupProbeSettled) {
+          audit({
+            phase: "popup_dispose_cleanup_failed",
+            reason: "watcher_shutdown_timeout",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+        }
+      }
+      if (popupProbeSettled && prepared && runtime.platform === "darwin" && !config.settingsOnly) {
+        const cleanupController = new AbortController();
+        const probeOutcome = await awaitWithin(
+          Promise.resolve().then(() =>
+            runtime.probe2FAState(2, { signal: cleanupController.signal })
+          ),
+          popupDisposeGraceMs
+        );
+        if (probeOutcome.kind !== "fulfilled") {
+          cleanupController.abort();
           audit({
             phase: "popup_dispose_cleanup_failed",
             reason: "dispose_probe_or_cleanup_failed",
             elapsedSincePrepareMs: elapsedSincePrepare(),
           });
+        } else if (probeOutcome.value?.action === "has_code_dialog") {
+          const cleanupOutcome = await awaitWithin(
+            Promise.resolve().then(() =>
+              runtime.runPopupPhase("dismiss_stale", 2, {
+                signal: cleanupController.signal,
+                compileIfNeeded: false,
+              })
+            ),
+            popupDisposeGraceMs
+          );
+          if (cleanupOutcome.kind !== "fulfilled") {
+            cleanupController.abort();
+            audit({
+              phase: "popup_dispose_cleanup_failed",
+              reason: "dispose_probe_or_cleanup_failed",
+              elapsedSincePrepareMs: elapsedSincePrepare(),
+            });
+          } else {
+            audit({
+              phase: "popup_dispose_cleanup",
+              action: cleanupOutcome.value?.action ?? "none",
+              elapsedSincePrepareMs: elapsedSincePrepare(),
+            });
+          }
         }
       }
       cancelAllDelays();

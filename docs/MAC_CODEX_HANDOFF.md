@@ -91,39 +91,50 @@ second browser library, or coordinate clicking.
 The formal 2FA collector is `scripts/lib/two-fa-sidecar.js`, created by
 `scripts/lib/account-browser-flow.js` through `createMac2FACollector(...)`.
 
-The default is **not** Settings-only. Keep the current race:
+The default is **not** Settings-only. Keep the strict serial fallback:
 
-1. The popup watcher attempts trusted Accessibility (AX) reading of the Apple
-   verification popup.
+1. A real acquisition begins only when ruyiPage emits `need_2fa`. The popup
+   watcher gets a 30-second primary window to read the trusted Apple
+   verification popup through Accessibility (AX).
 2. If AX cannot produce a valid code, the same verified Apple window may use
-   Vision OCR as a read-only fallback. OCR never clicks the screen.
-3. A real acquisition begins only when ruyiPage emits `need_2fa`. System
-   Settings joins no earlier than `max(preparedAt + 8 seconds, acquisition
-   start)` as a parallel fallback. It can try twice, up to 60 seconds per
-   try, with a five-second backoff.
-4. At 90 seconds from the first acquisition, a real TTY may offer hidden
-   manual code input.
-5. The first validated six-digit code wins. Losing providers are cancelled and
-   their helpers/popups are cleaned up with bounded timeouts.
+   Vision OCR as a read-only fallback. OCR never clicks the screen. A confirmed
+   Allow action gives popup AX/OCR a further 30 seconds before Settings may run.
+3. Only after the popup-primary window ends without a valid fresh code may
+   System Settings start. It can try at most twice, up to 60 seconds per try,
+   with a five-second backoff. Once Settings has started, a late popup candidate
+   cannot win that acquisition.
+4. Only after the bounded Settings attempts finish may a real TTY offer hidden
+   manual code input, and never before 90 seconds from the first acquisition.
+5. A validated six-digit code from the current serial stage is sent immediately
+   to ruyiPage. Later stages are not started; native helper and popup cleanup is
+   bounded background work and must not hold up webpage input.
 6. The shared acquisition deadline is 240 seconds from the first acquisition.
-   In the default multi-source mode, the two-attempt Settings budget is shared
-   by the whole collector and is not reset for generation 2. A second OTP
-   generation is requested only when the Apple page explicitly reports an
-   invalid, expired, or rejected first code. Captcha, lockout, or unknown login
-   errors stop the flow instead of endlessly retrying.
+   The two-attempt Settings budget is shared by the whole collector and is not
+   reset for generation 2. A second OTP generation is requested only when the
+   Apple page explicitly reports an invalid, expired, or rejected first code;
+   it restarts at popup-primary. Captcha, lockout, or unknown login errors stop
+   the flow instead of endlessly retrying.
 
 Relevant defaults:
 
 ```text
-BROWSER_2FA_SETTINGS_AFTER_MS=8000
+BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
+# BROWSER_2FA_DEBUG_SHOW_CODE=1  # optional; disabled unless explicitly set
 ```
 
-Do not switch `settingsOnly` on or disable popup/OCR/manual sources merely to
-work around one failed test. The user's current requirement is: use whichever
-source obtains a real, valid code first.
+Do not switch `settingsOnly` on, reintroduce a provider race, or disable
+popup/OCR/manual sources merely to work around one failed test. The user's
+current requirement is: popup first, then Settings only after popup-primary
+expires, then manual input only after Settings ends.
+
+Normal terminal output never prints OTP. Only an explicit
+`BROWSER_2FA_DEBUG_SHOW_CODE=1` may show the six digits only in a real local
+TTY outside supervised sessions for direct verification; redirected and
+supervised output must stay redacted. OTP must never be written to audit JSONL,
+reports, screenshots, error text, or evidence handed back to Windows.
 
 ### Native helper map
 
@@ -309,10 +320,10 @@ This is a manual-feedback phase. Do not start a real Apple Account flow,
 supervised GUI flow, browser, Settings, or automatic test. Do not read .env or
 output credentials, OTP, raw AX/OCR, screenshots, URLs, or auth-page text.
 
-Browser actions in this project must remain ruyiPage-only. Keep the existing
-multi-source 2FA race: popup AX/OCR, System Settings fallback, and optional
-hidden manual fallback; use whichever valid source wins first. Do not switch
-to Settings-only.
+Browser actions in this project must remain ruyiPage-only. Keep strict serial
+2FA fallback: popup AX/OCR first, System Settings only after the popup-primary
+window expires, then optional hidden manual entry only after Settings ends. Do
+not switch to Settings-only or reintroduce a provider race.
 
 Wait for my sanitized logs or properly redacted visual evidence. Once I
 provide evidence, identify the smallest owning module and give a targeted
