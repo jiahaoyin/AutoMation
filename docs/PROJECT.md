@@ -85,7 +85,8 @@ TTY 且手输未被明确禁用，才隐藏读取手输验证码。手输默认�
 - `BROWSER_2FA_SETTINGS_FALLBACK=1`：默认启用系统设置来源；设为 `0` 才禁用。
 - `BROWSER_2FA_MANUAL_FALLBACK=1`：显式启用隐藏终端手输；该来源默认启用，只有设为 `0` 才禁用，非 TTY 时始终不可用。它只在 Settings 有界尝试结束后、且不早于第一次 `getCode` acquisition 90 秒启用。
 - `BROWSER_2FA_POLL_MS=800`：FollowUpUI 状态轮询间隔。
-- `BROWSER_2FA_DEBUG_SHOW_CODE=1`：默认关闭；仅在真实 TTY、非受监督会话中把已校验六码显示到当前本地终端，便于人工核验。重定向和受监督会话一律不显示。无论是否启用，OTP 都不得写入 audit、报告、截图或错误文本。
+- `BROWSER_PRESERVE_ON_FAILURE=1`：直接运行 `./run.sh` 时失败后默认保留 Firefox，便于核对当前 Apple 页面；设置为 `0` 才关闭。受监督 broker 会话仍严格清理。
+- OTP 不会输出到终端、audit、报告、截图或错误文本；使用固定状态与交接阶段排查取码和填码问题。
 
 权限分层：
 
@@ -150,8 +151,8 @@ npm run test:account-browser-flow
 且只有可信 Apple 页明确英/简中/繁中 OTP 拒绝才进入第二代；第一代全局拒绝，
 第二代回到 popup 主阶段并共享期限与 Settings 预算，captcha、锁定和未知错误停止。
 固定 `onStatus` 阶段提示、Settings 结束后的 manual/240 秒期限以及 runner deadline
-cleanup 也已接入。OTP 默认不打印；仅显式设置 `BROWSER_2FA_DEBUG_SHOW_CODE=1` 且当前为
-真实 TTY、非受监督会话才可显示到当前本地终端，且绝不得写入 audit、报告、截图或错误文本。
+cleanup 也已接入。OTP 不会显示在终端，且绝不写入 audit、报告、截图或错误文本；通过固定
+交接阶段排查取码、投递、输入、提交和登录状态确认问题。
 
 Windows 发布门槛包括 Python 126 项、ruyipage flow/protocol、sidecar、
 account-browser-flow、Allow 61 项、permissions、release 和 mac-codex contract；每个待发布

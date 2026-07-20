@@ -31,7 +31,6 @@ function createRuntime(runBackend, options = {}) {
   let collectorOptions = null;
   let collectorCount = 0;
   const runtime = {
-    stdout: options.stdout,
     getBrowserEnvironmentSummary() {
       return {
         backend: "ruyipage",
@@ -173,80 +172,6 @@ async function runTwoGenerationForwardingTest() {
   assert.deepEqual(harness.codeRequests, requests);
 }
 
-async function runExplicitLocalDebugCodeDisplayTest() {
-  const previous = process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
-  const auditEntries = [];
-  const secrets = [];
-  const flowAudit = {
-    write(source, event, details = {}) {
-      auditEntries.push({ source, event, details });
-    },
-    addSecrets(values) {
-      secrets.push(...values);
-    },
-  };
-  try {
-    process.env.BROWSER_2FA_DEBUG_SHOW_CODE = "1";
-    const debugOutput = {
-      isTTY: true,
-      writes: [],
-      write(value) {
-        this.writes.push(String(value));
-      },
-    };
-    const harness = createRuntime(async (options) => {
-      assert.equal(await options.get2FACode({ generation: 2, rejectPrevious: true }), "654321");
-      return successfulResult();
-    }, { stdout: debugOutput });
-    const logs = await captureConsole("log", () =>
-      runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
-    );
-    assert.equal(logs.some((line) => line.includes("654321")), false);
-    assert.deepEqual(debugOutput.writes, ["[2FA] 调试验证码（仅本次终端显示，不写入报告）: 654321\n"]);
-    assert.deepEqual(secrets, ["654321"]);
-    assert.equal(JSON.stringify(auditEntries).includes("654321"), false);
-  } finally {
-    if (previous === undefined) delete process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
-    else process.env.BROWSER_2FA_DEBUG_SHOW_CODE = previous;
-  }
-}
-
-async function runDebugCodeNeverWritesToNonTtyOrSupervisedOutputTest() {
-  const previousDebug = process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
-  const previousSupervised = process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
-  const createOutput = (isTTY) => ({
-    isTTY,
-    writes: [],
-    write(value) {
-      this.writes.push(String(value));
-    },
-  });
-  try {
-    process.env.BROWSER_2FA_DEBUG_SHOW_CODE = "1";
-    for (const supervised of [false, true]) {
-      if (supervised) process.env.APPLE_AUTOMATION_SUPERVISED_GUI = "1";
-      else delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
-      for (const isTTY of [false, true]) {
-        const output = createOutput(isTTY);
-        const harness = createRuntime(async (options) => {
-          await options.get2FACode({ generation: 1, rejectPrevious: false });
-          return successfulResult();
-        }, { stdout: output });
-        await runAccountBrowserPhase(params, harness.runtime);
-        assert.deepEqual(
-          output.writes.filter((value) => value.includes("123456")),
-          supervised || !isTTY ? [] : ["[2FA] 调试验证码（仅本次终端显示，不写入报告）: 123456\n"]
-        );
-      }
-    }
-  } finally {
-    if (previousDebug === undefined) delete process.env.BROWSER_2FA_DEBUG_SHOW_CODE;
-    else process.env.BROWSER_2FA_DEBUG_SHOW_CODE = previousDebug;
-    if (previousSupervised === undefined) delete process.env.APPLE_AUTOMATION_SUPERVISED_GUI;
-    else process.env.APPLE_AUTOMATION_SUPERVISED_GUI = previousSupervised;
-  }
-}
-
 async function runBrowserFallbackEnvironmentSwitchesTest() {
   const previousSettings = process.env.BROWSER_2FA_SETTINGS_FALLBACK;
   const previousManual = process.env.BROWSER_2FA_MANUAL_FALLBACK;
@@ -293,12 +218,29 @@ async function runFlowAuditForwardingTest() {
       route: "owner",
     });
     await options.onEvent?.({
+      event: "status",
+      status: "browser_stage",
+      stage: "twofa_input",
+    });
+    await options.onEvent?.({
+      event: "runner_status",
+      status: "twofa_code_delivery_sent",
+      generation: 1,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "twofa_progress",
+      phase: "target_resolved",
+      generation: 1,
+      targetCount: 6,
+    });
+    await options.onEvent?.({
       event: "diagnostic",
       kind: "python_exception",
       failureStage: "password_input",
       errorType: "RuntimeError",
-      message: "synthetic failure",
-      traceback: "Traceback (most recent call last)",
+      errorClass: "twofa_target_missing",
+      hasTraceback: true,
     });
     await options.prepare2FA();
     await options.get2FACode({ generation: 1, rejectPrevious: false });
@@ -327,13 +269,43 @@ async function runFlowAuditForwardingTest() {
         entry.details.failureStage === "password_input" &&
         entry.details.errorType === "backend_diagnostic" &&
         entry.details.diagnosticErrorType === "runtimeerror" &&
-        entry.details.diagnosticMessageClass === "backend_exception" &&
-        entry.details.hasDiagnosticMessage === true &&
+        entry.details.diagnosticErrorClass === "twofa_target_missing" &&
+        entry.details.diagnosticMessageClass === "unknown" &&
+        entry.details.hasDiagnosticMessage === false &&
         entry.details.hasTraceback === true &&
         !("message" in entry.details) &&
         !("traceback" in entry.details) &&
         !("diagnosticMessage" in entry.details) &&
         !("diagnosticTraceback" in entry.details)
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "browser_stage" &&
+        entry.details.stage === "twofa_input"
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "runner_status" &&
+        entry.details.status === "twofa_code_delivery_sent" &&
+        entry.details.generation === 1
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "twofa_progress" &&
+        entry.details.phase === "target_resolved" &&
+        entry.details.generation === 1 &&
+        entry.details.targetCount === 6
     )
   );
   assert.ok(
@@ -348,6 +320,84 @@ async function runFlowAuditForwardingTest() {
         entry.hasError === true
     )
   );
+}
+
+async function runTwoFactorHandoffFailureContextTest() {
+  const entries = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, error, details = {}) {
+      entries.push({ source, event, details, hasError: Boolean(error) });
+    },
+    addSecrets() {},
+  };
+  const backendError = new Error("synthetic runner failure");
+  Object.defineProperties(backendError, {
+    ruyiPageFailureCode: { value: "twofa_handoff" },
+    ruyiPageFailureStage: { value: "twofa_input" },
+    ruyiPageFailureContext: {
+      value: {
+        stage: "twofa_input",
+        twoFaPhase: "target_waiting",
+        generation: 1,
+        codeDeliveryAttempted: true,
+        codeDeliverySent: true,
+        codeDeliveryAcknowledged: true,
+        browserPreserved: true,
+        browserErrorClass: "twofa_target_missing",
+        cleanupFailed: false,
+      },
+    },
+  });
+  const harness = createRuntime(async (options) => {
+    await options.onEvent?.({
+      event: "status",
+      status: "browser_stage",
+      stage: "twofa_input",
+    });
+    await options.onEvent?.({
+      event: "runner_status",
+      status: "twofa_code_delivery_sent",
+      generation: 1,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "twofa_progress",
+      phase: "handoff_failed",
+      generation: 1,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "browser_preserved",
+      failureStage: "twofa_input",
+    });
+    throw backendError;
+  });
+
+  await assert.rejects(
+    runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime),
+    (error) =>
+      readBrowserFailureCode(error) === "twofa_handoff" &&
+      readBrowserFailureStage(error) === "twofa_input"
+  );
+  const failure = entries.find(
+    (entry) => entry.source === "account_browser" && entry.event === "runner_failed"
+  );
+  assert.deepEqual(failure?.details, {
+    failureCode: "twofa_handoff",
+    failureStage: "twofa_input",
+    runnerStage: "twofa_input",
+    twoFaPhase: "target_waiting",
+    twoFaGeneration: 1,
+    codeDeliveryAttempted: true,
+    codeDeliverySent: true,
+    codeDeliveryAcknowledged: true,
+    browserPreserved: true,
+    browserErrorClass: "twofa_target_missing",
+    cleanupFailed: false,
+  });
 }
 
 async function runPasswordBidiInputProgressTest() {
@@ -626,15 +676,15 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 正在尝试通过系统设置获取验证码（第 2/2 次）...",
     "[2FA] 系统设置取码失败，5 秒后进行第 2/2 次尝试...",
     "[2FA] 系统设置取码需要辅助功能权限，正在等待授权；请按 macOS 提示完成勾选。",
-    "[2FA] 系统设置取码未成功；其他可用取码路径仍会继续。",
+    "[2FA] 系统设置取码未成功；将按串行顺序评估最终兜底。",
     "[2FA] 自动点击「允许」未成功，请在 Mac 上手动点击「允许」；取码仍在继续。",
     "[2FA] 自动取码仍未完成，请在终端隐藏输入 Mac 上显示的 6 位验证码。",
-    "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
+    "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；当前串行自动取码阶段将继续完成。",
     "[2FA] 已从 Apple 验证码弹窗取得验证码。",
     "[2FA] 已从系统设置取得验证码。",
     "[2FA] 已使用终端手动输入的验证码。",
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
-    "[2FA] 原生验证码弹窗未获辅助功能授权；将尝试已授权的屏幕录制 OCR，系统设置与终端手输仍在继续。",
+    "[2FA] 原生验证码弹窗未获辅助功能授权；将先尝试已授权的屏幕录制 OCR，无有效码才按顺序回退。",
     "[2FA] 网页已确认需要验证码，正在持续扫描受限 Apple 原生窗口。",
     "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
@@ -667,7 +717,7 @@ async function runSupervisedManualUnavailableStatusTest() {
     );
     assert.deepEqual(logs.filter((line) => line.startsWith("[2FA]")), [
       "[2FA] status:manual_unavailable",
-      "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；自动取码仍在继续。",
+        "[2FA] 当前会话没有可用交互终端，无法安全地隐藏输入验证码；当前串行自动取码阶段将继续完成。",
     ]);
     assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
   } finally {
@@ -1137,6 +1187,7 @@ const focusedTests = {
   "popup-primary": runProductionPopupPrimaryConfigurationTest,
   generations: runTwoGenerationForwardingTest,
   "flow-audit-forwarding": runFlowAuditForwardingTest,
+  "twofa-handoff-failure": runTwoFactorHandoffFailureContextTest,
   "password-bidi-progress": runPasswordBidiInputProgressTest,
   "prepared-accessibility": runPreparedAccessibilityCheckDoesNotBlockBrowserTest,
   "status-prompts": runFixedTwoFactorStatusPromptsTest,
@@ -1161,10 +1212,9 @@ if (focusedTest) {
 await runTwoFactorLifecycleTest();
 await runProductionPopupPrimaryConfigurationTest();
 await runTwoGenerationForwardingTest();
-await runExplicitLocalDebugCodeDisplayTest();
-await runDebugCodeNeverWritesToNonTtyOrSupervisedOutputTest();
 await runBrowserFallbackEnvironmentSwitchesTest();
 await runFlowAuditForwardingTest();
+await runTwoFactorHandoffFailureContextTest();
 await runPasswordBidiInputProgressTest();
 await runCollectorTimeoutIsAlways240SecondsTest();
 await runPreparedAccessibilityCheckDoesNotBlockBrowserTest();

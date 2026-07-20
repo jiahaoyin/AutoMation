@@ -122,7 +122,7 @@ BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
-# BROWSER_2FA_DEBUG_SHOW_CODE=1  # optional; disabled unless explicitly set
+BROWSER_PRESERVE_ON_FAILURE=1
 ```
 
 Do not switch `settingsOnly` on, reintroduce a provider race, or disable
@@ -130,10 +130,7 @@ popup/OCR/manual sources merely to work around one failed test. The user's
 current requirement is: popup first, then Settings only after popup-primary
 expires, then manual input only after Settings ends.
 
-Normal terminal output never prints OTP. Only an explicit
-`BROWSER_2FA_DEBUG_SHOW_CODE=1` may show the six digits only in a real local
-TTY outside supervised sessions for direct verification; redirected and
-supervised output must stay redacted. OTP must never be written to audit JSONL,
+Terminal output never prints OTP. It must never be written to audit JSONL,
 reports, screenshots, error text, or evidence handed back to Windows.
 
 ### Native helper map

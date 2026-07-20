@@ -360,10 +360,9 @@ function createHarness(options = {}) {
   );
   let collector;
   try {
-    collector = createMac2FACollector({
+    const collectorOptions = {
       reportDir,
       timeoutMs: options.timeoutMs ?? 30_000,
-      settingsFallbackAfterMs: options.settingsFallbackAfterMs ?? 8_000,
       popupPostAllowGraceMs: options.popupPostAllowGraceMs,
       settingsFallback: options.settingsFallback,
       settingsOnly: options.settingsOnly,
@@ -387,7 +386,13 @@ function createHarness(options = {}) {
         options.onStatus?.(status);
       },
       runtime: native.runtime,
-    });
+    };
+    if (Object.hasOwn(options, "settingsFallbackAfterMs")) {
+      collectorOptions.settingsFallbackAfterMs = options.settingsFallbackAfterMs;
+    } else {
+      collectorOptions.settingsFallbackAfterMs = 8_000;
+    }
+    collector = createMac2FACollector(collectorOptions);
   } catch (error) {
     cleanupHarnessReportDir(reportDir);
     throw error;
@@ -1795,6 +1800,36 @@ async function lateNeedStartsSettingsImmediatelyTest() {
   await clock.flush();
   assert.equal(await codePromise, "654321");
   await collector.dispose();
+}
+
+async function environmentCannotShortenPopupPrimaryWindowTest() {
+  const previous = process.env.BROWSER_2FA_SETTINGS_AFTER_MS;
+  try {
+    process.env.BROWSER_2FA_SETTINGS_AFTER_MS = "0";
+    const { clock, native, collector } = createHarness({
+      timeoutMs: 240_000,
+      settingsFallbackAfterMs: undefined,
+      manualFallback: false,
+    });
+    await collector.prepare();
+    const codePromise = collector.getCode({ generation: 1 });
+
+    await clock.advance(29_999);
+    assert.equal(
+      native.stats.settingsStarts,
+      0,
+      "environment overrides must not race the 30-second popup-primary window"
+    );
+    await clock.advance(1);
+    assert.equal(native.stats.settingsStarts, 1);
+    native.settingsRequests[0].resolve({ code: "654321", raw: "654 321", screenshot: null });
+    await clock.flush();
+    assert.equal(await codePromise, "654321");
+    await collector.dispose();
+  } finally {
+    if (previous === undefined) delete process.env.BROWSER_2FA_SETTINGS_AFTER_MS;
+    else process.env.BROWSER_2FA_SETTINGS_AFTER_MS = previous;
+  }
 }
 
 async function popupAppearingAfterPreparationIsRetainedUntilNeed2FATest() {
@@ -3679,6 +3714,7 @@ const focusedTests = {
   "timeout-late-popup": latePopupReaderAtDeadlineCannotWinTest,
   "winner-status": winnerUsesStatusWithoutDynamicConsoleTest,
   "late-need": lateNeedStartsSettingsImmediatelyTest,
+  "popup-primary-env-floor": environmentCannotShortenPopupPrimaryWindowTest,
   "popup-close-pending": popupCodeWinsAfterAllDialogCleanupPathsFailTest,
   "popup-close-grace": popupDeliveryGraceNeverExceedsConfiguredMaximumTest,
   "generation-cleanup": generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest,
@@ -3755,7 +3791,8 @@ if (focusedTest) {
   await sharedDeadlineEmitsTimeoutBeforeRejectingTest();
   await latePopupReaderAtDeadlineCannotWinTest();
   await winnerUsesStatusWithoutDynamicConsoleTest();
-  await lateNeedStartsSettingsImmediatelyTest();
+await lateNeedStartsSettingsImmediatelyTest();
+await environmentCannotShortenPopupPrimaryWindowTest();
   await popupAppearingAfterPreparationIsRetainedUntilNeed2FATest();
   await confirmedAllowExtendsPopupPrimaryWindowTest();
   await manualAllowExtendsPopupPrimaryWindowTest();

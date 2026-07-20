@@ -1650,7 +1650,10 @@ class BrowserFlowTests(unittest.TestCase):
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
-            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+            },
             clear=False,
         ), patch(
             "apple_account_flow.import_ruyipage",
@@ -1740,7 +1743,10 @@ class BrowserFlowTests(unittest.TestCase):
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
-            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+            },
             clear=False,
         ), patch(
             "apple_account_flow.import_ruyipage",
@@ -1896,6 +1902,29 @@ class BrowserFlowTests(unittest.TestCase):
                 "elapsedMs": 0,
             },
         )
+        twofa_progress = [
+            call.args[0]
+            for call in emit_event.call_args_list
+            if call.args[0].get("event") == "status"
+            and call.args[0].get("status") == "twofa_progress"
+        ]
+        self.assertEqual(
+            [event["phase"] for event in twofa_progress],
+            [
+                "code_received",
+                "target_waiting",
+                "target_resolved",
+                "input_started",
+                "input_completed",
+                "submit_started",
+                "submit_sent",
+                "transition_waiting",
+                "transition_confirmed",
+            ],
+        )
+        self.assertTrue(all(event["generation"] == 1 for event in twofa_progress))
+        self.assertEqual(twofa_progress[2]["targetCount"], 1)
+        self.assertIs(twofa_progress[6]["submitted"], False)
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
@@ -2590,7 +2619,11 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
-            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+                "BROWSER_PRESERVE_ON_FAILURE": "0",
+            },
             clear=False,
         ), patch(
             "apple_account_flow.import_ruyipage",
@@ -2608,6 +2641,52 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             events,
         )
         self.assertNotIn(secret, json.dumps(events))
+
+    def test_direct_failure_preserves_firefox_for_manual_inspection(self):
+        class FakeFirefoxOptions:
+            def __init__(self):
+                self.close_on_exit_values = []
+
+            def close_on_exit(self, value):
+                self.close_on_exit_values.append(value)
+
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        class FailingPage:
+            def __init__(self):
+                self.quit_calls = 0
+
+            def get(self, _url):
+                raise RuntimeError("navigation failed")
+
+            def quit(self):
+                self.quit_calls += 1
+
+        options = FakeFirefoxOptions()
+        page = FailingPage()
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {"APPLE_ID": "person@example.com", "APPLE_PASSWORD": "secret"},
+            clear=True,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(lambda: options, lambda _opts: page, FakeKeys),
+        ), patch("apple_account_flow.emit") as emit_event:
+            with self.assertRaisesRegex(RuntimeError, "navigation failed"):
+                browser_flow(args)
+
+        self.assertEqual(options.close_on_exit_values, [False])
+        self.assertEqual(page.quit_calls, 0)
+        self.assertIn(
+            {
+                "event": "status",
+                "status": "browser_preserved",
+                "failureStage": "login_navigation",
+            },
+            [call.args[0] for call in emit_event.call_args_list],
+        )
 
     def test_authentication_failure_does_not_persist_a_failure_screenshot(self):
         order = []
@@ -2689,7 +2768,10 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         self.assertEqual(events[0]["event"], "diagnostic")
         self.assertEqual(events[0]["kind"], "python_exception")
         self.assertEqual(events[0]["errorType"], "RuntimeError")
-        self.assertIn("RuntimeError", events[0]["traceback"])
+        self.assertEqual(events[0]["errorClass"], "browser_exception")
+        self.assertIs(events[0]["hasTraceback"], True)
+        self.assertNotIn("message", events[0])
+        self.assertNotIn("traceback", events[0])
         self.assertNotIn(self.SECRET_SENTINEL, json.dumps(events[0]))
         self.assertNotIn("123 456", json.dumps(events[0]))
         self.assertNotIn("user:pw@", json.dumps(events[0]))
@@ -3762,7 +3844,7 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertEqual(frame.actions.calls, [])
         self.assertEqual(page.actions.calls, [])
 
-    def test_six_digit_empty_element_bidi_switches_once_to_verified_owner_sequence(self):
+    def test_six_digit_empty_element_bidi_keeps_trusted_direct_inputs(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3785,34 +3867,34 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[(True, ""), *[(True, digit) for digit in "123456"]],
+            side_effect=[(True, "")] * 6,
         ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
         self.assertEqual(
             [field.inputs for field in fields],
-            [[("1", True)], [], [], [], [], []],
+            [[(digit, True)] for digit in "123456"],
         )
         self.assertEqual([field.value for field in fields], list("123456"))
         self.assertEqual(
             len([call for call in frame_actions.calls if call[0] == "human_click"]),
-            1,
+            0,
         )
         self.assertEqual(
             [call[1] for call in frame_actions.calls if call[0] == "type"],
-            ["123456"],
+            [],
         )
-        self.assertIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
-        self.assertIn(("press", FakeKeys.DELETE), frame_actions.calls)
+        self.assertNotIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
+        self.assertNotIn(("press", FakeKeys.DELETE), frame_actions.calls)
         self.assertEqual(page.actions.calls, [])
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertEqual(steps.count("element_bidi_unverified"), 1)
-        self.assertIn("sequence_focus_started", steps)
-        self.assertIn("sequence_cleared", steps)
-        self.assertIn("sequence_verified", steps)
+        self.assertEqual(steps.count("element_bidi_limited_continue"), 7)
+        self.assertNotIn("sequence_focus_started", steps)
+        self.assertNotIn("sequence_cleared", steps)
+        self.assertNotIn("sequence_verified", steps)
         self.assertNotIn("sequence_failed", steps)
 
-    def test_six_digit_owner_sequence_rejects_empty_readback(self):
+    def test_six_digit_limited_readback_never_replays_the_full_code(self):
         fields = [
             FakeElement(
                 attrs={"maxlength": "1"},
@@ -3835,21 +3917,23 @@ class SecurityCodeTests(unittest.TestCase):
 
         with patch(
             "apple_account_flow.read_element_input_value",
-            side_effect=[(True, "")] * 7,
-        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
-            RuntimeError,
-            "2FA code sequence verification failed",
-        ):
+            side_effect=[(True, "")] * 6,
+        ), patch("apple_account_flow.emit") as emit_event:
             fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
 
-        self.assertEqual([field.inputs for field in fields], [[("1", True)], [], [], [], [], []])
+        self.assertEqual(
+            [field.inputs for field in fields],
+            [[(digit, True)] for digit in "123456"],
+        )
         self.assertEqual(
             [call[1] for call in frame_actions.calls if call[0] == "type"],
-            ["123456"],
+            [],
         )
         steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
-        self.assertIn("sequence_failed", steps)
+        self.assertIn("element_bidi_limited_continue", steps)
+        self.assertNotIn("sequence_focus_started", steps)
         self.assertNotIn("sequence_verified", steps)
+        self.assertNotIn("sequence_failed", steps)
 
     def test_six_digit_mismatched_element_bidi_switches_once_to_owner_sequence(self):
         fields = [

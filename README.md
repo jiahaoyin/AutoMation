@@ -103,7 +103,8 @@ BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
-# BROWSER_2FA_DEBUG_SHOW_CODE=1  # 榛樿鍏抽棴锛涗粎鐪熷疄 TTY銆侀潪鍙楃洃鐫ｆ湰鍦扮粓绔樉绀?OTP
+BROWSER_PRESERVE_ON_FAILURE=1  # direct runs keep Firefox open after a failure; set 0 to close it
+# OTP is never printed.
 ```
 
 ## 2FA 鑾峰彇涓庢仮澶嶉『搴?
@@ -133,9 +134,8 @@ popup 璇诲埌骞舵牎楠屽叚浣嶉獙璇佺爜鍚庝細绔嬪嵆浜ょ粰�
 
 sidecar `onStatus` 宸叉帴鍏ュ灞傜粓绔紝鍙樉绀哄浐瀹氶樁娈垫彁绀猴紝鍖呮嫭 popup 涓婚樁娈点€丼ettings
 绗?1/2 娆°€? 绉掗噸璇曘€佹墜鍔?Allow銆侀殣钘忔墜杈撱€丱CR 鏉冮檺缂哄け銆佽幏鑳滄潵婧愬拰 240 绉掕秴鏃躲€?
-榛樿涓嶆墦鍗?OTP銆備粎鏄惧紡璁剧疆 `BROWSER_2FA_DEBUG_SHOW_CODE=1`锛屼笖褰撳墠杈撳嚭鏄湡瀹?TTY銆?
-闈炲彈鐩戠潱浼氳瘽鏃讹紝鎵嶄細鎶婂叚鐮佹樉绀哄埌褰撳墠鏈湴缁堢锛涢噸瀹氬悜鎴栧彈鐩戠潱杩愯涓€寰嬩笉鏄剧ず銆傚疄鐜扮粷涓嶅緱
-鎶?OTP 鍐欏叆 `2fa-audit.jsonl`銆乣report.json`銆佹埅鍥炬垨閿欒鏂囨湰銆?
+OTP is never printed to the terminal or written to `2fa-audit.jsonl`,
+`report.json`, screenshots, or error text. Use fixed handoff states instead.
 姝ｅ父鐘舵€佷笉浼氭彃鍏ュ師濮?AX/OCR/stderr 鎴栧畬鏁?Apple ID銆備富鎺?fresh Windows 楠岃瘉宸查€氳繃 Python
 126/126銆乺uyipage flow銆乸rotocol銆乻idecar銆乤ccount-browser-flow銆丄llow 61/61銆?
 permissions 鍜?release锛屽洓璺渶缁堜笓椤瑰瀹″潎涓?PASS銆傝璇佹嵁瑕嗙洊閫昏緫涓?source-contract锛屼笉浠ｈ〃 Swift 缂栬瘧銆?

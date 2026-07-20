@@ -17,7 +17,6 @@ import re
 import signal
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Callable, TextIO
 from urllib.parse import urljoin, urlsplit
@@ -125,9 +124,25 @@ diagnostic_secrets: list[str] = []
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
+BROWSER_PRESERVE_ON_FAILURE_ENV = "BROWSER_PRESERVE_ON_FAILURE"
 BROKER_APPLE_ID_MAX_LENGTH = 320
 BROKER_PASSWORD_MAX_LENGTH = 1024
 BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
+TWO_FACTOR_PROGRESS_PHASES = frozenset(
+    {
+        "code_received",
+        "target_waiting",
+        "target_resolved",
+        "input_started",
+        "input_completed",
+        "submit_started",
+        "submit_sent",
+        "transition_waiting",
+        "transition_retry_requested",
+        "transition_confirmed",
+        "handoff_failed",
+    }
+)
 
 
 def emit(event: dict[str, Any]) -> None:
@@ -187,6 +202,36 @@ def sanitize_diagnostic_text(value: Any) -> str:
     return text[: 64 * 1024] + ("\n[TRUNCATED]" if len(text) > 64 * 1024 else "")
 
 
+def classify_browser_exception(error: Exception) -> str:
+    """Convert backend exceptions to fixed diagnostics without forwarding page text."""
+    message = str(error).lower()
+    if "2fa digit input verification failed" in message:
+        return "twofa_digit_input_verification_failed"
+    if "2fa code sequence verification failed" in message:
+        return "twofa_sequence_failed"
+    if "2fa code input was not detected" in message:
+        return "twofa_input_missing"
+    if "2fa code input must resolve" in message:
+        return "twofa_input_target_count"
+    if "interactable otp target did not appear" in message:
+        return "twofa_target_missing"
+    if "input target focus was not confirmed" in message:
+        return "twofa_focus_unconfirmed"
+    if "2fa code page did not appear" in message:
+        return "twofa_page_missing"
+    if "login stopped before 2fa" in message:
+        return "login_stopped_before_2fa"
+    if "account session was not confirmed after 2fa" in message:
+        return "account_session_unconfirmed_after_2fa"
+    if "2fa/login failed" in message:
+        return "twofa_login_failed"
+    if "password input verification failed" in message:
+        return "password_input_verification_failed"
+    if "personal information page did not confirm" in message:
+        return "account_home_unconfirmed"
+    return "browser_exception"
+
+
 def emit_input_progress(label: str, step: str, route: str | None = None) -> None:
     normalized_label = label.strip().lower()
     field = {
@@ -215,6 +260,41 @@ def emit_remember_progress(step: str, route: str | None = None) -> None:
     if route in ("root", "owner"):
         event["route"] = route
     emit(event)
+
+
+def emit_two_factor_progress(
+    phase: str,
+    *,
+    generation: int,
+    target_count: int | None = None,
+    submitted: bool | None = None,
+) -> None:
+    """Emit only fixed, non-secret 2FA handoff checkpoints to the runner."""
+    if phase not in TWO_FACTOR_PROGRESS_PHASES:
+        raise RuntimeError("2FA progress phase is invalid")
+    generation = validate_otp_generation(generation)
+    event: dict[str, Any] = {
+        "event": "status",
+        "status": "twofa_progress",
+        "phase": phase,
+        "generation": generation,
+    }
+    if target_count in (1, 6):
+        event["targetCount"] = target_count
+    if submitted is not None:
+        event["submitted"] = submitted is True
+    emit(event)
+
+
+def preserve_browser_on_failure() -> bool:
+    """Keep direct-run Firefox open for a human to inspect a failed handoff.
+
+    Supervised broker sessions retain their strict process cleanup contract. The
+    direct `run.sh` path is intentionally inspectable unless explicitly disabled.
+    """
+    configured = os.environ.get(BROWSER_PRESERVE_ON_FAILURE_ENV, "1").strip().lower()
+    enabled = configured not in {"0", "false", "no", "off"}
+    return enabled and not browser_broker_mode_enabled()
 
 
 def classify_input_read(readable: bool, actual: Any, expected: str) -> str:
@@ -713,7 +793,7 @@ def input_otp_digit_with_element_bidi(
     field: Any,
     value: str,
     pause: Callable[[int, int], None] = human_pause,
-) -> bool:
+) -> str:
     """Use the discovered digit cell directly when focus probing is flaky."""
     require_otp_bidi_input_target(scope, field, "2FA digit")
     emit_input_progress("2FA digit", "element_bidi_started", "owner")
@@ -728,13 +808,14 @@ def input_otp_digit_with_element_bidi(
     emit_input_progress("2FA digit", f"element_bidi_value_{read_state}", "owner")
     if readable and str(actual) == value:
         emit_input_progress("2FA digit", "verified", "owner")
-        return True
+        return "verified"
     if otp_input_readback_is_limited(readable, actual):
-        # Do not count an unreadable cell as entered. The caller may make one
-        # full-code retry through the owner frame while no digit is verified.
+        # This is still a trusted ruyiPage BiDi input. Apple can mask every
+        # accepted cell in a six-cell widget, so a keyboard replay here can
+        # shift or duplicate the code in an iframe-owned control.
         validate_two_factor_scope(scope)
-        emit_input_progress("2FA digit", "element_bidi_unverified", "owner")
-        return False
+        emit_input_progress("2FA digit", "element_bidi_limited_continue", "owner")
+        return "limited"
     raise RuntimeError("2FA digit input verification failed")
 
 
@@ -1556,18 +1637,25 @@ def fill_security_code(
         require_otp_bidi_input_target(sequence_scope, field, "2FA digit")
 
     direct_digits_entered = 0
+    limited_readback_seen = False
     for (scope, field), digit in zip(fields, digits):
         try:
-            direct_verified = input_otp_digit_with_element_bidi(
+            direct_result = input_otp_digit_with_element_bidi(
                 scope,
                 field,
                 digit,
                 pause=pause,
             )
         except Exception:
-            direct_verified = False
+            direct_result = "failed"
 
-        if not direct_verified:
+        if direct_result == "limited":
+            limited_readback_seen = True
+            direct_digits_entered += 1
+            pause(80, 220)
+            continue
+
+        if direct_result != "verified":
             if direct_digits_entered == 0:
                 try:
                     sequenced = input_otp_digits_with_owner_actions(
@@ -1584,6 +1672,9 @@ def fill_security_code(
             raise RuntimeError("2FA code sequence verification failed")
         direct_digits_entered += 1
         pause(80, 220)
+
+    if limited_readback_seen:
+        emit_input_progress("2FA code", "element_bidi_limited_continue", "owner")
 
 
 def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
@@ -2153,6 +2244,7 @@ def node_self_test() -> int:
     request_two_factor_preparation()
     emit({"event": "need_2fa", "generation": 1})
     code = validate_two_factor_code_command(read_command(), 1)
+    emit_two_factor_progress("code_received", generation=1)
     argv_text = "\0".join(sys.argv[1:])
     sensitive_values = (os.environ.get("APPLE_ID", ""), os.environ.get("APPLE_PASSWORD", ""))
     credentials_in_argv = "--apple-id" in sys.argv or any(
@@ -2344,7 +2436,8 @@ def browser_flow(args: argparse.Namespace) -> int:
     opts.set_window_size(1280, 960)
     opts.set_timeouts(2, 90, 30)
     opts.headless(False)
-    opts.close_on_exit(True)
+    preserve_on_failure = preserve_browser_on_failure()
+    opts.close_on_exit(not preserve_on_failure)
     if hasattr(opts, "set_human_algorithm"):
         opts.set_human_algorithm("windmouse")
 
@@ -2476,20 +2569,52 @@ def browser_flow(args: argparse.Namespace) -> int:
                     )
                     add_diagnostic_secret(code)
                     set_browser_startup_stage("twofa_input")
-                    fields = wait_for_otp_target(page)
-                    fill_security_code(page, code, Keys, fields=fields)
-                    submitted = click_two_factor_submit(page)
-                    human_pause(900, 1600)
-                    signed_in_state = wait_for_signed_in(
-                        page,
-                        submitted=submitted,
-                        otp_generation=generation,
-                    )
+                    emit_two_factor_progress("code_received", generation=generation)
+                    try:
+                        emit_two_factor_progress("target_waiting", generation=generation)
+                        fields = wait_for_otp_target(page)
+                        emit_two_factor_progress(
+                            "target_resolved",
+                            generation=generation,
+                            target_count=len(fields),
+                        )
+                        emit_two_factor_progress("input_started", generation=generation)
+                        fill_security_code(page, code, Keys, fields=fields)
+                        emit_two_factor_progress("input_completed", generation=generation)
+                        emit_two_factor_progress("submit_started", generation=generation)
+                        submitted = click_two_factor_submit(page)
+                        emit_two_factor_progress(
+                            "submit_sent",
+                            generation=generation,
+                            submitted=submitted,
+                        )
+                        human_pause(900, 1600)
+                        emit_two_factor_progress(
+                            "transition_waiting",
+                            generation=generation,
+                            submitted=submitted,
+                        )
+                        signed_in_state = wait_for_signed_in(
+                            page,
+                            submitted=submitted,
+                            otp_generation=generation,
+                        )
+                    except Exception:
+                        emit_two_factor_progress("handoff_failed", generation=generation)
+                        raise
                     if signed_in_state.get("retry2FA"):
                         if generation != 1:
                             raise RuntimeError("2FA/login failed")
+                        emit_two_factor_progress(
+                            "transition_retry_requested",
+                            generation=generation,
+                        )
                         login_state = signed_in_state
                         continue
+                    emit_two_factor_progress(
+                        "transition_confirmed",
+                        generation=generation,
+                    )
                     set_browser_startup_stage("signed_in")
                     break
         else:
@@ -2552,18 +2677,29 @@ def browser_flow(args: argparse.Namespace) -> int:
         raise
     finally:
         had_error = sys.exc_info()[0] is not None
-        try:
-            page.quit()
-        except Exception:
+        if had_error and preserve_on_failure:
             for screenshot_path in generated_screenshot_paths:
                 screenshot_path.unlink(missing_ok=True)
-            if not had_error:
-                raise
-            emit({"event": "warning", "message": QUIT_FAILURE_REASON})
+            emit(
+                {
+                    "event": "status",
+                    "status": "browser_preserved",
+                    "failureStage": browser_startup_stage,
+                }
+            )
         else:
-            if had_error:
+            try:
+                page.quit()
+            except Exception:
                 for screenshot_path in generated_screenshot_paths:
                     screenshot_path.unlink(missing_ok=True)
+                if not had_error:
+                    raise
+                emit({"event": "warning", "message": QUIT_FAILURE_REASON})
+            else:
+                if had_error:
+                    for screenshot_path in generated_screenshot_paths:
+                        screenshot_path.unlink(missing_ok=True)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2604,9 +2740,9 @@ def run_cli(argv: list[str]) -> int:
                 "event": "diagnostic",
                 "kind": "python_exception",
                 "failureStage": browser_startup_stage,
-                "errorType": sanitize_diagnostic_text(type(error).__name__),
-                "message": sanitize_diagnostic_text(error),
-                "traceback": sanitize_diagnostic_text(traceback.format_exc()),
+                "errorType": type(error).__name__,
+                "errorClass": classify_browser_exception(error),
+                "hasTraceback": True,
             }
         )
         result = {

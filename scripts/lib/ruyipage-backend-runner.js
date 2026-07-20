@@ -33,12 +33,208 @@ const BROWSER_BROKER_ERRORS = Object.freeze({
   commandAck: "ruyipage browser broker command acknowledgement invalid",
   commandAckTimeout: "ruyipage browser broker command acknowledgement timed out",
 });
+const RUYIPAGE_BACKEND_STAGES = new Set([
+  "not_started",
+  "credentials_received",
+  "url_validated",
+  "runtime_importing",
+  "runtime_imported",
+  "browser_constructing",
+  "browser_ready",
+  "login_navigation",
+  "login_page_loaded",
+  "login_state_detected",
+  "email_wait",
+  "email_input",
+  "email_submit",
+  "password_wait",
+  "password_input",
+  "remember_account",
+  "twofa_prepare",
+  "password_submit",
+  "twofa_page_wait",
+  "twofa_code_wait",
+  "twofa_input",
+  "signed_in",
+  "account_information",
+]);
+const RUYIPAGE_TWO_FACTOR_PROGRESS_PHASES = new Set([
+  "code_received",
+  "target_waiting",
+  "target_resolved",
+  "input_started",
+  "input_completed",
+  "submit_started",
+  "submit_sent",
+  "transition_waiting",
+  "transition_retry_requested",
+  "transition_confirmed",
+  "handoff_failed",
+]);
+const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
+  "twofa_code_delivery_started",
+  "twofa_code_delivery_sent",
+  "twofa_code_delivery_acknowledged",
+]);
+const RUYIPAGE_RUNNER_FAILURE_CODES = new Set([
+  "backend_cleanup",
+  "backend_exit",
+  "backend_failed",
+  "backend_interrupted",
+  "backend_stdin",
+  "backend_timeout",
+  "broker_ack",
+  "broker_connect",
+  "broker_connect_timeout",
+  "broker_eof",
+  "broker_io",
+  "backend_protocol",
+  "event_handler",
+  "event_handler_timeout",
+  "protocol_invalid_json",
+  "two_fa_preparation",
+  "two_fa_provider",
+  "twofa_handoff",
+]);
+const RUYIPAGE_BACKEND_DIAGNOSTIC_CLASSES = new Set([
+  "twofa_digit_input_verification_failed",
+  "twofa_sequence_failed",
+  "twofa_input_missing",
+  "twofa_input_target_count",
+  "twofa_target_missing",
+  "twofa_focus_unconfirmed",
+  "twofa_page_missing",
+  "login_stopped_before_2fa",
+  "account_session_unconfirmed_after_2fa",
+  "twofa_login_failed",
+  "password_input_verification_failed",
+  "account_home_unconfirmed",
+  "browser_exception",
+]);
 const RUYIPAGE_LIFECYCLE_STATES = new Set([
   "preparing",
   "active",
   "inactive",
   "cleanup_failed",
 ]);
+
+function sanitizeBackendStage(value) {
+  return RUYIPAGE_BACKEND_STAGES.has(value) ? value : "unknown";
+}
+
+function sanitizeTwoFactorProgressPhase(value) {
+  return RUYIPAGE_TWO_FACTOR_PROGRESS_PHASES.has(value) ? value : "unknown";
+}
+
+function sanitizeBackendDiagnosticClass(value) {
+  return RUYIPAGE_BACKEND_DIAGNOSTIC_CLASSES.has(value) ? value : "unknown";
+}
+
+function snapshotProtocolContext(context) {
+  return Object.freeze({
+    stage: sanitizeBackendStage(context.stage),
+    twoFaPhase: sanitizeTwoFactorProgressPhase(context.twoFaPhase),
+    generation: context.generation === 1 || context.generation === 2 ? context.generation : 0,
+    codeDeliveryAttempted: context.codeDeliveryAttempted === true,
+    codeDeliverySent: context.codeDeliverySent === true,
+    codeDeliveryAcknowledged: context.codeDeliveryAcknowledged === true,
+    browserPreserved: context.browserPreserved === true,
+    browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
+    cleanupFailed: context.cleanupFailed === true,
+  });
+}
+
+export function shouldCleanUpRuyiPageProcessGroup({
+  timedOut,
+  terminationSignal,
+  usesBrowserBroker,
+  browserPreserved,
+}) {
+  if (timedOut === true || Boolean(terminationSignal)) return true;
+  return !(browserPreserved === true && usesBrowserBroker !== true);
+}
+
+function inferRunnerFailureCode(error, context) {
+  const message = error instanceof Error ? error.message : "";
+  if (RUYIPAGE_RUNNER_FAILURE_CODES.has(error?.ruyiPageFailureCode)) {
+    return error.ruyiPageFailureCode;
+  }
+  if (message === "Invalid JSONL from ruyipage backend") {
+    return "protocol_invalid_json";
+  }
+  if (
+    message === "ruyipage backend requested duplicate 2FA preparation" ||
+    message === "ruyipage backend requested 2FA preparation without a handler" ||
+    message === "ruyipage backend requested a 2FA code before preparation" ||
+    message === "ruyipage backend sent invalid 2FA generation"
+  ) {
+    return "backend_protocol";
+  }
+  const exact = new Map([
+    ["ruyipage browser broker socket closed", "broker_eof"],
+    ["ruyipage browser broker socket connection failed", "broker_connect"],
+    [
+      "ruyipage browser broker socket connection timed out",
+      "broker_connect_timeout",
+    ],
+    ["ruyipage browser broker socket I/O failed", "broker_io"],
+    ["ruyipage browser broker command acknowledgement invalid", "broker_ack"],
+    [
+      "ruyipage browser broker command acknowledgement timed out",
+      "broker_ack",
+    ],
+    ["ruyipage backend cleanup failed", "backend_cleanup"],
+    ["ruyipage backend stdin failed", "backend_stdin"],
+    ["ruyipage backend interrupted", "backend_interrupted"],
+    ["ruyipage event handler failed", "event_handler"],
+    ["ruyipage 2FA preparation failed", "two_fa_preparation"],
+    ["ruyipage 2FA code provider failed", "two_fa_provider"],
+  ]).get(message);
+  if (exact) return exact;
+  if (/^ruyipage backend exited (?:unknown|\d+)$/.test(message)) {
+    return "backend_exit";
+  }
+  if (/^ruyipage backend timed out after \d+ms$/.test(message)) {
+    return "backend_timeout";
+  }
+  if (/^ruyipage onEvent handler timed out for [a-z0-9_]+ after \d+ms$/.test(message)) {
+    return "event_handler_timeout";
+  }
+  if (
+    message === "ruyipage backend failed" &&
+    context.stage === "twofa_input" &&
+    context.codeDeliveryAttempted === true &&
+    context.twoFaPhase !== "transition_confirmed"
+  ) {
+    return "twofa_handoff";
+  }
+  return "backend_failed";
+}
+
+function annotateRunnerFailure(error, context) {
+  const failure = error instanceof Error ? error : new Error("ruyipage backend failed");
+  const code = inferRunnerFailureCode(failure, context);
+  const details = snapshotProtocolContext(context);
+  try {
+    Object.defineProperties(failure, {
+      ruyiPageFailureCode: {
+        configurable: true,
+        value: RUYIPAGE_RUNNER_FAILURE_CODES.has(code) ? code : "backend_failed",
+      },
+      ruyiPageFailureStage: {
+        configurable: true,
+        value: details.stage,
+      },
+      ruyiPageFailureContext: {
+        configurable: true,
+        value: details,
+      },
+    });
+  } catch {
+    /* The original fixed error remains usable for immutable errors. */
+  }
+  return failure;
+}
 
 export function validateRuyiPageLifecycleState(source, expectedNonce) {
   let value;
@@ -913,6 +1109,57 @@ async function runRuyiPageBackend({
         }
       );
 
+  const protocolContext = {
+    stage: "not_started",
+    twoFaPhase: "unknown",
+    generation: 0,
+    codeDeliveryAttempted: false,
+    codeDeliverySent: false,
+    codeDeliveryAcknowledged: false,
+    browserPreserved: false,
+    browserErrorClass: "unknown",
+    cleanupFailed: false,
+  };
+  const updateProtocolContext = (event) => {
+    if (!event || typeof event !== "object") return false;
+    let directCodeDeliveryAcknowledged = false;
+    if (event.event === "status") {
+      if (event.status === "browser_stage" || event.status === "browser_failure") {
+        protocolContext.stage = sanitizeBackendStage(event.stage ?? event.failureStage);
+      } else if (event.status === "twofa_progress") {
+        protocolContext.twoFaPhase = sanitizeTwoFactorProgressPhase(event.phase);
+        if (event.generation === 1 || event.generation === 2) {
+          protocolContext.generation = event.generation;
+        }
+        if (
+          !usesBrowserBroker &&
+          event.phase === "code_received" &&
+          event.generation === protocolContext.generation &&
+          protocolContext.codeDeliverySent &&
+          !protocolContext.codeDeliveryAcknowledged
+        ) {
+          protocolContext.codeDeliveryAcknowledged = true;
+          directCodeDeliveryAcknowledged = true;
+        }
+      } else if (event.status === "browser_preserved") {
+        protocolContext.stage = sanitizeBackendStage(event.failureStage);
+        protocolContext.browserPreserved = true;
+      }
+    } else if (event.event === "need_2fa") {
+      if (event.generation === 1 || event.generation === 2) {
+        protocolContext.generation = event.generation;
+      }
+      protocolContext.twoFaPhase = "unknown";
+      protocolContext.codeDeliveryAttempted = false;
+      protocolContext.codeDeliverySent = false;
+      protocolContext.codeDeliveryAcknowledged = false;
+      protocolContext.browserErrorClass = "unknown";
+    } else if (event.event === "diagnostic") {
+      protocolContext.browserErrorClass = sanitizeBackendDiagnosticClass(event.errorClass);
+    }
+    return directCodeDeliveryAcknowledged;
+  };
+
   const stdoutDecoder = new StringDecoder("utf8");
   let stdoutBuffer = "";
   let stdoutDecoderEnded = false;
@@ -977,7 +1224,7 @@ async function runRuyiPageBackend({
         ? BROWSER_BROKER_ERRORS.io
         : "ruyipage backend stdin failed"
     );
-    processingError ??= stdinFailure;
+    processingError ??= annotateRunnerFailure(stdinFailure, protocolContext);
     for (const rejectWrite of stdinWriteRejectors) rejectWrite(stdinFailure);
     stdinWriteRejectors.clear();
     if (!childEnded) stopper.stop();
@@ -1103,13 +1350,19 @@ async function runRuyiPageBackend({
   }
   const terminalError = (outcome) => {
     if (timedOut) {
-      return new Error(`ruyipage backend timed out after ${timeoutMs}ms`);
+      return annotateRunnerFailure(
+        new Error(`ruyipage backend timed out after ${timeoutMs}ms`),
+        protocolContext
+      );
     }
-    if (outcome?.error) return outcome.error;
+    if (outcome?.error) return annotateRunnerFailure(outcome.error, protocolContext);
     if (usesBrowserBroker && outcome?.exitCode === 0 && !finalResult) {
-      return new Error(BROWSER_BROKER_ERRORS.eof);
+      return annotateRunnerFailure(new Error(BROWSER_BROKER_ERRORS.eof), protocolContext);
     }
-    return new Error(`ruyipage backend exited ${outcome?.exitCode ?? "unknown"}`);
+    return annotateRunnerFailure(
+      new Error(`ruyipage backend exited ${outcome?.exitCode ?? "unknown"}`),
+      protocolContext
+    );
   };
   const pendingBrowserBrokerAcks = new Map();
   const browserBrokerAckKey = (command) => {
@@ -1207,6 +1460,7 @@ async function runRuyiPageBackend({
     const safeEventNames = new Set([
       "ready",
       "status",
+      "runner_status",
       "diagnostic",
       "prepare_2fa",
       "need_2fa",
@@ -1252,6 +1506,12 @@ async function runRuyiPageBackend({
     } finally {
       clearTimeout(handlerTimer);
     }
+  };
+  const reportRunnerStatus = async (status, generation) => {
+    if (!RUYIPAGE_RUNNER_STATUS_CODES.has(status)) return;
+    const event = { event: "runner_status", status };
+    if (generation === 1 || generation === 2) event.generation = generation;
+    await callOnEvent(event);
   };
   const writeCommand = async (command, requireBrowserBrokerAck = false) => {
     const ack = requireBrowserBrokerAck ? createBrowserBrokerAck(command) : null;
@@ -1304,7 +1564,11 @@ async function runRuyiPageBackend({
   child.stderr.resume();
 
   const processEvent = async (event) => {
+    const directCodeDeliveryAcknowledged = updateProtocolContext(event);
     await callOnEvent(event);
+    if (directCodeDeliveryAcknowledged) {
+      await reportRunnerStatus("twofa_code_delivery_acknowledged", event.generation);
+    }
     if (event?.event === "prepare_2fa") {
       if (twoFaPrepared) {
         throw new Error("ruyipage backend requested duplicate 2FA preparation");
@@ -1331,6 +1595,11 @@ async function runRuyiPageBackend({
         throw new Error("ruyipage backend sent invalid 2FA generation");
       }
       twoFaGeneration = generation;
+      protocolContext.generation = generation;
+      protocolContext.codeDeliveryAttempted = false;
+      protocolContext.codeDeliverySent = false;
+      protocolContext.codeDeliveryAcknowledged = false;
+      protocolContext.browserErrorClass = "unknown";
       const code = await whileChildAlive(() =>
         callExternal(
           () =>
@@ -1341,12 +1610,20 @@ async function runRuyiPageBackend({
           "ruyipage 2FA code provider failed"
         )
       );
+      protocolContext.codeDeliveryAttempted = true;
+      await reportRunnerStatus("twofa_code_delivery_started", generation);
       await writeCommand({ type: "2fa_code", generation, code }, usesBrowserBroker);
+      protocolContext.codeDeliverySent = true;
+      await reportRunnerStatus("twofa_code_delivery_sent", generation);
+      if (usesBrowserBroker) {
+        protocolContext.codeDeliveryAcknowledged = true;
+        await reportRunnerStatus("twofa_code_delivery_acknowledged", generation);
+      }
     }
     if (event?.event === "result") finalResult = event;
   };
   const recordProcessingFailure = (error) => {
-    processingError ??= error;
+    processingError ??= annotateRunnerFailure(error, protocolContext);
     if (!childEnded) stopper.stop();
   };
   const enqueueLine = (line) => {
@@ -1375,6 +1652,7 @@ async function runRuyiPageBackend({
   child.stdout.once("close", finishStdoutDecoding);
 
   let outcome;
+  let cleanupError = null;
   try {
     const completion = await Promise.race([
       childCloseOutcome.then((value) => ({ type: "close", value })),
@@ -1396,9 +1674,20 @@ async function runRuyiPageBackend({
     }
     let cleanupConfirmed = false;
     try {
-      if (!timedOut) stopper.stopIfProcessGroupAlive();
-      await stopper.waitForCleanup();
+      const shouldCleanUpProcessGroup = shouldCleanUpRuyiPageProcessGroup({
+        timedOut,
+        terminationSignal,
+        usesBrowserBroker,
+        browserPreserved: protocolContext.browserPreserved,
+      });
+      if (shouldCleanUpProcessGroup) {
+        if (!timedOut) stopper.stopIfProcessGroupAlive();
+        await stopper.waitForCleanup();
+      }
       cleanupConfirmed = true;
+    } catch (error) {
+      protocolContext.cleanupFailed = true;
+      cleanupError = error;
     } finally {
       try {
         if (processStatePath && processIdentity) {
@@ -1426,29 +1715,42 @@ async function runRuyiPageBackend({
     }
   }
   if (terminationSignal) {
-    throw new Error("ruyipage backend interrupted");
+    throw annotateRunnerFailure(new Error("ruyipage backend interrupted"), protocolContext);
   }
   if (timedOut) {
-    throw new Error(`ruyipage backend timed out after ${timeoutMs}ms`);
+    throw annotateRunnerFailure(
+      new Error(`ruyipage backend timed out after ${timeoutMs}ms`),
+      protocolContext
+    );
   }
-  if (processingError) throw processingError;
-  if (outcome.error) throw outcome.error;
+  if (processingError) throw annotateRunnerFailure(processingError, protocolContext);
+  if (outcome?.error) throw annotateRunnerFailure(outcome.error, protocolContext);
 
   if (!finalResult) {
     if (exitCode !== 0) {
-      throw new Error(`ruyipage backend exited ${exitCode}`);
+      throw annotateRunnerFailure(
+        new Error(`ruyipage backend exited ${exitCode}`),
+        protocolContext
+      );
     }
-    throw new Error(
-      usesBrowserBroker
-        ? BROWSER_BROKER_ERRORS.eof
-        : "ruyipage backend exited without result"
+    throw annotateRunnerFailure(
+      new Error(
+        usesBrowserBroker
+          ? BROWSER_BROKER_ERRORS.eof
+          : "ruyipage backend exited without result"
+      ),
+      protocolContext
     );
   }
   if (finalResult.success !== true) {
-    throw new Error("ruyipage backend failed");
+    throw annotateRunnerFailure(new Error("ruyipage backend failed"), protocolContext);
   }
   if (exitCode !== 0) {
-    throw new Error(`ruyipage backend exited ${exitCode}`);
+    throw annotateRunnerFailure(
+      new Error(`ruyipage backend exited ${exitCode}`),
+      protocolContext
+    );
   }
+  if (cleanupError) throw annotateRunnerFailure(cleanupError, protocolContext);
   return finalResult;
 }

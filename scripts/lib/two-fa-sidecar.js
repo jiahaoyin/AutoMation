@@ -49,13 +49,17 @@ function numberFromEnv(key, fallback) {
 
 function resolveConfig(options) {
   const settingsOnly = options.settingsOnly === true;
+  const configuredPopupPrimaryMs = numberFromEnv(
+    "BROWSER_2FA_SETTINGS_AFTER_MS",
+    30_000
+  );
   return {
     timeoutMs: options.timeoutMs ?? 240_000,
     settingsOnly,
     settingsFallbackAfterMs: settingsOnly
       ? 0
       : options.settingsFallbackAfterMs ??
-        numberFromEnv("BROWSER_2FA_SETTINGS_AFTER_MS", 30_000),
+        Math.max(30_000, configuredPopupPrimaryMs),
     popupPostAllowGraceMs: Math.max(
       0,
       options.popupPostAllowGraceMs ?? POPUP_POST_ALLOW_GRACE_MS

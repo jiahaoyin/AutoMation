@@ -13,6 +13,7 @@ import {
   createChildStopper,
   createRuyiPageBackendRunner,
   resolveBackendTimeouts,
+  shouldCleanUpRuyiPageProcessGroup,
 } from "./lib/ruyipage-backend-runner.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -156,7 +157,16 @@ if (generationScenario) {
     });
   const requestCode = async (generation) => {
     await writeEvent({ event: "need_2fa", generation });
-    return readCommand();
+    const command = await readCommand();
+    if (command?.type === "2fa_code" && command.generation === generation) {
+      await writeEvent({
+        event: "status",
+        status: "twofa_progress",
+        phase: "code_received",
+        generation,
+      });
+    }
+    return command;
   };
 
   await writeEvent({ event: "ready", mode: "node-self-test" });
@@ -749,7 +759,23 @@ async function runNodeRunnerBrowserBrokerSelfTest() {
   );
   assert.deepEqual(
     events.map((event) => event.event),
-    ["ready", "prepare_2fa", "need_2fa", "result"]
+    [
+      "ready",
+      "prepare_2fa",
+      "need_2fa",
+      "runner_status",
+      "runner_status",
+      "runner_status",
+      "result",
+    ]
+  );
+  assert.deepEqual(
+    events.filter((event) => event.event === "runner_status").map((event) => event.status),
+    [
+      "twofa_code_delivery_started",
+      "twofa_code_delivery_sent",
+      "twofa_code_delivery_acknowledged",
+    ]
   );
   assert.equal(result.success, true);
   assert.equal(result.receivedGeneration, 1);
@@ -1644,6 +1670,8 @@ async function runNodeRunnerProcessGroupSettlementSelfTest() {
     const settledAt = Date.now();
 
     assert.equal(outcome.error?.message, "ruyipage backend timed out after 40ms");
+    assert.equal(outcome.error?.ruyiPageFailureCode, "backend_timeout");
+    assert.equal(outcome.error?.ruyiPageFailureContext?.cleanupFailed, false);
     assert.ok(killAt != null, "runner cleanup must send the scheduled SIGKILL");
     assert.ok(esrchAt != null, "runner cleanup must observe ESRCH after SIGKILL");
     assert.ok(killAt - startedAt >= 65, "runner must use the real timeout and force-grace timers");
@@ -1709,7 +1737,9 @@ async function runNodeRunnerCleanupFailureWithoutChildExitSelfTest() {
     );
     const elapsedMs = Date.now() - startedAt;
 
-    assert.equal(outcome.error?.message, "ruyipage backend cleanup failed");
+    assert.equal(outcome.error?.message, "ruyipage backend timed out after 30ms");
+    assert.equal(outcome.error?.ruyiPageFailureCode, "backend_timeout");
+    assert.equal(outcome.error?.ruyiPageFailureContext?.cleanupFailed, true);
     assert.ok(elapsedMs >= 95, "runner must include timeout, kill grace, and cleanup polling");
     assert.ok(elapsedMs < 400, "runner cleanup failure must remain bounded");
     assert.equal(processIsAlive(backendPid), true);
@@ -1865,6 +1895,46 @@ async function runNodeRunnerGenerationProtocolSelfTest() {
   ]);
 }
 
+async function runNodeRunnerSecondGenerationStateResetTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--two-generation-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 100,
+  });
+  let failure = null;
+  await assert.rejects(
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      async prepare2FA() {},
+      async get2FACode(request) {
+        if (request?.generation === 2) {
+          throw createSecretCallbackError("second generation provider failure");
+        }
+        return SECRET_FIXTURES.verificationCode;
+      },
+    }),
+    (error) => {
+      failure = error;
+      return error?.ruyiPageFailureCode === "two_fa_provider";
+    }
+  );
+  assert.deepEqual(failure?.ruyiPageFailureContext, {
+    stage: "not_started",
+    twoFaPhase: "unknown",
+    generation: 2,
+    codeDeliveryAttempted: false,
+    codeDeliverySent: false,
+    codeDeliveryAcknowledged: false,
+    browserPreserved: false,
+    browserErrorClass: "unknown",
+    cleanupFailed: false,
+  });
+}
+
 async function runNodeRunnerInvalidGenerationSelfTest() {
   const cases = [
     { arg: "--missing-generation-child", expectedRequests: [] },
@@ -2017,11 +2087,63 @@ async function runNodeRunnerSelfTest() {
     },
   });
 
-  assert.deepEqual(events, ["ready", "prepare_2fa", "need_2fa", "result"]);
+  assert.deepEqual(events, [
+    "ready",
+    "prepare_2fa",
+    "need_2fa",
+    "runner_status",
+    "runner_status",
+    "status",
+    "runner_status",
+    "result",
+  ]);
   assert.equal(result.success, true);
   assert.equal(result.twoFaCodeLength, 6);
   assert.equal(result.receivedGeneration, 1);
   assert.equal(result.credentialsInArgv, false);
+}
+
+function runPreservedBrowserCleanupPolicyTest() {
+  assert.equal(
+    shouldCleanUpRuyiPageProcessGroup({
+      timedOut: false,
+      terminationSignal: null,
+      usesBrowserBroker: false,
+      browserPreserved: true,
+    }),
+    false,
+    "a direct run that explicitly preserved Firefox must not kill its process group"
+  );
+  assert.equal(
+    shouldCleanUpRuyiPageProcessGroup({
+      timedOut: false,
+      terminationSignal: null,
+      usesBrowserBroker: true,
+      browserPreserved: true,
+    }),
+    true,
+    "broker/supervised runs keep their strict cleanup contract"
+  );
+  assert.equal(
+    shouldCleanUpRuyiPageProcessGroup({
+      timedOut: true,
+      terminationSignal: null,
+      usesBrowserBroker: false,
+      browserPreserved: true,
+    }),
+    true,
+    "a timed-out run must still wait for the timeout cleanup path"
+  );
+  assert.equal(
+    shouldCleanUpRuyiPageProcessGroup({
+      timedOut: false,
+      terminationSignal: "SIGTERM",
+      usesBrowserBroker: false,
+      browserPreserved: true,
+    }),
+    true,
+    "an externally interrupted run must still clean up its process group"
+  );
 }
 
 async function runNodeRunnerDelayedResultOnEventSelfTest() {
@@ -2774,11 +2896,13 @@ const focusedTests = {
   generations: runNodeRunnerGenerationProtocolSelfTest,
   "invalid-generations": runNodeRunnerInvalidGenerationSelfTest,
   "stdin-eof": runNodeRunnerStdinEofSelfTest,
+  "generation-state-reset": runNodeRunnerSecondGenerationStateResetTest,
   "close-boundary": runNodeRunnerCloseBoundarySelfTest,
   "strict-result": runNodeRunnerStrictResultContractSelfTest,
   "utf8-chunks": runNodeRunnerSplitUtf8ChunkSelfTest,
   "supervisor-parent-exit": runSupervisorParentExitBeforeGateSelfTest,
   "supervisor-runtime-policy": runSupervisorRuntimePolicySelfTest,
+  "preserved-browser-cleanup": runPreservedBrowserCleanupPolicyTest,
 };
 
 const focusedTest = process.env.RUYIPAGE_PROTOCOL_FOCUSED_TEST;
@@ -2804,6 +2928,7 @@ await runNodeRunnerBrowserBrokerEofDuringCodeDeliveryTest();
 await runNodeRunnerBrowserBrokerCommandAckTimeoutTest();
 await runNodeRunnerBrowserBrokerCommandAckTimeoutIsCappedTest();
 await runNodeRunnerBrowserBrokerInvalidCommandAckTest();
+runPreservedBrowserCleanupPolicyTest();
 runChildStopperSelfTest();
 await runChildStopperLiveDescendantSelfTest();
 await runChildStopperCleanupDeadlineSelfTest();
@@ -2815,6 +2940,7 @@ await runNodeRunnerCleanupFailureWithoutChildExitSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupFailureSelfTest();
 await runNodeRunnerGenerationProtocolSelfTest();
+await runNodeRunnerSecondGenerationStateResetTest();
 await runNodeRunnerInvalidGenerationSelfTest();
 await runNodeRunnerPendingEventChildExitSelfTest();
 await runNodeRunnerPendingEventHandlerTimeoutSelfTest();

@@ -246,9 +246,8 @@ cd apple-id-automation-${VERSION}
 2FA 按严格串行顺序处理：popup 主阶段拿到有效新码后会立即交给 ruyiPage，Settings 和
 手输不会启动；Settings 最多两次（每次最多 60 秒、间隔 5 秒），手输只会在 Settings
 有界尝试结束后且不早于首次取码 90 秒出现。两代验证码共享 240 秒期限和 Settings 总预算。
-终端默认不显示 OTP；仅显式设置 \`BROWSER_2FA_DEBUG_SHOW_CODE=1\` 且当前输出是真实 TTY、
-非受监督会话时，才会把六码显示到当前本地终端；重定向和受监督输出一律不显示，且 OTP
-绝不写入 audit、报告、截图或错误文本。
+终端不显示 OTP；验证码绝不写入 audit、报告、截图或错误文本。取码后的交接阶段通过固定
+状态记录，便于定位 stdin 投递、目标解析、输入、提交或登录状态确认失败。
 
 ## 命令
 
@@ -279,7 +278,7 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_2FA_SETTINGS_FALLBACK\` | 可选，默认 \`1\`；设为 \`0\` 禁用系统设置取码 |
 | \`BROWSER_2FA_MANUAL_FALLBACK\` | 可选，默认 \`1\`；仅在 Settings 有界尝试结束后、且不早于首次取码 90 秒时允许在真实 TTY 隐藏手输验证码 |
 | \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
-| \`BROWSER_2FA_DEBUG_SHOW_CODE\` | 可选，默认关闭；仅设为 \`1\` 且当前为真实 TTY、非受监督会话时向当前本地终端显示 OTP；重定向/受监督输出不显示，绝不写入 audit、报告、截图或错误文本 |
+| \`BROWSER_PRESERVE_ON_FAILURE\` | 可选，直接运行默认 \`1\`；失败后保留 Firefox 供人工检查当前页面，设为 \`0\` 才关闭；受监督 broker 会话仍严格清理 |
 
 ## 故障排查
 
