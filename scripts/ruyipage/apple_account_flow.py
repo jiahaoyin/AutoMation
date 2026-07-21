@@ -997,12 +997,44 @@ def otp_fields_match_expected_lengths(
     )
 
 
+def require_pristine_six_cell_target(
+    page: Any,
+    expected_count: int,
+    reference_fields: list[tuple[Any, Any]],
+    timeout_s: float = TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S,
+) -> list[tuple[Any, Any]]:
+    """Require the same empty six-cell widget before any clear or fallback."""
+    if expected_count != 6 or len(reference_fields) != expected_count:
+        raise RuntimeError("2FA six-cell widget target count changed before entry")
+    reference_scope = reference_fields[0][0]
+    if any(scope is not reference_scope for scope, _field in reference_fields):
+        raise RuntimeError("2FA six-cell widget scopes changed before entry")
+    reference_context_id = scope_browsing_context_id(reference_scope)
+    if not otp_fields_match_expected_lengths(reference_fields, [0] * expected_count):
+        raise RuntimeError("2FA six-cell widget was not empty before entry")
+
+    current_fields = refresh_otp_target(
+        page,
+        expected_count=expected_count,
+        timeout_s=timeout_s,
+    )
+    current_scope = current_fields[0][0]
+    if scope_browsing_context_id(current_scope) != reference_context_id:
+        raise RuntimeError("2FA six-cell iframe changed before entry")
+    if not fields_keep_the_same_widget_identity(reference_fields, current_fields):
+        raise RuntimeError("2FA six-cell widget fields changed before entry")
+    if not otp_fields_match_expected_lengths(current_fields, [0] * expected_count):
+        raise RuntimeError("2FA six-cell widget was not empty before entry")
+    return current_fields
+
+
 def input_otp_sequence_in_owner_context(
     scope: Any,
     first_field: Any,
     value: str,
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
+    before_clear: Callable[[], None] | None = None,
 ) -> None:
     """Enter an OTP through its owning ruyiPage frame without reading its value."""
     validate_two_factor_scope(scope)
@@ -1011,6 +1043,8 @@ def input_otp_sequence_in_owner_context(
     pause(180, 480)
     validate_two_factor_scope(scope)
     require_keyboard_target_ready(first_field)
+    if before_clear is not None:
+        before_clear()
     scope.actions.combo(keys.COMMAND, "a").press(keys.DELETE).perform()
     emit_input_progress("2FA code", "sequence_cleared", "owner")
     pause(120, 320)
@@ -1025,6 +1059,7 @@ def fill_empty_six_cell_otp_with_element_bidi(
     page: Any,
     digits: str,
     expected_count: int,
+    pristine_fields: list[tuple[Any, Any]],
     pause: Callable[[int, int], None] = human_pause,
 ) -> list[tuple[Any, Any]] | None:
     """Use exact ruyiPage element input only when the six-cell widget is empty.
@@ -1038,7 +1073,7 @@ def fill_empty_six_cell_otp_with_element_bidi(
     if expected_count != 6 or len(digits) != 6:
         return None
     fallback_started = False
-    reference_fields: list[tuple[Any, Any]] = []
+    reference_fields = list(pristine_fields)
 
     def refresh_live_widget(expected_context_id: str) -> list[tuple[Any, Any]]:
         current_fields = refresh_otp_target(
@@ -1061,9 +1096,10 @@ def fill_empty_six_cell_otp_with_element_bidi(
         return current_fields
 
     try:
-        fields = refresh_otp_target(
+        fields = require_pristine_six_cell_target(
             page,
             expected_count=expected_count,
+            reference_fields=reference_fields,
             timeout_s=TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S,
         )
         scope = fields[0][0]
@@ -1071,10 +1107,8 @@ def fill_empty_six_cell_otp_with_element_bidi(
         if (
             not is_apple_six_cell_widget_scope(page, scope)
             or not fields_are_the_live_apple_six_cell_widget(scope, fields)
-            or not otp_fields_match_expected_lengths(fields, [0] * expected_count)
         ):
             return None
-        reference_fields = fields
 
         emit_input_progress("2FA code", "cell_bidi_fallback_started", "owner")
         fallback_started = True
@@ -1957,17 +1991,44 @@ def fill_security_code(
     # can erase a preceding cell after Apple has advanced focus.
     try:
         current_fields = refresh_otp_target(page, expected_count=expected_count)
-        scope, first_field = current_fields[0]
-        if any(candidate_scope is not scope for candidate_scope, _field in current_fields):
+        pristine_fields = require_pristine_six_cell_target(
+            page,
+            expected_count=expected_count,
+            reference_fields=current_fields,
+        )
+        scope, first_field = pristine_fields[0]
+        if any(candidate_scope is not scope for candidate_scope, _field in pristine_fields):
             raise RuntimeError("2FA code input must resolve to six targets in one trusted Apple frame")
-        for _candidate_scope, field in current_fields:
+        for _candidate_scope, field in pristine_fields:
             require_otp_bidi_input_target(scope, field, "2FA digit")
+
+        def require_pristine_before_clear() -> None:
+            require_pristine_six_cell_target(
+                page,
+                expected_count=expected_count,
+                reference_fields=pristine_fields,
+            )
+
         # Keep all input actions in the discovered owner frame. The page root
         # cannot safely dispatch keyboard actions into a cross-origin iframe.
-        input_otp_sequence_in_owner_context(scope, first_field, digits, keys, pause=pause)
+        input_otp_sequence_in_owner_context(
+            scope,
+            first_field,
+            digits,
+            keys,
+            pause=pause,
+            before_clear=require_pristine_before_clear,
+        )
     except Exception as error:
-        emit_input_progress("2FA code", "input_unconfirmed", "owner")
-        raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON) from error
+        if str(error) != FOCUS_NOT_CONFIRMED_REASON:
+            emit_input_progress("2FA code", "input_unconfirmed", "owner")
+            raise RuntimeError(TWO_FACTOR_INPUT_UNCONFIRMED_REASON) from error
+        # Firefox can accept an owner-frame pointer action while Apple's
+        # hsa2-sk7 control does not expose document.activeElement yet. The
+        # target is already exact and trusted, so defer to the narrower
+        # element-owned BiDi route below. It only runs if all six live cells
+        # remain empty, and never replays a partially entered code.
+        emit_input_progress("2FA code", "sequence_focus_unconfirmed", "owner")
 
     # The visible Apple widget is six separate inputs inside
     # iframe#aid-auth-widget-iFrame. Only if the first BiDi sequence left all
@@ -1977,6 +2038,7 @@ def fill_security_code(
         page,
         digits,
         expected_count=expected_count,
+        pristine_fields=pristine_fields,
         pause=pause,
     )
 

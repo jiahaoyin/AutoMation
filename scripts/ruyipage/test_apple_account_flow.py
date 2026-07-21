@@ -4131,6 +4131,246 @@ class SecurityCodeTests(unittest.TestCase):
         self.assertIn("cell_bidi_fallback_started", steps)
         self.assertIn("cell_bidi_fallback_completed", steps)
 
+    def test_six_digit_uses_exact_cell_fallback_when_owner_click_cannot_confirm_focus(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}, focused=False) for _ in range(6)]
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            actions=frame_actions,
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "codeInputCount": 6,
+            },
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": frame.state["href"]}
+        )
+        page = FakePage(
+            {
+                "css:iframe": [iframe],
+                "css:iframe#aid-auth-widget-iFrame": [iframe],
+            },
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame.parent = page
+
+        with patch("apple_account_flow.emit") as emit_event:
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual(
+            [field.inputs for field in fields],
+            [[(digit, False)] for digit in "123456"],
+        )
+        self.assertNotIn(
+            ("combo", (FakeKeys.COMMAND, "a")),
+            frame_actions.calls,
+        )
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_focus_unconfirmed", steps)
+        self.assertIn("cell_bidi_fallback_started", steps)
+        self.assertIn("cell_bidi_fallback_completed", steps)
+
+    def test_six_digit_focus_fallback_confirms_last_cell_auto_transition(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}, focused=False) for _ in range(6)]
+
+        class AutoTransitionFrame(FakePage):
+            def __init__(self):
+                super().__init__(
+                    actions=FakeActions(apply_typed_text=False),
+                    state={
+                        "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                        "twofa": True,
+                        "codeInputCount": 6,
+                    },
+                )
+                self.live_fields = fields
+                for field in fields:
+                    field.scope = self
+
+            def eles(self, selector, timeout=None):
+                self.eles_calls.append((selector, timeout))
+                if selector == "css:.form-security-code-inputs input":
+                    return list(self.live_fields)
+                return []
+
+        frame = AutoTransitionFrame()
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": frame.state["href"]}
+        )
+        page = FakePage(
+            {
+                "css:iframe": [iframe],
+                "css:iframe#aid-auth-widget-iFrame": [iframe],
+            },
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame.parent = page
+
+        original_input = fields[-1].input
+
+        def input_last_digit_and_transition(value, clear=True):
+            result = original_input(value, clear)
+            frame.live_fields = []
+            frame.state.update(
+                {"twofa": False, "trustPrompt": True, "codeInputCount": 0}
+            )
+            return result
+
+        fields[-1].input = input_last_digit_and_transition
+
+        with patch.object(
+            account_flow,
+            "TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S",
+            0.01,
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            completed = fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertIsNone(completed)
+        self.assertEqual([field.value for field in fields], list("123456"))
+        self.assertEqual(
+            [field.inputs for field in fields],
+            [[(digit, False)] for digit in "123456"],
+        )
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_focus_unconfirmed", steps)
+        self.assertIn("cell_bidi_fallback_started", steps)
+        self.assertIn("sequence_auto_submitted", steps)
+        self.assertNotIn("input_unconfirmed", steps)
+
+    def test_six_digit_stops_before_clear_when_widget_becomes_partially_filled(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
+        fields[0].on_click = lambda: setattr(fields[1], "value", "1")
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            actions=frame_actions,
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "codeInputCount": 6,
+            },
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": frame.state["href"]}
+        )
+        page = FakePage(
+            {
+                "css:iframe": [iframe],
+                "css:iframe#aid-auth-widget-iFrame": [iframe],
+            },
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame.parent = page
+
+        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA code input was not confirmed",
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_focus_started", steps)
+        self.assertIn("input_unconfirmed", steps)
+        self.assertNotIn("sequence_cleared", steps)
+        self.assertNotIn("cell_bidi_fallback_started", steps)
+        self.assertNotIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
+
+    def test_six_digit_refuses_initial_partial_widget_before_clear(self):
+        fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
+        fields[0].value = "1"
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:.form-security-code-inputs input": fields},
+            actions=frame_actions,
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "codeInputCount": 6,
+            },
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": frame.state["href"]}
+        )
+        page = FakePage(
+            {
+                "css:iframe": [iframe],
+                "css:iframe#aid-auth-widget-iFrame": [iframe],
+            },
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame.parent = page
+
+        with patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA code input was not confirmed",
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual(frame_actions.calls, [])
+        self.assertEqual([field.inputs for field in fields], [[], [], [], [], [], []])
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("input_unconfirmed", steps)
+        self.assertNotIn("sequence_focus_started", steps)
+        self.assertNotIn("cell_bidi_fallback_started", steps)
+
+    def test_six_digit_focus_fallback_rejects_a_replaced_pristine_widget(self):
+        initial_fields = [FakeElement(attrs={"maxlength": "1"}, focused=False) for _ in range(6)]
+        replacement_fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
+        frame_actions = FakeActions(apply_typed_text=False)
+        frame = FakePage(
+            {"css:.form-security-code-inputs input": initial_fields},
+            actions=frame_actions,
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "codeInputCount": 6,
+            },
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": frame.state["href"]}
+        )
+        page = FakePage(
+            {
+                "css:iframe": [iframe],
+                "css:iframe#aid-auth-widget-iFrame": [iframe],
+            },
+            frames=[frame],
+            state={"href": "https://account.apple.com/sign-in"},
+        )
+        frame.parent = page
+
+        def replace_widget():
+            for field in replacement_fields:
+                field.scope = frame
+            frame.elements_by_selector["css:.form-security-code-inputs input"] = replacement_fields
+
+        initial_fields[0].on_click = replace_widget
+
+        with patch(
+            "apple_account_flow.wait_for_otp_entry_confirmation",
+            side_effect=RuntimeError("synthetic unconfirmed entry"),
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "2FA code input was not confirmed",
+        ):
+            fill_security_code(page, "123456", FakeKeys, pause=lambda *_: None)
+
+        self.assertEqual([field.inputs for field in initial_fields], [[], [], [], [], [], []])
+        self.assertEqual([field.inputs for field in replacement_fields], [[], [], [], [], [], []])
+        self.assertNotIn(("combo", (FakeKeys.COMMAND, "a")), frame_actions.calls)
+        steps = [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)]
+        self.assertIn("sequence_focus_unconfirmed", steps)
+        self.assertNotIn("cell_bidi_fallback_started", steps)
+
     def test_six_digit_cell_fallback_requires_the_observed_apple_iframe_id(self):
         fields = [FakeElement(attrs={"maxlength": "1"}) for _ in range(6)]
         frame_actions = FakeActions(apply_typed_text=False)

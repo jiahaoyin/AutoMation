@@ -39,13 +39,15 @@ implementation follows this fixed order:
    itself. The code must not be entered by six `field.input(..., clear=True)`
    calls because each clear can erase a prior cell after focus has advanced.
 4. For the visible top-level six-cell `iframe#aid-auth-widget-iFrame` widget
-   only, if the first sequence can prove that all six cells are still empty,
+   only, if the primary sequence cannot create a confirmed entry and all six
+   cells can still be proven empty,
    use one `field.input(digit, clear=False)` call per already-discovered cell.
-   The live `form-security-code-inputs input` set must still contain exactly
-   the same six ordered ruyiPage elements in the same `tab_id` context.
-   Wrapper recreation for the same DOM element is accepted; a replaced cell,
-   frame, generic numeric control, partial entry, transition, or unreadable
-   widget stops the fallback before another digit is sent.
+   Before the first clear, the flow snapshots six zero-length fields. The live
+   `form-security-code-inputs input` set must still contain exactly the same
+   six ordered ruyiPage elements in the same `tab_id` context. Wrapper
+   recreation for the same DOM element is accepted; a replaced cell, frame,
+   generic numeric control, or any initial or newly observed partial entry
+   stops before clearing or sending another digit.
 5. Revalidate the trusted Apple frame before clearing, before typing, and
    after typing. A changed or untrusted frame stops the flow before another
    key action.
@@ -72,6 +74,22 @@ On failure, inspect `flow-audit.jsonl` for the `account_browser` event
 ruyiPage handoff but the six-cell widget could not prove a complete entry.
 Firefox is preserved for manual inspection in a direct run; the flow does not
 send an Enter or a second code into that unresolved widget.
+
+`target_resolved` followed by `sequence_focus_started`, with neither
+`sequence_cleared` nor `sequence_typed`, identifies the exact focus-observation
+failure seen with Apple's `hsa2-sk7` widget: the target was found in its owner
+iframe, but the post-click `activeElement` query did not confirm focus before
+the owner-frame keyboard sequence could start. It is not a selector failure.
+For that narrow case the current flow records `sequence_focus_unconfirmed` and,
+only after revalidating the visible Apple iframe and six empty cells, starts
+the element-owned ruyiPage BiDi path with `cell_bidi_fallback_started`. A live
+six-cell widget with all per-cell length checks emits
+`cell_bidi_fallback_completed`. If Apple removes the widget after the sixth
+cell, that branch has no completion event; it is accepted only after it
+observes the signed-in account state or a trust-browser prompt and records
+`sequence_auto_submitted`. Any partial entry, changed frame, changed cell, or
+missing length confirmation remains
+`twofa_input_unconfirmed` and leaves Firefox open for inspection.
 
 `browserPreserved: true` is emitted only after ruyiPage confirms
 `page.states.is_alive`. A requested-but-dead browser is cleaned up and is not
