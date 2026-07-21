@@ -38,12 +38,21 @@ implementation follows this fixed order:
    `owner_scope.actions.type(code)` sequence. Apple advances between six cells
    itself. The code must not be entered by six `field.input(..., clear=True)`
    calls because each clear can erase a prior cell after focus has advanced.
-4. Revalidate the trusted Apple frame before clearing, before typing, and
+4. For the visible top-level six-cell `iframe#aid-auth-widget-iFrame` widget
+   only, if the first sequence can prove that all six cells are still empty,
+   use one `field.input(digit, clear=False)` call per already-discovered cell.
+   The live `form-security-code-inputs input` set must still contain exactly
+   the same six ordered ruyiPage elements in the same `tab_id` context.
+   Wrapper recreation for the same DOM element is accepted; a replaced cell,
+   frame, generic numeric control, partial entry, transition, or unreadable
+   widget stops the fallback before another digit is sent.
+5. Revalidate the trusted Apple frame before clearing, before typing, and
    after typing. A changed or untrusted frame stops the flow before another
    key action.
-5. Confirm the rendered widget only through per-cell value lengths. When the
-   widget has disappeared and the Apple page has transitioned, treat that as
-   automatic submission; otherwise an unconfirmed write stops before submit.
+6. Confirm the rendered widget only through per-cell value lengths. When the
+   widget has disappeared, treat it as automatic submission only after a
+   confirmed signed-in state or Apple trust-browser prompt; otherwise an
+   unconfirmed write stops before submit.
 
 The browser action is always ruyiPage BiDi. No Playwright, Puppeteer,
 Selenium, JavaScript `dispatchEvent`, coordinate OCR click, or root-context
