@@ -120,7 +120,10 @@ SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
-TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 12.0
+# Apple can replace the authentication iframe before its account shell and
+# profile data finish hydrating. Keep the submit transition bounded, but do
+# not turn an ordinary slow account-page handoff into a false OTP failure.
+TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 30.0
 TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S = 5.0
 TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S = 1.5
 TWO_FACTOR_INPUT_UNCONFIRMED_REASON = "2FA code input was not confirmed"
@@ -731,6 +734,73 @@ def find_hosting_frame_element(frame_scope: Any) -> tuple[Any, Any]:
             return parent, matches[0]
         break
     raise RuntimeError("unable to map ruyiPage frame to its visible iframe element")
+
+
+def has_unique_visible_frame_host(parent: Any, frame_url: str) -> bool:
+    """Map a child frame without assuming its parent has an HTTPS URL."""
+    normalized_frame_url = normalized_apple_frame_url(frame_url)
+    if normalized_frame_url is None:
+        return False
+    candidates = [
+        candidate
+        for candidate in safe_elements(parent, "css:iframe")
+        if element_is_interactable(candidate)
+    ]
+    exact_matches = []
+    for candidate in candidates:
+        try:
+            candidate_url = normalized_apple_frame_url(str(candidate.attr("src") or ""))
+        except Exception:
+            continue
+        if candidate_url == normalized_frame_url:
+            exact_matches.append(candidate)
+    if len(exact_matches) == 1:
+        return True
+    # An opaque parent cannot safely resolve relative iframe sources. A single
+    # visible host is still enough to keep the child frame fail-closed live.
+    return bool(
+        is_opaque_two_factor_frame_url(scope_location_url(parent))
+        and len(candidates) == 1
+    )
+
+
+def scope_has_live_frame_chain(page: Any, scope: Any) -> bool:
+    """Return whether a frame still maps to visible iframe hosts under page."""
+    current = scope
+    seen: set[int] = set()
+    while current is not page:
+        identity = id(current)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        parent = getattr(current, "parent", None)
+        if parent is None:
+            return False
+        current_url = scope_location_url(current)
+        if is_opaque_two_factor_frame_url(current_url):
+            candidates = [
+                candidate
+                for candidate in safe_elements(parent, "css:iframe")
+                if element_is_interactable(candidate)
+            ]
+            known_widget = [
+                candidate
+                for candidate in candidates
+                if str(candidate.attr("id") or "").strip()
+                == APPLE_SIX_CELL_WIDGET_IFRAME_ID
+            ]
+            if len(known_widget) == 1:
+                pass
+            elif len(candidates) != 1:
+                return False
+        else:
+            try:
+                parent, _iframe = find_hosting_frame_element(current)
+            except Exception:
+                if not has_unique_visible_frame_host(parent, current_url):
+                    return False
+        current = parent
+    return True
 
 
 def is_apple_six_cell_widget_scope(page: Any, scope: Any) -> bool:
@@ -2548,9 +2618,9 @@ def detect_login_state(page: Any) -> dict[str, Any]:
     if not scope_states:
         raise RuntimeError("unable to inspect login page state through ruyiPage")
 
-    root_state = scope_states[0][1]
+    root_scope, root_state = scope_states[0]
     root_href = str(root_state.get("href") or "")
-    root_is_account_manage = is_account_manage_url(root_href)
+    root_is_account_manage = root_scope is page and is_account_manage_url(root_href)
     apple_states = [
         state
         for _scope, state in scope_states
@@ -2571,6 +2641,57 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         for state in apple_states
         for key in ("email", "password", "trustPrompt")
     ) or any(bool(state.get("twofa")) for state in two_factor_states)
+    root_has_auth_ui = any(
+        bool(root_state.get(key))
+        for key in ("email", "password", "trustPrompt", "twofa")
+    )
+    root_error = any(
+        bool(root_state.get(key)) for key in ("error", "otpRejected", "blocked")
+    )
+    has_descendant_login_or_trust_ui = any(
+        is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+        and bool(state.get(key))
+        and scope_has_live_frame_chain(page, scope)
+        for scope, state in scope_states
+        if scope is not page
+        for key in ("email", "password", "trustPrompt")
+    )
+    has_live_descendant_two_factor_ui = any(
+        is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+        and bool(state.get("twofa"))
+        and scope_has_live_frame_chain(page, scope)
+        for scope, state in scope_states
+        if scope is not page
+    )
+    has_live_descendant_error = any(
+        is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+        and any(bool(state.get(key)) for key in ("error", "otpRejected", "blocked"))
+        and scope_has_live_frame_chain(page, scope)
+        for scope, state in scope_states
+        if scope is not page
+    )
+    # After OTP submission, the top-level account shell is authoritative.
+    # Retiring idmsa frames can retain a verification widget or generic error
+    # text. A frame still mapped to a visible iframe host remains active and
+    # continues to block session success, as do login and Trust UI.
+    root_session_trusted = bool(
+        root_is_account_manage
+        and root_state.get("accountMarker")
+        and not root_has_auth_ui
+        and not root_error
+        and not has_descendant_login_or_trust_ui
+        and not has_live_descendant_two_factor_ui
+        and not has_live_descendant_error
+    )
+    legacy_session_trusted = bool(
+        not has_auth_ui
+        and root_is_account_manage
+        and has_apple_account_marker
+        and not root_error
+        and not has_descendant_login_or_trust_ui
+        and not has_live_descendant_two_factor_ui
+        and not has_live_descendant_error
+    )
     twofa_visible = any(bool(state.get("twofa")) for state in two_factor_states)
     code_input_count = max(
         (int(state.get("codeInputCount") or 0) for state in two_factor_states),
@@ -2589,14 +2710,23 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         "otpRejected": any(bool(state.get("otpRejected")) for state in two_factor_states),
         "blocked": any(bool(state.get("blocked")) for state in two_factor_states),
         "trusted": (
-            not has_auth_ui
-            and root_is_account_manage
-            and has_apple_account_marker
+            root_session_trusted
+            or legacy_session_trusted
         ),
+        "rootError": root_error,
+        "rootSessionTrusted": root_session_trusted,
         "password": any(bool(state.get("password")) for state in apple_states),
         "email": any(bool(state.get("email")) for state in apple_states),
         "codeInputCount": code_input_count,
     }
+
+
+def has_confirmed_account_session(state: dict[str, Any]) -> bool:
+    """Accept root-session evidence without letting retired 2FA frames win."""
+    return bool(
+        state.get("rootSessionTrusted")
+        or (state.get("trusted") and not state.get("rootError"))
+    )
 
 
 def settle_trust_state(
@@ -2659,15 +2789,16 @@ def wait_for_2fa_or_session(page: Any, timeout_s: int = 75) -> dict[str, Any]:
                 raise
             human_pause(500, 1000)
             continue
-        if last_state.get("error"):
-            raise RuntimeError("login stopped before 2FA")
         elapsed_ms = min(
             max(0, int((time.monotonic() - started) * 1000)),
             max(0, int(timeout_s * 1000)),
         )
-        if last_state.get("trusted"):
+        if has_confirmed_account_session(last_state):
+            last_state["trusted"] = True
             last_state["elapsedMs"] = elapsed_ms
             return last_state
+        if last_state.get("error"):
+            raise RuntimeError("login stopped before 2FA")
         if last_state.get("twofa"):
             fields = security_code_fields(page)
             if fields:
@@ -2733,12 +2864,17 @@ def wait_for_signed_in(
             str(last_state.get("href") or "")
         ):
             raise RuntimeError("2FA state left the verified Apple HTTPS origin")
+        if has_confirmed_account_session(last_state):
+            # A retiring idmsa frame can still expose generic error text after
+            # the top-level account shell has already established the session.
+            # A root-page error remains terminal; only retired child-frame
+            # evidence is allowed to lose to a confirmed root session.
+            last_state["trusted"] = True
+            return last_state
         if last_state.get("error"):
             if otp_retry_allowed(last_state, otp_generation):
                 return {**last_state, "retry2FA": True}
             raise RuntimeError("2FA/login failed")
-        if last_state.get("trusted"):
-            return last_state
         if (
             last_state.get("twofa")
             and submission_transition_deadline is not None
@@ -3448,10 +3584,14 @@ def browser_flow(args: argparse.Namespace) -> int:
             initial_state,
             deadline=time.monotonic() + 5.0,
         )
-        if initial_state.get("error"):
+        if initial_state.get("error") and not has_confirmed_account_session(
+            initial_state
+        ):
             raise RuntimeError("login page reported an authentication error")
         set_browser_startup_stage("login_state_detected")
-        skipped_login = bool(initial_state.get("trusted"))
+        skipped_login = has_confirmed_account_session(initial_state)
+        if skipped_login:
+            initial_state["trusted"] = True
         skipped_2fa = skipped_login
         remember_checked: bool | None = None
 
@@ -3639,10 +3779,11 @@ def browser_flow(args: argparse.Namespace) -> int:
             final_state,
             deadline=time.monotonic() + 5.0,
         )
-        if final_state.get("error"):
+        if final_state.get("error") and not has_confirmed_account_session(final_state):
             raise RuntimeError("personal information page reported an authentication error")
-        if not final_state.get("trusted"):
+        if not has_confirmed_account_session(final_state):
             raise RuntimeError("personal information page did not confirm an authenticated Apple session")
+        final_state["trusted"] = True
         set_browser_startup_stage("profile_capture")
         wait_for_profile_capture_ready(page)
         emit({"event": "status", "status": "profile_page_ready"})

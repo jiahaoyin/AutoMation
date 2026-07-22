@@ -3146,6 +3146,303 @@ class StrongTwoFactorClassifierTests(unittest.TestCase):
 
 
 class TwoFactorStateTests(unittest.TestCase):
+    @staticmethod
+    def nested_opaque_manage_shell(*, trust_prompt=False, error=False):
+        inner = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": False,
+                "trustPrompt": trust_prompt,
+                "error": error,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        inner_host = FakeElement(attrs={"src": inner.state["href"]})
+        outer = FakePage(
+            {"css:iframe": [inner_host]},
+            frames=[inner],
+            state={"href": "about:blank"},
+        )
+        outer_host = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": "about:blank"}
+        )
+        page = FakePage(
+            {"css:iframe": [outer_host]},
+            frames=[outer],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        outer.parent = page
+        inner.parent = outer
+        return page
+
+    def test_submitted_wait_accepts_manage_shell_despite_retiring_error_frame(self):
+        retiring_frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        page = FakePage(
+            frames=[retiring_frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        retiring_frame.parent = page
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="button",
+            )
+
+        self.assertTrue(state["trusted"])
+
+    def test_submitted_wait_does_not_accept_a_manage_shell_with_root_error(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
+                wait_for_signed_in(
+                    page,
+                    timeout_s=0.05,
+                    submitted=True,
+                    otp_generation=1,
+                    submission_method="button",
+                )
+
+    def test_submitted_wait_does_not_accept_a_manage_shell_with_live_otp_frame(self):
+        frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 6,
+            }
+        )
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
+                wait_for_signed_in(
+                    page,
+                    timeout_s=0.05,
+                    submitted=True,
+                    otp_generation=1,
+                    submission_method="button",
+                )
+
+    def test_submitted_wait_does_not_accept_a_manage_shell_with_live_opaque_otp_frame(self):
+        frame = FakePage(
+            state={
+                "href": "about:blank",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 6,
+            }
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": "about:blank"}
+        )
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
+                wait_for_signed_in(
+                    page,
+                    timeout_s=0.05,
+                    submitted=True,
+                    otp_generation=1,
+                    submission_method="button",
+                )
+
+    def test_live_opaque_trust_frame_blocks_manage_session_confirmation(self):
+        frame = FakePage(
+            state={
+                "href": "about:blank",
+                "twofa": False,
+                "trustPrompt": True,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": "about:blank"}
+        )
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+
+        state = detect_login_state(page)
+
+        self.assertFalse(account_flow.has_confirmed_account_session(state))
+
+    def test_live_opaque_error_frame_blocks_manage_session_confirmation(self):
+        frame = FakePage(
+            state={
+                "href": "about:srcdoc",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        iframe = FakeElement(
+            attrs={"id": "aid-auth-widget-iFrame", "src": "about:srcdoc"}
+        )
+        page = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+
+        state = detect_login_state(page)
+
+        self.assertTrue(state["error"])
+        self.assertFalse(account_flow.has_confirmed_account_session(state))
+
+    def test_nested_live_opaque_trust_frame_blocks_manage_session_confirmation(self):
+        state = detect_login_state(self.nested_opaque_manage_shell(trust_prompt=True))
+
+        self.assertFalse(account_flow.has_confirmed_account_session(state))
+
+    def test_nested_live_opaque_error_frame_blocks_manage_session_confirmation(self):
+        state = detect_login_state(self.nested_opaque_manage_shell(error=True))
+
+        self.assertTrue(state["error"])
+        self.assertFalse(account_flow.has_confirmed_account_session(state))
+
     def test_submitted_wait_retries_a_transient_unreadable_scope_before_confirming_session(self):
         recovered_state = {
             "href": "https://account.apple.com/account/manage",
@@ -6521,7 +6818,9 @@ class FrameLocationTests(unittest.TestCase):
                 "snippet": "Trust this browser",
             }
         )
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
         page = FakePage(
+            {"css:iframe": [iframe]},
             frames=[frame],
             state={
                 "href": "https://account.apple.com/account/manage",
@@ -6536,6 +6835,7 @@ class FrameLocationTests(unittest.TestCase):
                 "snippet": "Personal Information",
             },
         )
+        frame.parent = page
 
         self.assertFalse(detect_login_state(page)["trusted"])
 
