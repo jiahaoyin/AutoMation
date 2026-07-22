@@ -1,5 +1,10 @@
 import { append2FAAudit } from "./2fa-audit.js";
-import { readPopupCode, probe2FAState, tryAllowOnce } from "./mac-2fa-allow.js";
+import {
+  readPopupCode,
+  readSettingsVerificationCode,
+  probe2FAState,
+  tryAllowOnce,
+} from "./mac-2fa-allow.js";
 import {
   dismissCodePopupForWebFill,
   dismissStale2FAPopups,
@@ -93,6 +98,8 @@ function resolveRuntime(overrides = {}) {
     probe2FAState: overrides.probe2FAState ?? probe2FAState,
     tryAllowOnce: overrides.tryAllowOnce ?? tryAllowOnce,
     readPopupCode: overrides.readPopupCode ?? readPopupCode,
+    readSettingsVerificationCode:
+      overrides.readSettingsVerificationCode ?? readSettingsVerificationCode,
     runPopupPhase: overrides.runPopupPhase ?? runPopupPhase,
     dismissCodePopupForWebFill:
       overrides.dismissCodePopupForWebFill ?? dismissCodePopupForWebFill,
@@ -167,6 +174,12 @@ function settingsFailureReason(error) {
   }
 }
 
+function settingsAlertCleanupError() {
+  const error = new Error("Settings verification alert cleanup was not confirmed");
+  error.code = "2FA_SETTINGS_ALERT_CLEANUP_FAILED";
+  return error;
+}
+
 const APPLE_HELPER_LABELS = [
   "FollowUpUI",
   "CoreAuthUI",
@@ -213,8 +226,10 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "settings_provider_result",
     "settings_provider_cancelled",
     "settings_provider_cancel",
+    "settings_provider_cancel_cleanup_failed",
     "settings_provider_force_stop",
     "settings_provider_force_stop_cleanup",
+    "settings_ocr",
     "manual_provider_unavailable",
     "manual_fallback_start",
     "2fa_acquisition_requested",
@@ -325,6 +340,7 @@ const AUDIT_BOOLEAN_KEYS = new Set([
   "closedAfterForce",
   "confirmed",
   "forceStopped",
+  "alertCleanupConfirmed",
   "popupClosed",
 ]);
 const AUDIT_NUMBER_KEYS = new Set([
@@ -447,7 +463,11 @@ export function createMac2FACollector(options = {}) {
   let preexistingAllowIdleHits = 0;
   let settingsRequest = null;
   let settingsCompletion = null;
+  let settingsNativeCompletion = null;
   let settingsOutcome = null;
+  let settingsOcrController = null;
+  let settingsOcrPromise = null;
+  let settingsOcrDelay = null;
   let settingsStartDelay = null;
   let settingsProviderPromise = null;
   let settingsAttempt = 0;
@@ -472,6 +492,8 @@ export function createMac2FACollector(options = {}) {
   let manualUnavailableStatusSent = false;
   let ocrPermissionStatusSent = false;
   let ocrHelperUnavailableStatusSent = false;
+  let settingsOcrPermissionStatusSent = false;
+  let settingsOcrUnavailableStatusSent = false;
   let popupAccessibilityStatusSent = false;
   let popupAccessibilityAttempted = false;
   let popupAccessibilityController = null;
@@ -1672,6 +1694,83 @@ export function createMac2FACollector(options = {}) {
     !acquisition.winner.settled &&
     providerPhase === "settings";
 
+  const stopSettingsOcr = (controller = settingsOcrController) => {
+    if (controller != null && settingsOcrController !== controller) return false;
+    const retryDelay = settingsOcrDelay;
+    settingsOcrDelay = null;
+    settingsOcrController = null;
+    retryDelay?.cancel();
+    controller?.abort();
+    return retryDelay != null || controller != null;
+  };
+
+  const readSettingsOcrCandidate = async (acquisition, deadline, signal) => {
+    while (settingsPhaseCanContinue(acquisition) && !signal.aborted) {
+      const remainingMs = deadline - runtime.now();
+      if (remainingMs < 1_000) return null;
+      let result = null;
+      try {
+        result = await runtime.readSettingsVerificationCode(
+          Math.min(10, Math.max(1, Math.floor(remainingMs / 1_000))),
+          {
+            signal,
+            rejectCodes: rejectedCodes,
+            deadlineMs: deadline,
+            now: runtime.now,
+          }
+        );
+      } catch {
+        return null;
+      }
+      if (signal.aborted || !settingsPhaseCanContinue(acquisition)) return null;
+      const capability = result?.capability;
+      if (capability === "permission_missing") {
+        if (!settingsOcrPermissionStatusSent) {
+          settingsOcrPermissionStatusSent = true;
+          status("ocr_permission_missing", {
+            source: "settings",
+            remainingSec: remainingSeconds(deadline),
+          });
+          audit({
+            phase: "settings_ocr",
+            source: "vision",
+            outcome: "unavailable",
+            capability,
+            reason: "ocr_permission_missing",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+        }
+        return null;
+      }
+      if (capability === "unavailable" || capability === "accessibility_missing") {
+        if (!settingsOcrUnavailableStatusSent) {
+          settingsOcrUnavailableStatusSent = true;
+          status("ocr_helper_unavailable", {
+            source: "settings",
+            remainingSec: remainingSeconds(deadline),
+          });
+          audit({
+            phase: "settings_ocr",
+            source: "vision",
+            outcome: "unavailable",
+            capability,
+            reason: "ocr_helper_unavailable",
+            elapsedSincePrepareMs: elapsedSincePrepare(),
+          });
+        }
+        return null;
+      }
+      const code = normalizeSixDigitCode(result?.code);
+      if (code && !rejectedCodes.has(code)) return code;
+      const retryDelay = scheduleDelay(Math.min(400, Math.max(0, deadline - runtime.now())));
+      settingsOcrDelay = retryDelay;
+      const elapsed = await retryDelay.promise;
+      if (settingsOcrDelay === retryDelay) settingsOcrDelay = null;
+      if (!elapsed) return null;
+    }
+    return null;
+  };
+
   const startSettingsProvider = async (acquisition) => {
     const generationRetryAt =
       acquisition.generation === 2 && lastSettingsCandidateAt != null
@@ -1772,18 +1871,66 @@ export function createMac2FACollector(options = {}) {
       if (request) {
         settingsRequest = request;
         const outcomeGate = createDeferred();
-        void Promise.resolve(request.promise).then(
-          (result) => outcomeGate.resolve({ kind: "result", result }),
-          (error) =>
-            outcomeGate.resolve({
+        const nativeCompletion = Promise.resolve(request.promise).then(
+          (result) => ({ kind: "result", result }),
+          (error) => ({
               kind: error?.code === "2FA_SETTINGS_CANCELLED" ? "cancelled" : "failed",
               error,
             })
         );
+        void nativeCompletion.then((nativeOutcome) => outcomeGate.resolve(nativeOutcome));
         const completion = outcomeGate.promise;
         settingsCompletion = completion;
+        settingsNativeCompletion = nativeCompletion;
         settingsOutcome = outcomeGate;
+        const ocrController = new AbortController();
+        settingsOcrController = ocrController;
+        const ocrDeadline = runtime.now() + attemptTimeoutMs;
+        const alertReady = Promise.race([
+          Promise.resolve(request.alertReady).then((ready) => ready === true, () => false),
+          nativeCompletion.then(() => false),
+        ]);
+        const ocrPromise = alertReady.then((ready) => {
+          if (!ready || !settingsPhaseCanContinue(acquisition)) return null;
+          return readSettingsOcrCandidate(acquisition, ocrDeadline, ocrController.signal);
+        }).then((code) => {
+          if (code) outcomeGate.resolve({ kind: "ocr", code });
+        });
+        settingsOcrPromise = ocrPromise;
         outcome = await completion;
+        stopSettingsOcr(ocrController);
+        if (settingsOcrPromise === ocrPromise) settingsOcrPromise = null;
+
+        if (outcome.kind === "ocr") {
+          const code = normalizeSixDigitCode(outcome.code);
+          if (code && !rejectedCodes.has(code)) {
+            audit({
+              phase: "settings_provider_result",
+              source: "vision",
+              outcome: "candidate_ready",
+              elapsedSincePrepareMs: elapsedSincePrepare(),
+            });
+            const cleanup = await cancelSettingsProvider("settings_ocr_won", {
+              requireAlertCleanup: true,
+            });
+            if (cleanup.alertCleanupConfirmed) {
+              const accepted = acquisition.offer({ source: "settings", code });
+              if (accepted) lastSettingsCandidateAt = runtime.now();
+              return;
+            }
+            outcome = {
+              kind: "failed",
+              error: cleanup.error ?? settingsAlertCleanupError(),
+              failureReason: "settings_alert_cleanup_failed",
+            };
+          } else {
+            await cancelSettingsProvider("settings_ocr_invalid");
+            outcome = { kind: "failed" };
+          }
+        }
+        if (outcome.kind !== "ocr" && settingsNativeCompletion === nativeCompletion) {
+          settingsNativeCompletion = null;
+        }
         if (settingsRequest === request) settingsRequest = null;
         if (settingsCompletion === completion) settingsCompletion = null;
         if (settingsOutcome === outcomeGate) settingsOutcome = null;
@@ -1877,14 +2024,18 @@ export function createMac2FACollector(options = {}) {
     }
   };
 
-  const cancelSettingsProvider = async (reason) => {
+  const cancelSettingsProvider = async (reason, options = {}) => {
     const startDelay = settingsStartDelay;
     const request = settingsRequest;
     const completion = settingsCompletion;
+    const nativeCompletion = settingsNativeCompletion;
     const outcomeGate = settingsOutcome;
     if (settingsStartDelay === startDelay) settingsStartDelay = null;
     startDelay?.cancel();
-    if (!request || !completion) return;
+    stopSettingsOcr();
+    if (!request || !completion || !nativeCompletion) {
+      return { alertCleanupConfirmed: false, error: settingsAlertCleanupError() };
+    }
     const existing = settingsCancelPromises.get(request);
     if (existing) return existing;
 
@@ -1893,34 +2044,60 @@ export function createMac2FACollector(options = {}) {
       audit({ phase: "settings_provider_cancel", reason, cancelSignalled });
 
       const cleanupTimeout = scheduleDelay(config.cleanupGraceMs);
-      const cleaned = await Promise.race([
-        completion.then(() => true),
-        cleanupTimeout.promise.then(() => false),
+      let nativeOutcome = null;
+      const initialCleanup = await Promise.race([
+        nativeCompletion.then((outcome) => ({ settled: true, outcome })),
+        cleanupTimeout.promise.then(() => ({ settled: false })),
       ]);
       cleanupTimeout.cancel();
-      if (!cleaned) {
+      if (initialCleanup.settled) {
+        nativeOutcome = initialCleanup.outcome;
+      } else {
         const forceStopped = request.forceStop();
         audit({ phase: "settings_provider_force_stop", reason, forceStopped });
         const forceWait = scheduleDelay(config.cleanupGraceMs);
-        const closedAfterForce = await Promise.race([
-          completion.then(() => true),
-          forceWait.promise.then(() => false),
+        const forcedCleanup = await Promise.race([
+          nativeCompletion.then((outcome) => ({ settled: true, outcome })),
+          forceWait.promise.then(() => ({ settled: false })),
         ]);
         forceWait.cancel();
         audit({
           phase: "settings_provider_force_stop_cleanup",
           reason,
-          closedAfterForce,
+          closedAfterForce: forcedCleanup.settled,
         });
-        if (!closedAfterForce) outcomeGate?.resolve({ kind: "cancelled" });
+        if (forcedCleanup.settled) {
+          nativeOutcome = forcedCleanup.outcome;
+        } else {
+          outcomeGate?.resolve({ kind: "cancelled" });
+        }
+      }
+      const alertCleanupConfirmed =
+        nativeOutcome?.kind === "result" || nativeOutcome?.error?.alertCleanupConfirmed === true;
+      const error =
+        nativeOutcome?.kind === "failed"
+          ? nativeOutcome.error
+          : alertCleanupConfirmed
+            ? null
+            : settingsAlertCleanupError();
+      if (options.requireAlertCleanup === true && !alertCleanupConfirmed) {
+        audit({
+          phase: "settings_provider_cancel_cleanup_failed",
+          reason: "settings_alert_cleanup_failed",
+          alertCleanupConfirmed,
+          elapsedSincePrepareMs: elapsedSincePrepare(),
+        });
       }
       if (settingsRequest === request) settingsRequest = null;
       if (settingsCompletion === completion) settingsCompletion = null;
+      if (settingsNativeCompletion === nativeCompletion) settingsNativeCompletion = null;
       if (settingsOutcome === outcomeGate) settingsOutcome = null;
+      settingsOcrPromise = null;
+      return { alertCleanupConfirmed, error };
     })();
     settingsCancelPromises.set(request, cleanup);
     try {
-      await cleanup;
+      return await cleanup;
     } finally {
       settingsCancelPromises.delete(request);
     }

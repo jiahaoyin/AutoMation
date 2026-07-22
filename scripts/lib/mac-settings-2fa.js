@@ -21,6 +21,7 @@ const FORCE_STOP_CLEANUP_GRACE_MS = 4_000;
 const SETTINGS_HELPER_COMPILE_TIMEOUT_MS = 120_000;
 const HELPER_SUCCESS_REASON = "ok";
 const HELPER_ACCESSIBILITY_READY_REASON = "accessibility_ready";
+const HELPER_ALERT_READY_EVENT = "verification_alert_ready";
 const HELPER_FAILURES = Object.freeze({
   cancelled: ["2FA_SETTINGS_CANCELLED", "2FA settings request was cancelled"],
   accessibility_unavailable: [
@@ -139,9 +140,12 @@ function removeCancelFile(cancelFile) {
   }
 }
 
-function cancelledError(message = "系统设置验证码请求已取消") {
+function cancelledError(message = "系统设置验证码请求已取消", options = {}) {
   const error = new Error(message);
   error.code = "2FA_SETTINGS_CANCELLED";
+  if (options.alertCleanupConfirmed === true) {
+    error.alertCleanupConfirmed = true;
+  }
   return error;
 }
 
@@ -181,6 +185,7 @@ function resolveHelperPath(runtime) {
  * }} [opts]
  * @returns {{
  *   promise: Promise<{ code: string }>,
+ *   alertReady: Promise<boolean>,
  *   cancel: () => boolean,
  *   forceStop: () => boolean
  * }}
@@ -249,11 +254,22 @@ export function start2FASettingsCodeRequest(opts = {}) {
   let forceKillTimer = null;
   let resolveResult;
   let rejectResult;
+  let alertReadySettled = false;
+  let resolveAlertReady;
+  let helperOutputRemainder = "";
 
   const promise = new Promise((resolve, reject) => {
     resolveResult = resolve;
     rejectResult = reject;
   });
+  const alertReady = new Promise((resolve) => {
+    resolveAlertReady = resolve;
+  });
+  const settleAlertReady = (value) => {
+    if (alertReadySettled) return;
+    alertReadySettled = true;
+    resolveAlertReady(value === true);
+  };
 
   const finish = (error, value) => {
     if (settled) return;
@@ -267,8 +283,23 @@ export function start2FASettingsCodeRequest(opts = {}) {
       forceKillTimer = null;
     }
     removeCancelFile(cancelFile);
+    settleAlertReady(false);
     if (error) rejectResult(error);
     else resolveResult(value);
+  };
+
+  const observeHelperEvents = (chunk) => {
+    helperOutputRemainder += chunk.toString();
+    const lines = helperOutputRemainder.split(/\r?\n/);
+    helperOutputRemainder = lines.pop() ?? "";
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line);
+        if (event?.event === HELPER_ALERT_READY_EVENT) settleAlertReady(true);
+      } catch {
+        // Only the fixed event is useful before final helper completion.
+      }
+    }
   };
 
   const appendOutput = (current, chunk, label) => {
@@ -294,6 +325,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
 
   child.stdout.on("data", (chunk) => {
     stdout = appendOutput(stdout, chunk, "stdout");
+    observeHelperEvents(chunk);
   });
   child.stderr.on("data", (chunk) => {
     const bytes = Buffer.byteLength(chunk);
@@ -354,13 +386,17 @@ export function start2FASettingsCodeRequest(opts = {}) {
 
     const helperReason =
       parsedOutput && typeof parsed?.reason === "string" ? parsed.reason : null;
-    if (cancelRequested || helperReason === "cancelled") {
-      finish(cancelledError());
-      return;
-    }
     const reasonError = helperReasonError(helperReason);
     if (reasonError) {
       finish(annotateHelperError(reasonError, parsed));
+      return;
+    }
+    if (helperReason === "cancelled") {
+      finish(cancelledError(undefined, { alertCleanupConfirmed: true }));
+      return;
+    }
+    if (cancelRequested && helperReason == null) {
+      finish(cancelledError());
       return;
     }
     const suffix =
@@ -475,7 +511,7 @@ export function start2FASettingsCodeRequest(opts = {}) {
     beginForceStop(timeoutCleanupGraceMs);
   }, Math.max(0, timeoutMs - timeoutCleanupGraceMs));
 
-  return { promise, cancel, forceStop };
+  return { promise, alertReady, cancel, forceStop };
 }
 
 /**

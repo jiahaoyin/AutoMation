@@ -34,6 +34,7 @@ let appleIDSettingsExecutablePaths: Set<String> = [
 ]
 let axSheetsAttribute = "AXSheets"
 let accessibilityPermissionPollIntervalMs = 250
+let twoFactorNavigationTimeoutMs = 15_000
 var cancelFilePath: String?
 var verificationCodeRequested = false
 
@@ -121,6 +122,10 @@ let exactTextAttributes = [
     kAXValueAttribute as String,
 ]
 
+let controlTextAttributes = exactTextAttributes + [
+    kAXIdentifierAttribute as String,
+]
+
 let verificationAlertTitles = [
     "Apple 账户验证码",
     "Apple 帐户验证码",
@@ -131,6 +136,8 @@ let verificationAlertTitles = [
 ]
 
 let verificationAlertCloseButtons = ["好", "OK", "Done", "完成", "关闭", "Close"]
+let verificationAlertFallbackCloseButtons = ["\u{597D}", "OK"]
+let maskedVerificationAlertImageNames = ["AppleIDSettings"]
 let verificationPromptFragments = [
     "在网页上输入此验证码",
     "输入此验证码以登录",
@@ -151,9 +158,42 @@ func axExactTexts(_ element: AXUIElement) -> [String] {
         .filter { !$0.isEmpty }
 }
 
+func axControlTexts(_ element: AXUIElement) -> [String] {
+    controlTextAttributes
+        .compactMap { axString(element, $0) }
+        .map(normalizedAXText)
+        .filter { !$0.isEmpty }
+}
+
 func hasExactName(_ element: AXUIElement, names: [String]) -> Bool {
     let expected = Set(names.map(normalizedAXText))
     return axExactTexts(element).contains(where: expected.contains)
+}
+
+// Some System Settings controls keep their stable visible label on a child or
+// AXIdentifier. This remains an exact match and is only used to resolve a
+// trusted, visible AXButton before an action is dispatched.
+func hasExactControlName(_ element: AXUIElement, names: [String]) -> Bool {
+    let expected = Set(names.map(normalizedAXText))
+    return axControlTexts(element).contains(where: expected.contains)
+}
+
+// System Settings exposes some navigation rows as generic AXButton elements.
+// Their localized heading is the first clause of AXDescription rather than an
+// exact AXTitle, so keep this prefix matcher limited to navigation discovery.
+func hasNavigationName(_ element: AXUIElement, names: [String]) -> Bool {
+    let expected = names.map(normalizedAXText)
+    for text in axControlTexts(element) {
+        for name in expected {
+            guard text.hasPrefix(name) else { continue }
+            let remainder = text.dropFirst(name.count)
+            guard let first = remainder.first else { return true }
+            if first.isWhitespace || "\u{3001}\u{FF0C},\u{FF1A}:\u{FF1B};".contains(first) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 func sixDigitCodeCandidates(_ text: String) -> Set<String> {
@@ -211,6 +251,34 @@ func treeContainsExactText(
            axBool(node, kAXHiddenAttribute as String) != true,
            axFrame(node) != nil,
            hasExactName(node, names: names) {
+            return isTrustedSystemSettingsProcess(expectedPid)
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return false
+}
+
+func treeContainsNavigationName(
+    _ root: AXUIElement,
+    names: [String],
+    expectedPid: pid_t,
+    maxNodes: Int = 900
+) -> Bool {
+    guard isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(root, pid: expectedPid) else { return false }
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var visited = 0
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        if elementBelongsToProcess(node, pid: expectedPid),
+           axBool(node, kAXHiddenAttribute as String) != true,
+           axFrame(node) != nil,
+           hasNavigationName(node, names: names) {
             return isTrustedSystemSettingsProcess(expectedPid)
         }
         queue.append(contentsOf: axSheets(node))
@@ -282,6 +350,47 @@ func findExactButton(
     }
     guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
     return matches.count == 1 ? matches[0] : nil
+}
+
+func findExactControlButton(
+    in root: AXUIElement,
+    names: [String],
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    maxNodes: Int = 900
+) -> AXUIElement? {
+    guard isTrustedSystemSettingsProcess(expectedPid) else { return nil }
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var visited = 0
+    var matches: [AXUIElement] = []
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        visited += 1
+        if elementBelongsToProcess(node, pid: expectedPid),
+           hasExactControlName(node, names: names),
+           let button = nearestNavigationPressableAncestor(
+               from: node,
+               appElement: appElement,
+               expectedPid: expectedPid
+           ),
+           axRole(button) == kAXButtonRole as String,
+           let frame = axFrame(button),
+           frame.width <= 1_000,
+           frame.height <= 200,
+           pointIsOnActiveDisplay(CGPoint(x: frame.midX, y: frame.midY)),
+           !matches.contains(where: { $0 == button }) {
+            matches.append(button)
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    guard isTrustedSystemSettingsProcess(expectedPid), matches.count == 1 else {
+        return nil
+    }
+    return matches[0]
 }
 
 func collectSheetRoots(_ appElement: AXUIElement, expectedPid: pid_t) -> [AXUIElement] {
@@ -444,13 +553,17 @@ func findVerificationCodeAlertRoot(
             queue.append(contentsOf: axChildren(node))
         }
     }
-    return nil
+    return findMaskedVerificationAlertRoot(
+        appElement: appElement,
+        expectedPid: expectedPid
+    )
 }
 
 struct VerificationCodeAlert {
     let appElement: AXUIElement
     let root: AXUIElement
     let ownerPid: pid_t
+    let usesMaskedCloseButton: Bool
 }
 
 struct TrustedSettingsControl {
@@ -494,7 +607,11 @@ func locateVerificationCodeAlert(
         return VerificationCodeAlert(
             appElement: ownerElement,
             root: root,
-            ownerPid: ownerPid
+            ownerPid: ownerPid,
+            usesMaskedCloseButton: isMaskedVerificationAlertRoot(
+                root,
+                expectedPid: ownerPid
+            )
         )
     }
     return nil
@@ -624,6 +741,49 @@ func findVerificationCodePromptRoot(
     return nil
 }
 
+func isMaskedVerificationAlertRoot(
+    _ root: AXUIElement,
+    expectedPid: pid_t
+) -> Bool {
+    guard verificationCodeRequested,
+          isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(root, pid: expectedPid),
+          treeContainsNavigationName(
+              root,
+              names: maskedVerificationAlertImageNames,
+              expectedPid: expectedPid,
+              maxNodes: 800
+          ),
+          findExactButton(
+              in: root,
+              names: verificationAlertFallbackCloseButtons,
+              expectedPid: expectedPid,
+              maxNodes: 800
+          ) != nil else { return false }
+    return isTrustedSystemSettingsProcess(expectedPid)
+}
+
+func findMaskedVerificationAlertRoot(
+    appElement: AXUIElement,
+    expectedPid: pid_t
+) -> AXUIElement? {
+    guard verificationCodeRequested,
+          isTrustedSystemSettingsProcess(expectedPid),
+          elementBelongsToProcess(appElement, pid: expectedPid) else { return nil }
+    let roots = collectWindows(appElement: appElement, expectedPid: expectedPid)
+    let windowMatches = roots.filter {
+        isMaskedVerificationAlertRoot($0, expectedPid: expectedPid)
+    }
+    if windowMatches.count == 1 {
+        return windowMatches[0]
+    }
+    guard windowMatches.isEmpty,
+          isMaskedVerificationAlertRoot(appElement, expectedPid: expectedPid) else {
+        return nil
+    }
+    return appElement
+}
+
 func findGetCodeControl(
     appElement: AXUIElement,
     expectedPid: pid_t,
@@ -644,15 +804,16 @@ func findGetCodeControl(
         }
         for root in roots {
             guard elementBelongsToProcess(root, pid: ownerPid),
-                  treeContainsExactText(
+                  treeContainsNavigationName(
                       root,
                       names: twoFactorNames,
                       expectedPid: ownerPid,
                       maxNodes: 2_000
                   ),
-                  let button = findExactButton(
+                  let button = findExactControlButton(
                       in: root,
                       names: buttonNames,
+                      appElement: ownerElement,
                       expectedPid: ownerPid,
                       maxNodes: 2_000
                   ),
@@ -1105,6 +1266,7 @@ func clickElementAtVerifiedFrame(
     appElement: AXUIElement,
     expectedPid: pid_t,
     names: [String],
+    allowControlName: Bool = false,
     deadline: Date? = nil
 ) -> Bool {
     let focusTimeoutMs = deadline.map {
@@ -1133,11 +1295,14 @@ func clickElementAtVerifiedFrame(
           buttonWindow == focusedWindow,
           let focusedFrame = axFrame(focusedWindow),
           focusedFrame.contains(buttonFrame) else { return false }
+    let nameMatches = allowControlName
+        ? hasExactControlName(element, names: names)
+        : hasExactName(element, names: names)
     guard axRole(element) == kAXButtonRole as String,
-          elementBelongsToProcess(element, pid: expectedPid),
-          axBool(element, kAXEnabledAttribute as String) == true,
-          supportsPressAction(element),
-          hasExactName(element, names: names),
+           elementBelongsToProcess(element, pid: expectedPid),
+           axBool(element, kAXEnabledAttribute as String) == true,
+           supportsPressAction(element),
+           nameMatches,
           pointIsOnActiveDisplay(CGPoint(x: buttonFrame.midX, y: buttonFrame.midY)),
           hitTestMatchesButton(
               element,
@@ -1199,7 +1364,7 @@ func clickNamed(
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        if hasExactName(node, names: names),
+        if hasNavigationName(node, names: names),
            let pressableAncestor = nearestNavigationPressableAncestor(
                from: node,
                appElement: root,
@@ -1305,7 +1470,7 @@ func hasNavigableNamedElement(
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        if hasExactName(node, names: names),
+        if hasNavigationName(node, names: names),
            nearestNavigationPressableAncestor(
                from: node,
                appElement: root,
@@ -1408,6 +1573,53 @@ func waitForGetCodeButton(
             expectedPid: expectedPid
         )
     } while true
+}
+
+func pressTwoFactorNavigationUntilGetCode(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date
+) -> NavigationTargetReadiness {
+    var pressAttempts = 0
+    while Date() < deadline {
+        guard actionMayProceed(
+            deadline: deadline,
+            appElement: appElement,
+            expectedPid: expectedPid
+        ) else {
+            return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
+        }
+        if findGetCodeButton(
+            appElement: appElement,
+            expectedPid: expectedPid,
+            twoFactorNames: twoFactor,
+            buttonNames: getCodeBtn
+        ) != nil {
+            return .getCodeReady
+        }
+        if pressAttempts < 3,
+           hasNavigableNamedElementInTrustedSettingsOwners(
+               appElement: appElement,
+               expectedPid: expectedPid,
+               names: twoFactor
+           ) {
+            let pressed = clickNamedInTrustedSettingsOwners(
+                appElement: appElement,
+                expectedPid: expectedPid,
+                names: twoFactor,
+                deadline: deadline
+            )
+            if pressed { pressAttempts += 1 }
+        }
+        let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 450)
+        guard pauseMs > 0 else { return .timedOut }
+        cancellablePause(
+            UInt32(pauseMs * 1_000),
+            appElement: appElement,
+            expectedPid: expectedPid
+        )
+    }
+    return isTrustedSystemSettingsProcess(expectedPid) ? .timedOut : .ownerLost
 }
 
 func collectWindows(appElement: AXUIElement, expectedPid: pid_t) -> [AXUIElement] {
@@ -1693,6 +1905,16 @@ func emit(_ output: Output) -> Never {
     exit(output.ok ? 0 : 1)
 }
 
+// This fixed, code-free event is emitted only after the current helper has
+// confirmed the alert created by its own Get Verification Code request. The
+// Node sidecar uses the owning child process as the per-request boundary
+// before it starts its constrained Vision read.
+func emitVerificationAlertReady() {
+    FileHandle.standardOutput.write(
+        "{\"event\":\"verification_alert_ready\"}\n".data(using: .utf8)!
+    )
+}
+
 @discardableResult
 func closeVerificationCodeAlert(
     appElement: AXUIElement,
@@ -1717,15 +1939,20 @@ func closeVerificationCodeAlert(
         }
         if let closeButton = findExactButton(
             in: alert.root,
-            names: verificationAlertCloseButtons,
+            names: alert.usesMaskedCloseButton
+                ? verificationAlertFallbackCloseButtons
+                : verificationAlertCloseButtons,
             expectedPid: alert.ownerPid
         ) {
+            let closeNames = alert.usesMaskedCloseButton
+                ? verificationAlertFallbackCloseButtons
+                : verificationAlertCloseButtons
             if pressAttempts < 2 {
                 _ = pressExactButton(
                     closeButton,
                     appElement: alert.appElement,
                     expectedPid: alert.ownerPid,
-                    names: verificationAlertCloseButtons
+                    names: closeNames
                 )
                 pressAttempts += 1
             } else if !coordinateFallbackUsed {
@@ -1733,7 +1960,7 @@ func closeVerificationCodeAlert(
                     closeButton,
                     appElement: alert.appElement,
                     expectedPid: alert.ownerPid,
-                    names: verificationAlertCloseButtons
+                    names: closeNames
                 )
                 coordinateFallbackUsed = true
             }
@@ -1755,11 +1982,19 @@ func stopIfCancelled(appElement: AXUIElement? = nil, expectedPid: pid_t? = nil) 
     guard let path = cancelFilePath,
           FileManager.default.fileExists(atPath: path) else { return }
     if let appElement, let expectedPid {
-        closeVerificationCodeAlert(
+        let closed = closeVerificationCodeAlert(
             appElement: appElement,
             expectedPid: expectedPid,
             waitForAlertMs: verificationCodeRequested ? 3_000 : 0
         )
+        if verificationCodeRequested && !closed {
+            emit(Output(
+                ok: false,
+                code: nil,
+                message: "verification alert cleanup failed",
+                reason: OutputReason.verificationAlertCleanupFailed.rawValue
+            ))
+        }
     }
     emit(Output(ok: false, code: nil, message: "cancelled", reason: OutputReason.cancelled.rawValue))
 }
@@ -1847,6 +2082,10 @@ func requestVerificationCodeAlert(
         appElement: appElement,
         expectedPid: expectedPid
     ) else { return false }
+    // Enable the constrained masked-alert locator before the first lookup so
+    // a stale alert from a prior request is closed rather than treated as this
+    // request's Vision target.
+    verificationCodeRequested = true
     if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
         let closeWaitMs = remainingMilliseconds(until: deadline, cappedAt: 1_000)
         guard closeWaitMs > 0 else { return false }
@@ -1864,6 +2103,7 @@ func requestVerificationCodeAlert(
     }
 
     var actionAttempts = 0
+    var currentRequestActionSucceeded = false
     while Date() < deadline {
         guard actionMayProceed(
             deadline: deadline,
@@ -1871,11 +2111,30 @@ func requestVerificationCodeAlert(
             expectedPid: expectedPid
         ) else { return false }
         if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
-            return actionMayProceed(
-                deadline: deadline,
-                appElement: appElement,
-                expectedPid: expectedPid
-            )
+            if currentRequestActionSucceeded {
+                return actionMayProceed(
+                    deadline: deadline,
+                    appElement: appElement,
+                    expectedPid: expectedPid
+                )
+            }
+            let closeWaitMs = remainingMilliseconds(until: deadline, cappedAt: 1_000)
+            guard closeWaitMs > 0,
+                  closeVerificationCodeAlert(
+                      appElement: appElement,
+                      expectedPid: expectedPid,
+                      waitForAlertMs: closeWaitMs
+                  ), actionMayProceed(
+                      deadline: deadline,
+                      appElement: appElement,
+                      expectedPid: expectedPid
+                  ), !hasVerificationCodeAlert(
+                      appElement: appElement,
+                      expectedPid: expectedPid
+                  ) else {
+                return false
+            }
+            continue
         }
         let control = findGetCodeControl(
             appElement: appElement,
@@ -1889,46 +2148,66 @@ func requestVerificationCodeAlert(
             expectedPid: expectedPid
         ) else { return false }
         guard let control else {
-            if waitForVerificationCodeAlert(
+            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 250)
+            guard pauseMs > 0 else { return false }
+            cancellablePause(
+                UInt32(pauseMs * 1_000),
                 appElement: appElement,
-                expectedPid: expectedPid,
-                timeoutMs: remainingMilliseconds(until: deadline, cappedAt: 250),
-                deadline: deadline
-            ) {
-                return true
-            }
+                expectedPid: expectedPid
+            )
             continue
         }
 
-        verificationCodeRequested = true
+        // The alert must still be absent immediately before this helper's
+        // action. A delayed stale alert is closed by the next loop instead of
+        // being allowed to satisfy the current request.
+        if hasVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) {
+            continue
+        }
+        var actionSucceeded = false
         if actionAttempts < 2 {
-            _ = pressExactButton(
+            actionSucceeded = pressElement(
                 control.element,
                 appElement: control.appElement,
                 expectedPid: control.ownerPid,
-                names: buttonNames,
                 deadline: deadline
             )
         } else if actionAttempts == 2 {
-            _ = clickElementAtVerifiedFrame(
+            actionSucceeded = clickElementAtVerifiedFrame(
                 control.element,
                 appElement: control.appElement,
                 expectedPid: control.ownerPid,
                 names: buttonNames,
+                allowControlName: true,
                 deadline: deadline
             )
         }
         actionAttempts += 1
 
-        if waitForVerificationCodeAlert(
-            appElement: appElement,
-            expectedPid: expectedPid,
-            timeoutMs: actionAttempts <= 3
-                ? remainingMilliseconds(until: deadline, cappedAt: 2_000)
-                : remainingMilliseconds(until: deadline, cappedAt: 250),
-            deadline: deadline
-        ) {
-            return true
+        if actionSucceeded {
+            currentRequestActionSucceeded = true
+            if waitForVerificationCodeAlert(
+                appElement: appElement,
+                expectedPid: expectedPid,
+                timeoutMs: actionAttempts <= 3
+                    ? remainingMilliseconds(until: deadline, cappedAt: 2_000)
+                    : remainingMilliseconds(until: deadline, cappedAt: 250),
+                deadline: deadline
+            ) {
+                return true
+            }
+            // A later alert is no longer bound to this action. Clear the
+            // one-action confirmation gate so the next loop treats it as
+            // stale and closes it before retrying.
+            currentRequestActionSucceeded = false
+        } else {
+            let pauseMs = remainingMilliseconds(until: deadline, cappedAt: 250)
+            guard pauseMs > 0 else { return false }
+            cancellablePause(
+                UInt32(pauseMs * 1_000),
+                appElement: appElement,
+                expectedPid: expectedPid
+            )
         }
     }
     return false
@@ -1979,16 +2258,20 @@ func prepareVerificationCodeAlert(
         logStep(4, "Two-Factor Authentication already open")
     } else {
         logStep(3, "click Sign-In & Security")
+        let signInSecurityDeadline = min(
+            deadline,
+            Date().addingTimeInterval(TimeInterval(twoFactorNavigationTimeoutMs) / 1000.0)
+        )
         _ = clickNamedInTrustedSettingsOwners(
             appElement: appElement,
             expectedPid: expectedPid,
             names: signInSecurity,
-            deadline: deadline
+            deadline: signInSecurityDeadline
         )
         switch waitForTwoFactorNavigationTarget(
             appElement: appElement,
             expectedPid: expectedPid,
-            deadline: deadline
+            deadline: signInSecurityDeadline
         ) {
         case .getCodeReady:
             logStep(4, "Two-Factor Authentication already open")
@@ -2018,16 +2301,14 @@ func prepareVerificationCodeAlert(
             logStep(4, "Two-Factor Authentication already open")
         } else {
             logStep(4, "click Two-Factor Authentication")
-            _ = clickNamedInTrustedSettingsOwners(
-                appElement: appElement,
-                expectedPid: expectedPid,
-                names: twoFactor,
-                deadline: deadline
+            let twoFactorDeadline = min(
+                deadline,
+                Date().addingTimeInterval(TimeInterval(twoFactorNavigationTimeoutMs) / 1000.0)
             )
-            guard waitForGetCodeButton(
+            guard pressTwoFactorNavigationUntilGetCode(
                 appElement: appElement,
                 expectedPid: expectedPid,
-                deadline: deadline
+                deadline: twoFactorDeadline
             ) == .getCodeReady else {
                 return isTrustedSystemSettingsProcess(expectedPid)
                     ? .twoFactorNotFound
@@ -2193,7 +2474,7 @@ for uiOwnerAttempt in 1...2 {
         guard isTrustedSystemSettingsProcess(settingsPid) else { continue }
         emit(Output(ok: false, code: nil, message: "verification code alert was not opened", reason: OutputReason.verificationAlertNotOpened.rawValue))
     case .ready:
-        break
+        emitVerificationAlertReady()
     }
 
     logStep(6, "waiting for verification code alert…")

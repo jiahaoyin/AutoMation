@@ -343,6 +343,7 @@ export async function readPopupCodeViaOcr(timeoutSec = 10, options = {}) {
   );
   if (boundedTimeoutSec < 1) return unavailableOcrResult("unavailable");
   const args = ["--timeout", String(boundedTimeoutSec)];
+  if (options.settingsAlertOnly === true) args.push("--settings-alert-only");
   try {
     const timeout = boundedExecutionTimeout(
       boundedTimeoutSec * 1_000 + HELPER_EXIT_GRACE_MS,

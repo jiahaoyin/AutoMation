@@ -67,9 +67,18 @@ class ManualClock {
   }
 }
 
-function cancellationError() {
+async function waitForClockCondition(clock, predicate, description) {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    await clock.flush();
+    if (predicate()) return;
+  }
+  assert.fail(description);
+}
+
+function cancellationError({ alertCleanupConfirmed = false } = {}) {
   const error = new Error("cancelled");
   error.code = "2FA_SETTINGS_CANCELLED";
+  if (alertCleanupConfirmed) error.alertCleanupConfirmed = true;
   return error;
 }
 
@@ -119,6 +128,9 @@ function createNativeHarness(
     dismissAction = "dismissed_stale",
     popupCapability = null,
     popupReadResults = [],
+    settingsOcrResults = [],
+    settingsOcrProvider = null,
+    settingsAlertReady = true,
     probeCapability = null,
     probe2FAState: customProbe2FAState = null,
     initialAllowVisible = false,
@@ -129,6 +141,7 @@ function createNativeHarness(
   let allowVisible = initialAllowVisible;
   const probeResults = [];
   const queuedPopupReadResults = [...popupReadResults];
+  const queuedSettingsOcrResults = [...settingsOcrResults];
   let fallbackCloseFailuresRemaining = popupFallbackCloseFailures;
   let settingsStartFailuresRemaining = settingsStartFailures;
   const settingsRequests = [];
@@ -147,6 +160,7 @@ function createNativeHarness(
     accessibilityOptions: [],
     allowAttempts: [],
     popupReads: [],
+    settingsOcrReads: [],
     fullAllowWaits: 0,
     probeCalls: 0,
   };
@@ -204,6 +218,14 @@ function createNativeHarness(
       if (!popup) return null;
       return { code: popup.code, raw: popup.raw, source: popupSource };
     },
+    async readSettingsVerificationCode(timeoutSec, options) {
+      stats.settingsOcrReads.push({ timeoutSec, options });
+      if (settingsOcrProvider) return settingsOcrProvider(timeoutSec, options);
+      if (queuedSettingsOcrResults.length > 0) {
+        return queuedSettingsOcrResults.shift();
+      }
+      return null;
+    },
     async runPopupPhase(phase) {
       stats.popupPhaseCalls.push(phase);
       if (phase === "read_code" && popup) {
@@ -251,11 +273,19 @@ function createNativeHarness(
         throw settingsStartError ?? new Error("settings start failed");
       }
       const result = deferred();
+      const alertReady = deferred();
+      if (settingsAlertReady !== "pending") {
+        alertReady.resolve(settingsAlertReady === true);
+      }
       let settled = false;
       const options = arguments[0];
       const request = {
         options,
         promise: result.promise,
+        alertReady: alertReady.promise,
+        markAlertReady() {
+          alertReady.resolve(true);
+        },
         resolve(value) {
           if (settled) return;
           settled = true;
@@ -272,7 +302,7 @@ function createNativeHarness(
           stats.settingsCancels += 1;
           if (!settingsCancelSettles) return true;
           settled = true;
-          result.reject(cancellationError());
+          result.reject(cancellationError({ alertCleanupConfirmed: true }));
           return true;
         },
         forceStop() {
@@ -2242,6 +2272,171 @@ async function settingsOnlyStartsImmediatelyWithoutPopupHelpersTest() {
   );
 }
 
+async function settingsScopedOcrCandidateWinsAndCancelsSettingsTest() {
+  const { clock, native, collector, statuses, audits } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsOcrResults: [{ code: "482915", source: "vision" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1,
+    "Settings OCR worker did not start"
+  );
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(native.stats.settingsOcrReads.length, 1);
+  assert.equal(await codePromise, "482915");
+  assert.equal(native.stats.settingsCancels, 1, "OCR winner must cancel Settings for alert cleanup");
+  assert.equal(
+    audits.some(
+      ({ phase, source, outcome }) =>
+        phase === "settings_provider_result" && source === "vision" && outcome === "candidate_ready"
+    ),
+    true
+  );
+  assert.equal(
+    statuses.some(({ status, source }) => status === "winner" && source === "settings"),
+    true
+  );
+  assert.deepEqual(popupHelperStats(native), {
+    stalePopupCleanupCalls: 0,
+    probeCalls: 0,
+    allowAttempts: 0,
+    popupReads: 0,
+    popupPhaseCalls: 0,
+    popupCloseCalls: 0,
+  });
+  await collector.dispose();
+}
+
+async function settingsOcrWaitsForFreshAlertReadyTest() {
+  const { clock, native, collector } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsAlertReady: "pending",
+    settingsOcrResults: [{ code: "482915", source: "vision" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsStarts === 1,
+    "Settings helper did not start"
+  );
+  await clock.flush();
+  assert.equal(
+    native.stats.settingsOcrReads.length,
+    0,
+    "Settings OCR must not read a stale alert before the current request is confirmed"
+  );
+
+  native.settingsRequests[0].markAlertReady();
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1,
+    "Settings OCR did not start after the current alert was confirmed"
+  );
+  assert.equal(await codePromise, "482915");
+  await collector.dispose();
+}
+
+async function settingsOcrWinnerWaitsForNativeAlertCleanupTest() {
+  const { clock, native, collector } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsCancelSettles: false,
+    settingsOcrResults: [{ code: "482915", source: "vision" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+  let settled = false;
+  void codePromise.then(() => {
+    settled = true;
+  });
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1 && native.stats.settingsCancels === 1,
+    "Settings OCR winner did not signal native alert cleanup"
+  );
+  assert.equal(settled, false, "OCR winner must wait for the native Settings helper");
+
+  native.settingsRequests[0].reject(cancellationError({ alertCleanupConfirmed: true }));
+  await clock.flush();
+  assert.equal(await codePromise, "482915");
+  await collector.dispose();
+}
+
+async function settingsOcrUnavailableStopsRetryingTest() {
+  const { clock, native, collector, statuses, audits } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsOcrResults: [{ code: null, capability: "permission_missing" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+  const rejected = assert.rejects(codePromise, /disposed/i);
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1,
+    "Settings OCR worker did not start"
+  );
+  await clock.advance(1_000);
+  assert.equal(native.stats.settingsOcrReads.length, 1, "unavailable OCR must not retry");
+  assert.deepEqual(
+    statuses.filter(({ status, source }) => status === "ocr_permission_missing" && source === "settings"),
+    [{ status: "ocr_permission_missing", source: "settings", remainingSec: 30 }]
+  );
+  assert.equal(
+    audits.some(
+      ({ phase, source, capability, reason }) =>
+        phase === "settings_ocr" &&
+        source === "vision" &&
+        capability === "permission_missing" &&
+        reason === "ocr_permission_missing"
+    ),
+    true
+  );
+  await collector.dispose();
+  await rejected;
+}
+
+async function settingsOcrRetryTimerStopsWhenSettingsWinsTest() {
+  const { clock, native, collector } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsOcrResults: [null],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1,
+    "Settings OCR worker did not start"
+  );
+  assert.equal(native.stats.settingsOcrReads.length, 1);
+  assert.equal(
+    clock.timers.size,
+    2,
+    "empty OCR result must leave only the acquisition deadline and one bounded OCR retry"
+  );
+
+  native.settingsRequests[0].resolve({ code: "135790" });
+  await clock.flush();
+  assert.equal(await codePromise, "135790");
+  assert.equal(clock.timers.size, 0, "Settings winner must cancel the pending OCR retry");
+
+  await clock.advance(400);
+  assert.equal(native.stats.settingsOcrReads.length, 1, "cancelled OCR retry must not restart");
+  await collector.dispose();
+}
+
 async function settingsOnlyManualFallbackStartsAtNinetySecondsTest() {
   const manual = createManualProviderHarness();
   const { clock, native, collector } = createHarness({
@@ -3727,6 +3922,11 @@ const focusedTests = {
   "settings-max": settingsNeverStartsThirdAttemptTest,
   "settings-cancel": cancelledSettingsDoesNotRetryTest,
   "settings-only": settingsOnlyStartsImmediatelyWithoutPopupHelpersTest,
+  "settings-ocr": settingsScopedOcrCandidateWinsAndCancelsSettingsTest,
+  "settings-ocr-ready": settingsOcrWaitsForFreshAlertReadyTest,
+  "settings-ocr-native-cleanup": settingsOcrWinnerWaitsForNativeAlertCleanupTest,
+  "settings-ocr-retry-cleanup": settingsOcrRetryTimerStopsWhenSettingsWinsTest,
+  "settings-ocr-unavailable": settingsOcrUnavailableStopsRetryingTest,
   "settings-only-manual": settingsOnlyManualFallbackStartsAtNinetySecondsTest,
   "settings-only-accessibility-manual": settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest,
   "settings-only-generation": settingsOnlyGenerationTwoRejectsPreviousCodeTest,
@@ -3804,9 +4004,14 @@ await environmentCannotShortenPopupPrimaryWindowTest();
   await popupCodeIsPublishedWhenDialogCleanupFailsTest();
   await popupCodeWinsAfterAllDialogCleanupPathsFailTest();
   await settingsGracePeriodTest();
-await settingsOnlyStartsImmediatelyWithoutPopupHelpersTest();
-await settingsOnlyManualFallbackStartsAtNinetySecondsTest();
-await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
+  await settingsOnlyStartsImmediatelyWithoutPopupHelpersTest();
+  await settingsScopedOcrCandidateWinsAndCancelsSettingsTest();
+  await settingsOcrWaitsForFreshAlertReadyTest();
+  await settingsOcrWinnerWaitsForNativeAlertCleanupTest();
+  await settingsOcrRetryTimerStopsWhenSettingsWinsTest();
+  await settingsOcrUnavailableStopsRetryingTest();
+  await settingsOnlyManualFallbackStartsAtNinetySecondsTest();
+  await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
   await settingsOnlyGenerationTwoRejectsPreviousCodeTest();
   await settingsStartFailureEmitsFixedStatusAfterAuditTest();
   await diagnosticCallbackSanitizesSettingsFailureTest();

@@ -897,6 +897,61 @@ async function runSuccessTest() {
   }
 }
 
+async function runVerificationAlertReadyEventTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    let ready = null;
+    void request.alertReady.then((value) => {
+      ready = value;
+    });
+
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from('{"event":"verification_alert_ready"}\n')
+    );
+    await Promise.resolve();
+    assert.equal(ready, true, "the fixed readiness event must open this helper's OCR gate");
+
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from('{"ok":true,"reason":"ok","message":"ok","code":"123456"}\n')
+    );
+    harness.child.emit("close", 0, null);
+    assert.deepEqual(await request.promise, { code: "123456" });
+  } finally {
+    harness.cleanup();
+  }
+}
+
+async function runMissingVerificationAlertReadyEventFailsClosedTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from('{"ok":true,"reason":"ok","message":"ok","code":"123456"}\n')
+    );
+    harness.child.emit("close", 0, null);
+    assert.equal(
+      await request.alertReady,
+      false,
+      "a completed helper without the current alert event must not authorize Settings OCR"
+    );
+    assert.deepEqual(await request.promise, { code: "123456" });
+  } finally {
+    harness.cleanup();
+  }
+}
+
 async function runSettingsAccessibilityPreflightTest() {
   const harness = createHarness();
   try {
@@ -1132,6 +1187,36 @@ async function runFixedHelperReasonMappingTest() {
     const error = await rejectionOf(request.promise);
     assertSafeError(error);
     assert.equal(error.code, "2FA_SETTINGS_HELPER_EXIT");
+    assertNoSecrets(error.message);
+  } finally {
+    harness.cleanup();
+  }
+}
+
+async function runCancellationCleanupFailureIsPreservedTest() {
+  const harness = createHarness();
+  try {
+    const request = start2FASettingsCodeRequest({
+      reportDir: harness.reportDir,
+      runtime: harness.runtime,
+      verbose: false,
+    });
+    assert.equal(request.cancel(), true);
+    harness.child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          ok: false,
+          reason: "verification_alert_cleanup_failed",
+          message: SECRET_TEXT,
+        }) + "\n"
+      )
+    );
+    harness.child.emit("close", 1, null);
+
+    const error = await rejectionOf(request.promise);
+    assertSafeError(error);
+    assert.equal(error.code, "2FA_SETTINGS_ALERT_CLEANUP_FAILED");
     assertNoSecrets(error.message);
   } finally {
     harness.cleanup();
@@ -1750,8 +1835,8 @@ function runStrictVerificationCodeSourceContractTest() {
     "Get Verification Code lookup must retain the normal settings root when sheets are present"
   );
   assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*ownerPid\)/);
-  assert.match(getCodeFinder, /treeContainsExactText\(\s*root,/);
-  assert.match(getCodeFinder, /let button = findExactButton\(\s*in:\s*root,/);
+  assert.match(getCodeFinder, /treeContainsNavigationName\(\s*root,/);
+  assert.match(getCodeFinder, /let button = findExactControlButton\(\s*in:\s*root,/);
   assert.match(getCodeFinder, /matches\.count\s*==\s*1/);
   assert.match(
     getCodeFinder,
@@ -1759,7 +1844,7 @@ function runStrictVerificationCodeSourceContractTest() {
     "Get Verification Code must verify the Two-Factor Authentication scope before finding its button"
   );
   assert.ok(
-    getCodeFinder.indexOf("twoFactorNames") < getCodeFinder.indexOf("findExactButton("),
+    getCodeFinder.indexOf("twoFactorNames") < getCodeFinder.indexOf("findExactControlButton("),
     "Two-Factor Authentication scope verification must precede strict button lookup"
   );
   assert.doesNotMatch(
@@ -1791,7 +1876,7 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   const navigationAncestor = functionBody("nearestNavigationPressableAncestor");
   assert.match(navigationClick, /expectedPid/);
-  assert.match(navigationClick, /hasExactName\(node,\s*names:\s*names\)/);
+  assert.match(navigationClick, /hasNavigationName\(node,\s*names:\s*names\)/);
   assert.match(navigationClick, /nearestNavigationPressableAncestor\(/);
   assert.match(navigationAncestor, /axParent\(candidate\)/);
   assert.match(navigationAncestor, /kAXHiddenAttribute/);
@@ -1829,11 +1914,11 @@ function runStrictVerificationCodeSourceContractTest() {
   const navigationPrepare = functionBody("prepareVerificationCodeAlert");
   assert.match(
     navigationPrepare,
-    /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*(?:signInSecurity|twoFactor)[\s\S]{0,220}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*deadline/
+    /let signInSecurityDeadline\s*=\s*min\([\s\S]{0,180}Date\(\)\.addingTimeInterval\(TimeInterval\(twoFactorNavigationTimeoutMs\)\s*\/\s*1000\.0\)[\s\S]{0,300}_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*signInSecurity,[\s\S]{0,160}deadline:\s*signInSecurityDeadline[\s\S]{0,260}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*signInSecurityDeadline/
   );
   assert.match(
     navigationPrepare,
-    /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*(?:signInSecurity|twoFactor)[\s\S]{0,600}waitForGetCodeButton\([\s\S]{0,180}deadline:\s*deadline/
+    /let twoFactorDeadline\s*=\s*min\([\s\S]{0,180}Date\(\)\.addingTimeInterval\(TimeInterval\(twoFactorNavigationTimeoutMs\)\s*\/\s*1000\.0\)[\s\S]{0,300}pressTwoFactorNavigationUntilGetCode\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,180}deadline:\s*twoFactorDeadline/
   );
   assert.doesNotMatch(source, /boundedNavigationDeadline|navigationSettleTimeoutMs/);
 
@@ -1931,7 +2016,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(request, /actionMayProceed\([\s\S]{0,120}deadline:\s*deadline/);
   assert.match(
     request,
-    /pressExactButton\([\s\S]{0,320}deadline:\s*deadline/
+    /pressElement\([\s\S]{0,320}deadline:\s*deadline/
   );
   assert.match(
     request,
@@ -1944,7 +2029,7 @@ function runStrictVerificationCodeSourceContractTest() {
   const postActionBody = retryBody.slice(retryBody.indexOf("if actionAttempts < 2"));
   assertOrdered(
     postActionBody,
-    ["pressExactButton(", "clickElementAtVerifiedFrame(", "waitForVerificationCodeAlert(", "return true"],
+    ["pressElement(", "clickElementAtVerifiedFrame(", "waitForVerificationCodeAlert(", "return true"],
     "each click attempt must be followed by bounded alert confirmation"
   );
   assert.doesNotMatch(
@@ -1980,7 +2065,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(prepare, /deadline:\s*Date/);
   assert.match(
     prepare,
-    /clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*deadline/
+    /let signInSecurityDeadline\s*=\s*min\([\s\S]{0,180}twoFactorNavigationTimeoutMs[\s\S]{0,260}clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*signInSecurityDeadline/
   );
   assert.match(
     prepare,
@@ -2141,9 +2226,10 @@ function runVerificationCodeHardeningSourceContractTest() {
   const buttonIndex = request.indexOf("findGetCodeControl(", loopStart);
   assert.ok(buttonIndex > loopStart, "each poll must freshly resolve the Get Verification Code control");
   assert.match(request, /var actionAttempts\s*=\s*0/);
+  assert.match(request, /var currentRequestActionSucceeded\s*=\s*false/);
   assert.match(
     request,
-    /if actionAttempts < 2\s*\{[\s\S]{0,280}pressExactButton\([\s\S]{0,180}control\.element[\s\S]{0,180}control\.ownerPid/
+    /if actionAttempts < 2\s*\{[\s\S]{0,280}pressElement\([\s\S]{0,180}control\.element[\s\S]{0,180}control\.ownerPid/
   );
   assert.match(
     request,
@@ -2167,8 +2253,8 @@ function runVerificationCodeHardeningSourceContractTest() {
     (match) => match.index
   );
   assert.ok(
-    alertChecks.length >= 2,
-    "each poll needs pre-button and missing-button late-alert checks"
+    alertChecks.length >= 3,
+    "each poll needs stale-alert cleanup and a pre-action absence check"
   );
   assert.ok(alertChecks[0] < buttonIndex, "new-alert check must precede button lookup");
 
@@ -2177,8 +2263,32 @@ function runVerificationCodeHardeningSourceContractTest() {
   const missingButtonPath = request.slice(request.indexOf("else", buttonIndex), missingButtonEnd);
   assert.match(
     missingButtonPath,
-    /(?:hasVerificationCodeAlert|waitForVerificationCodeAlert)\(/,
-    "missing-button path must check for a late verification alert before continuing"
+    /cancellablePause\(/,
+    "missing-button path must wait for the control instead of accepting an unbound alert"
+  );
+  assert.doesNotMatch(
+    missingButtonPath,
+    /waitForVerificationCodeAlert\(/,
+    "missing-button path must not accept a stale alert without a current action"
+  );
+  const actionSucceeded = request.indexOf("var actionSucceeded = false");
+  const currentAction = request.indexOf("currentRequestActionSucceeded = true", actionSucceeded);
+  const confirmationWait = request.indexOf("if waitForVerificationCodeAlert(", currentAction);
+  const confirmationGateCleared = request.indexOf(
+    "currentRequestActionSucceeded = false",
+    confirmationWait
+  );
+  assert.ok(
+    actionSucceeded >= 0 &&
+      currentAction > actionSucceeded &&
+      confirmationWait > currentAction &&
+      confirmationGateCleared > confirmationWait,
+    "only a successful current Get Verification Code action may confirm an alert"
+  );
+  const preActionAlert = request.lastIndexOf("if hasVerificationCodeAlert(", actionSucceeded);
+  assert.ok(
+    preActionAlert > buttonIndex && preActionAlert < actionSucceeded,
+    "an alert that appears after control discovery must be handled before pressing"
   );
   assert.match(
     request,
@@ -2356,6 +2466,86 @@ function runTraditionalChineseStateContractTest() {
   );
 }
 
+function runEvidenceDrivenSettingsNavigationContractTest() {
+  const source = readSettingsSwiftSource();
+  const functionBody = (name) => {
+    const start = source.indexOf(`func ${name}`);
+    assert.notEqual(start, -1, `missing Swift function ${name}`);
+    const next = source.indexOf("\nfunc ", start + 5);
+    return source.slice(start, next === -1 ? source.length : next);
+  };
+
+  const controlTexts = functionBody("axControlTexts");
+  const exactControlName = functionBody("hasExactControlName");
+  const exactControlButton = functionBody("findExactControlButton");
+  const navigationName = functionBody("hasNavigationName");
+  assert.match(source, /let controlTextAttributes\s*=\s*exactTextAttributes[\s\S]*kAXIdentifierAttribute/);
+  assert.match(controlTexts, /controlTextAttributes/);
+  assert.match(navigationName, /axControlTexts\(element\)/);
+  assert.match(navigationName, /text\.hasPrefix\(name\)/);
+  assert.match(navigationName, /remainder\.first/);
+  assert.doesNotMatch(navigationName, /blob\.contains/);
+  assert.match(exactControlName, /axControlTexts\(element\)/);
+  assert.match(exactControlName, /expected\.contains/);
+  assert.match(exactControlButton, /hasExactControlName\(node,\s*names:\s*names\)/);
+  assert.match(exactControlButton, /nearestNavigationPressableAncestor\(/);
+  assert.match(exactControlButton, /axRole\(button\)\s*==\s*kAXButtonRole/);
+
+  const navigationClick = functionBody("clickNamed");
+  const navigationProbe = functionBody("hasNavigableNamedElement");
+  const navigationScope = functionBody("treeContainsNavigationName");
+  assert.match(navigationClick, /hasNavigationName\(node,\s*names:\s*names\)/);
+  assert.match(navigationProbe, /hasNavigationName\(node,\s*names:\s*names\)/);
+  assert.match(navigationScope, /hasNavigationName\(node,\s*names:\s*names\)/);
+  assert.match(navigationScope, /elementBelongsToProcess\(node,\s*pid:\s*expectedPid\)/);
+
+  const retry = functionBody("pressTwoFactorNavigationUntilGetCode");
+  assert.match(retry, /var pressAttempts\s*=\s*0/);
+  assert.match(retry, /pressAttempts\s*<\s*3/);
+  assert.match(retry, /findGetCodeButton\(/);
+  assert.match(retry, /clickNamedInTrustedSettingsOwners\(/);
+  assert.match(retry, /let pressed\s*=\s*clickNamedInTrustedSettingsOwners/);
+  assert.match(retry, /if pressed\s*\{\s*pressAttempts\s*\+=\s*1\s*\}/);
+  assert.match(retry, /cappedAt:\s*450/);
+  assert.match(retry, /deadline:\s*deadline/);
+
+  const masked = functionBody("isMaskedVerificationAlertRoot");
+  const maskedFinder = functionBody("findMaskedVerificationAlertRoot");
+  const alertFinder = functionBody("findVerificationCodeAlertRoot");
+  const alertLocator = functionBody("locateVerificationCodeAlert");
+  const closeAlert = functionBody("closeVerificationCodeAlert");
+  const requestAlert = functionBody("requestVerificationCodeAlert");
+  const alertReadyEvent = functionBody("emitVerificationAlertReady");
+  assert.match(source, /let verificationAlertFallbackCloseButtons\s*=\s*\[/);
+  assert.match(source, /let maskedVerificationAlertImageNames\s*=\s*\[/);
+  assert.match(masked, /guard verificationCodeRequested/);
+  assert.match(masked, /treeContainsNavigationName\(/);
+  assert.match(masked, /findExactButton\(/);
+  assert.match(maskedFinder, /collectWindows\(/);
+  assert.match(maskedFinder, /let windowMatches\s*=\s*roots\.filter/);
+  assert.match(maskedFinder, /if windowMatches\.count\s*==\s*1/);
+  assert.match(maskedFinder, /guard windowMatches\.isEmpty/);
+  assert.match(maskedFinder, /isMaskedVerificationAlertRoot\(appElement/);
+  assert.match(alertFinder, /findMaskedVerificationAlertRoot\(/);
+  assert.match(alertLocator, /usesMaskedCloseButton/);
+  assert.match(closeAlert, /verificationAlertFallbackCloseButtons/);
+  assert.match(closeAlert, /alert\.usesMaskedCloseButton/);
+  assert.match(alertReadyEvent, /verification_alert_ready/);
+  assert.ok(
+    requestAlert.indexOf("verificationCodeRequested = true") <
+      requestAlert.indexOf("if hasVerificationCodeAlert"),
+    "stale masked alerts must be recognized before the first Get Verification Code action"
+  );
+  const prepareCall = source.indexOf("switch prepareVerificationCodeAlert(");
+  const readyEvent = source.indexOf("emitVerificationAlertReady()", prepareCall);
+  const alertWait = source.indexOf('logStep(6, "waiting for verification code alert', prepareCall);
+  assert.ok(
+    prepareCall >= 0 && readyEvent > prepareCall && alertWait > readyEvent,
+    "the fixed readiness event must be emitted only after the current alert preparation succeeds"
+  );
+  assert.doesNotMatch(source, /ScreenCaptureKit|VNRecognize|screencapture/i);
+}
+
 function runManualSettingsPrivacyContractTest() {
   const source = fs.readFileSync(
     new URL("./test-2fa-settings-code.mjs", import.meta.url),
@@ -2380,6 +2570,8 @@ function runManualSettingsPrivacyContractTest() {
 }
 
 await runSuccessTest();
+await runVerificationAlertReadyEventTest();
+await runMissingVerificationAlertReadyEventFailsClosedTest();
 await runSettingsAccessibilityPreflightTest();
 await runFixedSuccessStateTest();
 await runSequentialSettingsCodeRequestsTest();
@@ -2387,6 +2579,7 @@ await runSensitiveOutputSanitizationTest();
 await runHelperFailureSanitizationTest();
 await runAccessibilityFailureClassificationTest();
 await runFixedHelperReasonMappingTest();
+await runCancellationCleanupFailureIsPreservedTest();
 await runChildErrorSanitizationTest();
 await runCancelTest();
 runMissingSourceRejectsOldBinaryTest();
@@ -2404,6 +2597,7 @@ runAccessibilityPromptSourceContractTest();
 runVerificationCodeHardeningSourceContractTest();
 runStrictVerificationCodeSourceContractTest();
 runTraditionalChineseStateContractTest();
+runEvidenceDrivenSettingsNavigationContractTest();
 runManualSettingsPrivacyContractTest();
 
 console.log("mac settings 2fa lifecycle: ok");

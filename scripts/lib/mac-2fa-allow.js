@@ -519,3 +519,41 @@ export async function readPopupCode(timeoutSec = 10, options = {}) {
     deadlineScope.dispose();
   }
 }
+
+/**
+ * Read only the masked System Settings verification alert through the Vision
+ * helper. This deliberately skips the generic popup AX reader and cannot
+ * inspect an arbitrary shared-host window.
+ */
+export async function readSettingsVerificationCode(timeoutSec = 10, options = {}) {
+  const runtime = options.runtime ?? {};
+  const readViaOcr = runtime.readPopupCodeViaOcr ?? readPopupCodeViaOcr;
+  const rejectCodes = options.rejectCodes;
+  if (options.signal?.aborted) return unavailablePopupCode();
+
+  let result = null;
+  try {
+    result = await readViaOcr(timeoutSec, {
+      ...options,
+      settingsAlertOnly: true,
+      compileIfNeeded: false,
+      requestPermission: false,
+    });
+  } catch (error) {
+    if (isAbortFailure(error, options.signal)) return unavailablePopupCode();
+  }
+
+  if (options.signal?.aborted) return unavailablePopupCode();
+  const code = typeof result?.code === "string" && /^\d{6}$/.test(result.code)
+    ? result.code
+    : null;
+  if (!code) {
+    return {
+      code: null,
+      source: result?.source ?? "vision",
+      capability: result?.capability ?? "unavailable",
+    };
+  }
+  if (rejectCodes?.has(code)) return rejectedPopupCode();
+  return { code, source: "vision" };
+}

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   probe2FAState,
+  readSettingsVerificationCode,
   tryAllowOnce,
   waitForManualAllow,
 } from "./lib/mac-2fa-allow.js";
@@ -968,13 +969,10 @@ test("AX and OCR share one constrained verification-code prompt predicate", () =
     popupReadSwiftSource,
     "func hasCodeDisplayPrompt"
   );
-  const ocrPromptStart = popupOcrSwiftSource.indexOf("func looksLikeCodeDialog");
-  const ocrPromptEnd = popupOcrSwiftSource.indexOf(
-    "\nlet dedicatedAuthExecutables",
-    ocrPromptStart
+  const ocrPrompt = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func looksLikeCodeDialog"
   );
-  assert.ok(ocrPromptStart >= 0 && ocrPromptEnd > ocrPromptStart);
-  const ocrPrompt = popupOcrSwiftSource.slice(ocrPromptStart, ocrPromptEnd);
   const findOcrTargets = sourceFunctionBody(
     popupOcrSwiftSource,
     "func findCodeDialogs"
@@ -995,6 +993,87 @@ test("AX and OCR share one constrained verification-code prompt predicate", () =
     findOcrTargets,
     /let hasCodePrompt = looksLikeCodeDialog\(blob\)[\s\S]*isEligibleCodeWindow\([\s\S]*hasCodePrompt: hasCodePrompt/
   );
+});
+
+test("Settings OCR only targets the masked Apple Account alert", () => {
+  const finder = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func findSettingsMaskedCodeDialogs"
+  );
+  const closeFinder = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func findMaskedAlertCloseButton"
+  );
+  const imageEvidence = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func hasSettingsMaskedAlertImage"
+  );
+  const contextEvidence = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func hasSettingsTwoFactorRequestEvidence"
+  );
+  const settingsMarkerTexts = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func axSettingsMarkerTexts"
+  );
+  const settingsMarkerBlob = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func settingsMarkerBlob"
+  );
+  const ocr = sourceFunctionBody(popupOcrSwiftSource, "func tryOcrOnImage");
+  assert.match(finder, /isSystemSettingsSharedHost\(app\)/);
+  assert.match(finder, /hasSettingsTwoFactorRequestEvidence\(appElement\)/);
+  assert.match(finder, /findMaskedAlertCloseButton\(window\)/);
+  assert.match(finder, /hasSettingsMaskedAlertImage\(window\)/);
+  assert.match(finder, /resolveOnScreenWindowID\([\s\S]*near:\s*closeFrame/);
+  assert.match(finder, /requiresAppleAccountEvidence:\s*true/);
+  assert.match(closeFinder, /settingsMaskedAlertCloseButtons/);
+  assert.match(closeFinder, /kAXButtonRole/);
+  assert.match(closeFinder, /supportsPressAction/);
+  assert.match(imageEvidence, /kAXImageRole/);
+  assert.match(imageEvidence, /axSettingsMarkerTexts\(node\)/);
+  assert.match(imageEvidence, /settingsMaskedAlertImageMarker/);
+  assert.match(popupOcrSwiftSource, /let settingsMarkerTextAttributes\s*=\s*\[[\s\S]*kAXIdentifierAttribute/);
+  assert.match(settingsMarkerTexts, /settingsMarkerTextAttributes/);
+  assert.match(settingsMarkerBlob, /axSettingsMarkerTexts\(root\)/);
+  assert.match(contextEvidence, /settingsTwoFactorMarkers/);
+  assert.match(contextEvidence, /settingsGetCodeMarkers/);
+  assert.match(contextEvidence, /settingsMarkerBlob\(surface\)/);
+  assert.match(ocr, /requiresAppleAccountEvidence\s*\?\s*uniqueCode/);
+  assert.match(
+    popupOcrSwiftSource,
+    /CommandLine\.arguments\[i\]\s*==\s*"--settings-alert-only"/
+  );
+  assert.match(
+    popupOcrSwiftSource,
+    /if settingsAlertOnly\s*\{[\s\S]*dialogs\s*=\s*findSettingsMaskedCodeDialogs\(\)/
+  );
+  assert.match(
+    sourceFunctionBody(popupOcrSwiftSource, "func isEligibleCodeWindow"),
+    /case \.sharedHost:[\s\S]*hasCodePrompt && hasExplicitAppleAccountEvidence\(blob\)/
+  );
+  assert.match(
+    popupOcrSwiftSource,
+    /candidate\.requiresStability\s*\|\|\s*settingsAlertOnly/
+  );
+});
+
+test("Settings OCR wrapper requests only the masked-alert helper mode", async () => {
+  const calls = [];
+  const result = await readSettingsVerificationCode(7, {
+    runtime: {
+      async readPopupCodeViaOcr(timeoutSec, options) {
+        calls.push({ timeoutSec, options });
+        return { code: "482915", source: "vision" };
+      },
+    },
+  });
+  assert.deepEqual(result, { code: "482915", source: "vision" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].timeoutSec, 7);
+  assert.equal(calls[0].options.settingsAlertOnly, true);
+  assert.equal(calls[0].options.compileIfNeeded, false);
+  assert.equal(calls[0].options.requestPermission, false);
 });
 
 test("zh-Hant code reading and completion cleanup share one state chain", () => {

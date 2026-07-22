@@ -57,8 +57,28 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
     axCopy(element, kAXChildrenAttribute as String) ?? []
 }
 
+func axSheets(_ element: AXUIElement) -> [AXUIElement] {
+    axCopy(element, "AXSheets") ?? []
+}
+
 func axTexts(_ element: AXUIElement) -> [String] {
     [kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute, kAXRoleDescriptionAttribute]
+        .compactMap { axString(element, $0 as String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+}
+
+let settingsMarkerTextAttributes = [
+    kAXTitleAttribute,
+    kAXValueAttribute,
+    kAXDescriptionAttribute,
+    kAXRoleDescriptionAttribute,
+    kAXIdentifierAttribute,
+]
+
+// Identifiers are not part of generic popup or OTP text handling. They are
+// only accepted here for the fixed System Settings marker allowlist.
+func axSettingsMarkerTexts(_ element: AXUIElement) -> [String] {
+    settingsMarkerTextAttributes
         .compactMap { axString(element, $0 as String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 }
@@ -82,6 +102,9 @@ func blobOf(_ root: AXUIElement, depth: Int = 0, maxDepth: Int = 14) -> String {
     for child in axChildren(root) {
         b += " " + blobOf(child, depth: depth + 1, maxDepth: maxDepth)
     }
+    for sheet in axSheets(root) {
+        b += " " + blobOf(sheet, depth: depth + 1, maxDepth: maxDepth)
+    }
     return b
 }
 
@@ -97,6 +120,18 @@ func looksLikeCodeDialog(_ blob: String) -> Bool {
     let lower = blob.lowercased()
     if lower.contains("enter this verification code on the web") { return true }
     return false
+}
+
+func settingsMarkerBlob(_ root: AXUIElement, depth: Int = 0, maxDepth: Int = 14) -> String {
+    if depth > maxDepth { return "" }
+    var blob = axSettingsMarkerTexts(root).joined(separator: " ")
+    for child in axChildren(root) {
+        blob += " " + settingsMarkerBlob(child, depth: depth + 1, maxDepth: maxDepth)
+    }
+    for sheet in axSheets(root) {
+        blob += " " + settingsMarkerBlob(sheet, depth: depth + 1, maxDepth: maxDepth)
+    }
+    return blob
 }
 
 let dedicatedAuthExecutables: Set<String> = [
@@ -130,6 +165,17 @@ let sharedHostBundleIDs: Set<String> = [
 enum CandidateKind: Equatable {
     case dedicated
     case sharedHost
+}
+
+func axRole(_ element: AXUIElement) -> String {
+    axString(element, kAXRoleAttribute as String) ?? ""
+}
+
+func axBool(_ element: AXUIElement, _ attr: String) -> Bool? {
+    guard let value: CFTypeRef = axCopy(element, attr) else { return nil }
+    if let boolean = value as? Bool { return boolean }
+    if let number = value as? NSNumber { return number.boolValue }
+    return nil
 }
 
 func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
@@ -335,6 +381,111 @@ func findCodeDialogs() -> [DialogTarget] {
     return out
 }
 
+let settingsMaskedAlertCloseButtons = ["\u{597D}", "OK"]
+let settingsMaskedAlertImageMarker = "appleidsettings"
+let settingsTwoFactorMarkers = [
+    "two-factor authentication",
+    "\u{53CC}\u{91CD}\u{8BA4}\u{8BC1}",
+    "\u{96D9}\u{91CD}\u{8A8D}\u{8B49}",
+]
+let settingsGetCodeMarkers = [
+    "get verification code",
+    "get a verification code",
+    "\u{83B7}\u{53D6}\u{9A8C}\u{8BC1}\u{7801}",
+    "\u{53D6}\u{5F97}\u{9A57}\u{8B49}\u{78BC}",
+]
+
+func normalizedControlText(_ text: String) -> String {
+    text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+}
+
+func supportsPressAction(_ element: AXUIElement) -> Bool {
+    var actions: CFArray?
+    guard AXUIElementCopyActionNames(element, &actions) == .success,
+          let values = actions as? [String] else { return false }
+    return values.contains(kAXPressAction as String)
+}
+
+func findMaskedAlertCloseButton(_ root: AXUIElement) -> AXUIElement? {
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var matches: [AXUIElement] = []
+    while !queue.isEmpty && seen.count < 800 {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        let texts = axTexts(node).map(normalizedControlText)
+        if axRole(node) == kAXButtonRole as String,
+           axBool(node, kAXEnabledAttribute as String) == true,
+           supportsPressAction(node),
+           texts.contains(where: { settingsMaskedAlertCloseButtons.contains($0) }),
+           frameOf(node) != nil,
+           !matches.contains(where: { $0 == node }) {
+            matches.append(node)
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func hasSettingsMaskedAlertImage(_ root: AXUIElement) -> Bool {
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    while !queue.isEmpty && seen.count < 800 {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        if axRole(node) == kAXImageRole as String,
+           axSettingsMarkerTexts(node)
+            .joined(separator: " ")
+            .lowercased()
+            .contains(settingsMaskedAlertImageMarker) {
+            return true
+        }
+        queue.append(contentsOf: axSheets(node))
+        queue.append(contentsOf: axChildren(node))
+    }
+    return false
+}
+
+func hasSettingsTwoFactorRequestEvidence(_ root: AXUIElement) -> Bool {
+    var surfaces = [root]
+    for window in windowsForApp(root) {
+        if !surfaces.contains(where: { $0 == window }) { surfaces.append(window) }
+    }
+    let text = surfaces.map { surface in settingsMarkerBlob(surface) }
+        .joined(separator: " ")
+        .lowercased()
+    return settingsTwoFactorMarkers.contains(where: { marker in text.contains(marker) }) &&
+        settingsGetCodeMarkers.contains(where: { marker in text.contains(marker) })
+}
+
+func findSettingsMaskedCodeDialogs() -> [DialogTarget] {
+    var targets: [DialogTarget] = []
+    var windowIDs = Set<CGWindowID>()
+    for app in NSWorkspace.shared.runningApplications {
+        guard isSystemSettingsSharedHost(app) else { continue }
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        guard hasSettingsTwoFactorRequestEvidence(appElement) else { continue }
+        for window in windowsForApp(appElement) {
+            guard let closeButton = findMaskedAlertCloseButton(window),
+                  hasSettingsMaskedAlertImage(window),
+                  let closeFrame = frameOf(closeButton) else { continue }
+            let windowID = resolveOnScreenWindowID(
+                pid: app.processIdentifier,
+                near: closeFrame
+            ) ?? windowIDFor(closeButton) ?? windowIDFor(window)
+            guard let windowID,
+                  windowIDs.insert(windowID).inserted else { continue }
+            targets.append(
+                DialogTarget(windowID: windowID, requiresAppleAccountEvidence: true)
+            )
+        }
+    }
+    return targets
+}
+
 func captureWindowByID(_ wid: CGWindowID) async -> CGImage? {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(
@@ -464,6 +615,16 @@ func firstCode(in lines: [String], allowContiguous: Bool) -> String? {
     return nil
 }
 
+func uniqueCode(in lines: [String], allowContiguous: Bool) -> String? {
+    var matches = Set<String>()
+    for line in lines {
+        if let code = findFormattedCode(line, allowContiguous: allowContiguous) {
+            matches.insert(code)
+        }
+    }
+    return matches.count == 1 ? matches.first : nil
+}
+
 func hasSharedHostVisionEvidence(_ lines: [String]) -> Bool {
     var evidence = ""
     for line in lines {
@@ -483,7 +644,10 @@ func tryOcrOnImage(_ cg: CGImage, requiresAppleAccountEvidence: Bool) -> OcrCand
     if requiresAppleAccountEvidence && !hasSharedHostVisionEvidence(fullLines) {
         return nil
     }
-    if let hit = firstCode(in: fullLines, allowContiguous: false) {
+    let fullWindowCode = requiresAppleAccountEvidence
+        ? uniqueCode(in: fullLines, allowContiguous: false)
+        : firstCode(in: fullLines, allowContiguous: false)
+    if let hit = fullWindowCode {
         return OcrCandidate(code: hit, source: .fullWindow)
     }
     // 中心裁剪再试（大字号验证码常在中间）
@@ -492,12 +656,18 @@ func tryOcrOnImage(_ cg: CGImage, requiresAppleAccountEvidence: Bool) -> OcrCand
     let cropRect = CGRect(x: w * 0.1, y: h * 0.2, width: w * 0.8, height: h * 0.55)
     if let cropped = cg.cropping(to: cropRect) {
         let cropLines = ocrLines(from: cropped, level: .accurate)
-        if let hit = firstCode(in: cropLines, allowContiguous: true) {
+        let centerCropCode = requiresAppleAccountEvidence
+            ? uniqueCode(in: cropLines, allowContiguous: true)
+            : firstCode(in: cropLines, allowContiguous: true)
+        if let hit = centerCropCode {
             return OcrCandidate(code: hit, source: .centerCrop)
         }
         if cropLines.isEmpty {
             let fastCropLines = ocrLines(from: cropped, level: .fast)
-            if let hit = firstCode(in: fastCropLines, allowContiguous: true) {
+            let fastCenterCropCode = requiresAppleAccountEvidence
+                ? uniqueCode(in: fastCropLines, allowContiguous: true)
+                : firstCode(in: fastCropLines, allowContiguous: true)
+            if let hit = fastCenterCropCode {
                 return OcrCandidate(code: hit, source: .centerCrop)
             }
         }
@@ -517,6 +687,7 @@ func emit(_ output: Output) -> Never {
 var timeoutSec = 8
 var preflightScreenCapture = false
 var promptScreenCapture = false
+var settingsAlertOnly = false
 var i = 1
 while i < CommandLine.arguments.count {
     if CommandLine.arguments[i] == "--preflight-screen-capture" {
@@ -526,6 +697,11 @@ while i < CommandLine.arguments.count {
     }
     if CommandLine.arguments[i] == "--prompt-screen-capture" {
         promptScreenCapture = true
+        i += 1
+        continue
+    }
+    if CommandLine.arguments[i] == "--settings-alert-only" {
+        settingsAlertOnly = true
         i += 1
         continue
     }
@@ -553,7 +729,9 @@ var centerCandidateTracker = CenterCandidateTracker()
 while Date() < deadline {
     capturePass += 1
     let dialogs: [DialogTarget]
-    if AXIsProcessTrusted() {
+    if settingsAlertOnly {
+        dialogs = findSettingsMaskedCodeDialogs()
+    } else if AXIsProcessTrusted() {
         let axDialogs = findCodeDialogs()
         dialogs = axDialogs.isEmpty ? findScreenOnlyCodeDialogs() : axDialogs
     } else {
@@ -579,7 +757,7 @@ while Date() < deadline {
             centerCandidateTracker.reset(windowID: wid)
             continue
         }
-        if candidate.requiresStability {
+        if candidate.requiresStability || settingsAlertOnly {
             guard centerCandidateTracker.observeCenterCandidate(
                 windowID: wid,
                 code: candidate.code,
