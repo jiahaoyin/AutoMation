@@ -23,6 +23,22 @@ from urllib.parse import urljoin, urlsplit
 
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
+PERSONAL_INFORMATION_PATH = "/account/manage/section/information"
+PROFILE_CARD_SELECTORS = (
+    "css:button.button.button-bare",
+    "css:button[class*='button-bare']",
+    "css:.card",
+)
+PROFILE_NAME_CARD_SELECTORS = PROFILE_CARD_SELECTORS[:2]
+PROFILE_NAME_MODAL_SELECTORS = (
+    "css:[id^='modal-content-']",
+    "css:[role='dialog']",
+    "css:aside",
+)
+PROFILE_CARD_WAIT_TIMEOUT_S = 35.0
+PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
+PROFILE_VALUE_STABLE_OBSERVATIONS = 2
+PROFILE_VALUE_MAX_LENGTHS = {"name": 256, "birthday": 128}
 EMAIL_SELECTORS = (
     "css:#account_name_text_field",
     "css:input[name='accountName']",
@@ -132,6 +148,9 @@ BROWSER_STARTUP_STAGES = {
     "twofa_input",
     "signed_in",
     "account_information",
+    "profile_capture",
+    "profile_birthday",
+    "profile_name",
 }
 browser_startup_stage = "not_started"
 browser_stage_file: Path | None = None
@@ -140,6 +159,9 @@ BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
 BROWSER_PRESERVE_ON_FAILURE_ENV = "BROWSER_PRESERVE_ON_FAILURE"
+BROWSER_PRESERVE_ON_SUCCESS_ENV = "BROWSER_PRESERVE_ON_SUCCESS"
+BROWSER_ATTACH_EXISTING_ENV = "BROWSER_ATTACH_EXISTING"
+BROWSER_ATTACH_ADDRESS_ENV = "BROWSER_ATTACH_ADDRESS"
 BROKER_APPLE_ID_MAX_LENGTH = 320
 BROKER_PASSWORD_MAX_LENGTH = 1024
 BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
@@ -248,6 +270,8 @@ def classify_browser_exception(error: Exception) -> str:
         return "password_input_verification_failed"
     if "personal information page did not confirm" in message:
         return "account_home_unconfirmed"
+    if "personal information" in message or "profile" in message:
+        return "profile_capture_failed"
     return "browser_exception"
 
 
@@ -312,6 +336,13 @@ def preserve_browser_on_failure() -> bool:
     direct `run.sh` path is intentionally inspectable unless explicitly disabled.
     """
     configured = os.environ.get(BROWSER_PRESERVE_ON_FAILURE_ENV, "1").strip().lower()
+    enabled = configured not in {"0", "false", "no", "off"}
+    return enabled and not browser_broker_mode_enabled()
+
+
+def preserve_browser_on_success() -> bool:
+    """Keep a direct-run authenticated session available for the next run."""
+    configured = os.environ.get(BROWSER_PRESERVE_ON_SUCCESS_ENV, "1").strip().lower()
     enabled = configured not in {"0", "false", "no", "off"}
     return enabled and not browser_broker_mode_enabled()
 
@@ -2725,57 +2756,347 @@ def wait_for_signed_in(
     raise RuntimeError("account session was not confirmed after 2FA")
 
 
-def collect_scope_personal_info(scope: Any) -> dict[str, Any]:
-    raw = scope.run_js(
+def is_personal_information_scope(page: Any, scope: Any) -> bool:
+    if scope is not page or getattr(scope, "parent", None) is not None:
+        return False
+    parsed = parse_valid_apple_url(scope_location_url(scope))
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() == "account.apple.com"
+        and parsed.path == PERSONAL_INFORMATION_PATH
+    )
+
+
+def parse_profile_query_result(raw: Any, label: str) -> dict[str, Any]:
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(value, dict):
+        raise RuntimeError(f"personal information {label} query returned an invalid result")
+    return value
+
+
+def profile_card_summary(card: Any) -> dict[str, Any]:
+    raw = card.run_js(
         r"""
-        return JSON.stringify((() => {
-          const lines = (document.body?.innerText || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
-          const pick = (labels) => {
-            for (let i = 0; i < lines.length; i++) {
-              if (labels.some(l => lines[i] === l || lines[i].startsWith(l + ' '))) return lines[i + 1] || null;
+        function () {
+          // ruyipage-profile-card-summary
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              element.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const lines = String(this.innerText || this.textContent || '')
+            .split(/\n+/).map((line) => line.trim()).filter(Boolean);
+          const labels = {
+            name: ['full name', 'name', '姓名', '全名'],
+            birthday: ['date of birth', 'birthday', '出生日期', '生日']
+          };
+          const labelIndex = (kind) => lines.findIndex((line) => {
+            const normalized = normalize(line);
+            return labels[kind].some((label) =>
+              normalized === normalize(label) ||
+              normalized.startsWith(`${normalize(label)} `));
+          });
+          const birthdayIndex = labelIndex('birthday');
+          const birthdayLabel = birthdayIndex >= 0 ? lines[birthdayIndex] : '';
+          const birthdayLabelNormalized = normalize(birthdayLabel);
+          const birthdayValue = (() => {
+            if (birthdayIndex < 0) return null;
+            for (const label of labels.birthday) {
+              const normalizedLabel = normalize(label);
+              if (birthdayLabelNormalized.startsWith(normalizedLabel)) {
+                const tail = birthdayLabel.slice(label.length).trim();
+                if (tail) return tail;
+              }
             }
-            return null;
-          };
-          return {
-            fullName: pick(['Name', '姓名', 'Full Name', '全名']),
-            birthday: pick(['Birthday', '生日', 'Date of Birth', '出生日期']),
-            href: location.href,
-            title: document.title
-          };
-        })())
+            const next = lines[birthdayIndex + 1] || '';
+            if (next) return next;
+            return lines.find((line) =>
+              /(?:\d{4}\s*[年./-]\s*\d{1,2}\s*[月./-]\s*\d{1,2}|\d{1,2}\s*[./-]\s*\d{1,2}\s*[./-]\s*\d{2,4}|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b)/i.test(line)
+            ) || null;
+          })();
+          return JSON.stringify({
+            visible: visible(this),
+            name: labelIndex('name') >= 0,
+            birthday: birthdayIndex >= 0,
+            birthdayValue
+          });
+        }
         """
     )
-    return json.loads(raw) if isinstance(raw, str) else raw
+    result = parse_profile_query_result(raw, "card")
+    return {
+        "visible": result.get("visible") is True,
+        "name": result.get("name") is True,
+        "birthday": result.get("birthday") is True,
+        "birthdayValue": result.get("birthdayValue"),
+    }
+
+
+def normalize_profile_value(value: Any, field: str) -> str:
+    if field not in PROFILE_VALUE_MAX_LENGTHS or not isinstance(value, str):
+        raise RuntimeError(f"personal information {field} is invalid")
+    if any(character in value for character in ("\r", "\n", "\0")):
+        raise RuntimeError(f"personal information {field} is invalid")
+    normalized = " ".join(value.split())
+    if not normalized or len(normalized) > PROFILE_VALUE_MAX_LENGTHS[field]:
+        raise RuntimeError(f"personal information {field} is invalid")
+    return normalized
+
+
+def profile_value_is_ready(value: Any, field: str) -> bool:
+    try:
+        normalize_profile_value(value, field)
+    except RuntimeError:
+        return False
+    return True
+
+
+def profile_card_candidates(page: Any, kind: str) -> list[tuple[Any, Any, dict[str, Any]]]:
+    if kind not in {"name", "birthday"}:
+        raise RuntimeError("personal information card kind is invalid")
+    selectors = PROFILE_NAME_CARD_SELECTORS if kind == "name" else PROFILE_CARD_SELECTORS
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: dict[tuple[Any, ...], str] = {}
+    for selector in selectors:
+        for card in safe_elements(page, selector):
+            if not element_is_interactable(card):
+                continue
+            try:
+                summary = profile_card_summary(card)
+            except Exception:
+                continue
+            identity = (
+                element_stability_signature(page, card),
+                summary["name"],
+                summary["birthday"],
+                normalize_profile_value(summary.get("birthdayValue"), "birthday")
+                if profile_value_is_ready(summary.get("birthdayValue"), "birthday")
+                else "",
+            )
+            previous_selector = seen.get(identity)
+            if previous_selector is not None and previous_selector != selector:
+                continue
+            seen.setdefault(identity, selector)
+            if summary["visible"] and summary[kind] is True:
+                candidates.append((page, card, summary))
+    return candidates
+
+
+def resolve_profile_card(page: Any, kind: str) -> tuple[Any, Any, dict[str, Any]] | None:
+    if not is_personal_information_scope(page, page):
+        return None
+    candidates = profile_card_candidates(page, kind)
+    if not candidates:
+        return None
+    if kind == "birthday":
+        candidates = [
+            candidate
+            for candidate in candidates
+            if profile_value_is_ready(candidate[2].get("birthdayValue"), "birthday")
+        ]
+        if not candidates:
+            return None
+        values = {
+            normalize_profile_value(summary.get("birthdayValue"), "birthday")
+            for _scope, _card, summary in candidates
+        }
+        if len(values) == 1:
+            return candidates[0]
+        if len(values) > 1:
+            raise RuntimeError("personal information birthday card is ambiguous")
+    if len(candidates) != 1:
+        raise RuntimeError(f"personal information {kind} card is ambiguous")
+    return candidates[0]
+
+
+def wait_for_profile_card(
+    page: Any,
+    kind: str,
+    timeout_s: float = PROFILE_CARD_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] | None = None,
+) -> tuple[Any, Any, dict[str, Any]]:
+    if pause is None:
+        pause = human_pause
+    if not is_personal_information_scope(page, page):
+        raise RuntimeError(f"personal information {kind} card was not found")
+    deadline = time.monotonic() + timeout_s
+    previous_signature: tuple[Any, ...] | None = None
+    stable_observations = 0
+    while time.monotonic() < deadline:
+        resolved = resolve_profile_card(page, kind)
+        if resolved is not None:
+            _scope, card, summary = resolved
+            signature = (
+                element_stability_signature(_scope, card),
+                normalize_profile_value(summary.get("birthdayValue"), "birthday")
+                if kind == "birthday"
+                else "name-card",
+            )
+            stable_observations = (
+                stable_observations + 1 if signature == previous_signature else 1
+            )
+            previous_signature = signature
+            if stable_observations >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return resolved
+        else:
+            previous_signature = None
+            stable_observations = 0
+        pause(180, 420)
+    raise RuntimeError(f"personal information {kind} card was not found")
+
+
+def profile_name_modal_summary(modal: Any) -> dict[str, Any]:
+    raw = modal.run_js(
+        r"""
+        function () {
+          // ruyipage-profile-name-modal
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              element.getAttribute('aria-hidden') !== 'true';
+          };
+          const labelText = (field) => {
+            const labels = Array.from(field.labels || []).map((label) => label.innerText || label.textContent || '');
+            const closest = field.closest('label')?.innerText || '';
+            return [
+              field.getAttribute('autocomplete'), field.getAttribute('name'), field.getAttribute('id'),
+              field.getAttribute('aria-label'), field.getAttribute('placeholder'), closest, ...labels
+            ].filter(Boolean).join(' ');
+          };
+          const fields = Array.from(this.querySelectorAll('input')).filter((field) =>
+            visible(field) && !field.disabled && !field.readOnly &&
+            ['text', 'search'].includes(String(field.type || 'text').toLowerCase())
+          );
+          const classify = (field) => {
+            const meta = normalize(labelText(field));
+            if (/middle-name|middlename|additional-name|additionalname|\u4e2d\u95f4\u540d|\u4e2d\u9593\u540d/.test(meta)) return 'middle';
+            if (/family-name|familyname|surname|last-name|lastname|姓氏|姓/.test(meta)) return 'family';
+            if (/given-name|givenname|first-name|firstname|名字|名/.test(meta)) return 'given';
+            return null;
+          };
+          let given = null;
+          let family = null;
+          for (const field of fields) {
+            const value = String(field.value || '').trim();
+            if (!value) continue;
+            const kind = classify(field);
+            if (kind === 'given' && given === null) given = value;
+            if (kind === 'family' && family === null) family = value;
+          }
+          return JSON.stringify({
+            visible: visible(this),
+            fieldCount: fields.length,
+            given,
+            family
+          });
+        }
+        """
+    )
+    result = parse_profile_query_result(raw, "name modal")
+    return {
+        "visible": result.get("visible") is True,
+        "fieldCount": int(result.get("fieldCount") or 0),
+        "given": result.get("given"),
+        "family": result.get("family"),
+    }
+
+
+def resolve_profile_name_modal(page: Any) -> tuple[Any, Any, dict[str, Any]] | None:
+    if not is_personal_information_scope(page, page):
+        return None
+    for selector in PROFILE_NAME_MODAL_SELECTORS:
+        visible_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+        candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+        seen: dict[tuple[str, tuple[str, ...]], str] = {}
+        for modal in safe_elements(page, selector):
+            if not element_is_interactable(modal):
+                continue
+            try:
+                summary = profile_name_modal_summary(modal)
+            except Exception:
+                continue
+            identity = element_stability_signature(page, modal)
+            previous_selector = seen.get(identity)
+            if previous_selector is not None and previous_selector != selector:
+                continue
+            seen.setdefault(identity, selector)
+            if not (summary["visible"] and summary["fieldCount"] >= 2):
+                continue
+            visible_candidates.append((page, modal, summary))
+            if profile_value_is_ready(summary.get("given"), "name") and profile_value_is_ready(
+                summary.get("family"), "name"
+            ):
+                candidates.append((page, modal, summary))
+        if visible_candidates:
+            if len(visible_candidates) != 1:
+                raise RuntimeError("personal information name modal is ambiguous")
+            return candidates[0] if candidates else None
+    return None
+
+
+def wait_for_profile_name_modal(
+    page: Any,
+    timeout_s: float = PROFILE_MODAL_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] | None = None,
+) -> tuple[Any, Any, dict[str, Any]]:
+    if pause is None:
+        pause = human_pause
+    deadline = time.monotonic() + timeout_s
+    previous_signature: tuple[Any, ...] | None = None
+    stable_observations = 0
+    while time.monotonic() < deadline:
+        resolved = resolve_profile_name_modal(page)
+        if resolved is not None:
+            _scope, modal, summary = resolved
+            signature = (
+                element_stability_signature(_scope, modal),
+                normalize_profile_value(summary.get("given"), "name"),
+                normalize_profile_value(summary.get("family"), "name"),
+            )
+            stable_observations = (
+                stable_observations + 1 if signature == previous_signature else 1
+            )
+            previous_signature = signature
+            if stable_observations >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return resolved
+        else:
+            previous_signature = None
+            stable_observations = 0
+        pause(180, 420)
+    raise RuntimeError("personal information name modal was not found")
+
+
+def wait_for_profile_capture_ready(page: Any) -> None:
+    wait_for_profile_card(page, "birthday")
+    wait_for_profile_card(page, "name")
 
 
 def collect_personal_info(page: Any) -> dict[str, Any]:
-    collected: list[dict[str, Any]] = []
-    for scope in iter_page_scopes(page):
-        try:
-            info = collect_scope_personal_info(scope)
-        except Exception:
-            continue
-        if isinstance(info, dict):
-            if not is_apple_url(str(info.get("href") or "")):
-                continue
-            collected.append(info)
+    _birthday_scope, _birthday_card, birthday_summary = wait_for_profile_card(
+        page,
+        "birthday",
+    )
+    birthday = normalize_profile_value(birthday_summary.get("birthdayValue"), "birthday")
+    emit({"event": "status", "status": "profile_birthday_collected"})
 
-    if not collected:
-        raise RuntimeError("unable to inspect personal information through ruyiPage")
-
-    root_info = collected[0]
-    return {
-        "fullName": next(
-            (info.get("fullName") for info in collected if info.get("fullName")),
-            None,
-        ),
-        "birthday": next(
-            (info.get("birthday") for info in collected if info.get("birthday")),
-            None,
-        ),
-        "href": sanitized_apple_url(str(root_info.get("href") or "")),
-        "title": root_info.get("title"),
-    }
+    name_scope, name_card, _name_summary = wait_for_profile_card(page, "name")
+    set_browser_startup_stage("profile_name")
+    human_pause(280, 620)
+    human_click(name_scope, name_card)
+    _modal_scope, _modal, modal_summary = wait_for_profile_name_modal(page)
+    given = normalize_profile_value(modal_summary.get("given"), "name")
+    family = normalize_profile_value(modal_summary.get("family"), "name")
+    name = normalize_profile_value(f"{given} {family}", "name")
+    emit({"event": "status", "status": "profile_name_collected"})
+    return {"name": name, "birthday": birthday}
 
 
 def validate_personal_info_result(
@@ -2784,14 +3105,18 @@ def validate_personal_info_result(
 ) -> None:
     if not login_state.get("trusted"):
         raise RuntimeError("personal information page did not confirm an authenticated Apple session")
-    if not (personal_info.get("fullName") or personal_info.get("birthday")):
+    if not (personal_info.get("name") and personal_info.get("birthday")):
         raise RuntimeError("personal information page loaded but name and birthday were not parsed")
 
 
 def take_screenshot(page: Any, path: Path) -> str | None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if hasattr(path.parent, "chmod"):
+            path.parent.chmod(0o700)
         page.screenshot(str(path), full_page=True)
+        if hasattr(path, "chmod"):
+            path.chmod(0o600)
         return str(path)
     except Exception:
         emit({"event": "warning", "message": SCREENSHOT_FAILURE_REASON})
@@ -2821,7 +3146,7 @@ def node_self_test() -> int:
             "success": len(code) == 6,
             "twoFaCodeLength": len(code),
             "credentialsInArgv": credentials_in_argv,
-            "personalInfo": {"fullName": None, "birthday": None, "selfTest": True},
+            "personalInfo": {"name": None, "birthday": None, "selfTest": True},
             "screenshots": {},
         }
     )
@@ -2951,6 +3276,86 @@ def load_browser_credentials(
     return read_browser_broker_credentials(input_stream)
 
 
+def should_attach_existing_browser() -> bool:
+    configured = os.environ.get(BROWSER_ATTACH_EXISTING_ENV, "1").strip().lower()
+    return configured not in {"0", "false", "no", "off"} and not browser_broker_mode_enabled()
+
+
+def valid_browser_attach_address(value: str) -> str | None:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    host, separator, port = candidate.rpartition(":")
+    if separator != ":" or host not in {"127.0.0.1", "localhost"}:
+        return None
+    try:
+        numeric_port = int(port)
+    except ValueError:
+        return None
+    return candidate if 1 <= numeric_port <= 65535 else None
+
+
+def attached_account_matches_apple_id(scope: Any, expected_apple_id: str) -> bool:
+    expected = str(expected_apple_id or "").strip().lower()
+    if not expected or any(character in expected for character in ("\r", "\n", "\0")):
+        return False
+    try:
+        raw = scope.run_js(
+            r"""
+            function () {
+              // ruyipage-account-session-identity
+              const root = document.querySelector('#root') || document.body;
+              const text = String(root?.innerText || root?.textContent || '');
+              const matches = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+              return JSON.stringify([...new Set(matches.map((value) => value.trim().toLowerCase()))]);
+            }
+            """
+        )
+        values = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return False
+    if not isinstance(values, list):
+        return False
+    candidates = {
+        str(value).strip().lower()
+        for value in values
+        if isinstance(value, str)
+        and 3 <= len(value.strip()) <= BROKER_APPLE_ID_MAX_LENGTH
+        and not any(character in value for character in ("\r", "\n", "\0"))
+    }
+    return candidates == {expected}
+
+
+def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
+    """Return an already-open account tab through a documented ruyiPage attach API."""
+    if not should_attach_existing_browser():
+        return None
+    try:
+        ruyipage = importlib.import_module("ruyipage")
+        address = valid_browser_attach_address(
+            os.environ.get(BROWSER_ATTACH_ADDRESS_ENV, "")
+        )
+        if address:
+            attach = getattr(ruyipage, "attach_exist_browser", None)
+            candidate = attach(address=address, latest_tab=True) if callable(attach) else None
+        else:
+            attach = getattr(ruyipage, "auto_attach_exist_browser_by_process", None)
+            candidate = attach() if callable(attach) else None
+        if candidate is None or not browser_connection_is_alive(candidate):
+            return None
+        for account_tab in candidate.get_tabs(url="account.apple.com"):
+            if not browser_connection_is_alive(account_tab):
+                continue
+            if (
+                is_account_manage_url(scope_location_url(account_tab))
+                and attached_account_matches_apple_id(account_tab, expected_apple_id)
+            ):
+                return account_tab
+        return None
+    except Exception:
+        return None
+
+
 def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
     if not browser_broker_mode_enabled() or sys.platform != "darwin":
         return FirefoxPage(opts)
@@ -3002,29 +3407,39 @@ def browser_flow(args: argparse.Namespace) -> int:
     opts.set_timeouts(2, 90, 30)
     opts.headless(False)
     preserve_on_failure = preserve_browser_on_failure()
-    opts.close_on_exit(not preserve_on_failure)
+    preserve_on_success = preserve_browser_on_success()
+    opts.close_on_exit(not (preserve_on_failure or preserve_on_success))
     if hasattr(opts, "set_human_algorithm"):
         opts.set_human_algorithm("windmouse")
 
     screenshots_dir = report_dir / "screenshots"
     success_screenshot_paths = (
         screenshots_dir / "02-ruyipage-after-login.png",
-        screenshots_dir / "03-account-manage.png",
+        screenshots_dir / "03-account-information.png",
     )
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
+    account_home_confirmed = False
     if broker_mode:
         set_browser_startup_stage("browser_constructing")
         emit({"event": "status", "status": "browser_constructing"})
-    page = construct_firefox_page(FirefoxPage, opts)
+    page = try_attach_existing_account_page(apple_id)
+    attached_existing_browser = page is not None
+    if page is None:
+        page = construct_firefox_page(FirefoxPage, opts)
     if broker_mode:
         set_browser_startup_stage("browser_ready")
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
         set_browser_startup_stage("login_navigation")
-        page.get(sign_in_url)
-        page.wait.doc_loaded(timeout=20)
-        human_pause(900, 1800)
+        if attached_existing_browser:
+            emit({"event": "status", "status": "browser_session_attached"})
+            page.wait.doc_loaded(timeout=20)
+            human_pause(300, 700)
+        else:
+            page.get(sign_in_url)
+            page.wait.doc_loaded(timeout=20)
+            human_pause(900, 1800)
         set_browser_startup_stage("login_page_loaded")
 
         initial_state = detect_login_state(page)
@@ -3206,6 +3621,8 @@ def browser_flow(args: argparse.Namespace) -> int:
         else:
             set_browser_startup_stage("signed_in")
 
+        emit({"event": "status", "status": "account_home_confirmed"})
+        account_home_confirmed = True
         screenshots["afterLogin"] = take_screenshot(
             page, success_screenshot_paths[0]
         )
@@ -3226,13 +3643,26 @@ def browser_flow(args: argparse.Namespace) -> int:
             raise RuntimeError("personal information page reported an authentication error")
         if not final_state.get("trusted"):
             raise RuntimeError("personal information page did not confirm an authenticated Apple session")
-        personal_info = collect_personal_info(page)
-        validate_personal_info_result(final_state, personal_info)
-        screenshots["manage"] = take_screenshot(
+        set_browser_startup_stage("profile_capture")
+        wait_for_profile_capture_ready(page)
+        emit({"event": "status", "status": "profile_page_ready"})
+        screenshots["personalInformation"] = take_screenshot(
             page, success_screenshot_paths[1]
         )
-        if screenshots["manage"] is not None:
+        if screenshots["personalInformation"] is not None:
             generated_screenshot_paths.append(success_screenshot_paths[1])
+            emit({"event": "status", "status": "profile_screenshot_saved"})
+        set_browser_startup_stage("profile_birthday")
+        personal_info = collect_personal_info(page)
+        validate_personal_info_result(final_state, personal_info)
+        if preserve_on_success and browser_connection_is_alive(page):
+            emit(
+                {
+                    "event": "status",
+                    "status": "browser_session_preserved",
+                    "preserved": True,
+                }
+            )
 
         emit(
             {
@@ -3244,6 +3674,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     "accountHomeConfirmed": True,
                     "skippedLogin": skipped_login,
                     "skipped2FA": skipped_2fa,
+                    "sessionReused": skipped_login or attached_existing_browser,
                     "rememberAccount": remember_checked,
                 },
                 "personalInfo": personal_info,
@@ -3264,8 +3695,9 @@ def browser_flow(args: argparse.Namespace) -> int:
     finally:
         had_error = sys.exc_info()[0] is not None
         if had_error and preserve_on_failure and browser_connection_is_alive(page):
-            for screenshot_path in generated_screenshot_paths:
-                screenshot_path.unlink(missing_ok=True)
+            if not account_home_confirmed:
+                for screenshot_path in generated_screenshot_paths:
+                    screenshot_path.unlink(missing_ok=True)
             emit(
                 {
                     "event": "status",
@@ -3274,6 +3706,8 @@ def browser_flow(args: argparse.Namespace) -> int:
                     "preserved": True,
                 }
             )
+        elif not had_error and preserve_on_success and browser_connection_is_alive(page):
+            pass
         else:
             try:
                 page.quit()

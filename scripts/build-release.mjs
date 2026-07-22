@@ -292,7 +292,7 @@ cd apple-id-automation-${VERSION}
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
 - **屏幕录制未授权**：在「隐私与安全性 -> 屏幕与系统音频录制」允许实际运行主体；按 macOS 提示重开终端或 Codex 后重新运行 \`./install.sh\`
 - **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能和屏幕录制权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
-- **姓名/生日为空**：查看 \`screenshots/03-account-manage.png\`，可能需更新页面解析
+- **姓名/生日为空**：查看 \`screenshots/03-account-information.png\`，可能需更新页面解析
 
 ## 安全
 
@@ -321,6 +321,12 @@ APPLE_PASSWORD=your_password
 # BROWSER_2FA_SETTINGS_FALLBACK=1
 # BROWSER_2FA_MANUAL_FALLBACK=1
 # BROWSER_2FA_POLL_MS=800
+# BROWSER_PRESERVE_ON_FAILURE=1
+# BROWSER_PRESERVE_ON_SUCCESS=1
+# BROWSER_ATTACH_EXISTING=1
+# BROWSER_ATTACH_ADDRESS=127.0.0.1:9222
+# name=
+# birthday=
 `
   );
 }

@@ -57,6 +57,9 @@ const RUYIPAGE_BACKEND_STAGES = new Set([
   "twofa_input",
   "signed_in",
   "account_information",
+  "profile_capture",
+  "profile_birthday",
+  "profile_name",
 ]);
 const RUYIPAGE_TWO_FACTOR_PROGRESS_PHASES = new Set([
   "code_received",
@@ -111,6 +114,7 @@ const RUYIPAGE_BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_login_failed",
   "password_input_verification_failed",
   "account_home_unconfirmed",
+  "profile_capture_failed",
   "browser_exception",
 ]);
 const RUYIPAGE_LIFECYCLE_STATES = new Set([
@@ -143,7 +147,9 @@ function snapshotProtocolContext(context) {
     codeDeliveryWriteStarted: context.codeDeliveryWriteStarted === true,
     codeDeliveryWriteCompleted: context.codeDeliveryWriteCompleted === true,
     browserLaunchObserved: context.browserLaunchObserved === true,
+    accountHomeConfirmed: context.accountHomeConfirmed === true,
     browserPreserved: context.browserPreserved === true,
+    browserSessionPreserved: context.browserSessionPreserved === true,
     directBrowserPreservationRequested:
       context.directBrowserPreservationRequested === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
@@ -161,12 +167,15 @@ export function shouldCleanUpRuyiPageProcessGroup({
   usesBrowserBroker,
   strictProcessCleanup,
   browserPreserved,
+  browserSessionPreserved,
   directBrowserPreservationRequested,
 }) {
   if (timedOut === true || Boolean(terminationSignal)) return true;
   if (usesBrowserBroker === true || strictProcessCleanup === true) return true;
   return !(
-    browserPreserved === true || directBrowserPreservationRequested === true
+    browserPreserved === true ||
+    browserSessionPreserved === true ||
+    directBrowserPreservationRequested === true
   );
 }
 
@@ -821,7 +830,8 @@ export function resolveBackendTimeouts(env = process.env) {
  *   killGraceMs?: number,
  *   eventHandlerTimeoutMs?: number,
  *   childStopperOptions?: object,
- *   browserBrokerTransportOptions?: object
+ *   browserBrokerTransportOptions?: object,
+ *   sanitizeResult?: (result: object) => object
  * }} [options]
  */
 export function createRuyiPageBackendRunner(options = {}) {
@@ -845,6 +855,8 @@ export function createRuyiPageBackendRunner(options = {}) {
       : configuredTimeouts.eventHandlerTimeoutMs;
   const childStopperOptions = options.childStopperOptions ?? {};
   const browserBrokerTransportOptions = options.browserBrokerTransportOptions ?? {};
+  const sanitizeResult =
+    typeof options.sanitizeResult === "function" ? options.sanitizeResult : null;
 
   return {
     /**
@@ -867,6 +879,7 @@ export function createRuyiPageBackendRunner(options = {}) {
         childStopperOptions,
         browserBrokerTransportOptions,
         ...params,
+        sanitizeResult,
       });
     },
   };
@@ -1032,6 +1045,7 @@ async function runRuyiPageBackend({
   eventHandlerTimeoutMs,
   childStopperOptions,
   browserBrokerTransportOptions,
+  sanitizeResult,
   creds,
   reportDir,
   onEvent,
@@ -1160,7 +1174,9 @@ async function runRuyiPageBackend({
     codeDeliveryWriteStarted: false,
     codeDeliveryWriteCompleted: false,
     browserLaunchObserved: false,
+    accountHomeConfirmed: false,
     browserPreserved: false,
+    browserSessionPreserved: false,
     directBrowserPreservationRequested: false,
     browserErrorClass: "unknown",
     backendExitCode: null,
@@ -1192,6 +1208,10 @@ async function runRuyiPageBackend({
       } else if (event.status === "browser_preserved") {
         protocolContext.stage = sanitizeBackendStage(event.failureStage);
         if (event.preserved === true) protocolContext.browserPreserved = true;
+      } else if (event.status === "account_home_confirmed") {
+        protocolContext.accountHomeConfirmed = true;
+      } else if (event.status === "browser_session_preserved") {
+        if (event.preserved === true) protocolContext.browserSessionPreserved = true;
       }
     } else if (event.event === "need_2fa") {
       if (event.generation === 1 || event.generation === 2) {
@@ -1708,7 +1728,13 @@ async function runRuyiPageBackend({
         await reportRunnerStatus("twofa_code_delivery_acknowledged", generation);
       }
     }
-    if (event?.event === "result") finalResult = event;
+    if (event?.event === "result") {
+      const sanitized = sanitizeResult ? sanitizeResult(event) : event;
+      if (!sanitized || typeof sanitized !== "object") {
+        throw new Error("ruyipage backend result schema is invalid");
+      }
+      finalResult = sanitized;
+    }
   };
   const recordProcessingFailure = (error) => {
     processingError ??= annotateRunnerFailure(error, protocolContext);
@@ -1781,6 +1807,7 @@ async function runRuyiPageBackend({
         strictProcessCleanup:
           usesProcessStateSupervisor || usesOuterProcessSupervisor,
         browserPreserved: protocolContext.browserPreserved,
+        browserSessionPreserved: protocolContext.browserSessionPreserved,
         directBrowserPreservationRequested:
           protocolContext.directBrowserPreservationRequested,
       });
@@ -1789,6 +1816,7 @@ async function runRuyiPageBackend({
         await stopper.waitForCleanup();
       } else if (
         protocolContext.browserPreserved ||
+        protocolContext.browserSessionPreserved ||
         protocolContext.directBrowserPreservationRequested
       ) {
         directBrowserBackendStopper.stop();

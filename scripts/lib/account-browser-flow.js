@@ -6,6 +6,7 @@
  */
 
 import { isAccessibilityGranted } from "./accessibility.js";
+import { saveAppleProfileToEnv } from "./credentials.js";
 import { getBrowserEnvironmentSummary } from "./env-setup.js";
 import { createRuyiPageBackendRunner } from "./ruyipage-backend-runner.js";
 import { createMac2FACollector } from "./two-fa-sidecar.js";
@@ -64,6 +65,13 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "browser_stage",
   "browser_failure",
   "browser_preserved",
+  "browser_session_attached",
+  "browser_session_preserved",
+  "account_home_confirmed",
+  "profile_page_ready",
+  "profile_screenshot_saved",
+  "profile_birthday_collected",
+  "profile_name_collected",
   "input_progress",
   "remember_progress",
   "twofa_progress",
@@ -87,6 +95,15 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
   "twofa_code_delivery_sent",
   "twofa_code_delivery_acknowledged",
 ]);
+const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
+  browser_session_attached: "[ruyipage] ♻ 已接管现有 Apple 账户标签页",
+  account_home_confirmed: "[ruyipage] ✓ 已确认 Apple 账户登录态",
+  profile_page_ready: "[ruyipage] ✓ 个人信息页面已就绪",
+  profile_screenshot_saved: "[ruyipage] ✓ 已保存个人信息页面截图",
+  profile_birthday_collected: "[ruyipage] ✓ 已读取出生日期",
+  profile_name_collected: "[ruyipage] ✓ 已读取姓名",
+  browser_session_preserved: "[ruyipage] ✓ 已保留 Firefox 窗口和账户标签页",
+});
 const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_digit_input_verification_failed",
   "twofa_sequence_failed",
@@ -102,6 +119,7 @@ const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_login_failed",
   "password_input_verification_failed",
   "account_home_unconfirmed",
+  "profile_capture_failed",
   "browser_exception",
 ]);
 const PASSWORD_BIDI_INPUT_PROGRESS = new Map([
@@ -146,6 +164,9 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "twofa_input",
   "signed_in",
   "account_information",
+  "profile_capture",
+  "profile_birthday",
+  "profile_name",
 ]);
 const BROWSER_RUN_FAILURE_CODES = new Set([
   "account_home_unconfirmed",
@@ -164,6 +185,7 @@ const BROWSER_RUN_FAILURE_CODES = new Set([
   "event_handler",
   "event_handler_timeout",
   "process_state",
+  "profile_persistence",
   "two_fa_preparation",
   "two_fa_provider",
   "backend_protocol",
@@ -349,7 +371,9 @@ function readRunnerFailureContext(error) {
       codeDeliveryWriteStarted: false,
       codeDeliveryWriteCompleted: false,
       browserLaunchObserved: false,
+      accountHomeConfirmed: false,
       browserPreserved: false,
+      browserSessionPreserved: false,
       directBrowserPreservationRequested: false,
       browserErrorClass: "unknown",
       backendExitCode: null,
@@ -366,13 +390,32 @@ function readRunnerFailureContext(error) {
     codeDeliveryWriteStarted: context.codeDeliveryWriteStarted === true,
     codeDeliveryWriteCompleted: context.codeDeliveryWriteCompleted === true,
     browserLaunchObserved: context.browserLaunchObserved === true,
+    accountHomeConfirmed: context.accountHomeConfirmed === true,
     browserPreserved: context.browserPreserved === true,
+    browserSessionPreserved: context.browserSessionPreserved === true,
     directBrowserPreservationRequested:
       context.directBrowserPreservationRequested === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
     backendExitCode: sanitizeBackendExitCode(context.backendExitCode),
     cleanupFailed: context.cleanupFailed === true,
   };
+}
+
+export function readBrowserAccountHomeConfirmed(error) {
+  return (
+    error?.browserAccountHomeConfirmed === true ||
+    readRunnerFailureContext(error).accountHomeConfirmed === true
+  );
+}
+
+function markBrowserAccountHomeConfirmed(error) {
+  if (error && (typeof error === "object" || typeof error === "function")) {
+    Object.defineProperty(error, "browserAccountHomeConfirmed", {
+      configurable: true,
+      value: true,
+    });
+  }
+  return error;
 }
 
 function sanitizeBackendDiagnosticType(value) {
@@ -465,6 +508,86 @@ function writeFlowAuditError(flowAudit, source, event, error, details = {}) {
   }
 }
 
+function normalizeCapturedProfileValue(value, label, maxLength) {
+  if (typeof value !== "string" || /[\r\n\u0000]/.test(value)) {
+    throw new Error(`ruyipage ${label} is invalid`);
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized || normalized.length > maxLength) {
+    throw new Error(`ruyipage ${label} is invalid`);
+  }
+  return normalized;
+}
+
+function shouldPrintCapturedProfile() {
+  return process.stdout.isTTY && process.env.APPLE_AUTOMATION_SUPERVISED_GUI !== "1";
+}
+
+function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile) {
+  const name = normalizeCapturedProfileValue(personalInfo?.name, "profile name", 256);
+  const birthday = normalizeCapturedProfileValue(
+    personalInfo?.birthday,
+    "profile birthday",
+    128
+  );
+  flowAudit?.addSecrets?.([name, birthday]);
+  saveProfile({ name, birthday });
+  if (printProfile === true) {
+    console.log("[账号资料] ✓ 已写入 .env");
+    console.log(`[账号资料] 姓名: ${name}`);
+    console.log(`[账号资料] 出生日期: ${birthday}`);
+  }
+  return { collected: true, nameStored: true, birthdayStored: true };
+}
+
+function sanitizeScreenshotMetadata(screenshots) {
+  const source = screenshots && typeof screenshots === "object" ? screenshots : {};
+  const result = {};
+  const expectedFiles = {
+    afterLogin: "02-ruyipage-after-login.png",
+    personalInformation: "03-account-information.png",
+  };
+  for (const [key, expectedFile] of Object.entries(expectedFiles)) {
+    const value = source[key];
+    if (typeof value !== "string") continue;
+    const name = value.split(/[\\/]/).pop() || "";
+    if (name === expectedFile) {
+      result[key] = expectedFile;
+    }
+  }
+  return result;
+}
+
+function sanitizeBrowserLoginMetadata(browserLogin) {
+  const source = browserLogin && typeof browserLogin === "object" ? browserLogin : {};
+  return {
+    success: source.success === true,
+    backend: source.backend === "ruyipage" ? "ruyipage" : "unknown",
+    accountHomeConfirmed: source.accountHomeConfirmed === true,
+    skippedLogin: source.skippedLogin === true,
+    skipped2FA: source.skipped2FA === true,
+    sessionReused: source.sessionReused === true,
+    rememberAccount:
+      source.rememberAccount === true ? true : source.rememberAccount === false ? false : null,
+  };
+}
+
+function sanitizeAccountBrowserBackendResult(result) {
+  const source = result && typeof result === "object" ? result : {};
+  const personalInfo = source.personalInfo && typeof source.personalInfo === "object"
+    ? source.personalInfo
+    : {};
+  return {
+    success: source.success === true,
+    browserLogin: sanitizeBrowserLoginMetadata(source.browserLogin),
+    personalInfo: {
+      name: personalInfo.name,
+      birthday: personalInfo.birthday,
+    },
+    screenshots: sanitizeScreenshotMetadata(source.screenshots),
+  };
+}
+
 function auditRuyiPageEvent(flowAudit, event) {
   if (!event || typeof event !== "object") {
     writeFlowAudit(flowAudit, "ruyipage", "invalid_event");
@@ -508,6 +631,12 @@ function auditRuyiPageEvent(flowAudit, event) {
     if (event.status === "browser_preserved") {
       details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
       details.preserved = event.preserved === true;
+    }
+    if (event.status === "browser_session_preserved") {
+      details.preserved = event.preserved === true;
+    }
+    if (event.status === "account_home_confirmed") {
+      details.accountHomeConfirmed = true;
     }
     if (event.status === "twofa_progress") {
       details.phase = sanitizeTwoFactorProgressPhase(event.phase);
@@ -637,6 +766,8 @@ export async function runAccountBrowserPhase(
   const createRunner =
     runtime.createRuyiPageBackendRunner ?? createRuyiPageBackendRunner;
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
+  const saveProfile = runtime.saveAppleProfileToEnv ?? saveAppleProfileToEnv;
+  const shouldPrintProfile = runtime.shouldPrintCapturedProfile ?? shouldPrintCapturedProfile;
 
   const summary = getEnvironmentSummary();
   writeFlowAudit(flowAudit, "account_browser", "environment", {
@@ -697,10 +828,10 @@ export async function runAccountBrowserPhase(
   try {
     console.log("[ruyipage] status:runtime_resolving");
     writeFlowAudit(flowAudit, "ruyipage", "runtime_resolving");
-    const runner = createRunner();
+    const runner = createRunner({ sanitizeResult: sanitizeAccountBrowserBackendResult });
     console.log("[ruyipage] status:backend_starting");
     writeFlowAudit(flowAudit, "ruyipage", "backend_starting");
-    result = await runner.run({
+    result = sanitizeAccountBrowserBackendResult(await runner.run({
       creds,
       reportDir,
       onEvent(event) {
@@ -735,6 +866,11 @@ export async function runAccountBrowserPhase(
           console.log(`[ruyipage] status:${inputStatusLine}`);
         } else if (twoFactorHandoffLine) {
           console.log(`[ruyipage] status:${twoFactorHandoffLine}`);
+        } else if (
+          event.event === "status" &&
+          Object.hasOwn(RUYIPAGE_PROFILE_STATUS_MESSAGES, event.status)
+        ) {
+          console.log(RUYIPAGE_PROFILE_STATUS_MESSAGES[event.status]);
         } else if (event.event === "status" && event.status === "browser_preserved") {
           if (event.preserved === true) {
             console.warn("[ruyipage] 流程失败，Firefox 已保留供人工核对当前页面");
@@ -794,7 +930,7 @@ export async function runAccountBrowserPhase(
         });
         return code;
       },
-    });
+    }));
   } catch (error) {
     runError = error;
     const failureCode = classifyBrowserRunFailure(error);
@@ -814,13 +950,16 @@ export async function runAccountBrowserPhase(
       codeDeliveryWriteStarted: runnerContext.codeDeliveryWriteStarted,
       codeDeliveryWriteCompleted: runnerContext.codeDeliveryWriteCompleted,
       browserLaunchObserved: runnerContext.browserLaunchObserved,
+      accountHomeConfirmed: runnerContext.accountHomeConfirmed,
       browserPreserved: runnerContext.browserPreserved,
+      browserSessionPreserved: runnerContext.browserSessionPreserved,
       directBrowserPreservationRequested:
         runnerContext.directBrowserPreservationRequested,
       browserErrorClass: runnerContext.browserErrorClass,
       backendExitCode: runnerContext.backendExitCode,
       cleanupFailed: runnerContext.cleanupFailed,
     });
+    if (runnerContext.accountHomeConfirmed) markBrowserAccountHomeConfirmed(error);
     throw annotateBrowserRunFailure(error, null, failureStage);
   } finally {
     try {
@@ -850,10 +989,32 @@ export async function runAccountBrowserPhase(
 
   writeFlowAudit(flowAudit, "account_browser", "account_home_confirmed");
 
+  let personalInfo;
+  try {
+    personalInfo = saveCapturedProfile(
+      result.personalInfo,
+      flowAudit,
+      saveProfile,
+      shouldPrintProfile()
+    );
+  } catch (error) {
+    markBrowserAccountHomeConfirmed(error);
+    writeFlowAuditError(flowAudit, "account_browser", "profile_persistence_failed", error, {
+      failureStage: "profile_capture",
+      failureCode: "profile_persistence",
+    });
+    throw annotateBrowserRunFailure(error, "profile_persistence", "profile_capture");
+  }
+  writeFlowAudit(flowAudit, "account_browser", "profile_persisted", {
+    collected: true,
+    nameStored: true,
+    birthdayStored: true,
+  });
+
   return {
-    browserLogin: result.browserLogin,
+    browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
-    personalInfo: result.personalInfo ?? null,
-    screenshots: result.screenshots ?? {},
+    personalInfo,
+    screenshots: sanitizeScreenshotMetadata(result.screenshots),
   };
 }

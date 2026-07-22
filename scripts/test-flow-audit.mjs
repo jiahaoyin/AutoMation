@@ -20,6 +20,8 @@ const OCR = "OCR_PRIVATE_CANARY";
 const SCREENSHOT = "SCREENSHOT_PRIVATE_CANARY";
 const SCREENSHOT_PATH_WIN = "C:\\Users\\person\\Desktop\\screenshots\\99-ruyipage-failure.png";
 const SCREENSHOT_PATH_MAC = "/Users/admin/Desktop/Apple-AutoMation/data/reports/screenshots/99-ruyipage-failure.png";
+const PROFILE_NAME = "Profile Name Private Canary";
+const BIRTHDAY = "1999-12-31";
 
 function assertNoSecret(text) {
   for (const secret of [
@@ -34,6 +36,8 @@ function assertNoSecret(text) {
     OCR,
     SCREENSHOT,
     "BUFFER_PRIVATE_CANARY",
+    PROFILE_NAME,
+    BIRTHDAY,
   ]) {
     assert.equal(text.includes(secret), false, `audit leaked ${secret}`);
   }
@@ -69,6 +73,9 @@ function runAuditRedactionTest() {
       cause: "untrusted_cause",
       traceback: "untrusted_traceback",
       appleId: EMAIL,
+      name: PROFILE_NAME,
+      fullName: PROFILE_NAME,
+      birthday: BIRTHDAY,
       password: PASSWORD,
       code: OTP,
       rawAx: AX,
@@ -119,6 +126,9 @@ function runAuditRedactionTest() {
     assert.equal(lines[0].details.route, "unknown");
     assert.equal(lines[0].details.unreadable, "[ACCESSOR_OMITTED]");
     assert.equal("message" in lines[0].details, false);
+    assert.equal("name" in lines[0].details, false);
+    assert.equal("fullName" in lines[0].details, false);
+    assert.equal("birthday" in lines[0].details, false);
     assert.equal("stack" in lines[0].details, false);
     assert.equal("cause" in lines[0].details, false);
     assert.equal("traceback" in lines[0].details, false);

@@ -72,6 +72,20 @@ if (process.argv.includes("--unsafe-result-error-child")) {
   await new Promise(() => {});
 }
 
+if (process.argv.includes("--result-with-unsafe-metadata-child")) {
+  process.stdout.write(
+    `${JSON.stringify({
+      event: "result",
+      success: true,
+      appleId: SECRET_CHILD_OUTPUT,
+      browserLogin: { accountHomeConfirmed: true, profileName: SECRET_CHILD_OUTPUT },
+      screenshots: { extra: SECRET_CHILD_OUTPUT },
+    })}\n`,
+    () => process.exit(0)
+  );
+  await new Promise(() => {});
+}
+
 if (process.argv.includes("--failed-result-exit-child")) {
   process.stdout.write(
     `${JSON.stringify({ event: "result", success: false, failureStage: "twofa_input" })}\n`,
@@ -2005,7 +2019,9 @@ async function runNodeRunnerSecondGenerationStateResetTest() {
     codeDeliveryWriteStarted: false,
     codeDeliveryWriteCompleted: false,
     browserLaunchObserved: true,
+    accountHomeConfirmed: false,
     browserPreserved: false,
+    browserSessionPreserved: false,
     directBrowserPreservationRequested: true,
     browserErrorClass: "unknown",
     backendExitCode: null,
@@ -2274,7 +2290,9 @@ async function runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest() {
     codeDeliveryWriteStarted: true,
     codeDeliveryWriteCompleted: true,
     browserLaunchObserved: true,
+    accountHomeConfirmed: false,
     browserPreserved: false,
+    browserSessionPreserved: false,
     directBrowserPreservationRequested: isDirectBrowserFailurePreservationEnabled(),
     browserErrorClass: "twofa_input_unconfirmed",
     backendExitCode: 1,
@@ -2306,6 +2324,25 @@ function runPreservedBrowserCleanupPolicyTest() {
     }),
     false,
     "a direct run that explicitly preserved Firefox must not kill its process group"
+  );
+  assert.equal(
+    shouldCleanUpRuyiPageProcessGroup({
+      timedOut: false,
+      terminationSignal: null,
+      usesBrowserBroker: false,
+      browserSessionPreserved: true,
+    }),
+    false,
+    "a successful retained session must not kill its Firefox process group"
+  );
+  const runnerSource = fs.readFileSync(
+    new URL("./lib/ruyipage-backend-runner.js", import.meta.url),
+    "utf8"
+  );
+  assert.match(
+    runnerSource,
+    /browserSessionPreserved:\s*protocolContext\.browserSessionPreserved/,
+    "the successful retained-session status must reach process-group cleanup"
   );
   assert.equal(
     shouldCleanUpRuyiPageProcessGroup({
@@ -3048,6 +3085,36 @@ async function runNodeRunnerStrictResultContractSelfTest() {
   );
 }
 
+async function runNodeRunnerResultSanitizerSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--result-with-unsafe-metadata-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 100,
+    sanitizeResult(event) {
+      return {
+        success: event?.success === true,
+        browserLogin: {
+          accountHomeConfirmed: event?.browserLogin?.accountHomeConfirmed === true,
+        },
+      };
+    },
+  });
+
+  const result = await runner.run({
+    creds: FIXTURE_CREDS,
+    reportDir: "data/reports/protocol-test",
+  });
+
+  assert.deepEqual(result, {
+    success: true,
+    browserLogin: { accountHomeConfirmed: true },
+  });
+  assert.equal(JSON.stringify(result).includes(SECRET_CHILD_OUTPUT), false);
+}
+
 async function runNodeRunnerSplitUtf8ChunkSelfTest() {
   const runner = createRuyiPageBackendRunner({
     python: process.execPath,
@@ -3198,6 +3265,7 @@ await runNodeRunnerForcedTimeoutSelfTest();
 await runNodeRunnerSpawnFailureSelfTest();
 await runNodeRunnerCloseBoundarySelfTest();
 await runNodeRunnerStrictResultContractSelfTest();
+await runNodeRunnerResultSanitizerSelfTest();
 await runNodeRunnerSplitUtf8ChunkSelfTest();
 await runSupervisorParentExitBeforeGateSelfTest();
 await runSupervisorRuntimePolicySelfTest();

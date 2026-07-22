@@ -105,6 +105,123 @@ class BrowserStageRecorderTests(unittest.TestCase):
         )
 
 
+class ExistingBrowserAttachTests(unittest.TestCase):
+    def test_prefers_the_authenticated_manage_tab_when_multiple_account_tabs_exist(self):
+        sign_in_tab = object()
+        manage_tab = object()
+
+        class Candidate:
+            def __init__(self):
+                self.url_query = None
+
+            def get_tabs(self, *, url):
+                self.url_query = url
+                return [sign_in_tab, manage_tab]
+
+        candidate = Candidate()
+
+        class RuyiPageModule:
+            @staticmethod
+            def auto_attach_exist_browser_by_process():
+                return candidate
+
+        with patch.dict(
+            os.environ,
+            {
+                "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "0",
+                "BROWSER_ATTACH_EXISTING": "1",
+            },
+            clear=False,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.scope_location_url",
+            side_effect=[
+                "https://account.apple.com/account/sign-in",
+                "https://account.apple.com/account/manage",
+            ],
+        ), patch(
+            "apple_account_flow.attached_account_matches_apple_id",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.importlib.import_module",
+            return_value=RuyiPageModule,
+        ):
+            attached = account_flow.try_attach_existing_account_page("person@example.com")
+
+        self.assertIs(attached, manage_tab)
+        self.assertEqual(candidate.url_query, "account.apple.com")
+
+    def test_rejects_an_attached_manage_tab_for_a_different_account(self):
+        manage_tab = object()
+
+        class Candidate:
+            def get_tabs(self, *, url):
+                self.url_query = url
+                return [manage_tab]
+
+        class RuyiPageModule:
+            @staticmethod
+            def auto_attach_exist_browser_by_process():
+                return Candidate()
+
+        with patch.dict(
+            os.environ,
+            {
+                "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "0",
+                "BROWSER_ATTACH_EXISTING": "1",
+            },
+            clear=False,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.scope_location_url",
+            return_value="https://account.apple.com/account/manage",
+        ), patch(
+            "apple_account_flow.attached_account_matches_apple_id",
+            return_value=False,
+        ), patch(
+            "apple_account_flow.importlib.import_module",
+            return_value=RuyiPageModule,
+        ):
+            attached = account_flow.try_attach_existing_account_page("person@example.com")
+
+        self.assertIsNone(attached)
+
+    def test_attached_account_identity_requires_an_exact_single_match(self):
+        class IdentityScope:
+            def __init__(self, values):
+                self.values = values
+                self.script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(self.values)
+
+        matching = IdentityScope(["person@example.com"])
+        self.assertTrue(
+            account_flow.attached_account_matches_apple_id(
+                matching,
+                "Person@Example.com",
+            )
+        )
+        self.assertIn("ruyipage-account-session-identity", matching.script)
+        self.assertFalse(
+            account_flow.attached_account_matches_apple_id(
+                IdentityScope(["other@example.com"]),
+                "person@example.com",
+            )
+        )
+        self.assertFalse(
+            account_flow.attached_account_matches_apple_id(
+                IdentityScope(["person@example.com", "other@example.com"]),
+                "person@example.com",
+            )
+        )
+
+
 class PageTransitionWaitTests(unittest.TestCase):
     def test_document_settle_reports_a_dead_ruyipage_connection(self):
         page = FakePage()
@@ -324,6 +441,30 @@ class FakeElement:
     def run_js(self, script):
         if not str(script).lstrip().startswith("function"):
             raise RuntimeError("FirefoxElement.run_js requires a function declaration")
+        if "ruyipage-profile-card-summary" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "profileCard",
+                    {
+                        "visible": self.states.is_displayed,
+                        "name": False,
+                        "birthday": False,
+                        "birthdayValue": None,
+                    },
+                )
+            )
+        if "ruyipage-profile-name-modal" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "profileModal",
+                    {
+                        "visible": self.states.is_displayed,
+                        "fieldCount": 0,
+                        "given": None,
+                        "family": None,
+                    },
+                )
+            )
         if "ruyipage-otp-length-check" in script:
             expected = re.search(r"value\.length === (\d+)", script)
             return bool(expected and len(str(self.value)) == int(expected.group(1)))
@@ -1817,8 +1958,11 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.take_screenshot",
             return_value=None,
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -1924,8 +2068,11 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.take_screenshot",
             return_value=None,
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -2051,8 +2198,10 @@ class BrowserFlowTests(unittest.TestCase):
         ) as signed_in, patch(
             "apple_account_flow.take_screenshot", return_value=None
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready", return_value=None
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch("apple_account_flow.human_pause", return_value=None), patch(
             "apple_account_flow.emit"
         ) as emit_event:
@@ -2172,8 +2321,11 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.take_screenshot",
             return_value=None,
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -2269,8 +2421,11 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.take_screenshot",
             return_value=None,
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -2392,8 +2547,10 @@ class BrowserFlowTests(unittest.TestCase):
         ), patch(
             "apple_account_flow.click_trust_browser", side_effect=click_without_pause
         ), patch("apple_account_flow.take_screenshot", return_value=None), patch(
+            "apple_account_flow.wait_for_profile_capture_ready", return_value=None
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch("apple_account_flow.human_pause", return_value=None), patch(
             "apple_account_flow.emit"
         ):
@@ -2441,8 +2598,10 @@ class BrowserFlowTests(unittest.TestCase):
         ), patch(
             "apple_account_flow.click_trust_browser", side_effect=click_without_pause
         ), patch("apple_account_flow.take_screenshot", return_value=None), patch(
+            "apple_account_flow.wait_for_profile_capture_ready", return_value=None
+        ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value={"fullName": "Person", "birthday": None},
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch("apple_account_flow.human_pause", return_value=None), patch(
             "apple_account_flow.emit"
         ):
@@ -2495,6 +2654,9 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             "apple_account_flow.settle_trust_state",
             side_effect=lambda _page, state, **_kwargs: state,
         ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
             "apple_account_flow.collect_personal_info",
             return_value=personal_info,
         ), patch(
@@ -2518,7 +2680,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     report_dir,
                     page,
                     {"trusted": False, "error": True},
-                    {"fullName": "Person", "birthday": None},
+                    {"name": "Test Given Test Family", "birthday": "2000-01-02"},
                     events,
                 )
 
@@ -2537,11 +2699,59 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     report_dir,
                     page,
                     {"trusted": True, "error": False},
-                    {"fullName": None, "birthday": None},
+                    {"name": None, "birthday": None},
                     events,
                 )
 
             self.assertEqual(list(report_dir.rglob("*.png")), [])
+            self.assertNotIn(secret, json.dumps(events))
+
+    def test_profile_capture_failure_keeps_personal_information_screenshot_and_browser(self):
+        class PreservedProfilePage(self.DiskScreenshotPage):
+            def __init__(self, secret):
+                super().__init__(secret)
+                self.states = type("FakeStates", (), {"is_alive": True})()
+                self.quit_calls = 0
+
+            def quit(self):
+                self.quit_calls += 1
+                super().quit()
+
+        secret = "person@example.com OTP 123456"
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            page = PreservedProfilePage(secret)
+            with patch.dict(
+                os.environ,
+                {
+                    "BROWSER_PRESERVE_ON_FAILURE": "1",
+                    "BROWSER_PRESERVE_ON_SUCCESS": "1",
+                },
+                clear=False,
+            ), self.assertRaisesRegex(RuntimeError, "name and birthday"):
+                self.run_late_flow(
+                    report_dir,
+                    page,
+                    {"trusted": True, "error": False},
+                    {"name": None, "birthday": None},
+                    events,
+                )
+
+            self.assertEqual(
+                sorted(path.name for path in report_dir.rglob("*.png")),
+                ["02-ruyipage-after-login.png", "03-account-information.png"],
+            )
+            self.assertEqual(page.quit_calls, 0)
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "browser_preserved",
+                    "failureStage": "profile_birthday",
+                    "preserved": True,
+                },
+                events,
+            )
             self.assertNotIn(secret, json.dumps(events))
 
     def test_quit_failure_removes_all_success_screenshots_from_disk(self):
@@ -2556,7 +2766,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     report_dir,
                     page,
                     {"trusted": True, "error": False},
-                    {"fullName": "Person", "birthday": None},
+                    {"name": "Test Given Test Family", "birthday": "2000-01-02"},
                     events,
                 )
 
@@ -2575,7 +2785,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     report_dir,
                     page,
                     {"trusted": True, "error": False},
-                    {"fullName": "Person", "birthday": None},
+                    {"name": "Test Given Test Family", "birthday": "2000-01-02"},
                     events,
                 ),
                 0,
@@ -2584,7 +2794,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             screenshots = sorted(path.name for path in report_dir.rglob("*.png"))
             self.assertEqual(
                 screenshots,
-                ["02-ruyipage-after-login.png", "03-account-manage.png"],
+                ["02-ruyipage-after-login.png", "03-account-information.png"],
             )
 
     def test_early_failure_does_not_delete_fixed_screenshots_from_an_older_run(self):
@@ -2605,7 +2815,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             screenshots_dir.mkdir(parents=True)
             older_files = (
                 screenshots_dir / "02-ruyipage-after-login.png",
-                screenshots_dir / "03-account-manage.png",
+                screenshots_dir / "03-account-information.png",
             )
             for path in older_files:
                 path.write_text("older run", encoding="utf-8")
@@ -6741,108 +6951,362 @@ class BrowserBrokerLaunchTests(unittest.TestCase):
 
 
 class PersonalInformationTests(unittest.TestCase):
-    def test_personal_info_ignores_non_apple_frames(self):
-        evil_frame = FakePage(
+    def test_waits_for_hydrated_birthday_value_before_accepting_the_card(self):
+        birthday_card = FakeElement()
+        summaries = [
+            {
+                "visible": True,
+                "name": False,
+                "birthday": True,
+                "birthdayValue": "",
+            },
+            {
+                "visible": True,
+                "name": False,
+                "birthday": True,
+                "birthdayValue": "2000-01-02",
+            },
+            {
+                "visible": True,
+                "name": False,
+                "birthday": True,
+                "birthdayValue": "2000-01-02",
+            },
+        ]
+
+        def read_summary(script):
+            self.assertIn("ruyipage-profile-card-summary", script)
+            return json.dumps(summaries.pop(0))
+
+        birthday_card.run_js = read_summary
+        page = FakePage(
+            {"css:.card": [birthday_card]},
             state={
-                "href": "https://evil.example/account",
-                "fullName": "Wrong Person",
-                "birthday": "2000-01-01",
-                "title": "Fake",
+                "href": "https://account.apple.com/account/manage/section/information"
+            },
+        )
+
+        _scope, card, summary = account_flow.wait_for_profile_card(
+            page,
+            "birthday",
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(card, birthday_card)
+        self.assertEqual(summary["birthdayValue"], "2000-01-02")
+        self.assertEqual(summaries, [])
+
+    def test_prefers_nested_name_content_and_waits_for_hydrated_values(self):
+        outer_modal = FakeElement(
+            attrs={
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 3,
+                    "given": "Outer",
+                    "family": "Container",
+                }
             }
         )
-        apple_frame = FakePage(
+        inner_modal = FakeElement()
+        summaries = [
+            {"visible": True, "fieldCount": 3, "given": "", "family": ""},
+            {
+                "visible": True,
+                "fieldCount": 3,
+                "given": "Given",
+                "family": "Family",
+            },
+            {
+                "visible": True,
+                "fieldCount": 3,
+                "given": "Given",
+                "family": "Family",
+            },
+        ]
+
+        def read_summary(script):
+            self.assertIn("ruyipage-profile-name-modal", script)
+            return json.dumps(summaries.pop(0))
+
+        inner_modal.run_js = read_summary
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [inner_modal],
+                "css:[role='dialog']": [outer_modal],
+                "css:aside": [outer_modal],
+            },
             state={
-                "href": "https://account.apple.com/frame",
-                "fullName": "Right Person",
-                "birthday": None,
-                "title": "Apple Account",
+                "href": "https://account.apple.com/account/manage/section/information"
+            },
+        )
+
+        _scope, modal, summary = account_flow.wait_for_profile_name_modal(
+            page,
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(modal, inner_modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+        self.assertEqual(summaries, [])
+
+    def test_profile_card_wait_accepts_a_rewrapped_ruyipage_element(self):
+        class RewrappingProfilePage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    state={
+                        "href": "https://account.apple.com/account/manage/section/information"
+                    }
+                )
+                self.wrappers: list[FakeElement] = []
+
+            def eles(self, selector, timeout=None):
+                self.eles_calls.append((selector, timeout))
+                if selector != "css:.card":
+                    return []
+                card = FakeElement(
+                    attrs={
+                        "id": "birthday-card",
+                        "profileCard": {
+                            "visible": True,
+                            "name": False,
+                            "birthday": True,
+                            "birthdayValue": "2000-01-02",
+                        },
+                    }
+                )
+                card.scope = self
+                self.wrappers.append(card)
+                return [card]
+
+        page = RewrappingProfilePage()
+        _scope, card, summary = account_flow.wait_for_profile_card(
+            page,
+            "birthday",
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(card, page.wrappers[-1])
+        self.assertEqual(summary["birthdayValue"], "2000-01-02")
+        self.assertEqual(len(page.wrappers), 2)
+        self.assertIsNot(page.wrappers[0], page.wrappers[1])
+
+    def test_profile_name_modal_wait_accepts_a_rewrapped_ruyipage_element(self):
+        class RewrappingProfilePage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    state={
+                        "href": "https://account.apple.com/account/manage/section/information"
+                    }
+                )
+                self.wrappers: list[FakeElement] = []
+
+            def eles(self, selector, timeout=None):
+                self.eles_calls.append((selector, timeout))
+                if selector != "css:[id^='modal-content-']":
+                    return []
+                modal = FakeElement(
+                    attrs={
+                        "id": "modal-content-stable",
+                        "profileModal": {
+                            "visible": True,
+                            "fieldCount": 3,
+                            "given": "Given",
+                            "family": "Family",
+                        },
+                    }
+                )
+                modal.scope = self
+                self.wrappers.append(modal)
+                return [modal]
+
+        page = RewrappingProfilePage()
+        _scope, modal, summary = account_flow.wait_for_profile_name_modal(
+            page,
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(modal, page.wrappers[-1])
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+        self.assertEqual(len(page.wrappers), 2)
+        self.assertIsNot(page.wrappers[0], page.wrappers[1])
+
+    def test_name_modal_rejects_order_guessing_and_excludes_chinese_middle_name(self):
+        modal = FakeElement(
+            attrs={
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 3,
+                    "given": "Given",
+                    "family": "Family",
+                }
+            }
+        )
+        original_run_js = modal.run_js
+
+        def inspect_query(script):
+            self.assertIn(r"\u4e2d\u95f4\u540d", script)
+            self.assertIn(r"\u4e2d\u9593\u540d", script)
+            self.assertNotIn("fallback[2]", script)
+            return original_run_js(script)
+
+        modal.run_js = inspect_query
+        summary = account_flow.profile_name_modal_summary(modal)
+
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+
+    def test_collects_birthday_before_opening_the_name_modal(self):
+        calls: list[str] = []
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000年1月2日",
+                }
+            }
+        )
+        original_birthday_run_js = birthday_card.run_js
+
+        def record_birthday_query(script):
+            if "ruyipage-profile-card-summary" in script:
+                calls.append("birthday")
+            return original_birthday_run_js(script)
+
+        birthday_card.run_js = record_birthday_query
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 3,
+                    "given": "Given",
+                    "family": "Family",
+                }
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: (
+                calls.append("name_click"),
+                setattr(modal.states, "is_displayed", True),
+            ),
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+                "css:[role='dialog']": [modal],
+                "css:aside": [],
+                "css:[id^='modal-content-']": [],
+            },
+            state={
+                "href": "https://account.apple.com/account/manage/section/information"
+            },
+        )
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            result = collect_personal_info(page)
+
+        self.assertEqual(
+            result,
+            {"name": "Given Family", "birthday": "2000年1月2日"},
+        )
+        self.assertLess(calls.index("birthday"), calls.index("name_click"))
+        self.assertEqual(name_card.clicks, 0)
+        self.assertIn(("human_click", name_card), page.actions.calls)
+
+    def test_rejects_ambiguous_name_cards_without_clicking_either(self):
+        cards = [
+            FakeElement(
+                attrs={
+                    "profileCard": {
+                        "visible": True,
+                        "name": True,
+                        "birthday": False,
+                        "birthdayValue": None,
+                    }
+                }
+            )
+            for _ in range(2)
+        ]
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
             }
         )
         page = FakePage(
-            frames=[evil_frame, apple_frame],
+            {
+                "css:button.button.button-bare": cards,
+                "css:button[class*='button-bare']": cards,
+                "css:.card": [birthday_card],
+            },
             state={
-                "href": "https://account.apple.com/account/manage",
-                "fullName": None,
-                "birthday": None,
-                "title": "Apple Account",
+                "href": "https://account.apple.com/account/manage/section/information"
             },
         )
 
-        self.assertEqual(collect_personal_info(page)["fullName"], "Right Person")
+        with patch("apple_account_flow.human_pause", lambda *_: None), self.assertRaisesRegex(
+            RuntimeError,
+            "name card is ambiguous",
+        ):
+            collect_personal_info(page)
 
-    def test_personal_info_sanitizes_apple_root_and_iframe_urls(self):
-        secret = "SECRET"
-        root_page = FakePage(
-            state={
-                "href": f"https://account.apple.com/account/manage?token={secret}#fragment",
-                "fullName": "Root Person",
-                "birthday": None,
-                "title": "Apple Account",
+        self.assertEqual(page.actions.calls, [])
+
+    def test_rejects_profile_cards_outside_the_authenticated_manage_page(self):
+        card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
             }
         )
-        evil_frame = FakePage(
-            state={
-                "href": f"https://evil.example/account?token={secret}#fragment",
-                "fullName": "Wrong Person",
-                "birthday": "2000-01-01",
-                "title": "Fake",
-            }
-        )
-        apple_frame = FakePage(
-            state={
-                "href": f"https://idmsa.apple.com/appleauth/auth/profile?token={secret}#fragment",
-                "fullName": "Frame Person",
-                "birthday": None,
-                "title": "Apple Account",
-            }
-        )
-        framed_page = FakePage(
-            frames=[evil_frame, apple_frame],
-            state={
-                "href": f"https://evil.example/root?token={secret}#fragment",
-                "fullName": "Wrong Root Person",
-                "birthday": "1999-01-01",
-                "title": "Fake Root",
-            },
+        page = FakePage(
+            {"css:.card": [card]},
+            state={"href": "https://evil.example/account/manage/section/information"},
         )
 
-        cases = (
-            (
-                "apple root page",
-                root_page,
-                "Root Person",
-                "https://account.apple.com/account/manage",
-            ),
-            (
-                "apple iframe after non-Apple scopes",
-                framed_page,
-                "Frame Person",
-                "https://idmsa.apple.com/appleauth/auth/profile",
-            ),
-        )
-        for label, page, expected_name, expected_href in cases:
-            with self.subTest(label=label):
-                result = collect_personal_info(page)
-
-                self.assertEqual(result["fullName"], expected_name)
-                self.assertEqual(result["href"], expected_href)
-                self.assertNotIn(secret, json.dumps(result))
+        with patch("apple_account_flow.human_pause", lambda *_: None), self.assertRaisesRegex(
+            RuntimeError,
+            "birthday card was not found",
+        ):
+            collect_personal_info(page)
 
     def test_requires_authenticated_state_and_at_least_one_parsed_field(self):
         with self.assertRaisesRegex(RuntimeError, "authenticated"):
             validate_personal_info_result(
                 {"trusted": False},
-                {"fullName": "Person", "birthday": None},
+                {"name": "Person", "birthday": None},
             )
         with self.assertRaisesRegex(RuntimeError, "name and birthday"):
             validate_personal_info_result(
                 {"trusted": True},
-                {"fullName": None, "birthday": None},
+                {"name": None, "birthday": None},
             )
 
         validate_personal_info_result(
             {"trusted": True},
-            {"fullName": "Person", "birthday": None},
+            {"name": "Test Given Test Family", "birthday": "2000-01-02"},
         )
 
 

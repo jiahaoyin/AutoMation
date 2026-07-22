@@ -31,7 +31,7 @@ export function loadEnvFile() {
   const envPath = resolveEnvPath();
   if (!fs.existsSync(envPath)) return envPath;
 
-  const lines = fs.readFileSync(envPath, "utf-8").split("\n");
+  const lines = fs.readFileSync(envPath, "utf-8").split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -53,6 +53,7 @@ function formatEnvValue(val) {
 
 function upsertEnvLines(lines, entries) {
   const pending = new Map(Object.entries(entries));
+  const handled = new Set();
   const out = [];
 
   for (const line of lines) {
@@ -67,9 +68,12 @@ function upsertEnvLines(lines, entries) {
       continue;
     }
     const key = trimmed.slice(0, eq).trim();
-    if (pending.has(key)) {
-      out.push(`${key}=${formatEnvValue(pending.get(key))}`);
-      pending.delete(key);
+    if (Object.hasOwn(entries, key)) {
+      if (!handled.has(key)) {
+        out.push(`${key}=${formatEnvValue(entries[key])}`);
+        handled.add(key);
+        pending.delete(key);
+      }
     } else {
       out.push(line);
     }
@@ -86,25 +90,75 @@ function upsertEnvLines(lines, entries) {
   return out;
 }
 
+function readEnvDocument(file) {
+  const text = fs.readFileSync(file, "utf-8");
+  return {
+    lines: text.split(/\r?\n/),
+    lineEnding: text.includes("\r\n") ? "\r\n" : "\n",
+  };
+}
+
+function writePrivateEnvFile(envPath, lines, lineEnding) {
+  const body = lines.join(lineEnding);
+  const content = body.endsWith(lineEnding) ? body : `${body}${lineEnding}`;
+  if (fs.existsSync(envPath)) fs.chmodSync(envPath, 0o600);
+  fs.writeFileSync(envPath, content, { encoding: "utf8", mode: 0o600 });
+  fs.chmodSync(envPath, 0o600);
+}
+
 /**
  * 将账号密码写入 .env（权限 600）
  */
 export function saveCredentialsToEnv({ appleId, password }) {
   const envPath = resolveEnvPath();
   let lines = [];
+  let lineEnding = "\n";
 
   if (fs.existsSync(envPath)) {
-    lines = fs.readFileSync(envPath, "utf-8").split("\n");
+    ({ lines, lineEnding } = readEnvDocument(envPath));
   } else if (fs.existsSync(path.join(PACKAGE_ROOT, ".env.example"))) {
-    lines = fs.readFileSync(path.join(PACKAGE_ROOT, ".env.example"), "utf-8").split("\n");
+    ({ lines, lineEnding } = readEnvDocument(path.join(PACKAGE_ROOT, ".env.example")));
   }
 
   const updated = upsertEnvLines(lines, {
     APPLE_ID: appleId,
     APPLE_PASSWORD: password,
   });
-  const body = updated.join("\n");
-  fs.writeFileSync(envPath, body.endsWith("\n") ? body : `${body}\n`, { mode: 0o600 });
+  writePrivateEnvFile(envPath, updated, lineEnding);
+  return envPath;
+}
+
+function normalizeProfileEnvValue(value, label, maxLength) {
+  if (typeof value !== "string") {
+    throw new Error(`${label} is invalid`);
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (
+    !normalized ||
+    normalized.length > maxLength ||
+    /[\r\n\u0000]/.test(value)
+  ) {
+    throw new Error(`${label} is invalid`);
+  }
+  return normalized;
+}
+
+/**
+ * Persist only values collected from the authenticated profile page. Callers
+ * keep those values out of reports and audit records.
+ */
+export function saveAppleProfileToEnv({ name, birthday }) {
+  const safeName = normalizeProfileEnvValue(name, "profile name", 256);
+  const safeBirthday = normalizeProfileEnvValue(birthday, "profile birthday", 128);
+  const envPath = resolveEnvPath();
+  const { lines, lineEnding } = fs.existsSync(envPath)
+    ? readEnvDocument(envPath)
+    : { lines: [], lineEnding: "\n" };
+  const updated = upsertEnvLines(lines, {
+    name: safeName,
+    birthday: safeBirthday,
+  });
+  writePrivateEnvFile(envPath, updated, lineEnding);
   return envPath;
 }
 

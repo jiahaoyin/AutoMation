@@ -5,19 +5,23 @@ import path from "node:path";
 
 import {
   classifyBrowserRunFailure,
+  readBrowserAccountHomeConfirmed,
   readBrowserFailureCode,
   readBrowserFailureStage,
   runAccountBrowserPhase,
 } from "./lib/account-browser-flow.js";
-import { createFlowFailureEnvelope } from "./apple-id-full-flow.mjs";
+import { createFlowFailureEnvelope, createFlowReport } from "./apple-id-full-flow.mjs";
 import {
   loadEnvFile,
   maskAppleId,
   parseEnvValue,
+  saveCredentialsToEnv,
+  saveAppleProfileToEnv,
   shouldAutoConfirmAppleCredentials,
 } from "./lib/credentials.js";
 import {
   resolveReportRoot,
+  writeReport,
   writeAccountHomeAcceptanceMarker,
 } from "./lib/report.js";
 
@@ -65,6 +69,12 @@ function createRuntime(runBackend, options = {}) {
         },
       };
     },
+    saveAppleProfileToEnv(profile) {
+      return options.saveAppleProfileToEnv?.(profile) ?? "/tmp/test-profile.env";
+    },
+    shouldPrintCapturedProfile() {
+      return options.shouldPrintCapturedProfile === true;
+    },
   };
   return {
     runtime,
@@ -101,7 +111,7 @@ function successfulResult() {
       backend: "ruyipage",
       accountHomeConfirmed: true,
     },
-    personalInfo: { fullName: "Test Person", birthday: null },
+    personalInfo: { name: "Test Given Test Family", birthday: "2000-01-02" },
     screenshots: {},
   };
 }
@@ -261,7 +271,7 @@ async function runFlowAuditForwardingTest() {
 
   await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
 
-  assert.deepEqual(secrets, ["123456"]);
+  assert.deepEqual(secrets, ["123456", "Test Given Test Family", "2000-01-02"]);
   assert.ok(
     entries.some(
       (entry) =>
@@ -288,6 +298,8 @@ async function runFlowAuditForwardingTest() {
     }
   );
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+  assert.equal(JSON.stringify(entries).includes("Test Given Test Family"), false);
+  assert.equal(JSON.stringify(entries).includes("2000-01-02"), false);
   assert.ok(
     entries.some(
       (entry) =>
@@ -473,7 +485,9 @@ async function runTwoFactorHandoffFailureContextTest() {
     codeDeliveryWriteStarted: true,
     codeDeliveryWriteCompleted: true,
     browserLaunchObserved: true,
+    accountHomeConfirmed: false,
     browserPreserved: true,
+    browserSessionPreserved: false,
     directBrowserPreservationRequested: false,
     browserErrorClass: "twofa_target_missing",
     backendExitCode: 1,
@@ -977,7 +991,7 @@ async function runMissingAccountHomeConfirmationTest() {
   const harness = createRuntime(async () => ({
     success: true,
     browserLogin: { success: true, backend: "ruyipage" },
-    personalInfo: { fullName: "Test Person", birthday: null },
+    personalInfo: { name: "Test Given Test Family", birthday: "2000-01-02" },
     screenshots: {},
   }));
 
@@ -1003,6 +1017,182 @@ async function runTrustedSessionDisposalTest() {
   await runAccountBrowserPhase(params, harness.runtime);
   assert.deepEqual(harness.calls, ["dispose"]);
   assert.equal(harness.collectorCount, 1);
+}
+
+async function runProfilePersistenceAndAuditRedactionTest() {
+  const storedProfiles = [];
+  const auditEntries = [];
+  const auditSecrets = [];
+  const profile = {
+    name: "Test Given Test Family",
+    birthday: "2000-01-02",
+  };
+  const harness = createRuntime(async () => ({
+    ...successfulResult(),
+    personalInfo: profile,
+  }), {
+    saveAppleProfileToEnv(value) {
+      storedProfiles.push(value);
+      return "/tmp/test-profile.env";
+    },
+    shouldPrintCapturedProfile: true,
+  });
+  const flowAudit = {
+    addSecrets(values) {
+      auditSecrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+
+  let browserResult;
+  const logs = await captureConsole("log", async () => {
+    browserResult = await runAccountBrowserPhase(
+      { ...params, flowAudit },
+      harness.runtime
+    );
+    assert.deepEqual(browserResult.personalInfo, {
+      collected: true,
+      nameStored: true,
+      birthdayStored: true,
+    });
+  });
+
+  assert.deepEqual(storedProfiles, [profile]);
+  assert.deepEqual(auditSecrets, [profile.name, profile.birthday]);
+  assert.ok(logs.some((line) => line.includes(profile.name)));
+  assert.ok(logs.some((line) => line.includes(profile.birthday)));
+  const auditText = JSON.stringify(auditEntries);
+  assert.equal(auditText.includes(profile.name), false);
+  assert.equal(auditText.includes(profile.birthday), false);
+
+  const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-profile-report-"));
+  const reportFile = path.join(reportDir, "report.json");
+  try {
+    writeReport(reportDir, { phases: { accountBrowser: browserResult } });
+    const reportText = fs.readFileSync(reportFile, "utf8");
+    assert.equal(reportText.includes(profile.name), false);
+    assert.equal(reportText.includes(profile.birthday), false);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(reportFile).mode & 0o777, 0o600);
+    }
+  } finally {
+    if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
+    fs.rmdirSync(reportDir);
+  }
+}
+
+async function runBrowserResultMetadataAllowlistTest() {
+  const profile = { name: "Test Given Test Family", birthday: "2000-01-02" };
+  const harness = createRuntime(async () => ({
+    success: true,
+    browserLogin: {
+      success: true,
+      backend: "ruyipage",
+      accountHomeConfirmed: true,
+      skippedLogin: true,
+      skipped2FA: false,
+      sessionReused: true,
+      rememberAccount: false,
+      appleId: SECRET_FIXTURE,
+      profileName: SECRET_FIXTURE,
+    },
+    personalInfo: profile,
+    screenshots: {
+      afterLogin: "/private/run/02-ruyipage-after-login.png",
+      personalInformation: "/private/run/03-account-information.png",
+      extra: SECRET_FIXTURE,
+    },
+    unexpected: SECRET_FIXTURE,
+  }));
+
+  const result = await runAccountBrowserPhase(params, harness.runtime);
+
+  assert.deepEqual(result.browserLogin, {
+    success: true,
+    backend: "ruyipage",
+    accountHomeConfirmed: true,
+    skippedLogin: true,
+    skipped2FA: false,
+    sessionReused: true,
+    rememberAccount: false,
+  });
+  assert.deepEqual(result.screenshots, {
+    afterLogin: "02-ruyipage-after-login.png",
+    personalInformation: "03-account-information.png",
+  });
+  assert.equal(JSON.stringify(result).includes(SECRET_FIXTURE), false);
+}
+
+async function runPostHomeProfileFailureRetentionTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({ event: "status", status: "account_home_confirmed" });
+    await options.onEvent({
+      event: "status",
+      status: "browser_preserved",
+      failureStage: "profile_name",
+      preserved: true,
+    });
+    const error = new Error("ruyipage backend failed");
+    Object.defineProperties(error, {
+      ruyiPageFailureCode: { value: "backend_failed" },
+      ruyiPageFailureStage: { value: "profile_name" },
+      ruyiPageFailureContext: {
+        value: {
+          stage: "profile_name",
+          twoFaPhase: "unknown",
+          generation: 0,
+          codeDeliveryAttempted: false,
+          codeDeliverySent: false,
+          codeDeliveryAcknowledged: false,
+          codeDeliveryWriteStarted: false,
+          codeDeliveryWriteCompleted: false,
+          browserLaunchObserved: true,
+          accountHomeConfirmed: true,
+          browserPreserved: true,
+          browserSessionPreserved: false,
+          directBrowserPreservationRequested: false,
+          browserErrorClass: "profile_capture_failed",
+          backendExitCode: 1,
+          cleanupFailed: false,
+        },
+      },
+    });
+    throw error;
+  });
+
+  await captureConsole("log", async () => {
+    await assert.rejects(
+      runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime),
+      (error) => {
+        assert.equal(readBrowserFailureCode(error), "backend_failed");
+        assert.equal(readBrowserFailureStage(error), "profile_name");
+        assert.equal(readBrowserAccountHomeConfirmed(error), true);
+        return true;
+      }
+    );
+  });
+
+  const runnerFailure = entries.find(
+    (entry) => entry.source === "account_browser" && entry.event === "runner_failed"
+  );
+  assert.equal(runnerFailure?.details.accountHomeConfirmed, true);
+  assert.equal(runnerFailure?.details.browserPreserved, true);
+  assert.equal(runnerFailure?.details.browserSessionPreserved, false);
 }
 
 async function runWarningSanitizationTest() {
@@ -1131,15 +1321,41 @@ function runEnvDataParsingTest() {
   try {
     fs.writeFileSync(
       envPath,
-      `${externalKey}=from-file\n${loadedKey}="a\\\\b\\\"c # $HOME"\n`,
+      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
       "utf8"
     );
+    fs.chmodSync(envPath, 0o644);
     process.env[externalKey] = "";
     delete process.env[loadedKey];
     process.chdir(tempDir);
     assert.equal(loadEnvFile(), envPath);
     assert.equal(process.env[externalKey], "");
     assert.equal(process.env[loadedKey], 'a\\b"c # $HOME');
+    assert.equal(
+      saveCredentialsToEnv({ appleId: "person@example.com", password: "secret" }),
+      envPath
+    );
+    assert.equal(
+      saveAppleProfileToEnv({
+        name: "Test Given Test Family",
+        birthday: "2000-01-02",
+      }),
+      envPath
+    );
+    const saved = fs.readFileSync(envPath, "utf8");
+    assert.match(saved, /^name="Test Given Test Family"$/m);
+    assert.match(saved, /^birthday=2000-01-02$/m);
+    assert.equal((saved.match(/^name=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^birthday=/gm) ?? []).length, 1);
+    assert.equal(saved.includes("\r\n"), true);
+    assert.equal(/(?<!\r)\n/.test(saved), false);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+    }
+    assert.throws(
+      () => saveAppleProfileToEnv({ name: "line\nbreak", birthday: "2000-01-02" }),
+      /profile name/
+    );
   } finally {
     process.chdir(originalCwd);
     if (originalExternal === undefined) delete process.env[externalKey];
@@ -1148,6 +1364,23 @@ function runEnvDataParsingTest() {
     else process.env[loadedKey] = originalLoaded;
     if (fs.existsSync(envPath)) fs.unlinkSync(envPath);
     fs.rmdirSync(tempDir);
+  }
+}
+
+function runFlowReportPrivacyTest() {
+  const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-flow-report-"));
+  const reportFile = path.join(reportDir, "report.json");
+  try {
+    const report = createFlowReport(new Date("2030-01-02T03:04:05.678Z"));
+    writeReport(reportDir, report);
+    const saved = fs.readFileSync(reportFile, "utf8");
+    assert.deepEqual(JSON.parse(saved), report);
+    assert.equal(Object.hasOwn(report, "appleId"), false);
+    assert.equal(saved.includes(params.creds.appleId), false);
+    assert.equal(saved.includes(maskAppleId(params.creds.appleId)), false);
+  } finally {
+    if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
+    fs.rmdirSync(reportDir);
   }
 }
 
@@ -1166,9 +1399,10 @@ function runFullFlowSourceContractTest() {
   );
   assert.match(
     source,
-    /import\s+\{\s*confirmOrPromptAppleCredentials,\s*maskAppleId\s*\}\s+from\s+"\.\/lib\/credentials\.js";/
+    /import\s+\{\s*confirmOrPromptAppleCredentials\s*\}\s+from\s+"\.\/lib\/credentials\.js";/
   );
-  assert.match(source, /report\.appleId\s*=\s*maskAppleId\(creds\.appleId\)/);
+  assert.match(source, /export function createFlowReport/);
+  assert.doesNotMatch(source, /maskAppleId|report\.appleId/);
   assert.doesNotMatch(source, /creds\.appleId\.replace\(/);
   assert.match(source, /report\.error\s*=\s*"Apple ID flow failed"/);
   assert.match(source, /readBrowserFailureStage/);
@@ -1257,11 +1491,15 @@ const focusedTests = {
   "mask-apple-id": () => {
     runAppleIdMaskingTest();
     runEnvDataParsingTest();
+    runFlowReportPrivacyTest();
     runFullFlowSourceContractTest();
     runSupervisedCredentialConfirmationTest();
     runReportRootOverrideTest();
     runAcceptanceMarkerTest();
   },
+  "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
+  "result-allowlist": runBrowserResultMetadataAllowlistTest,
+  "post-home-profile-failure": runPostHomeProfileFailureRetentionTest,
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
   "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
@@ -1307,6 +1545,9 @@ await runSupervisedSettingsStatusWhitelistTest();
 await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
+await runProfilePersistenceAndAuditRedactionTest();
+await runBrowserResultMetadataAllowlistTest();
+await runPostHomeProfileFailureRetentionTest();
 await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
 await runReadyModeSanitizationTest();
@@ -1316,6 +1557,7 @@ runAppleIdMaskingTest();
 runBrowserFailureClassificationTest();
 runFlowFailureEnvelopeTest();
 runEnvDataParsingTest();
+runFlowReportPrivacyTest();
 runFullFlowSourceContractTest();
 runSupervisedCredentialConfirmationTest();
 runReportRootOverrideTest();

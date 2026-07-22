@@ -16,11 +16,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  readBrowserAccountHomeConfirmed,
   readBrowserFailureCode,
   readBrowserFailureStage,
   runAccountBrowserPhase,
 } from "./lib/account-browser-flow.js";
-import { confirmOrPromptAppleCredentials, maskAppleId } from "./lib/credentials.js";
+import { confirmOrPromptAppleCredentials } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
 import {
   createReportDir,
@@ -48,6 +49,13 @@ export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = 
   };
 }
 
+export function createFlowReport(runAt = new Date()) {
+  return {
+    runAt: runAt.toISOString(),
+    phases: {},
+  };
+}
+
 export async function main() {
   console.log("[apple-automation] stage:flow_main_started");
   console.log("═══════════════════════════════════════════");
@@ -61,10 +69,7 @@ export async function main() {
     },
   });
   console.log(`[报告] 统一诊断日志: ${flowAudit.path}`);
-  const report = {
-    runAt: new Date().toISOString(),
-    phases: {},
-  };
+  const report = createFlowReport();
   let reportFile = null;
   let creds = null;
   let failureStage = "unknown";
@@ -110,8 +115,6 @@ export async function main() {
     }
     flowAudit.addSecrets([creds.appleId, creds.password]);
     console.log("[apple-automation] stage:credentials_ready");
-    report.appleId = maskAppleId(creds.appleId);
-
     if (!skipMac) {
       failureStage = "mac_settings";
       failureCode = "mac_settings_failed";
@@ -153,11 +156,21 @@ export async function main() {
           failureStage,
           failureCode,
         });
+        const accountHomeConfirmed = readBrowserAccountHomeConfirmed(e);
         report.phases.accountBrowser = {
           success: false,
           error: "Account browser phase failed",
           failureStage,
           failureCode,
+          ...(accountHomeConfirmed
+            ? {
+                browserLogin: {
+                  success: true,
+                  backend: "ruyipage",
+                  accountHomeConfirmed: true,
+                },
+              }
+            : {}),
         };
         throw e;
       }
