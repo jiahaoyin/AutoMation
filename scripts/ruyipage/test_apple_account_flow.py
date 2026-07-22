@@ -167,6 +167,17 @@ class ExistingBrowserAttachTests(unittest.TestCase):
                 "127.0.0.1:19457",
             )
 
+    def test_macos_stale_regular_profile_lock_allows_new_browser_when_firefox_is_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("stale", encoding="utf-8")
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.macos_firefox_process_uses_profile",
+                return_value=False,
+            ):
+                self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
     def test_macos_stale_plus_pid_profile_lock_does_not_block_startup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             profile_dir = Path(temp_dir) / "profile"
@@ -175,20 +186,25 @@ class ExistingBrowserAttachTests(unittest.TestCase):
             with patch(
                 "apple_account_flow.os.path.lexists",
                 side_effect=lambda candidate: Path(candidate) == lock_path,
-            ), patch.object(
-                Path,
-                "is_symlink",
-                return_value=True,
-            ), patch(
-                "apple_account_flow.os.readlink",
-                return_value="127.0.0.1:+999999",
-            ), patch(
-                "apple_account_flow.os.kill",
-                side_effect=ProcessLookupError,
-            ) as kill, patch.object(account_flow.sys, "platform", "darwin"):
+            ), patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.macos_firefox_process_uses_profile",
+                return_value=False,
+            ):
                 self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
 
-        kill.assert_called_once_with(999999, 0)
+    def test_macos_empty_firefox_process_scan_allows_new_browser_with_a_stale_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("stale", encoding="utf-8")
+            no_firefox = type(
+                "PsResult", (), {"returncode": 0, "stdout": "1 /sbin/launchd\n"}
+            )()
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                return_value=no_firefox,
+            ):
+                self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
 
     def test_macos_live_plus_pid_profile_lock_blocks_startup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -202,16 +218,11 @@ class ExistingBrowserAttachTests(unittest.TestCase):
                 Path,
                 "is_symlink",
                 return_value=True,
-            ), patch(
-                "apple_account_flow.os.readlink",
-                return_value="127.0.0.1:+1234",
-            ), patch(
-                "apple_account_flow.os.kill",
-                return_value=None,
-            ) as kill, patch.object(account_flow.sys, "platform", "darwin"):
+            ), patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.macos_firefox_process_uses_profile",
+                return_value=True,
+            ):
                 self.assertTrue(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
-
-        kill.assert_called_once_with(1234, 0)
 
     def test_macos_unparseable_profile_symlink_does_not_permanently_block_startup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -225,11 +236,126 @@ class ExistingBrowserAttachTests(unittest.TestCase):
                 Path,
                 "is_symlink",
                 return_value=True,
-            ), patch(
-                "apple_account_flow.os.readlink",
-                return_value="stale-lock-target",
-            ), patch.object(account_flow.sys, "platform", "darwin"):
+            ), patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.macos_firefox_process_uses_profile",
+                return_value=False,
+            ):
                 self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
+    def test_macos_process_probe_matches_only_the_exact_firefox_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile with spaces"
+            profile_dir.mkdir()
+            other_profile = Path(temp_dir) / "other-profile"
+            firefox = "/Applications/Firefox.app/Contents/MacOS/firefox"
+            matching = type(
+                "PsResult",
+                (), {
+                    "returncode": 0,
+                    "stdout": "123 /Applications/Firefox.app/Contents/MacOS/firefox\n",
+                },
+            )()
+            matching_details = type(
+                "PsResult",
+                (), {
+                    "returncode": 0,
+                    "stdout": (
+                        f"123 {firefox} {firefox} --profile {profile_dir} "
+                        "--width=1280 --height=960\n"
+                    ),
+                },
+            )()
+            other = type(
+                "PsResult",
+                (), {
+                    "returncode": 0,
+                    "stdout": "456 /Applications/Firefox.app/Contents/MacOS/firefox\n",
+                },
+            )()
+            other_details = type(
+                "PsResult",
+                (), {
+                    "returncode": 0,
+                    "stdout": (
+                        f"456 {firefox} {firefox} -profile {other_profile} "
+                        "--width=1280 --height=960\n"
+                    ),
+                },
+            )()
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                side_effect=[matching, matching_details],
+            ):
+                self.assertTrue(account_flow.macos_firefox_process_uses_profile(profile_dir))
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                side_effect=[other, other_details],
+            ):
+                self.assertFalse(account_flow.macos_firefox_process_uses_profile(profile_dir))
+
+    def test_macos_profile_command_rejects_unknown_trailing_option(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            profile_path = account_flow.normalized_profile_path(profile_dir)
+            self.assertIsNotNone(profile_path)
+            command = f"/Applications/Firefox.app/Contents/MacOS/firefox --profile {profile_dir} --mystery"
+            self.assertIsNone(
+                account_flow.raw_firefox_command_uses_profile(command, profile_path)
+            )
+
+    def test_macos_profile_command_keeps_scanning_known_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile --width=1280"
+            profile_dir.mkdir()
+            profile_path = account_flow.normalized_profile_path(profile_dir)
+            self.assertIsNotNone(profile_path)
+            command = (
+                "/Applications/Firefox.app/Contents/MacOS/firefox --profile "
+                f"{profile_dir} --width=1280 --height=960"
+            )
+            self.assertTrue(
+                account_flow.raw_firefox_command_uses_profile(command, profile_path)
+            )
+
+    def test_macos_profile_probe_failure_keeps_an_existing_lock_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("unverified", encoding="utf-8")
+            failed = type("PsResult", (), {"returncode": 1, "stdout": ""})()
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                return_value=failed,
+            ):
+                self.assertTrue(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
+    def test_macos_firefox_detail_probe_failure_keeps_an_existing_lock_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("unverified", encoding="utf-8")
+            firefox = "/Applications/Firefox.app/Contents/MacOS/firefox"
+            listing = type("PsResult", (), {"returncode": 0, "stdout": f"123 {firefox}\n"})()
+            failed_details = type("PsResult", (), {"returncode": 1, "stdout": ""})()
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                side_effect=[listing, failed_details],
+            ):
+                self.assertTrue(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
+    def test_macos_firefox_that_exits_after_listing_does_not_block_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            firefox = "/Applications/Firefox.app/Contents/MacOS/firefox"
+            listing = type("PsResult", (), {"returncode": 0, "stdout": f"123 {firefox}\n"})()
+            exited_details = type("PsResult", (), {"returncode": 0, "stdout": ""})()
+            with patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                side_effect=[listing, exited_details],
+            ):
+                self.assertFalse(account_flow.macos_firefox_process_uses_profile(profile_dir))
 
     def test_prefers_the_authenticated_manage_tab_when_multiple_account_tabs_exist(self):
         sign_in_tab = object()
@@ -2398,6 +2524,48 @@ class BrowserFlowTests(unittest.TestCase):
             {"event": "status", "status": "browser_profile_attach_required"},
             [call.args[0] for call in emit_event.call_args_list],
         )
+
+    def test_browser_flow_launches_when_a_stale_lock_has_no_live_firefox(self):
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("stale", encoding="utf-8")
+            args = parse_args(
+                ["--report-dir", "test-report", "--profile-dir", str(profile_dir)]
+            )
+            no_firefox = type(
+                "PsResult", (), {"returncode": 0, "stdout": "1 /sbin/launchd\n"}
+            )()
+            with patch.dict(
+                os.environ,
+                {
+                    "APPLE_ID": "person@example.com",
+                    "APPLE_PASSWORD": "secret",
+                    "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "0",
+                    "BROWSER_ATTACH_EXISTING": "1",
+                },
+                clear=False,
+            ), patch(
+                "apple_account_flow.import_ruyipage",
+                return_value=(FakeFirefoxOptions, object(), FakeKeys),
+            ), patch(
+                "apple_account_flow.try_attach_existing_browser_for_flow",
+                return_value=(None, "new_browser"),
+            ), patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.subprocess.run",
+                return_value=no_firefox,
+            ), patch(
+                "apple_account_flow.construct_firefox_page",
+                side_effect=RuntimeError("new Firefox launch requested"),
+            ) as construct_page, patch("apple_account_flow.emit"):
+                with self.assertRaisesRegex(RuntimeError, "new Firefox launch requested"):
+                    browser_flow(args)
+
+        construct_page.assert_called_once()
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})

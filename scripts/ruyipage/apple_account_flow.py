@@ -15,6 +15,7 @@ import os
 import random
 import re
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -3562,6 +3563,198 @@ def persist_browser_attach_address(page: Any, profile_dir: str) -> str | None:
     return address
 
 
+def normalized_profile_path(value: str | Path) -> Path | None:
+    candidate = str(value or "").strip()
+    if not candidate or any(character in candidate for character in ("\r", "\n", "\0")):
+        return None
+    try:
+        return Path(candidate).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def macos_firefox_process_ids() -> list[int] | None:
+    """List Firefox process IDs without reading unrelated process command lines."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-ax", "-o", "pid=", "-o", "comm="],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    process_ids: list[int] = []
+    for line in str(result.stdout or "").splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        executable = Path(parts[1]).name.casefold()
+        if executable not in {"firefox", "firefox-bin"}:
+            continue
+        process_ids.append(int(parts[0]))
+    return process_ids
+
+
+RUYIPAGE_PROFILE_OPTION_PATTERN = (
+    r"(?:--headless|-private|--width=\d+|--height=\d+|--fpfile=[^\s]+)"
+)
+
+
+def ruyipage_profile_trailing_options_are_supported(value: str) -> bool:
+    """Accept the known FirefoxOptions arguments emitted after ``--profile``."""
+    return bool(
+        re.fullmatch(
+            rf"{RUYIPAGE_PROFILE_OPTION_PATTERN}(?:\s+{RUYIPAGE_PROFILE_OPTION_PATTERN})*",
+            str(value or "").strip(),
+        )
+    )
+
+
+def ruyipage_profile_argument_has_unknown_option(value: str) -> bool:
+    """Reject only option-shaped path fragments ruyiPage cannot emit here."""
+    options = re.findall(
+        r"(?:^|\s)(--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s]*)?)",
+        str(value or ""),
+    )
+    return any(
+        re.fullmatch(RUYIPAGE_PROFILE_OPTION_PATTERN, option) is None
+        for option in options
+    )
+
+
+def raw_firefox_command_uses_profile(command: str, profile_path: Path) -> bool | None:
+    """Compare the ruyiPage ``--profile`` argument without shell parsing."""
+    command_text = str(command or "")
+    matches = list(
+        re.finditer(r"(?:^|\s)(?:--profile|-profile)(?:=|\s+)", command_text)
+    )
+    if not matches:
+        # ruyiPage always launches this managed profile with --profile. A
+        # Firefox without the flag cannot be using this non-default directory.
+        return False
+    if len(matches) != 1:
+        return None
+    tail = command_text[matches[0].end() :].strip()
+    if not tail:
+        return None
+    if tail[0] in {"'", '"'}:
+        quote = tail[0]
+        closing = tail.find(quote, 1)
+        if closing <= 0:
+            return None
+        trailing = tail[closing + 1 :].strip()
+        if trailing and not ruyipage_profile_trailing_options_are_supported(trailing):
+            return None
+        argument = tail[1:closing]
+    else:
+        # macOS ps does not guarantee shell quoting. First honor the whole
+        # remaining string when it is the target Profile itself, which avoids
+        # mistaking a literal `` --width=...`` in a Profile name for an option.
+        if normalized_profile_path(tail) == profile_path:
+            return True
+        boundaries = list(re.finditer(
+            r"\s+(?=(?:--headless(?:\s|$)|-private(?:\s|$)|--fpfile=|"
+            r"--width=\d+(?:\s|$)|--height=\d+(?:\s|$)))",
+            tail,
+        ))
+        if not boundaries:
+            if ruyipage_profile_argument_has_unknown_option(tail):
+                return None
+            argument = tail
+        else:
+            for boundary in boundaries:
+                argument = tail[: boundary.start()].strip()
+                trailing = tail[boundary.start() :].strip()
+                if (
+                    not argument
+                    or ruyipage_profile_argument_has_unknown_option(argument)
+                    or not ruyipage_profile_trailing_options_are_supported(trailing)
+                ):
+                    # An unquoted unknown option is indistinguishable from part
+                    # of a Profile path, so retain the lock rather than guessing.
+                    return None
+                candidate_path = normalized_profile_path(argument)
+                if candidate_path is None:
+                    return None
+                if candidate_path == profile_path:
+                    return True
+            return False
+    if not argument:
+        return None
+    candidate_path = normalized_profile_path(argument)
+    if candidate_path is None:
+        return None
+    return candidate_path == profile_path
+
+
+def macos_firefox_process_uses_profile(
+    profile_dir: str | Path,
+    process_ids: list[int] | None = None,
+) -> bool | None:
+    """Return whether macOS Firefox is using exactly ``profile_dir``."""
+    if sys.platform != "darwin":
+        return None
+    profile_path = normalized_profile_path(profile_dir)
+    if profile_path is None:
+        return None
+    candidate_ids = process_ids
+    if candidate_ids is None:
+        candidate_ids = macos_firefox_process_ids()
+    if candidate_ids is None:
+        return None
+    for process_id in dict.fromkeys(candidate_ids):
+        if not isinstance(process_id, int) or process_id <= 0:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "/bin/ps",
+                    "-p",
+                    str(process_id),
+                    "-ww",
+                    "-o",
+                    "pid=",
+                    "-o",
+                    "comm=",
+                    "-o",
+                    "command=",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        lines = [line for line in str(result.stdout or "").splitlines() if line.strip()]
+        # BSD ps may report success but produce no row after a lock PID exits.
+        # That is a stale lock, not an uncertain live Firefox process.
+        if not lines:
+            continue
+        if len(lines) != 1:
+            return None
+        parts = lines[0].strip().split(maxsplit=2)
+        if len(parts) != 3 or parts[0] != str(process_id):
+            return None
+        executable = Path(parts[1]).name.casefold()
+        if executable not in {"firefox", "firefox-bin"}:
+            continue
+        profile_match = raw_firefox_command_uses_profile(parts[2], profile_path)
+        if profile_match is True:
+            return True
+        if profile_match is None:
+            return None
+    return False
+
+
 def firefox_profile_has_active_lock(profile_dir: str) -> bool:
     normalized = str(profile_dir or "").strip()
     if not normalized or any(character in normalized for character in ("\r", "\n", "\0")):
@@ -3570,10 +3763,21 @@ def firefox_profile_has_active_lock(profile_dir: str) -> bool:
         profile_path = Path(normalized).expanduser()
     except (TypeError, ValueError):
         return False
-    for lock_name in ("parent.lock", ".parentlock", "lock"):
-        lock_path = profile_path / lock_name
-        if not os.path.lexists(lock_path):
-            continue
+    lock_paths = [
+        profile_path / lock_name for lock_name in ("parent.lock", ".parentlock", "lock")
+    ]
+    lock_paths = [lock_path for lock_path in lock_paths if os.path.lexists(lock_path)]
+    if not lock_paths:
+        return False
+    # A stale macOS profile lock can retain a reused PID or remain as a regular
+    # file. Only an actual Firefox command bound to this exact profile blocks a
+    # new ruyiPage launch; a failed process probe remains fail-closed.
+    if sys.platform == "darwin":
+        return (
+            macos_firefox_process_uses_profile(profile_path)
+            is not False
+        )
+    for lock_path in lock_paths:
         if not lock_path.is_symlink():
             return True
         try:
