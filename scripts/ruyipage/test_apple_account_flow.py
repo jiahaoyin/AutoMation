@@ -190,6 +190,107 @@ class ExistingBrowserAttachTests(unittest.TestCase):
 
         self.assertIsNone(attached)
 
+    def test_reuses_a_blank_attached_tab_for_sign_in(self):
+        blank_tab = object()
+
+        class Candidate:
+            latest_tab = blank_tab
+
+            def get_tabs(self, *, url):
+                self.url_query = url
+                return []
+
+        candidate = Candidate()
+
+        with patch(
+            "apple_account_flow.try_attach_existing_browser",
+            return_value=candidate,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.scope_location_url",
+            return_value="about:newtab",
+        ):
+            page, route = account_flow.try_attach_existing_browser_for_flow(
+                "person@example.com"
+            )
+
+        self.assertIs(page, blank_tab)
+        self.assertEqual(route, "empty_tab")
+        self.assertEqual(candidate.url_query, "account.apple.com")
+
+    def test_opens_a_new_blank_tab_when_attached_tab_has_other_content(self):
+        other_tab = object()
+        new_tab = object()
+
+        class Candidate:
+            latest_tab = other_tab
+
+            def __init__(self):
+                self.opened_url = None
+
+            def get_tabs(self, *, url):
+                self.url_query = url
+                return []
+
+            def new_tab(self, url):
+                self.opened_url = url
+                return new_tab
+
+        candidate = Candidate()
+
+        with patch(
+            "apple_account_flow.try_attach_existing_browser",
+            return_value=candidate,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.scope_location_url",
+            return_value="https://example.test/work",
+        ):
+            page, route = account_flow.try_attach_existing_browser_for_flow(
+                "person@example.com"
+            )
+
+        self.assertIs(page, new_tab)
+        self.assertEqual(route, "new_tab")
+        self.assertEqual(candidate.opened_url, "about:blank")
+
+    def test_opens_a_new_blank_tab_when_attached_tab_url_is_unreadable(self):
+        current_tab = object()
+        new_tab = object()
+
+        class Candidate:
+            latest_tab = current_tab
+
+            def get_tabs(self, *, url):
+                return []
+
+            def new_tab(self, url):
+                self.opened_url = url
+                return new_tab
+
+        candidate = Candidate()
+        with patch(
+            "apple_account_flow.try_attach_existing_browser",
+            return_value=candidate,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.scope_location_url",
+            return_value="",
+        ):
+            page, route = account_flow.try_attach_existing_browser_for_flow(
+                "person@example.com"
+            )
+
+        self.assertIs(page, new_tab)
+        self.assertEqual(route, "new_tab")
+        self.assertEqual(candidate.opened_url, "about:blank")
+
     def test_attached_account_identity_requires_an_exact_single_match(self):
         class IdentityScope:
             def __init__(self, values):
@@ -2008,6 +2109,7 @@ class BrowserFlowTests(unittest.TestCase):
 
         def fill_code(_page, code, _keys, **kwargs):
             calls.append(("fill_security_code", code, kwargs.get("fields")))
+            return target
 
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
@@ -2060,11 +2162,11 @@ class BrowserFlowTests(unittest.TestCase):
             side_effect=fill_code,
         ), patch(
             "apple_account_flow.click_two_factor_submit",
-            return_value=True,
+            return_value=False,
         ), patch(
             "apple_account_flow.wait_for_signed_in",
             return_value={"trusted": True},
-        ), patch(
+        ) as wait_signed_in, patch(
             "apple_account_flow.take_screenshot",
             return_value=None,
         ), patch(
@@ -2124,7 +2226,14 @@ class BrowserFlowTests(unittest.TestCase):
         )
         self.assertTrue(all(event["generation"] == 1 for event in twofa_progress))
         self.assertEqual(twofa_progress[2]["targetCount"], 1)
-        self.assertIs(twofa_progress[6]["submitted"], True)
+        self.assertIs(twofa_progress[6]["submitted"], False)
+        self.assertIs(twofa_progress[7]["submitted"], False)
+        wait_signed_in.assert_called_once_with(
+            root,
+            submitted=True,
+            otp_generation=1,
+            submission_method="automatic",
+        )
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})

@@ -3462,8 +3462,8 @@ def attached_account_matches_apple_id(scope: Any, expected_apple_id: str) -> boo
     return candidates == {expected}
 
 
-def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
-    """Return an already-open account tab through a documented ruyiPage attach API."""
+def try_attach_existing_browser() -> Any | None:
+    """Attach to one running Firefox through ruyiPage without changing its tabs."""
     if not should_attach_existing_browser():
         return None
     try:
@@ -3477,8 +3477,29 @@ def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
         else:
             attach = getattr(ruyipage, "auto_attach_exist_browser_by_process", None)
             candidate = attach() if callable(attach) else None
-        if candidate is None or not browser_connection_is_alive(candidate):
-            return None
+        return candidate if browser_connection_is_alive(candidate) else None
+    except Exception:
+        return None
+
+
+def is_blank_or_home_tab(page: Any) -> bool:
+    """Only reuse Firefox's empty/home tab; leave any user content untouched."""
+    current_url = scope_location_url(page).strip().lower()
+    normalized_url = current_url.split("#", 1)[0].split("?", 1)[0]
+    return normalized_url in {
+        "about:blank",
+        "about:newtab",
+        "about:home",
+        "about:welcome",
+    }
+
+
+def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
+    """Return an already-open authenticated account tab through ruyiPage."""
+    candidate = try_attach_existing_browser()
+    if candidate is None:
+        return None
+    try:
         for account_tab in candidate.get_tabs(url="account.apple.com"):
             if not browser_connection_is_alive(account_tab):
                 continue
@@ -3490,6 +3511,38 @@ def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
         return None
     except Exception:
         return None
+
+
+def try_attach_existing_browser_for_flow(expected_apple_id: str) -> tuple[Any | None, str]:
+    """Choose a safe tab in an attached Firefox without replacing user content."""
+    candidate = try_attach_existing_browser()
+    if candidate is None:
+        return None, "new_browser"
+
+    try:
+        account_tabs = candidate.get_tabs(url="account.apple.com") or []
+    except Exception:
+        account_tabs = []
+    for account_tab in account_tabs:
+        if not browser_connection_is_alive(account_tab):
+            continue
+        if (
+            is_account_manage_url(scope_location_url(account_tab))
+            and attached_account_matches_apple_id(account_tab, expected_apple_id)
+        ):
+            return account_tab, "account_session"
+
+    try:
+        latest_tab = getattr(candidate, "latest_tab", None) or candidate
+        if latest_tab is not None and browser_connection_is_alive(latest_tab):
+            if is_blank_or_home_tab(latest_tab):
+                return latest_tab, "empty_tab"
+        new_tab = candidate.new_tab("about:blank")
+        if new_tab is not None and browser_connection_is_alive(new_tab):
+            return new_tab, "new_tab"
+    except Exception:
+        pass
+    return None, "new_browser"
 
 
 def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
@@ -3559,8 +3612,8 @@ def browser_flow(args: argparse.Namespace) -> int:
     if broker_mode:
         set_browser_startup_stage("browser_constructing")
         emit({"event": "status", "status": "browser_constructing"})
-    page = try_attach_existing_account_page(apple_id)
-    attached_existing_browser = page is not None
+    page, browser_route = try_attach_existing_browser_for_flow(apple_id)
+    attached_existing_browser = browser_route == "account_session"
     if page is None:
         page = construct_firefox_page(FirefoxPage, opts)
     if broker_mode:
@@ -3724,10 +3777,6 @@ def browser_flow(args: argparse.Namespace) -> int:
                             generation=generation,
                             submitted=submitted,
                         )
-                        if not submitted:
-                            if submit_outcome.get("failure") == "focus_unconfirmed":
-                                raise RuntimeError(FOCUS_NOT_CONFIRMED_REASON)
-                            raise RuntimeError("2FA submit target was not confirmed")
                         human_pause(900, 1600)
                         emit_two_factor_progress(
                             "transition_waiting",
@@ -3736,9 +3785,15 @@ def browser_flow(args: argparse.Namespace) -> int:
                         )
                         signed_in_state = wait_for_signed_in(
                             page,
-                            submitted=submitted,
+                            # Apple can submit after the final OTP digit while
+                            # the component retires before ruyiPage confirms a
+                            # separate button or Enter action.  Wait once for
+                            # a trusted account transition; never replay the code.
+                            submitted=True,
                             otp_generation=generation,
-                            submission_method=submit_outcome.get("method"),
+                            submission_method=(
+                                submit_outcome.get("method") if submitted else "automatic"
+                            ),
                         )
                     except Exception:
                         emit_two_factor_progress("handoff_failed", generation=generation)
