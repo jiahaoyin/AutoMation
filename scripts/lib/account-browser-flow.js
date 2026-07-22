@@ -66,6 +66,9 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "browser_failure",
   "browser_preserved",
   "browser_session_attached",
+  "browser_blank_tab_attached",
+  "browser_login_tab_created",
+  "browser_profile_attach_required",
   "browser_session_preserved",
   "account_home_confirmed",
   "profile_page_ready",
@@ -97,6 +100,10 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
 ]);
 const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   browser_session_attached: "[ruyipage] ♻ 已接管现有 Apple 账户标签页",
+  browser_blank_tab_attached: "[ruyipage] ♻ 已接管现有 Firefox 空白标签页",
+  browser_login_tab_created: "[ruyipage] ♻ 已在现有 Firefox 中新建登录标签页",
+  browser_profile_attach_required:
+    "[ruyipage] 已发现正在使用的 Firefox Profile，但控制连接不可用；未启动第二个浏览器",
   account_home_confirmed: "[ruyipage] ✓ 已确认 Apple 账户登录态",
   profile_page_ready: "[ruyipage] ✓ 个人信息页面已就绪",
   profile_screenshot_saved: "[ruyipage] ✓ 已保存个人信息页面截图",

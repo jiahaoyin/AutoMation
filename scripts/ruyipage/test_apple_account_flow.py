@@ -106,6 +106,131 @@ class BrowserStageRecorderTests(unittest.TestCase):
 
 
 class ExistingBrowserAttachTests(unittest.TestCase):
+    def test_reuses_the_persisted_ruyipage_address_before_process_scanning(self):
+        attached = object()
+
+        class RuyiPageModule:
+            attach_calls = []
+
+            @classmethod
+            def attach_exist_browser(cls, *, address, latest_tab):
+                cls.attach_calls.append((address, latest_tab))
+                return attached
+
+            @staticmethod
+            def auto_attach_exist_browser_by_process(*_args, **_kwargs):
+                raise AssertionError("process scan should not run after a saved address attaches")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            state_path = account_flow.browser_attach_state_path(str(profile_dir))
+            self.assertIsNotNone(state_path)
+            state_path.write_text(
+                json.dumps({"version": 1, "address": "127.0.0.1:19456"}),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "0",
+                    "BROWSER_ATTACH_EXISTING": "1",
+                    "BROWSER_ATTACH_ADDRESS": "",
+                },
+                clear=False,
+            ), patch(
+                "apple_account_flow.browser_connection_is_alive",
+                return_value=True,
+            ), patch(
+                "apple_account_flow.importlib.import_module",
+                return_value=RuyiPageModule,
+            ):
+                page = account_flow.try_attach_existing_browser(str(profile_dir))
+
+        self.assertIs(page, attached)
+        self.assertEqual(RuyiPageModule.attach_calls, [("127.0.0.1:19456", True)])
+
+    def test_persists_only_a_valid_local_ruyipage_address(self):
+        page = type(
+            "AttachedPage",
+            (), {"browser": type("Browser", (), {"address": "127.0.0.1:19457"})()},
+        )()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            self.assertEqual(
+                account_flow.persist_browser_attach_address(page, str(profile_dir)),
+                "127.0.0.1:19457",
+            )
+            self.assertEqual(
+                account_flow.read_browser_attach_address(str(profile_dir)),
+                "127.0.0.1:19457",
+            )
+
+    def test_macos_stale_plus_pid_profile_lock_does_not_block_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            lock_path = profile_dir / "parent.lock"
+            with patch(
+                "apple_account_flow.os.path.lexists",
+                side_effect=lambda candidate: Path(candidate) == lock_path,
+            ), patch.object(
+                Path,
+                "is_symlink",
+                return_value=True,
+            ), patch(
+                "apple_account_flow.os.readlink",
+                return_value="127.0.0.1:+999999",
+            ), patch(
+                "apple_account_flow.os.kill",
+                side_effect=ProcessLookupError,
+            ) as kill, patch.object(account_flow.sys, "platform", "darwin"):
+                self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
+        kill.assert_called_once_with(999999, 0)
+
+    def test_macos_live_plus_pid_profile_lock_blocks_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            lock_path = profile_dir / "parent.lock"
+            with patch(
+                "apple_account_flow.os.path.lexists",
+                side_effect=lambda candidate: Path(candidate) == lock_path,
+            ), patch.object(
+                Path,
+                "is_symlink",
+                return_value=True,
+            ), patch(
+                "apple_account_flow.os.readlink",
+                return_value="127.0.0.1:+1234",
+            ), patch(
+                "apple_account_flow.os.kill",
+                return_value=None,
+            ) as kill, patch.object(account_flow.sys, "platform", "darwin"):
+                self.assertTrue(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
+        kill.assert_called_once_with(1234, 0)
+
+    def test_macos_unparseable_profile_symlink_does_not_permanently_block_startup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            lock_path = profile_dir / "parent.lock"
+            with patch(
+                "apple_account_flow.os.path.lexists",
+                side_effect=lambda candidate: Path(candidate) == lock_path,
+            ), patch.object(
+                Path,
+                "is_symlink",
+                return_value=True,
+            ), patch(
+                "apple_account_flow.os.readlink",
+                return_value="stale-lock-target",
+            ), patch.object(account_flow.sys, "platform", "darwin"):
+                self.assertFalse(account_flow.firefox_profile_has_active_lock(str(profile_dir)))
+
     def test_prefers_the_authenticated_manage_tab_when_multiple_account_tabs_exist(self):
         sign_in_tab = object()
         manage_tab = object()
@@ -2162,8 +2287,7 @@ class BrowserFlowTests(unittest.TestCase):
             side_effect=fill_code,
         ), patch(
             "apple_account_flow.click_two_factor_submit",
-            return_value=False,
-        ), patch(
+        ) as click_submit, patch(
             "apple_account_flow.wait_for_signed_in",
             return_value={"trusted": True},
         ) as wait_signed_in, patch(
@@ -2226,13 +2350,53 @@ class BrowserFlowTests(unittest.TestCase):
         )
         self.assertTrue(all(event["generation"] == 1 for event in twofa_progress))
         self.assertEqual(twofa_progress[2]["targetCount"], 1)
-        self.assertIs(twofa_progress[6]["submitted"], False)
-        self.assertIs(twofa_progress[7]["submitted"], False)
+        self.assertIs(twofa_progress[6]["submitted"], True)
+        self.assertIs(twofa_progress[7]["submitted"], True)
+        click_submit.assert_not_called()
         wait_signed_in.assert_called_once_with(
             root,
             submitted=True,
             otp_generation=1,
             submission_method="automatic",
+        )
+
+    def test_browser_flow_does_not_launch_a_second_browser_for_an_active_profile(self):
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_dir = Path(temp_dir) / "profile"
+            profile_dir.mkdir()
+            (profile_dir / "parent.lock").write_text("active", encoding="utf-8")
+            args = parse_args(
+                ["--report-dir", "test-report", "--profile-dir", str(profile_dir)]
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "APPLE_ID": "person@example.com",
+                    "APPLE_PASSWORD": "secret",
+                    "APPLE_AUTOMATION_BROWSER_BROKER_MODE": "0",
+                    "BROWSER_ATTACH_EXISTING": "1",
+                },
+                clear=False,
+            ), patch(
+                "apple_account_flow.import_ruyipage",
+                return_value=(FakeFirefoxOptions, object(), FakeKeys),
+            ), patch(
+                "apple_account_flow.try_attach_existing_browser_for_flow",
+                return_value=(None, "new_browser"),
+            ), patch(
+                "apple_account_flow.construct_firefox_page",
+            ) as construct_page, patch("apple_account_flow.emit") as emit_event:
+                with self.assertRaisesRegex(RuntimeError, "active Firefox profile"):
+                    browser_flow(args)
+
+        construct_page.assert_not_called()
+        self.assertIn(
+            {"event": "status", "status": "browser_profile_attach_required"},
+            [call.args[0] for call in emit_event.call_args_list],
         )
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
@@ -3255,6 +3419,20 @@ class StrongTwoFactorClassifierTests(unittest.TestCase):
 
 
 class TwoFactorStateTests(unittest.TestCase):
+    def test_submitted_wait_accepts_account_manage_url_before_dom_hydration(self):
+        page = FakePage(state={"href": "https://account.apple.com/account/manage"})
+        with patch(
+            "apple_account_flow.browser_connection_is_alive",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=AssertionError("the settled DOM should not be required after the redirect"),
+        ):
+            state = wait_for_signed_in(page, timeout_s=0.05, submitted=True)
+
+        self.assertTrue(state["trusted"])
+        self.assertTrue(state["rootSessionTrusted"])
+
     @staticmethod
     def nested_opaque_manage_shell(*, trust_prompt=False, error=False):
         inner = FakePage(
@@ -3331,6 +3509,7 @@ class TwoFactorStateTests(unittest.TestCase):
             },
         )
         retiring_frame.parent = page
+        page.states = FakeStates(alive=True)
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             state = wait_for_signed_in(
@@ -3359,6 +3538,7 @@ class TwoFactorStateTests(unittest.TestCase):
                 "codeInputCount": 0,
             }
         )
+        page.states = FakeStates(alive=True)
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
@@ -3403,6 +3583,7 @@ class TwoFactorStateTests(unittest.TestCase):
             },
         )
         frame.parent = page
+        page.states = FakeStates(alive=True)
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
@@ -3449,6 +3630,7 @@ class TwoFactorStateTests(unittest.TestCase):
             },
         )
         frame.parent = page
+        page.states = FakeStates(alive=True)
 
         with patch("apple_account_flow.human_pause", lambda *_: None):
             with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
@@ -3459,6 +3641,38 @@ class TwoFactorStateTests(unittest.TestCase):
                     otp_generation=1,
                     submission_method="button",
                 )
+
+    def test_automatic_otp_wait_never_clicks_a_trust_prompt(self):
+        page = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": False,
+                "trustPrompt": True,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+
+        with patch("apple_account_flow.click_trust_browser") as click_trust, patch(
+            "apple_account_flow.human_pause",
+            lambda *_: None,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "account session was not confirmed"):
+                wait_for_signed_in(
+                    page,
+                    timeout_s=0.05,
+                    submitted=True,
+                    otp_generation=1,
+                    submission_method="automatic",
+                )
+
+        click_trust.assert_not_called()
 
     def test_live_opaque_trust_frame_blocks_manage_session_confirmation(self):
         frame = FakePage(

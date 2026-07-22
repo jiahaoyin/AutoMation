@@ -123,10 +123,12 @@ FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
 # Apple can replace the authentication iframe before its account shell and
 # profile data finish hydrating. Keep the submit transition bounded, but do
 # not turn an ordinary slow account-page handoff into a false OTP failure.
-TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 30.0
+TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 60.0
 TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S = 5.0
 TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S = 1.5
 TWO_FACTOR_INPUT_UNCONFIRMED_REASON = "2FA code input was not confirmed"
+BROWSER_ATTACH_STATE_FILE_SUFFIX = ".ruyipage-attach.json"
+BROWSER_ATTACH_STATE_MAX_BYTES = 1024
 BROWSER_STARTUP_STAGES = {
     "not_started",
     "credentials_received",
@@ -2586,6 +2588,73 @@ def is_account_manage_url(url: str) -> bool:
     )
 
 
+def confirmed_account_manage_state(page: Any) -> dict[str, Any] | None:
+    """Accept the account root redirect only when no live auth UI contradicts it."""
+    if not browser_connection_is_alive(page):
+        return None
+    current_url = scope_location_url(page)
+    if not is_account_manage_url(current_url):
+        return None
+
+    # The URL can change before account-page text has hydrated, so do not
+    # require an account marker here.  We do still query the root and every
+    # live trusted child context for explicit authentication UI or errors.
+    # Retired/unreadable child frames are intentionally ignored: they are a
+    # normal part of Apple's post-OTP iframe teardown.
+    blockers = (
+        "twofa",
+        "trustPrompt",
+        "error",
+        "otpRejected",
+        "blocked",
+        "password",
+        "email",
+    )
+    root_state: dict[str, Any] | None = None
+    for scope in iter_page_scopes(page):
+        try:
+            state = detect_scope_login_state(scope)
+        except Exception:
+            if scope is page:
+                return None
+            continue
+        if scope is page:
+            root_state = state
+            if not is_account_manage_url(str(state.get("href") or "")):
+                return None
+            if any(bool(state.get(key)) for key in blockers):
+                return None
+        else:
+            if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
+                continue
+            if not scope_has_live_frame_chain(page, scope):
+                continue
+            if any(bool(state.get(key)) for key in blockers):
+                return None
+
+        if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
+            continue
+        try:
+            shadow_roots = scope.shadow_roots(mode="all", include_frames=False)
+        except Exception:
+            shadow_roots = []
+        for root in list(shadow_roots or []):
+            shadow_state = detect_shadow_root_state(root)
+            if any(bool(shadow_state.get(key)) for key in blockers):
+                return None
+
+    if root_state is None:
+        return None
+    return {
+        **root_state,
+        "href": current_url,
+        "accountManage": True,
+        "rootSessionTrusted": True,
+        "rootError": False,
+        "trusted": True,
+    }
+
+
 def detect_login_state(page: Any) -> dict[str, Any]:
     scope_states: list[tuple[Any, dict[str, Any]]] = []
     for scope in iter_page_scopes(page):
@@ -2843,10 +2912,17 @@ def wait_for_signed_in(
         else None
     )
     last_state: dict[str, Any] = {}
+    allow_post_otp_clicks = not (
+        submitted and submission_method == "automatic"
+    )
     while time.monotonic() < deadline:
+        direct_session_state = confirmed_account_manage_state(page)
+        if direct_session_state is not None:
+            return direct_session_state
         try:
             last_state = detect_login_state(page)
-            last_state = settle_trust_state(page, last_state, deadline=deadline)
+            if allow_post_otp_clicks:
+                last_state = settle_trust_state(page, last_state, deadline=deadline)
         except RuntimeError as error:
             if str(error) != "unable to inspect login page state through ruyiPage":
                 raise
@@ -3431,6 +3507,97 @@ def valid_browser_attach_address(value: str) -> str | None:
     return candidate if 1 <= numeric_port <= 65535 else None
 
 
+def browser_attach_state_path(profile_dir: str) -> Path | None:
+    normalized = str(profile_dir or "").strip()
+    if not normalized or any(character in normalized for character in ("\r", "\n", "\0")):
+        return None
+    try:
+        profile_path = Path(normalized).expanduser()
+    except (TypeError, ValueError):
+        return None
+    profile_name = profile_path.name
+    if not profile_name or profile_name in {".", ".."}:
+        return None
+    return profile_path.parent / f".{profile_name}{BROWSER_ATTACH_STATE_FILE_SUFFIX}"
+
+
+def read_browser_attach_address(profile_dir: str) -> str | None:
+    state_path = browser_attach_state_path(profile_dir)
+    if state_path is None:
+        return None
+    try:
+        if state_path.is_symlink() or not state_path.is_file():
+            return None
+        if state_path.stat().st_size > BROWSER_ATTACH_STATE_MAX_BYTES:
+            return None
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return valid_browser_attach_address(str(payload.get("address") or ""))
+
+
+def persist_browser_attach_address(page: Any, profile_dir: str) -> str | None:
+    state_path = browser_attach_state_path(profile_dir)
+    if state_path is None:
+        return None
+    try:
+        address = valid_browser_attach_address(str(page.browser.address or ""))
+    except Exception:
+        return None
+    if address is None:
+        return None
+    try:
+        if state_path.is_symlink() or not state_path.parent.is_dir():
+            return None
+        state_path.write_text(
+            json.dumps({"version": 1, "address": address}, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        if os.name != "nt":
+            os.chmod(state_path, 0o600)
+    except OSError:
+        return None
+    return address
+
+
+def firefox_profile_has_active_lock(profile_dir: str) -> bool:
+    normalized = str(profile_dir or "").strip()
+    if not normalized or any(character in normalized for character in ("\r", "\n", "\0")):
+        return False
+    try:
+        profile_path = Path(normalized).expanduser()
+    except (TypeError, ValueError):
+        return False
+    for lock_name in ("parent.lock", ".parentlock", "lock"):
+        lock_path = profile_path / lock_name
+        if not os.path.lexists(lock_path):
+            continue
+        if not lock_path.is_symlink():
+            return True
+        try:
+            target = os.readlink(lock_path)
+        except OSError:
+            return True
+        pid_match = re.search(r":\+?(\d+)$", target)
+        if pid_match is None:
+            # macOS Firefox uses ``127.0.0.1:+<pid>``.  A symlink outside
+            # that documented shape has no liveness proof; treating it as
+            # permanently active would strand a profile after a stale lock.
+            return sys.platform != "darwin"
+        try:
+            os.kill(int(pid_match.group(1)), 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+    return False
+
+
 def attached_account_matches_apple_id(scope: Any, expected_apple_id: str) -> bool:
     expected = str(expected_apple_id or "").strip().lower()
     if not expected or any(character in expected for character in ("\r", "\n", "\0")):
@@ -3462,24 +3629,50 @@ def attached_account_matches_apple_id(scope: Any, expected_apple_id: str) -> boo
     return candidates == {expected}
 
 
-def try_attach_existing_browser() -> Any | None:
+def try_attach_existing_browser(profile_dir: str = "") -> Any | None:
     """Attach to one running Firefox through ruyiPage without changing its tabs."""
     if not should_attach_existing_browser():
         return None
     try:
         ruyipage = importlib.import_module("ruyipage")
-        address = valid_browser_attach_address(
-            os.environ.get(BROWSER_ATTACH_ADDRESS_ENV, "")
-        )
-        if address:
-            attach = getattr(ruyipage, "attach_exist_browser", None)
-            candidate = attach(address=address, latest_tab=True) if callable(attach) else None
-        else:
-            attach = getattr(ruyipage, "auto_attach_exist_browser_by_process", None)
-            candidate = attach() if callable(attach) else None
-        return candidate if browser_connection_is_alive(candidate) else None
     except Exception:
         return None
+
+    attach = getattr(ruyipage, "attach_exist_browser", None)
+    addresses = [
+        valid_browser_attach_address(os.environ.get(BROWSER_ATTACH_ADDRESS_ENV, "")),
+        read_browser_attach_address(profile_dir),
+    ]
+    attempted_addresses: set[str] = set()
+    for address in addresses:
+        if not address or address in attempted_addresses or not callable(attach):
+            continue
+        attempted_addresses.add(address)
+        try:
+            candidate = attach(address=address, latest_tab=True)
+        except Exception:
+            continue
+        if browser_connection_is_alive(candidate):
+            return candidate
+
+    attach_by_process = getattr(ruyipage, "auto_attach_exist_browser_by_process", None)
+    if not callable(attach_by_process):
+        return None
+    for attempt in range(3):
+        try:
+            candidate = attach_by_process(timeout=1.0, max_workers=64, latest_tab=True)
+        except TypeError:
+            try:
+                candidate = attach_by_process()
+            except Exception:
+                candidate = None
+        except Exception:
+            candidate = None
+        if browser_connection_is_alive(candidate):
+            return candidate
+        if attempt < 2:
+            time.sleep(0.35)
+    return None
 
 
 def is_blank_or_home_tab(page: Any) -> bool:
@@ -3494,9 +3687,9 @@ def is_blank_or_home_tab(page: Any) -> bool:
     }
 
 
-def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
+def try_attach_existing_account_page(expected_apple_id: str, profile_dir: str = "") -> Any | None:
     """Return an already-open authenticated account tab through ruyiPage."""
-    candidate = try_attach_existing_browser()
+    candidate = try_attach_existing_browser(profile_dir)
     if candidate is None:
         return None
     try:
@@ -3513,9 +3706,11 @@ def try_attach_existing_account_page(expected_apple_id: str) -> Any | None:
         return None
 
 
-def try_attach_existing_browser_for_flow(expected_apple_id: str) -> tuple[Any | None, str]:
+def try_attach_existing_browser_for_flow(
+    expected_apple_id: str, profile_dir: str = ""
+) -> tuple[Any | None, str]:
     """Choose a safe tab in an attached Firefox without replacing user content."""
-    candidate = try_attach_existing_browser()
+    candidate = try_attach_existing_browser(profile_dir)
     if candidate is None:
         return None, "new_browser"
 
@@ -3612,10 +3807,14 @@ def browser_flow(args: argparse.Namespace) -> int:
     if broker_mode:
         set_browser_startup_stage("browser_constructing")
         emit({"event": "status", "status": "browser_constructing"})
-    page, browser_route = try_attach_existing_browser_for_flow(apple_id)
+    page, browser_route = try_attach_existing_browser_for_flow(apple_id, args.profile_dir)
     attached_existing_browser = browser_route == "account_session"
     if page is None:
+        if should_attach_existing_browser() and firefox_profile_has_active_lock(args.profile_dir):
+            emit({"event": "status", "status": "browser_profile_attach_required"})
+            raise RuntimeError("active Firefox profile could not be attached through ruyiPage")
         page = construct_firefox_page(FirefoxPage, opts)
+    persist_browser_attach_address(page, args.profile_dir)
     if broker_mode:
         set_browser_startup_stage("browser_ready")
     try:
@@ -3626,6 +3825,10 @@ def browser_flow(args: argparse.Namespace) -> int:
             page.wait.doc_loaded(timeout=20)
             human_pause(300, 700)
         else:
+            if browser_route == "empty_tab":
+                emit({"event": "status", "status": "browser_blank_tab_attached"})
+            elif browser_route == "new_tab":
+                emit({"event": "status", "status": "browser_login_tab_created"})
             page.get(sign_in_url)
             page.wait.doc_loaded(timeout=20)
             human_pause(900, 1800)
@@ -3755,23 +3958,13 @@ def browser_flow(args: argparse.Namespace) -> int:
                             target_count=len(fields),
                         )
                         emit_two_factor_progress("input_started", generation=generation)
-                        confirmed_fields = fill_security_code(page, code, Keys, fields=fields)
+                        fill_security_code(page, code, Keys, fields=fields)
                         emit_two_factor_progress("input_completed", generation=generation)
                         emit_two_factor_progress("submit_started", generation=generation)
-                        submit_outcome: dict[str, str] = {}
-                        if confirmed_fields is None:
-                            # Apple accepted the final key and removed the OTP
-                            # widget before ruyiPage could re-read it.  Do not
-                            # send a second submit event into the new page.
-                            submitted = True
-                            submit_outcome["method"] = "automatic"
-                        else:
-                            submitted = click_two_factor_submit(
-                                page,
-                                keys=Keys,
-                                fields=confirmed_fields,
-                                submit_outcome=submit_outcome,
-                            )
+                        # Apple submits a verified code as soon as the final
+                        # digit lands. A second click or Enter can race the
+                        # retiring iframe and interrupt the account redirect.
+                        submitted = True
                         emit_two_factor_progress(
                             "submit_sent",
                             generation=generation,
@@ -3785,15 +3978,9 @@ def browser_flow(args: argparse.Namespace) -> int:
                         )
                         signed_in_state = wait_for_signed_in(
                             page,
-                            # Apple can submit after the final OTP digit while
-                            # the component retires before ruyiPage confirms a
-                            # separate button or Enter action.  Wait once for
-                            # a trusted account transition; never replay the code.
                             submitted=True,
                             otp_generation=generation,
-                            submission_method=(
-                                submit_outcome.get("method") if submitted else "automatic"
-                            ),
+                            submission_method="automatic",
                         )
                     except Exception:
                         emit_two_factor_progress("handoff_failed", generation=generation)
@@ -3834,6 +4021,10 @@ def browser_flow(args: argparse.Namespace) -> int:
             final_state,
             deadline=time.monotonic() + 5.0,
         )
+        if not has_confirmed_account_session(final_state):
+            direct_session_state = confirmed_account_manage_state(page)
+            if direct_session_state is not None:
+                final_state = direct_session_state
         if final_state.get("error") and not has_confirmed_account_session(final_state):
             raise RuntimeError("personal information page reported an authentication error")
         if not has_confirmed_account_session(final_state):
