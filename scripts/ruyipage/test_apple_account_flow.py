@@ -3503,7 +3503,9 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     f"BiDi navigation failed {self.SECRET_SENTINEL} 123 456 "
                     "https://user:pw@example.invalid/path?token=secret#otp"
                 ),
-            ), patch("apple_account_flow.emit") as emit_event, redirect_stderr(stderr):
+            ), patch("apple_account_flow.browser_startup_stage", "not_started"), patch(
+                "apple_account_flow.emit"
+            ) as emit_event, redirect_stderr(stderr):
                 return_code = run_cli([])
         finally:
             account_flow.configure_diagnostic_secrets()
@@ -3527,6 +3529,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 "event": "result",
                 "success": False,
                 "error": "ruyipage_browser_flow_failed",
+                "failureStage": "not_started",
             },
         )
         combined_output = json.dumps(emit_event.call_args.args[0]) + stderr.getvalue()
@@ -3606,7 +3609,7 @@ class TwoFactorStateTests(unittest.TestCase):
         inner = FakePage(
             state={
                 "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
-                "twofa": False,
+                "twofa": True,
                 "trustPrompt": trust_prompt,
                 "error": error,
                 "otpRejected": False,
@@ -3688,6 +3691,235 @@ class TwoFactorStateTests(unittest.TestCase):
                 submission_method="button",
             )
 
+        self.assertTrue(state["trusted"])
+
+    @staticmethod
+    def manage_shell_with_shadow_error(*, code_input_count):
+        shadow_root = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": False,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 6 if code_input_count == 6 else 0,
+                    "codeInputCount": code_input_count,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "error": True,
+                }
+            }
+        )
+        frame = FakePage(
+            shadow_roots=[shadow_root],
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame_host = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [frame_host]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+        page.states = FakeStates(alive=True)
+        return page, shadow_root
+
+    def test_automatic_post_otp_wait_accepts_manage_shell_with_a_live_error_only_frame(self):
+        retiring_frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        frame_host = FakeElement(attrs={"src": retiring_frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [frame_host]},
+            frames=[retiring_frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        retiring_frame.parent = page
+        page.states = FakeStates(alive=True)
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+            )
+
+        self.assertTrue(state["trusted"])
+
+    def test_automatic_post_otp_wait_does_not_accept_a_live_twofa_frame(self):
+        frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 6,
+            }
+        )
+        frame_host = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [frame_host]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": True,
+                "accountMarker": True,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+        page.states = FakeStates(alive=True)
+
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+
+    def test_automatic_post_otp_wait_does_not_accept_a_live_shadow_twofa_error(self):
+        page, shadow_root = self.manage_shell_with_shadow_error(code_input_count=6)
+
+        self.assertEqual(
+            account_flow.detect_shadow_root_state(shadow_root)["codeInputCount"],
+            6,
+        )
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+
+    def test_automatic_post_otp_wait_accepts_a_retired_shadow_error(self):
+        page, shadow_root = self.manage_shell_with_shadow_error(code_input_count=0)
+
+        self.assertEqual(
+            account_flow.detect_shadow_root_state(shadow_root)["codeInputCount"],
+            0,
+        )
+        state = account_flow.confirmed_account_manage_state(
+            page,
+            allow_retiring_child_errors=True,
+        )
+        self.assertIsNotNone(state)
+        self.assertTrue(state["trusted"])
+
+    def test_automatic_post_otp_wait_allows_manage_shell_to_hydrate_before_child_error_fails(self):
+        frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        frame_host = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [frame_host]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+        page.states = FakeStates(alive=True)
+        pauses = 0
+
+        def hydrate_after_one_pause(*_args):
+            nonlocal pauses
+            pauses += 1
+            page.state["accountMarker"] = True
+
+        with patch("apple_account_flow.human_pause", hydrate_after_one_pause):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+            )
+
+        self.assertGreaterEqual(pauses, 1)
         self.assertTrue(state["trusted"])
 
     def test_submitted_wait_does_not_accept_a_manage_shell_with_root_error(self):

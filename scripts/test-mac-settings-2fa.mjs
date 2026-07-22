@@ -42,6 +42,12 @@ function readSettingsSwiftSource() {
   );
 }
 
+function readVisualHelperSwiftSource() {
+  return readNormalizedText(
+    new URL("./swift/mac-2fa-popup-ocr.swift", import.meta.url)
+  );
+}
+
 async function rejectionOf(promise) {
   try {
     await promise;
@@ -292,8 +298,13 @@ function assertSettingsOwnerSafetyContract(source) {
   assert.match(postSettleGuard, /guard Date\(\)\s*<\s*deadline else \{ continue \}/);
   assert.match(
     ownerLoop,
-    /case \.twoFactorNotFound:[\s\S]{0,100}if uiOwnerAttempt\s*<\s*2\s*\{\s*continue\s*\}[\s\S]{0,180}Two-Factor Authentication not found/,
-    "a transient first navigation miss must reopen before failing"
+    /case \.twoFactorNotFound:[\s\S]{0,180}Two-Factor Authentication not found/,
+    "a fully elapsed navigation deadline must report a fixed missing-control result"
+  );
+  assert.match(
+    ownerLoop,
+    /case \.twoFactorAXUnavailable:[\s\S]{0,220}OutputReason\.twoFactorAXUnavailable\.rawValue/,
+    "a fully elapsed sparse AX transition must report a fixed unavailable reason"
   );
 
   const exactButton = swiftFunctionBodyFromSource(source, "findExactButton");
@@ -307,6 +318,119 @@ function assertSettingsOwnerSafetyContract(source) {
     exactButton,
     /return matches\.count\s*==\s*1\s*\?\s*matches\[0\]\s*:\s*nil/,
     "strict button discovery must fail closed unless one button exists"
+  );
+
+  const navigationWait = swiftFunctionBodyFromSource(
+    source,
+    "waitForTwoFactorNavigationTarget"
+  );
+  const navigationRetry = swiftFunctionBodyFromSource(
+    source,
+    "pressTwoFactorNavigationUntilGetCode"
+  );
+  const navigationTimeout = swiftFunctionBodyFromSource(
+    source, "navigationTimeoutReadiness"
+  );
+  const navigationRecovery = swiftFunctionBodyFromSource(
+    source, "recoverTrustedSettingsNavigationFocus"
+  );
+  const navigationPrepare = swiftFunctionBodyFromSource(
+    source, "prepareVerificationCodeAlert"
+  );
+  const navigationEvidence = swiftFunctionBodyFromSource(
+    source, "hasVisibleAppleAccountNavigationEvidence"
+  );
+  const navigationOwnerElement = swiftFunctionBodyFromSource(
+    source, "trustedSettingsNavigationOwnerElement"
+  );
+  assert.match(source, /let navigationAXRecoveryIntervalMs\s*=\s*2_000/);
+  assert.doesNotMatch(
+    source,
+    /twoFactorNavigationTimeoutMs|signInSecurityDeadline|twoFactorDeadline/,
+    "a temporary ExtensionKit AX gap must use the request-wide deadline"
+  );
+  assert.match(
+    source,
+    /case twoFactorAXUnavailable = "two_factor_ax_unavailable"/,
+    "a fully empty AX transition needs a fixed, sanitized terminal reason"
+  );
+  assert.match(
+    navigationTimeout,
+    /guard let lastNavigationEvidenceAt else \{ return \.axUnavailable \}/
+  );
+  assert.match(navigationTimeout, /navigationAXRecoveryIntervalMs/);
+  assert.match(
+    navigationOwnerElement,
+    /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)\.contains\(navigationOwnerPid\)[\s\S]{0,240}AXUIElementCreateApplication\(navigationOwnerPid\)[\s\S]{0,220}elementBelongsToProcess\(ownerElement,\s*pid:\s*navigationOwnerPid/
+  );
+  assert.match(
+    navigationEvidence,
+    /trustedSettingsNavigationOwnerElement\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid[\s\S]{0,220}expectedPid:\s*navigationOwnerPid/
+  );
+  assert.match(
+    navigationRecovery,
+    /trustedSettingsNavigationOwnerElement\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid[\s\S]{0,320}NSRunningApplication\(processIdentifier:\s*navigationOwnerPid\)[\s\S]{0,220}isTrustedSystemSettings\(settingsOwner\)/,
+    "focus recovery may only target the current verified navigation owner"
+  );
+  assert.match(
+    navigationRecovery,
+    /focusExistingSettingsWindow\([\s\S]{0,220}expectedPid:\s*navigationOwnerPid/
+  );
+  assert.doesNotMatch(
+    navigationRecovery,
+    /uniqueTrustedSettingsApp/,
+    "AX recovery must not rebound to another Settings owner"
+  );
+  for (const body of [navigationWait, navigationRetry]) {
+    assert.match(body, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
+    assert.match(body, /var lastNavigationEvidenceAt:\s*Date\?/);
+    assert.match(body, /var nextNavigationRecoveryAt\s*=\s*Date\(\)/);
+    assert.match(body, /recoverTrustedSettingsNavigationFocus\(/);
+    assert.match(body, /navigationTimeoutReadiness\(/);
+    assert.match(body, /cancellablePause\(/);
+    assert.match(body, /let navigationOwnerPid = twoFactorNavigationOwnerPid \?\? expectedPid/);
+    assert.match(body, /hasVisibleAppleAccountNavigationEvidence\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid/);
+    assert.match(body, /recoverTrustedSettingsNavigationFocus\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid/);
+    assert.match(
+      body,
+      /if let trackedOwnerPid = twoFactorNavigationOwnerPid,[\s\S]{0,260}trustedSettingsNavigationOwnerElement\([\s\S]{0,200}navigationOwnerPid:\s*trackedOwnerPid[\s\S]{0,180}twoFactorNavigationOwnerPid\s*=\s*nil/
+    );
+  }
+  assert.match(
+    navigationPrepare,
+    /clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*deadline[\s\S]{0,280}waitForTwoFactorNavigationTarget\([\s\S]{0,240}deadline:\s*deadline/
+  );
+  assert.match(
+    navigationPrepare,
+    /pressTwoFactorNavigationUntilGetCode\([\s\S]{0,560}deadline:\s*deadline/
+  );
+  const navigationOwnerProbe = swiftFunctionBodyFromSource(
+    source, "navigableNamedElementOwnerInTrustedSettingsOwners"
+  );
+  const pinnedNavigationClick = swiftFunctionBodyFromSource(
+    source, "clickNamedInTrustedSettingsOwnerPid"
+  );
+  assert.match(
+    navigationWait,
+    /twoFactorNavigationOwnerPid:\s*inout\s+pid_t\?/
+  );
+  assert.match(
+    navigationWait,
+    /if let ownerPid = navigableNamedElementOwnerInTrustedSettingsOwners\([\s\S]{0,320}twoFactorNavigationOwnerPid\s*=\s*ownerPid/
+  );
+  assert.match(
+    navigationRetry,
+    /let targetOwnerPid = twoFactorNavigationOwnerPid \?\?[\s\S]{0,320}navigableNamedElementOwnerInTrustedSettingsOwners\([\s\S]{0,620}clickNamedInTrustedSettingsOwnerPid\([\s\S]{0,180}ownerPid:\s*targetOwnerPid/
+  );
+  assert.doesNotMatch(
+    navigationRetry,
+    /clickNamedInTrustedSettingsOwner\(/,
+    "a detected Two-Factor owner must not be replaced by a fresh cross-owner click search"
+  );
+  assert.match(navigationOwnerProbe, /return ownerPid/);
+  assert.match(
+    pinnedNavigationClick,
+    /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)\.contains\(ownerPid\)[\s\S]{0,260}clickNamed\([\s\S]{0,180}expectedPid:\s*ownerPid/
   );
 }
 
@@ -458,10 +582,14 @@ function runSettingsOwnerMutationResistanceTest() {
     /final deadline gate|immediately before CGEvent/
   );
 
-  const missingRequestAttemptState = source.replace(
-    "verificationCodeRequested = true",
-    "_ = verificationCodeRequested"
-  );
+  const requestStart = source.indexOf("func requestVerificationCodeAlert");
+  assert.ok(requestStart >= 0, "request state mutation needs the normal AX action path");
+  const missingRequestAttemptState =
+    source.slice(0, requestStart) +
+    source.slice(requestStart).replace(
+      "verificationCodeRequested = true",
+      "_ = verificationCodeRequested"
+    );
   assert.notEqual(
     missingRequestAttemptState,
     source,
@@ -587,6 +715,81 @@ function runSettingsOwnerMutationResistanceTest() {
   assert.throws(
     () => assertSettingsOwnerSafetyContract(missingInitialWindowlessReturn),
     /return before host reactivation/
+  );
+
+  const missingNavigationRecovery = source.replace(
+    "            _ = recoverTrustedSettingsNavigationFocus(",
+    "            _ = ignoredNavigationFocusRecovery("
+  );
+  assert.notEqual(
+    missingNavigationRecovery,
+    source,
+    "AX recovery mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingNavigationRecovery),
+    /recoverTrustedSettingsNavigationFocus/
+  );
+
+  const legacyNavigationCutoff = source.replace(
+    "let navigationAXRecoveryIntervalMs = 2_000",
+    "let twoFactorNavigationTimeoutMs = 15_000"
+  );
+  assert.notEqual(
+    legacyNavigationCutoff,
+    source,
+    "legacy navigation-cutoff mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(legacyNavigationCutoff),
+    /request-wide deadline|navigationAXRecoveryIntervalMs/
+  );
+
+  const missingAxUnavailableReason = source.replace(
+    'case twoFactorAXUnavailable = "two_factor_ax_unavailable"',
+    'case twoFactorAXUnavailable = "navigation_transition_failed"'
+  );
+  assert.notEqual(
+    missingAxUnavailableReason,
+    source,
+    "AX-unavailable reason mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(missingAxUnavailableReason),
+    /empty AX transition/
+  );
+
+  const unpinnedNavigationEvidence = source.replace(
+    "let navigationOwnerPid = twoFactorNavigationOwnerPid ?? expectedPid",
+    "let navigationOwnerPid = expectedPid"
+  );
+  assert.notEqual(
+    unpinnedNavigationEvidence,
+    source,
+    "tracked navigation-owner mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(unpinnedNavigationEvidence),
+    assert.AssertionError
+  );
+
+  const retryBody = swiftFunctionBodyFromSource(
+    source,
+    "pressTwoFactorNavigationUntilGetCode"
+  );
+  const crossOwnerRetryBody = retryBody.replace(
+    "clickNamedInTrustedSettingsOwnerPid(",
+    "clickNamedInTrustedSettingsOwner("
+  );
+  const crossOwnerRetry = source.replace(retryBody, crossOwnerRetryBody);
+  assert.notEqual(
+    crossOwnerRetry,
+    source,
+    "detected-owner click mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsOwnerSafetyContract(crossOwnerRetry),
+    /fresh cross-owner click search|clickNamedInTrustedSettingsOwnerPid/
   );
 }
 
@@ -1138,6 +1341,7 @@ async function runAccessibilityFailureClassificationTest() {
 async function runFixedHelperReasonMappingTest() {
   const cases = [
     ["two_factor_not_found", "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND"],
+    ["two_factor_ax_unavailable", "2FA_SETTINGS_TWO_FACTOR_AX_UNAVAILABLE"],
     ["verification_alert_not_opened", "2FA_SETTINGS_ALERT_NOT_OPENED"],
     ["verification_alert_not_found", "2FA_SETTINGS_ALERT_NOT_FOUND"],
     ["verification_alert_cleanup_failed", "2FA_SETTINGS_ALERT_CLEANUP_FAILED"],
@@ -1747,7 +1951,11 @@ function runAccessibilityPromptSourceContractTest() {
   assert.match(wait, /remainingMilliseconds\(\s*until:\s*deadline,\s*cappedAt:\s*accessibilityPermissionPollIntervalMs\s*\)/);
   assert.match(wait, /cancellablePause\(UInt32\(pauseMs \* 1_000\)\)/);
   assert.match(source, /let accessibilityPermissionPollIntervalMs\s*=\s*250/);
-  assert.doesNotMatch(source, /NSAppleScript|osascript|OCR/i);
+  assert.doesNotMatch(
+    source,
+    /NSAppleScript|osascript|import\s+ScreenCaptureKit|import\s+Vision|VNRecognize|SCScreenshotManager/i
+  );
+  assert.match(source, /mac-2fa-popup-ocr/);
 
   const mainStart = source.lastIndexOf("let deadline = Date().addingTimeInterval(");
   const accessibilityGate = source.indexOf(
@@ -1837,15 +2045,11 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(getCodeFinder, /elementBelongsToProcess\(root,\s*pid:\s*ownerPid\)/);
   assert.match(getCodeFinder, /treeContainsNavigationName\(\s*root,/);
   assert.match(getCodeFinder, /let button = findExactControlButton\(\s*in:\s*root,/);
-  assert.match(getCodeFinder, /matches\.count\s*==\s*1/);
+  assert.match(getCodeFinder, /contextualMatches\.count\s*==\s*1/);
   assert.match(
     getCodeFinder,
-    /(?:guard|if)[\s\S]{0,300}twoFactorNames/,
-    "Get Verification Code must verify the Two-Factor Authentication scope before finding its button"
-  );
-  assert.ok(
-    getCodeFinder.indexOf("twoFactorNames") < getCodeFinder.indexOf("findExactControlButton("),
-    "Two-Factor Authentication scope verification must precede strict button lookup"
+    /if treeContainsNavigationName\([\s\S]{0,260}contextualMatches\.append\(control\)/,
+    "Get Verification Code must retain the Two-Factor Authentication scope as its primary lookup"
   );
   assert.doesNotMatch(
     getCodeFinder,
@@ -1871,7 +2075,16 @@ function runStrictVerificationCodeSourceContractTest() {
   const crossOwnerNavigationClick = functionBody(
     "clickNamedInTrustedSettingsOwners"
   );
+  const crossOwnerNavigationOwner = functionBody(
+    "clickNamedInTrustedSettingsOwner"
+  );
+  const pinnedOwnerNavigationClick = functionBody(
+    "clickNamedInTrustedSettingsOwnerPid"
+  );
   const crossOwnerNavigationProbe = functionBody(
+    "navigableNamedElementOwnerInTrustedSettingsOwners"
+  );
+  const crossOwnerNavigationProbeBoolean = functionBody(
     "hasNavigableNamedElementInTrustedSettingsOwners"
   );
   const navigationAncestor = functionBody("nearestNavigationPressableAncestor");
@@ -1890,21 +2103,28 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(navigationClick, /matches\.count\s*==\s*1/);
   assert.doesNotMatch(navigationClick, /blob\.contains|blob\s*=|names\.contains/);
-  for (const body of [crossOwnerNavigationClick, crossOwnerNavigationProbe]) {
+  for (const body of [pinnedOwnerNavigationClick, crossOwnerNavigationProbe]) {
     assert.match(body, /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)/);
     assert.match(body, /AXUIElementCreateApplication\(ownerPid\)/);
     assert.match(body, /ownerPid == expectedPid\s*\?\s*appElement/);
     assert.match(body, /elementBelongsToProcess\(ownerElement,\s*pid:\s*ownerPid\)/);
   }
-  assert.match(crossOwnerNavigationClick, /clickNamed\([\s\S]{0,180}in:\s*ownerElement[\s\S]{0,180}expectedPid:\s*ownerPid/);
+  assert.match(crossOwnerNavigationOwner, /clickNamedInTrustedSettingsOwnerPid\([\s\S]{0,180}ownerPid:\s*ownerPid[\s\S]{0,160}return ownerPid/);
+  assert.match(pinnedOwnerNavigationClick, /clickNamed\([\s\S]{0,180}in:\s*ownerElement[\s\S]{0,180}expectedPid:\s*ownerPid/);
+  assert.match(crossOwnerNavigationClick, /clickNamedInTrustedSettingsOwner\([\s\S]{0,220}\)\s*!=\s*nil/);
   assert.match(crossOwnerNavigationProbe, /hasNavigableNamedElement\([\s\S]{0,180}in:\s*ownerElement[\s\S]{0,180}expectedPid:\s*ownerPid/);
+  assert.match(crossOwnerNavigationProbeBoolean, /navigableNamedElementOwnerInTrustedSettingsOwners\([\s\S]{0,180}\)\s*!=\s*nil/);
 
   const navigationWait = functionBody("waitForTwoFactorNavigationTarget");
   const getCodeWait = functionBody("waitForGetCodeButton");
-  assert.match(navigationWait, /findGetCodeButton\(/);
+  assert.match(navigationWait, /twoFactorNavigationOwnerPid:\s*inout\s+pid_t\?/);
+  assert.match(navigationWait, /confirmedTwoFactorOwnerPid:\s*inout\s+pid_t\?/);
+  assert.match(navigationWait, /findGetCodeControl\(/);
+  assert.match(navigationWait, /confirmedTwoFactorOwnerPid\s*=\s*control\.ownerPid/);
+  assert.match(navigationWait, /twoFactorNavigationOwnerPid\s*=\s*control\.ownerPid/);
   assert.match(
     navigationWait,
-    /hasNavigableNamedElementInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*twoFactor/
+    /if let ownerPid = navigableNamedElementOwnerInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*twoFactor[\s\S]{0,180}twoFactorNavigationOwnerPid\s*=\s*ownerPid/
   );
   assert.match(navigationWait, /cappedAt:\s*100/);
   assert.match(getCodeWait, /findGetCodeButton\(/);
@@ -1914,16 +2134,17 @@ function runStrictVerificationCodeSourceContractTest() {
   const navigationPrepare = functionBody("prepareVerificationCodeAlert");
   assert.match(
     navigationPrepare,
-    /let signInSecurityDeadline\s*=\s*min\([\s\S]{0,180}Date\(\)\.addingTimeInterval\(TimeInterval\(twoFactorNavigationTimeoutMs\)\s*\/\s*1000\.0\)[\s\S]{0,300}_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*signInSecurity,[\s\S]{0,160}deadline:\s*signInSecurityDeadline[\s\S]{0,260}waitForTwoFactorNavigationTarget\([\s\S]{0,180}deadline:\s*signInSecurityDeadline/
+    /_ = clickNamedInTrustedSettingsOwners\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,120}names:\s*signInSecurity,[\s\S]{0,160}deadline:\s*deadline[\s\S]{0,260}waitForTwoFactorNavigationTarget\([\s\S]{0,220}twoFactorNavigationOwnerPid:\s*&twoFactorNavigationOwnerPid[\s\S]{0,180}deadline:\s*deadline/
   );
   assert.match(
     navigationPrepare,
-    /let twoFactorDeadline\s*=\s*min\([\s\S]{0,180}Date\(\)\.addingTimeInterval\(TimeInterval\(twoFactorNavigationTimeoutMs\)\s*\/\s*1000\.0\)[\s\S]{0,300}pressTwoFactorNavigationUntilGetCode\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,180}deadline:\s*twoFactorDeadline/
+    /pressTwoFactorNavigationUntilGetCode\([\s\S]{0,180}appElement:\s*appElement,[\s\S]{0,120}expectedPid:\s*expectedPid,[\s\S]{0,220}twoFactorNavigationOwnerPid:\s*&twoFactorNavigationOwnerPid[\s\S]{0,360}deadline:\s*deadline/
   );
-  assert.doesNotMatch(source, /boundedNavigationDeadline|navigationSettleTimeoutMs/);
+  assert.doesNotMatch(source, /twoFactorNavigationTimeoutMs|signInSecurityDeadline|twoFactorDeadline/);
 
   assert.match(source, /enum OutputReason: String/);
   assert.match(source, /case twoFactorNotFound = "two_factor_not_found"/);
+  assert.match(source, /case twoFactorAXUnavailable = "two_factor_ax_unavailable"/);
   assert.match(source, /case accessibilityUnavailable = "accessibility_unavailable"/);
   assert.match(source, /case settingsUnavailable = "settings_unavailable"/);
 
@@ -2065,7 +2286,7 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(prepare, /deadline:\s*Date/);
   assert.match(
     prepare,
-    /let signInSecurityDeadline\s*=\s*min\([\s\S]{0,180}twoFactorNavigationTimeoutMs[\s\S]{0,260}clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*signInSecurityDeadline/
+    /clickNamedInTrustedSettingsOwners\([\s\S]{0,220}deadline:\s*deadline[\s\S]{0,260}waitForTwoFactorNavigationTarget\([\s\S]{0,240}deadline:\s*deadline/
   );
   assert.match(
     prepare,
@@ -2167,7 +2388,11 @@ function runStrictVerificationCodeSourceContractTest() {
   assert.match(prepareCall, /expectedPid:\s*settingsPid/);
   assert.match(prepareCall, /deadline:\s*deadline/);
   assert.doesNotMatch(source, /blobDeep|findFormattedCodeInTree|extractSixDigit|looksLikeFormattedCode/);
-  assert.doesNotMatch(source, /screencapture|captureWindowScreenshot|captureSheetScreenshot|OCR/i);
+  assert.doesNotMatch(
+    source,
+    /import\s+ScreenCaptureKit|import\s+Vision|VNRecognize|SCScreenshotManager|captureWindowScreenshot|captureSheetScreenshot/i
+  );
+  assert.match(source, /mac-2fa-popup-ocr/);
 }
 
 function runVerificationCodeHardeningSourceContractTest() {
@@ -2400,8 +2625,9 @@ function runVerificationCodeHardeningSourceContractTest() {
 
   assert.doesNotMatch(
     source,
-    /OCR|screencapture|captureWindowScreenshot|captureSheetScreenshot|--screenshot/i
+    /import\s+ScreenCaptureKit|import\s+Vision|VNRecognize|SCScreenshotManager|captureWindowScreenshot|captureSheetScreenshot|--screenshot/i
   );
+  assert.match(source, /mac-2fa-popup-ocr/);
   assert.doesNotMatch(source, /\braw\s*:/);
 }
 
@@ -2440,7 +2666,7 @@ function runTraditionalChineseStateContractTest() {
   assert.match(source, /let getCodeBtn\s*=\s*\[[^\]]*"取得驗證碼"/);
 
   const resumeProbe = source.indexOf(
-    "let existingButton = findGetCodeButton(",
+    "let existingControl = findGetCodeControl(",
     source.indexOf("func prepareVerificationCodeAlert(")
   );
   const signInClick = source.indexOf("_ = clickNamedInTrustedSettingsOwners(", resumeProbe);
@@ -2463,6 +2689,94 @@ function runTraditionalChineseStateContractTest() {
       scan > getCodeRequest &&
       /buttonNames:\s*getCodeBtn/.test(requestCall),
     "zh-Hant navigation must still transition through request, alert scan, and code return"
+  );
+}
+
+function simulateSparseAxNavigation({
+  deadlineMs,
+  targetAtMs,
+  readableAtMs = [],
+  siblingReadableAtMs = [],
+}) {
+  const readableAt = new Set(readableAtMs);
+  const siblingReadableAt = new Set(siblingReadableAtMs);
+  const pollMs = 100;
+  const recoveryIntervalMs = 2_000;
+  let lastEvidenceAt = null;
+  let nextRecoveryAt = 0;
+  let recoveries = 0;
+  let siblingEvidenceSeen = false;
+
+  for (let now = 0; now < deadlineMs; now += pollMs) {
+    const readable = readableAt.has(now) || (targetAtMs != null && now >= targetAtMs);
+    const siblingReadable = siblingReadableAt.has(now);
+    if (siblingReadable) siblingEvidenceSeen = true;
+    if (readable) lastEvidenceAt = now;
+    else if (now >= nextRecoveryAt) {
+      recoveries += 1;
+      nextRecoveryAt = now + recoveryIntervalMs;
+    }
+    if (targetAtMs != null && now >= targetAtMs) {
+      return { outcome: "get_code_ready", recoveries, siblingEvidenceSeen };
+    }
+  }
+
+  const axUnavailable =
+    lastEvidenceAt == null || deadlineMs - lastEvidenceAt >= recoveryIntervalMs;
+  return {
+    outcome: axUnavailable ? "ax_unavailable" : "two_factor_not_found",
+    recoveries,
+    siblingEvidenceSeen,
+  };
+}
+
+function runSparseAxNavigationRecoveryStateTest() {
+  const delayedControl = simulateSparseAxNavigation({
+    deadlineMs: 60_000,
+    targetAtMs: 16_000,
+  });
+  assert.equal(
+    delayedControl.outcome,
+    "get_code_ready",
+    "a sparse AX surface that recovers after the old 15-second cutoff must continue"
+  );
+  assert.ok(
+    delayedControl.recoveries <= 8,
+    "sparse AX recovery must be bounded instead of focusing on every poll"
+  );
+
+  const missingAx = simulateSparseAxNavigation({ deadlineMs: 60_000, targetAtMs: null });
+  assert.equal(missingAx.outcome, "ax_unavailable");
+  assert.ok(
+    missingAx.recoveries <= 30,
+    "an empty AX tree must use the bounded recovery cadence until the global deadline"
+  );
+
+  const readableButMissing = simulateSparseAxNavigation({
+    deadlineMs: 60_000,
+    targetAtMs: null,
+    readableAtMs: Array.from({ length: 600 }, (_, index) => index * 100),
+  });
+  assert.equal(
+    readableButMissing.outcome,
+    "two_factor_not_found",
+    "a readable page without a target remains distinct from an unavailable AX surface"
+  );
+
+  const siblingEvidenceMustNotMask = simulateSparseAxNavigation({
+    deadlineMs: 60_000,
+    targetAtMs: null,
+    siblingReadableAtMs: Array.from({ length: 600 }, (_, index) => index * 100),
+  });
+  assert.equal(
+    siblingEvidenceMustNotMask.outcome,
+    "ax_unavailable",
+    "a sibling ExtensionKit owner cannot mask the selected owner's empty AX tree"
+  );
+  assert.equal(
+    siblingEvidenceMustNotMask.siblingEvidenceSeen,
+    true,
+    "the owner-isolation case must include continuously readable sibling evidence"
   );
 }
 
@@ -2501,20 +2815,127 @@ function runEvidenceDrivenSettingsNavigationContractTest() {
 
   const retry = functionBody("pressTwoFactorNavigationUntilGetCode");
   assert.match(retry, /var pressAttempts\s*=\s*0/);
+  assert.match(retry, /twoFactorNavigationOwnerPid:\s*inout\s+pid_t\?/);
+  assert.match(retry, /confirmedTwoFactorOwnerPid:\s*inout\s+pid_t\?/);
   assert.match(retry, /pressAttempts\s*<\s*3/);
-  assert.match(retry, /findGetCodeButton\(/);
-  assert.match(retry, /clickNamedInTrustedSettingsOwners\(/);
-  assert.match(retry, /let pressed\s*=\s*clickNamedInTrustedSettingsOwners/);
-  assert.match(retry, /if pressed\s*\{\s*pressAttempts\s*\+=\s*1\s*\}/);
+  assert.match(retry, /findGetCodeControl\(/);
+  assert.match(
+    retry,
+    /let targetOwnerPid = twoFactorNavigationOwnerPid \?\?[\s\S]{0,320}navigableNamedElementOwnerInTrustedSettingsOwners\([\s\S]{0,620}clickNamedInTrustedSettingsOwnerPid\([\s\S]{0,180}ownerPid:\s*targetOwnerPid[\s\S]{0,240}confirmedTwoFactorOwnerPid\s*=\s*targetOwnerPid/,
+    "the sparse-sheet permission must retain the exact owner that supplied the Two-Factor target"
+  );
+  assert.doesNotMatch(retry, /clickNamedInTrustedSettingsOwner\(/);
   assert.match(retry, /cappedAt:\s*450/);
   assert.match(retry, /deadline:\s*deadline/);
+
+  const getCodeControl = functionBody("findGetCodeControl");
+  const getCodeButton = functionBody("findGetCodeButton");
+  const navigationWait = functionBody("waitForTwoFactorNavigationTarget");
+  const navigationTimeout = functionBody("navigationTimeoutReadiness");
+  const navigationFocusRecovery = functionBody("recoverTrustedSettingsNavigationFocus");
+  const navigationEvidence = functionBody("hasVisibleAppleAccountNavigationEvidence");
+  const navigationOwnerElement = functionBody("trustedSettingsNavigationOwnerElement");
+  const requestAlert = functionBody("requestVerificationCodeAlert");
+  const prepare = functionBody("prepareVerificationCodeAlert");
+  assert.match(source, /let navigationAXRecoveryIntervalMs\s*=\s*2_000/);
+  assert.doesNotMatch(source, /twoFactorNavigationTimeoutMs/);
+  assert.match(source, /enum NavigationTargetReadiness[\s\S]*case axUnavailable/);
+  assert.match(source, /enum VerificationPreparationResult[\s\S]*case twoFactorAXUnavailable/);
+  assert.match(navigationOwnerElement, /trustedSettingsOwnerPids\(expectedPid:\s*expectedPid\)\.contains\(navigationOwnerPid\)/);
+  assert.match(navigationOwnerElement, /AXUIElementCreateApplication\(navigationOwnerPid\)/);
+  assert.match(navigationOwnerElement, /elementBelongsToProcess\(ownerElement,\s*pid:\s*navigationOwnerPid\)/);
+  assert.match(navigationEvidence, /trustedSettingsNavigationOwnerElement\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid/);
+  assert.match(navigationEvidence, /visibleExactMatchCounts\([\s\S]{0,260}expectedPid:\s*navigationOwnerPid[\s\S]{0,160}names:\s*appleAccountPageEvidence/);
+  assert.match(navigationTimeout, /guard let lastNavigationEvidenceAt else \{ return \.axUnavailable \}/);
+  assert.match(navigationTimeout, /navigationAXRecoveryIntervalMs/);
+  assert.match(navigationFocusRecovery, /NSRunningApplication\(processIdentifier:\s*navigationOwnerPid\)/);
+  assert.match(navigationFocusRecovery, /isTrustedSystemSettings\(settingsOwner\)/);
+  assert.match(navigationFocusRecovery, /focusExistingSettingsWindow\([\s\S]{0,200}expectedPid:\s*navigationOwnerPid/);
+  assert.doesNotMatch(navigationFocusRecovery, /uniqueTrustedSettingsApp/);
+  for (const body of [navigationWait, retry]) {
+    assert.match(body, /stopIfCancelled\(appElement:\s*appElement,\s*expectedPid:\s*expectedPid\)/);
+    assert.match(body, /var lastNavigationEvidenceAt:\s*Date\?/);
+    assert.match(body, /var nextNavigationRecoveryAt\s*=\s*Date\(\)/);
+    assert.match(body, /hasVisibleAppleAccountNavigationEvidence\(/);
+    assert.match(body, /recoverTrustedSettingsNavigationFocus\(/);
+    assert.match(body, /navigationTimeoutReadiness\(/);
+    assert.match(body, /cancellablePause\(/);
+    assert.match(body, /let navigationOwnerPid = twoFactorNavigationOwnerPid \?\? expectedPid/);
+    assert.match(body, /hasVisibleAppleAccountNavigationEvidence\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid/);
+    assert.match(body, /recoverTrustedSettingsNavigationFocus\([\s\S]{0,180}navigationOwnerPid:\s*navigationOwnerPid/);
+    assert.match(body, /if let trackedOwnerPid = twoFactorNavigationOwnerPid,[\s\S]{0,600}twoFactorNavigationOwnerPid\s*=\s*nil/);
+  }
+  assert.match(getCodeControl, /confirmedTwoFactorOwnerPid:\s*pid_t\?\s*=\s*nil/);
+  assert.match(getCodeControl, /var contextualMatches:\s*\[TrustedSettingsControl\]/);
+  assert.match(getCodeControl, /var sparseMatches:\s*\[TrustedSettingsControl\]/);
+  assert.match(
+    getCodeControl,
+    /if treeContainsNavigationName\([\s\S]{0,700}else if let confirmedTwoFactorOwnerPid,[\s\S]{0,180}confirmedTwoFactorOwnerPid\s*==\s*ownerPid[\s\S]{0,700}sparseMatches\.append\(control\)/,
+    "the sparse-sheet fallback must remain behind the contextual AX lookup"
+  );
+  assert.match(
+    getCodeControl,
+    /guard contextualMatches\.isEmpty,\s*confirmedTwoFactorOwnerPid\s*!=\s*nil,\s*sparseMatches\.count\s*==\s*1 else \{ return nil \}/,
+    "a sparse sheet may resolve only one exact Get Verification Code control in its confirmed owner"
+  );
+  assert.match(
+    getCodeButton,
+    /confirmedTwoFactorOwnerPid:\s*confirmedTwoFactorOwnerPid/,
+    "the button helper must preserve the explicit sparse-sheet owner"
+  );
+  const navigationLookup = navigationWait.slice(
+    navigationWait.indexOf("if let control = findGetCodeControl("),
+    navigationWait.indexOf("if let ownerPid = navigableNamedElementOwnerInTrustedSettingsOwners(")
+  );
+  assert.doesNotMatch(navigationLookup, /confirmedTwoFactorOwnerPid:/,
+    "unconfirmed navigation must not use the sparse-sheet fallback");
+  assert.match(
+    retry,
+    /findGetCodeControl\([\s\S]{0,220}confirmedTwoFactorOwnerPid:\s*confirmedTwoFactorOwnerPid/,
+    "only the already-confirmed Two-Factor transition may enable sparse lookup"
+  );
+  assert.match(
+    requestAlert,
+    /confirmedTwoFactorOwnerPid:\s*inout\s+pid_t\?[\s\S]*findGetCodeControl\([\s\S]{0,260}confirmedTwoFactorOwnerPid:\s*confirmedTwoFactorOwnerPid/,
+    "Get Verification Code retries must retain the confirmed navigation owner"
+  );
+  assert.match(
+    requestAlert,
+    /guard let control else \{[\s\S]{0,520}confirmedTwoFactorOwnerPid\s*=\s*control\.ownerPid/,
+    "a strict cross-owner Get Verification Code control must rebind the sparse fallback owner"
+  );
+  assert.match(prepare, /var confirmedTwoFactorOwnerPid\s*=\s*existingControl\?\.ownerPid/);
+  assert.match(prepare, /var twoFactorNavigationOwnerPid\s*=\s*existingControl\?\.ownerPid/);
+  assert.match(
+    prepare,
+    /waitForTwoFactorNavigationTarget\([\s\S]{0,220}twoFactorNavigationOwnerPid:\s*&twoFactorNavigationOwnerPid[\s\S]{0,180}confirmedTwoFactorOwnerPid:\s*&confirmedTwoFactorOwnerPid/,
+    "strict Get Verification Code discovery must preserve its detected navigation owner before a sparse sheet can follow"
+  );
+  const postNavigationProbe = prepare.slice(
+    prepare.indexOf("switch waitForTwoFactorNavigationTarget("),
+    prepare.indexOf("logStep(5, \"click Get Verification Code\")")
+  );
+  assert.match(
+    postNavigationProbe,
+    /if let control = findGetCodeControl\([\s\S]{0,300}\)\s*\{\s*confirmedTwoFactorOwnerPid\s*=\s*control\.ownerPid/,
+    "the post-navigation strict probe must retain its owner through sparse rehydration"
+  );
+  assert.match(
+    prepare,
+    /pressTwoFactorNavigationUntilGetCode\([\s\S]{0,240}twoFactorNavigationOwnerPid:\s*&twoFactorNavigationOwnerPid[\s\S]{0,180}confirmedTwoFactorOwnerPid:\s*&confirmedTwoFactorOwnerPid[\s\S]{0,300}twoFactorNavigationVisualTarget:\s*&twoFactorNavigationVisualTarget/,
+    "a visible Two-Factor row must stay pinned to its detected owner before sparse lookup"
+  );
+  assert.match(
+    prepare,
+    /requestVerificationCodeAlert\([\s\S]{0,320}confirmedTwoFactorOwnerPid:\s*&confirmedTwoFactorOwnerPid/,
+    "the request action must inherit only the confirmed navigation owner"
+  );
 
   const masked = functionBody("isMaskedVerificationAlertRoot");
   const maskedFinder = functionBody("findMaskedVerificationAlertRoot");
   const alertFinder = functionBody("findVerificationCodeAlertRoot");
   const alertLocator = functionBody("locateVerificationCodeAlert");
   const closeAlert = functionBody("closeVerificationCodeAlert");
-  const requestAlert = functionBody("requestVerificationCodeAlert");
   const alertReadyEvent = functionBody("emitVerificationAlertReady");
   assert.match(source, /let verificationAlertFallbackCloseButtons\s*=\s*\[/);
   assert.match(source, /let maskedVerificationAlertImageNames\s*=\s*\[/);
@@ -2543,7 +2964,303 @@ function runEvidenceDrivenSettingsNavigationContractTest() {
     prepareCall >= 0 && readyEvent > prepareCall && alertWait > readyEvent,
     "the fixed readiness event must be emitted only after the current alert preparation succeeds"
   );
-  assert.doesNotMatch(source, /ScreenCaptureKit|VNRecognize|screencapture/i);
+  assert.doesNotMatch(source, /import\s+ScreenCaptureKit|import\s+Vision|VNRecognize|SCScreenshotManager/i);
+  assert.match(source, /mac-2fa-popup-ocr/);
+}
+
+function assertSettingsVisualFallbackContract(settingsSource, visualSource, nodeSource) {
+  const functionBody = (source, name) => swiftFunctionBodyFromSource(source, name);
+  const press = functionBody(settingsSource, "pressTwoFactorNavigationUntilGetCode");
+  const bindWindow = functionBody(settingsSource, "bindTrustedSettingsNavigationVisualTarget");
+  const retainedWindow = functionBody(settingsSource, "retainsTrustedSettingsNavigationVisualTarget");
+  const refreshWindow = functionBody(settingsSource, "refreshTrustedSettingsNavigationVisualTarget");
+  const invokeVisual = functionBody(settingsSource, "requestVisualGetCodeButton");
+  const prepare = functionBody(settingsSource, "prepareVerificationCodeAlert");
+  const visualClick = functionBody(visualSource, "clickVisualSettingsGetCode");
+  const exactBoxes = functionBody(visualSource, "exactVisualSettingsGetCodeBoxes");
+  const stableBox = functionBody(visualSource, "visualSettingsGetCodeBoxIsStable");
+  const boundWindow = functionBody(visualSource, "boundOnScreenSettingsWindow");
+  const topmost = functionBody(visualSource, "targetWindowIsTopmostAtPoint");
+  const hitTest = functionBody(visualSource, "hitTestIsBoundSettingsWindow");
+
+  assert.match(nodeSource, /import\s*\{\s*resolvePrepared2FAOcrHelperPath\s*\}\s*from\s*"\.\/mac-2fa-ocr\.js"/);
+  assert.match(nodeSource, /resolvePrepared2FAOcrHelperPath\(\{\s*platform\s*\}\)/);
+  assert.match(nodeSource, /if \(visualGetCodeHelperPath\)\s*\{\s*args\.push\("--visual-get-code-helper", visualGetCodeHelperPath\)/);
+  assert.match(nodeSource, /preflightAccessibility\s*\?\s*null\s*:/);
+
+  assert.match(settingsSource, /case getCodeRequestedVisually/);
+  assert.match(press, /twoFactorNavigationVisualTarget:\s*inout\s+TrustedSettingsVisualTarget\?/);
+  assert.match(press, /visualGetCodeHelperPath:\s*String\?/);
+  assert.match(press, /var axUnavailableSince:\s*Date\?/);
+  assert.match(press, /var visualGetCodeAttempted\s*=\s*false/);
+  assert.match(press, /!visualGetCodeAttempted/);
+  assert.match(
+    press,
+    /now\.timeIntervalSince\(unavailableSince\)\s*>=\s*[\s\S]{0,120}navigationAXRecoveryIntervalMs/,
+    "visual recovery must wait through the AX-empty interval"
+  );
+  assert.match(press, /let helperPath = visualGetCodeHelperPath/);
+  const postPressAxState = press.slice(
+    press.indexOf("if hasVisibleAppleAccountNavigationEvidence("),
+    press.indexOf("if let control = findGetCodeControl(")
+  );
+  assert.match(postPressAxState, /lastNavigationEvidenceAt\s*=\s*now/);
+  assert.match(
+    postPressAxState,
+    /confirmedTwoFactorOwnerPid\s*==\s*navigationOwnerPid[\s\S]{0,240}twoFactorNavigationVisualTarget\s*!=\s*nil[\s\S]{0,180}axUnavailableSince\s*==\s*nil[\s\S]{0,120}axUnavailableSince\s*=\s*now/,
+    "the visual timer must track a missing post-press Get Code control"
+  );
+  assert.doesNotMatch(
+    postPressAxState,
+    /axUnavailableSince\s*=\s*nil/,
+    "generic Login & Security page evidence must not reset the Get Code AX timer"
+  );
+  assert.match(press, /confirmedOwnerPid == navigationOwnerPid/);
+  assert.match(press, /retainsTrustedSettingsNavigationVisualTarget\(/);
+  assert.match(press, /visualGetCodeAttempted\s*=\s*true/);
+  assert.match(press, /verificationCodeRequested\s*=\s*true/);
+  assert.match(press, /closeVerificationCodeAlert\(/);
+  assert.match(press, /refreshTrustedSettingsNavigationVisualTarget\([\s\S]{0,180}originalTarget:\s*visualTarget/);
+  assert.match(press, /twoFactorNavigationVisualTarget\s*=\s*refreshedVisualTarget/);
+  assert.match(press, /requestVisualGetCodeButton\([\s\S]{0,200}appElement:\s*appElement[\s\S]{0,160}expectedPid:\s*expectedPid[\s\S]{0,180}navigationOwnerPid:\s*refreshedVisualTarget\.ownerPid[\s\S]{0,160}navigationWindowID:\s*refreshedVisualTarget\.windowID/);
+  assert.match(press, /waitForVerificationCodeAlert\([\s\S]{0,260}return \.getCodeRequestedVisually/);
+  assert.doesNotMatch(press, /true\s*\|\|\s*waitForVerificationCodeAlert\(/);
+  assert.ok(
+    press.indexOf("requestVisualGetCodeButton(") < press.indexOf("waitForVerificationCodeAlert("),
+    "visual IPC success must still pass the normal alert gate"
+  );
+  assert.equal(
+    (settingsSource.match(/requestVisualGetCodeButton\(/g) ?? []).length,
+    2,
+    "the visual helper may only be declared and invoked from the Two-Factor press loop"
+  );
+
+  assert.match(bindWindow, /trustedSettingsNavigationOwnerElement\(/);
+  assert.match(bindWindow, /visualTargetForFocusedWindow\(navigationOwnerPid\)/);
+  assert.match(bindWindow, /windowlessAppleIDSettingsStatus\(/);
+  assert.match(bindWindow, /let settingsHost = uniqueTrustedSettingsApp\(\)/);
+  assert.match(bindWindow, /visualTargetForFocusedWindow\(settingsHost\.processIdentifier\)/);
+  const bindBeforePress = press.indexOf("let visualTarget = targetOwnerPid.flatMap");
+  const clickAfterBind = press.indexOf("clickNamedInTrustedSettingsOwnerPid(", bindBeforePress);
+  const retainBoundWindow = press.indexOf("twoFactorNavigationVisualTarget = visualTarget", clickAfterBind);
+  assert.ok(
+    bindBeforePress >= 0 && clickAfterBind > bindBeforePress && retainBoundWindow > clickAfterBind,
+    "the exact focused window must be bound before the successful Two-Factor press"
+  );
+  assert.match(retainedWindow, /visualTarget\.windowID != 0/);
+  assert.match(retainedWindow, /trustedSettingsNavigationOwnerElement\(/);
+  assert.match(retainedWindow, /isTrustedAppleIDSettingsExtension\(navigationOwner\)/);
+  assert.match(retainedWindow, /settingsHost\.processIdentifier == visualTarget\.ownerPid/);
+  assert.match(refreshWindow, /retainsTrustedSettingsNavigationVisualTarget\(/);
+  assert.match(refreshWindow, /visualTargetForFocusedWindow\(navigationOwnerPid\)/);
+  assert.match(refreshWindow, /isTrustedAppleIDSettingsExtension\(navigationOwner\)/);
+  assert.match(refreshWindow, /let settingsHost = uniqueTrustedSettingsApp\(\)/);
+  assert.match(refreshWindow, /visualTargetForFocusedWindow\(settingsHost\.processIdentifier\)/);
+  assert.match(refreshWindow, /refreshedTarget\.ownerPid == originalTarget\.ownerPid/);
+  assert.doesNotMatch(
+    refreshWindow,
+    /bindTrustedSettingsNavigationVisualTarget|windowlessAppleIDSettingsStatus/,
+    "a trusted rebind must not reread the AX-empty extension window list"
+  );
+  assert.match(
+    press,
+    /twoFactorNavigationOwnerPid\s*=\s*nil[\s\S]{0,180}confirmedTwoFactorOwnerPid\s*=\s*nil[\s\S]{0,180}twoFactorNavigationVisualTarget\s*=\s*nil/,
+    "owner invalidation must discard the confirmed owner and its bound window"
+  );
+  assert.match(prepare, /case \.getCodeRequestedVisually:\s*return \.ready/);
+  assert.match(invokeVisual, /--cancel-file/);
+  assert.match(invokeVisual, /if let cancelFilePath[\s\S]{0,180}arguments\.append\(contentsOf:\s*\["--cancel-file", cancelFilePath\]\)/);
+  assert.match(invokeVisual, /visualGetCodeCancellationRequested\(\)/);
+  assert.match(invokeVisual, /terminateVisualGetCodeChild\(/);
+  assert.match(invokeVisual, /while Date\(\) < childDeadline/);
+  assert.match(invokeVisual, /stopIfCancelled\(appElement: appElement, expectedPid: expectedPid\)/);
+
+  assert.match(visualSource, /--settings-visual-get-code/);
+  assert.match(visualSource, /--settings-owner-pid/);
+  assert.match(visualSource, /--settings-window-id/);
+  assert.match(visualSource, /CGPreflightScreenCaptureAccess\(\)/);
+  assert.match(visualClick, /AXIsProcessTrusted\(\)/);
+  assert.match(visualClick, /visualGetCodeCancellationRequested\(\)/);
+  assert.match(visualClick, /boundOnScreenSettingsWindow\(ownerPid: ownerPid, windowID: windowID\)/);
+  assert.match(visualClick, /framesAreVisuallyStable\(initialWindow\.frame, currentWindow\.frame\)/);
+  assert.match(visualClick, /framesAreVisuallyStable\(initialWindow\.frame, finalWindow\.frame\)/);
+  assert.match(visualClick, /framesAreVisuallyStable\(initialWindow\.frame, postCaptureWindow\.frame\)/);
+  assert.match(visualClick, /boxes\.count == 1/);
+  assert.match(visualClick, /finalBoxes\.count == 1/);
+  assert.match(visualClick, /visualSettingsGetCodeBoxIsStable\(boxes\[0\], finalBoxes\[0\]\)/);
+  assert.equal(
+    (visualClick.match(/captureWindowByID\(/g) ?? []).length,
+    2,
+    "the visual action must confirm the label in a fresh capture before clicking"
+  );
+  assert.match(visualClick, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point\)/);
+  assert.match(visualClick, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point\)/);
+  assert.match(visualClick, /mouseDown\.post/);
+  assert.match(visualClick, /mouseUp\.post/);
+  assert.match(visualClick, /Output\(ok: true, code: nil, source: "vision", message: "visual_get_code_clicked"\)/);
+  assert.doesNotMatch(visualClick, /logStep\(|FileHandle\.standard(?:Output|Error)|raw\s*:/i);
+  assert.match(exactBoxes, /visualSettingsGetCodeLabels\.contains\(normalizedVisualSettingsLabel\(text\)\)/);
+  assert.doesNotMatch(exactBoxes, /range\(of:|contains\(text\)|hasPrefix\(/);
+  assert.match(stableBox, /tolerance: CGFloat = 0\.005/);
+  assert.match(visualSource, /let visualSettingsGetCodeLabels: Set<String> = \[/);
+  assert.match(visualSource, /"get verification code"/);
+  assert.match(visualSource, /"get a verification code"/);
+  assert.match(boundWindow, /trustedSettingsVisualOwner\(ownerPid\)/);
+  assert.match(boundWindow, /optionOnScreenOnly/);
+  assert.match(topmost, /CGWindowListCopyWindowInfo/);
+  assert.match(topmost, /return CGWindowID\(windowNumber\.uint32Value\) == target\.windowID/);
+  assert.match(hitTest, /AXUIElementCopyElementAtPosition/);
+  assert.match(hitTest, /elementWindowID\(node\) == target\.windowID/);
+  assert.match(visualSource, /--cancel-file/);
+  assert.match(visualSource, /func visualGetCodeCancellationRequested\(\)/);
+}
+
+function runSettingsVisualFallbackContractTest() {
+  const settingsSource = readSettingsSwiftSource();
+  const visualSource = readVisualHelperSwiftSource();
+  const nodeSource = readNormalizedText(
+    new URL("./lib/mac-settings-2fa.js", import.meta.url)
+  );
+  assertSettingsVisualFallbackContract(settingsSource, visualSource, nodeSource);
+}
+
+function runSettingsVisualFallbackMutationResistanceTest() {
+  const settingsSource = readSettingsSwiftSource();
+  const visualSource = readVisualHelperSwiftSource();
+  const nodeSource = readNormalizedText(
+    new URL("./lib/mac-settings-2fa.js", import.meta.url)
+  );
+  const missingUniqueBox = visualSource.replace("boxes.count == 1", "boxes.count >= 1");
+  assert.notEqual(missingUniqueBox, visualSource, "unique-box mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(settingsSource, missingUniqueBox, nodeSource),
+    assert.AssertionError
+  );
+
+  const missingTopmostCheck = visualSource.replace(
+    "targetWindowIsTopmostAtPoint(postCaptureWindow, point)",
+    "true"
+  );
+  assert.notEqual(missingTopmostCheck, visualSource, "topmost mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(settingsSource, missingTopmostCheck, nodeSource),
+    assert.AssertionError
+  );
+
+  const repeatVisualAttempt = settingsSource.replace(
+    "!visualGetCodeAttempted",
+    "true"
+  );
+
+  const stalePrePressWindow = settingsSource.replace(
+    "navigationOwnerPid: refreshedVisualTarget.ownerPid",
+    "navigationOwnerPid: visualTarget.ownerPid"
+  ).replace(
+    "navigationWindowID: refreshedVisualTarget.windowID",
+    "navigationWindowID: visualTarget.windowID"
+  );
+
+  const rebindRequiresEmptyExtensionAx = settingsSource.replace(
+    "if originalTarget.ownerPid == navigationOwnerPid {",
+    "if windowlessAppleIDSettingsStatus(appElement: appElement, expectedPid: navigationOwnerPid) == .eligible, originalTarget.ownerPid == navigationOwnerPid {"
+  );
+  assert.notEqual(
+    rebindRequiresEmptyExtensionAx,
+    settingsSource,
+    "AX-empty rebind mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(
+      rebindRequiresEmptyExtensionAx,
+      visualSource,
+      nodeSource
+    ),
+    assert.AssertionError
+  );
+  assert.notEqual(
+    stalePrePressWindow,
+    settingsSource,
+    "pre-press window mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(
+      stalePrePressWindow,
+      visualSource,
+      nodeSource
+    ),
+    assert.AssertionError
+  );
+
+  const staleNavigationEvidenceReset = settingsSource.replace(
+    "lastNavigationEvidenceAt = now\n        } else {",
+    "lastNavigationEvidenceAt = now\n            axUnavailableSince = nil\n        } else {"
+  );
+  assert.notEqual(
+    staleNavigationEvidenceReset,
+    settingsSource,
+    "stale page-evidence reset mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(
+      staleNavigationEvidenceReset,
+      visualSource,
+      nodeSource
+    ),
+    assert.AssertionError
+  );
+  assert.notEqual(repeatVisualAttempt, settingsSource, "one-shot mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(repeatVisualAttempt, visualSource, nodeSource),
+    assert.AssertionError
+  );
+
+  const bypassAlertGate = settingsSource.replace(
+    "if alertWaitMs > 0, waitForVerificationCodeAlert(",
+    "if alertWaitMs > 0, true || waitForVerificationCodeAlert("
+  );
+  assert.notEqual(bypassAlertGate, settingsSource, "alert-gate mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(bypassAlertGate, visualSource, nodeSource),
+    assert.AssertionError
+  );
+
+  const missingFrameStability = visualSource.replace(
+    "framesAreVisuallyStable(initialWindow.frame, finalWindow.frame)",
+    "true"
+  );
+  assert.notEqual(missingFrameStability, visualSource, "frame-stability mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(settingsSource, missingFrameStability, nodeSource),
+    assert.AssertionError
+  );
+
+  const missingFreshVisualConfirmation = visualSource.replace(
+    "visualSettingsGetCodeBoxIsStable(boxes[0], finalBoxes[0])",
+    "true"
+  );
+  assert.notEqual(
+    missingFreshVisualConfirmation,
+    visualSource,
+    "fresh visual confirmation mutation fixture must apply"
+  );
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(
+      settingsSource,
+      missingFreshVisualConfirmation,
+      nodeSource
+    ),
+    assert.AssertionError
+  );
+
+  const missingCancelForwarding = settingsSource.replace(
+    "arguments.append(contentsOf: [\"--cancel-file\", cancelFilePath])",
+    "_ = cancelFilePath"
+  );
+  assert.notEqual(missingCancelForwarding, settingsSource, "cancel-forwarding mutation fixture must apply");
+  assert.throws(
+    () => assertSettingsVisualFallbackContract(missingCancelForwarding, visualSource, nodeSource),
+    assert.AssertionError
+  );
 }
 
 function runManualSettingsPrivacyContractTest() {
@@ -2597,7 +3314,10 @@ runAccessibilityPromptSourceContractTest();
 runVerificationCodeHardeningSourceContractTest();
 runStrictVerificationCodeSourceContractTest();
 runTraditionalChineseStateContractTest();
+runSparseAxNavigationRecoveryStateTest();
 runEvidenceDrivenSettingsNavigationContractTest();
+runSettingsVisualFallbackContractTest();
+runSettingsVisualFallbackMutationResistanceTest();
 runManualSettingsPrivacyContractTest();
 
 console.log("mac settings 2fa lifecycle: ok");

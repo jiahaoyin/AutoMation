@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolvePrepared2FAOcrHelperPath } from "./mac-2fa-ocr.js";
 import { resolveNativeHelperPath } from "./native-helper-path.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,10 @@ const HELPER_FAILURES = Object.freeze({
   two_factor_not_found: [
     "2FA_SETTINGS_TWO_FACTOR_NOT_FOUND",
     "2FA settings helper could not find Two-Factor Authentication",
+  ],
+  two_factor_ax_unavailable: [
+    "2FA_SETTINGS_TWO_FACTOR_AX_UNAVAILABLE",
+    "2FA settings helper could not read Two-Factor Authentication",
   ],
   verification_alert_not_opened: [
     "2FA_SETTINGS_ALERT_NOT_OPENED",
@@ -214,6 +219,12 @@ export function start2FASettingsCodeRequest(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 90_000;
   const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
   const preflightAccessibility = opts.preflightAccessibility === true;
+  // Missing Screen Recording or an out-of-date Vision helper must not block
+  // the regular AX path. The Swift helper simply keeps retrying AX until its
+  // request-wide deadline when this optional prepared path is absent.
+  const visualGetCodeHelperPath = preflightAccessibility
+    ? null
+    : resolvePrepared2FAOcrHelperPath({ platform });
   const markerDir = opts.reportDir || os.tmpdir();
   fs.mkdirSync(markerDir, { recursive: true });
   const cancelFile =
@@ -228,6 +239,9 @@ export function start2FASettingsCodeRequest(opts = {}) {
     "--cancel-file",
     cancelFile,
   ];
+  if (visualGetCodeHelperPath) {
+    args.push("--visual-get-code-helper", visualGetCodeHelperPath);
+  }
 
   const spawnProcess = runtime.spawn ?? spawn;
   let child;

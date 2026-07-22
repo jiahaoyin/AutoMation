@@ -25,6 +25,13 @@ struct Output: Codable {
     }
 }
 
+var cancelFilePath: String?
+
+func visualGetCodeCancellationRequested() -> Bool {
+    guard let cancelFilePath else { return false }
+    return FileManager.default.fileExists(atPath: cancelFilePath)
+}
+
 @_silgen_name("_AXUIElementGetWindow")
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>) -> AXError
 
@@ -161,6 +168,11 @@ let sharedHostBundleIDs: Set<String> = [
     "com.apple.systempreferences",
     "com.apple.SystemSettings",
 ]
+let appleIDSettingsExecutablePaths: Set<String> = [
+    "/System/Library/ExtensionKit/Extensions/AppleIDSettings.appex/Contents/MacOS/AppleIDSettings",
+    "/System/Applications/System Settings.app/Contents/PlugIns/AppleIDSettings.appex/Contents/MacOS/AppleIDSettings",
+    "/System/Applications/System Settings.app/Contents/PlugIns/AccountsSettingsExtension.appex/Contents/MacOS/AccountsSettingsExtension",
+]
 
 enum CandidateKind: Equatable {
     case dedicated
@@ -207,6 +219,30 @@ func isSystemSettingsSharedHost(_ app: NSRunningApplication) -> Bool {
     return executableURL.lastPathComponent == "System Settings" ||
         app.bundleIdentifier == "com.apple.systempreferences" ||
         app.bundleIdentifier == "com.apple.SystemSettings"
+}
+
+func isTrustedAppleIDSettingsExtension(_ app: NSRunningApplication) -> Bool {
+    guard let path = app.executableURL?.standardizedFileURL.path else { return false }
+    return appleIDSettingsExecutablePaths.contains(path)
+}
+
+// The visual Get Code mode receives a PID bound by the Settings AX helper. It
+// may only act on the single trusted System Settings host or AppleIDSettings
+// extension that owns that PID. This keeps the OCR branch independent from
+// arbitrary windows sharing the desktop.
+func trustedSettingsVisualOwner(_ pid: pid_t) -> NSRunningApplication? {
+    guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
+        return nil
+    }
+    if isSystemSettingsSharedHost(app) {
+        let owners = NSWorkspace.shared.runningApplications.filter(isSystemSettingsSharedHost)
+        return owners.count == 1 && owners[0].processIdentifier == pid ? app : nil
+    }
+    if isTrustedAppleIDSettingsExtension(app) {
+        let owners = NSWorkspace.shared.runningApplications.filter(isTrustedAppleIDSettingsExtension)
+        return owners.count == 1 && owners[0].processIdentifier == pid ? app : nil
+    }
+    return nil
 }
 
 func hasExplicitAppleAccountEvidence(_ blob: String) -> Bool {
@@ -510,6 +546,260 @@ func captureWindowByID(_ wid: CGWindowID) async -> CGImage? {
     }
 }
 
+struct BoundSettingsWindow {
+    let windowID: CGWindowID
+    let ownerPid: pid_t
+    let frame: CGRect
+}
+
+func framesAreVisuallyStable(
+    _ first: CGRect,
+    _ second: CGRect,
+    tolerance: CGFloat = 0.5
+) -> Bool {
+    abs(first.origin.x - second.origin.x) <= tolerance &&
+        abs(first.origin.y - second.origin.y) <= tolerance &&
+        abs(first.size.width - second.size.width) <= tolerance &&
+        abs(first.size.height - second.size.height) <= tolerance
+}
+
+func boundOnScreenSettingsWindow(
+    ownerPid: pid_t,
+    windowID: CGWindowID
+) -> BoundSettingsWindow? {
+    guard trustedSettingsVisualOwner(ownerPid) != nil, windowID != 0 else { return nil }
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let matches = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? [])
+        .compactMap { info -> BoundSettingsWindow? in
+            guard
+                let ownerPIDNumber = info[kCGWindowOwnerPID as String] as? NSNumber,
+                pid_t(ownerPIDNumber.int32Value) == ownerPid,
+                let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
+                CGWindowID(windowNumber.uint32Value) == windowID,
+                let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                frame.width > 80,
+                frame.height > 60,
+                let alpha = info[kCGWindowAlpha as String] as? NSNumber,
+                alpha.doubleValue > 0
+            else { return nil }
+            return BoundSettingsWindow(windowID: windowID, ownerPid: ownerPid, frame: frame)
+        }
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func pointIsOnActiveDisplay(_ point: CGPoint) -> Bool {
+    var displayCount: UInt32 = 0
+    guard CGGetActiveDisplayList(0, nil, &displayCount) == .success, displayCount > 0 else {
+        return false
+    }
+    var displayIDs = Array(repeating: CGDirectDisplayID(), count: Int(displayCount))
+    let status = displayIDs.withUnsafeMutableBufferPointer { buffer in
+        CGGetActiveDisplayList(displayCount, buffer.baseAddress, &displayCount)
+    }
+    guard status == .success else { return false }
+    return displayIDs.prefix(Int(displayCount)).contains { CGDisplayBounds($0).contains(point) }
+}
+
+// CGWindowList is ordered front to back. Recheck immediately before clicking,
+// so an interposed sheet, alert, or another app prevents a blind coordinate
+// event from being delivered to a changed surface.
+func targetWindowIsTopmostAtPoint(
+    _ target: BoundSettingsWindow,
+    point: CGPoint
+) -> Bool {
+    guard pointIsOnActiveDisplay(point),
+          trustedSettingsVisualOwner(target.ownerPid)?.isActive == true else {
+        return false
+    }
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+    for info in windows {
+        guard
+            let alpha = info[kCGWindowAlpha as String] as? NSNumber,
+            alpha.doubleValue > 0,
+            let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+            frame.contains(point),
+            let windowNumber = info[kCGWindowNumber as String] as? NSNumber,
+            let ownerPIDNumber = info[kCGWindowOwnerPID as String] as? NSNumber
+        else { continue }
+        return CGWindowID(windowNumber.uint32Value) == target.windowID &&
+            pid_t(ownerPIDNumber.int32Value) == target.ownerPid
+    }
+    return false
+}
+
+func elementBelongsToProcess(_ element: AXUIElement, pid: pid_t) -> Bool {
+    var actualPid: pid_t = 0
+    return AXUIElementGetPid(element, &actualPid) == .success && actualPid == pid
+}
+
+func elementWindowID(_ element: AXUIElement) -> CGWindowID? {
+    var windowID: CGWindowID = 0
+    return _AXUIElementGetWindow(element, &windowID) == .success && windowID != 0
+        ? windowID
+        : nil
+}
+
+func hitTestIsBoundSettingsWindow(
+    _ target: BoundSettingsWindow,
+    point: CGPoint
+) -> Bool {
+    let systemWide = AXUIElementCreateSystemWide()
+    var hit: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(
+        systemWide,
+        Float(point.x),
+        Float(point.y),
+        &hit
+    ) == .success, let hit, elementBelongsToProcess(hit, pid: target.ownerPid) else {
+        return false
+    }
+    var current: AXUIElement? = hit
+    for _ in 0..<12 {
+        guard let node = current, elementBelongsToProcess(node, pid: target.ownerPid) else {
+            return false
+        }
+        if elementWindowID(node) == target.windowID { return true }
+        var parent: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
+              let next = parent as? AXUIElement else { break }
+        current = next
+    }
+    return false
+}
+
+let visualSettingsGetCodeLabels: Set<String> = [
+    "get verification code",
+    "get a verification code",
+    "\u{83B7}\u{53D6}\u{9A8C}\u{8BC1}\u{7801}",
+    "\u{53D6}\u{5F97}\u{9A57}\u{8B49}\u{78BC}",
+]
+
+func normalizedVisualSettingsLabel(_ text: String) -> String {
+    text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").lowercased()
+}
+
+func exactVisualSettingsGetCodeBoxes(in cgImage: CGImage) -> [CGRect] {
+    var boxes: [CGRect] = []
+    let semaphore = DispatchSemaphore(value: 0)
+    let request = VNRecognizeTextRequest { request, _ in
+        defer { semaphore.signal() }
+        guard let observations = request.results as? [VNRecognizedTextObservation] else { return }
+        for observation in observations {
+            guard let text = observation.topCandidates(1).first?.string,
+                  visualSettingsGetCodeLabels.contains(normalizedVisualSettingsLabel(text)) else {
+                continue
+            }
+            let box = observation.boundingBox
+            guard box.width > 0.02, box.height > 0.008 else { continue }
+            boxes.append(box)
+        }
+    }
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    request.minimumTextHeight = 0.008
+    if #available(macOS 13.0, *) {
+        request.revision = VNRecognizeTextRequestRevision3
+        request.automaticallyDetectsLanguage = true
+    }
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    try? handler.perform([request])
+    semaphore.wait()
+    return boxes
+}
+
+func screenPointForVisualBox(_ box: CGRect, in window: BoundSettingsWindow) -> CGPoint? {
+    guard box.minX >= 0, box.maxX <= 1, box.minY >= 0, box.maxY <= 1 else { return nil }
+    let point = CGPoint(
+        x: window.frame.minX + box.midX * window.frame.width,
+        y: window.frame.minY + (1 - box.midY) * window.frame.height
+    )
+    return window.frame.contains(point) && pointIsOnActiveDisplay(point) ? point : nil
+}
+
+// OCR may report a bounding box with a small pixel-level variance between two
+// captures. Requiring the same unique label in the same normalized region
+// prevents an in-window redraw or sheet replacement from reusing a stale box.
+func visualSettingsGetCodeBoxIsStable(
+    _ first: CGRect,
+    _ second: CGRect,
+    tolerance: CGFloat = 0.005
+) -> Bool {
+    abs(first.origin.x - second.origin.x) <= tolerance &&
+        abs(first.origin.y - second.origin.y) <= tolerance &&
+        abs(first.size.width - second.size.width) <= tolerance &&
+        abs(first.size.height - second.size.height) <= tolerance
+}
+
+func clickVisualSettingsGetCode(
+    ownerPid: pid_t,
+    windowID: CGWindowID,
+    deadline: Date
+) async -> Output {
+    guard !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          screenCaptureCapability() == "available" else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "permission_missing")
+    }
+    guard AXIsProcessTrusted() else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "accessibility_missing")
+    }
+    guard !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          let initialWindow = boundOnScreenSettingsWindow(ownerPid: ownerPid, windowID: windowID),
+          let capture = await captureWindowByID(initialWindow.windowID),
+          !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          let currentWindow = boundOnScreenSettingsWindow(ownerPid: ownerPid, windowID: windowID),
+          framesAreVisuallyStable(initialWindow.frame, currentWindow.frame) else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "unavailable")
+    }
+    let boxes = exactVisualSettingsGetCodeBoxes(in: capture)
+    guard !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          let finalWindow = boundOnScreenSettingsWindow(ownerPid: ownerPid, windowID: windowID),
+          framesAreVisuallyStable(initialWindow.frame, finalWindow.frame),
+          let finalCapture = await captureWindowByID(finalWindow.windowID),
+          !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          let postCaptureWindow = boundOnScreenSettingsWindow(ownerPid: ownerPid, windowID: windowID),
+          framesAreVisuallyStable(initialWindow.frame, postCaptureWindow.frame) else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "unavailable")
+    }
+    let finalBoxes = exactVisualSettingsGetCodeBoxes(in: finalCapture)
+    guard !visualGetCodeCancellationRequested(),
+          Date() < deadline,
+          boxes.count == 1,
+          finalBoxes.count == 1,
+          visualSettingsGetCodeBoxIsStable(boxes[0], finalBoxes[0]),
+          let point = screenPointForVisualBox(finalBoxes[0], in: postCaptureWindow),
+          targetWindowIsTopmostAtPoint(postCaptureWindow, point),
+          hitTestIsBoundSettingsWindow(postCaptureWindow, point),
+          let source = CGEventSource(stateID: .hidSystemState),
+          let mouseDown = CGEvent(
+              mouseEventSource: source,
+              mouseType: .leftMouseDown,
+              mouseCursorPosition: point,
+              mouseButton: .left
+          ),
+          let mouseUp = CGEvent(
+              mouseEventSource: source,
+              mouseType: .leftMouseUp,
+              mouseCursorPosition: point,
+              mouseButton: .left
+          ) else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "unavailable")
+    }
+    guard !visualGetCodeCancellationRequested(), Date() < deadline else {
+        return Output(ok: false, code: nil, source: "vision", message: "visual_get_code_not_clicked", capability: "unavailable")
+    }
+    mouseDown.post(tap: .cghidEventTap)
+    mouseUp.post(tap: .cghidEventTap)
+    return Output(ok: true, code: nil, source: "vision", message: "visual_get_code_clicked")
+}
+
 // Screen Recording can still inspect a window when Accessibility is denied to
 // this helper. Keep the fallback limited to dedicated Apple authentication
 // processes plus the System Settings Apple Account sheet, which must pass
@@ -688,6 +978,9 @@ var timeoutSec = 8
 var preflightScreenCapture = false
 var promptScreenCapture = false
 var settingsAlertOnly = false
+var settingsVisualGetCode = false
+var settingsVisualOwnerPid: pid_t?
+var settingsVisualWindowID: CGWindowID?
 var i = 1
 while i < CommandLine.arguments.count {
     if CommandLine.arguments[i] == "--preflight-screen-capture" {
@@ -705,6 +998,30 @@ while i < CommandLine.arguments.count {
         i += 1
         continue
     }
+    if CommandLine.arguments[i] == "--settings-visual-get-code" {
+        settingsVisualGetCode = true
+        i += 1
+        continue
+    }
+    if CommandLine.arguments[i] == "--settings-owner-pid", i + 1 < CommandLine.arguments.count {
+        if let parsed = Int32(CommandLine.arguments[i + 1]), parsed > 0 {
+            settingsVisualOwnerPid = pid_t(parsed)
+        }
+        i += 2
+        continue
+    }
+    if CommandLine.arguments[i] == "--settings-window-id", i + 1 < CommandLine.arguments.count {
+        if let parsed = UInt32(CommandLine.arguments[i + 1]), parsed > 0 {
+            settingsVisualWindowID = CGWindowID(parsed)
+        }
+        i += 2
+        continue
+    }
+    if CommandLine.arguments[i] == "--cancel-file", i + 1 < CommandLine.arguments.count {
+        cancelFilePath = CommandLine.arguments[i + 1]
+        i += 2
+        continue
+    }
     if CommandLine.arguments[i] == "--timeout", i + 1 < CommandLine.arguments.count {
         timeoutSec = Int(CommandLine.arguments[i + 1]) ?? timeoutSec
         i += 2
@@ -720,6 +1037,35 @@ if preflightScreenCapture {
         source: nil,
         message: "preflight",
         capability: screenCaptureCapability(requestPermission: promptScreenCapture)
+    ))
+}
+
+if settingsVisualGetCode {
+    guard let ownerPid = settingsVisualOwnerPid,
+          let windowID = settingsVisualWindowID else {
+        emit(Output(
+            ok: false,
+            code: nil,
+            source: "vision",
+            message: "visual_get_code_not_clicked",
+            capability: "unavailable"
+        ))
+    }
+    if visualGetCodeCancellationRequested() {
+        emit(Output(
+            ok: false,
+            code: nil,
+            source: "vision",
+            message: "cancelled",
+            capability: "unavailable"
+        ))
+    }
+    let visualTimeoutSec = min(2, max(1, timeoutSec))
+    let visualDeadline = Date().addingTimeInterval(TimeInterval(visualTimeoutSec))
+    emit(await clickVisualSettingsGetCode(
+        ownerPid: ownerPid,
+        windowID: windowID,
+        deadline: visualDeadline
     ))
 }
 

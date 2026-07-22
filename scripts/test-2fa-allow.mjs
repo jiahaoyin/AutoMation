@@ -2269,11 +2269,36 @@ test("AX popup helpers fail closed while OCR keeps its screen-recording fallback
   assert.match(sidecarSource, /status\("popup_accessibility"/);
 });
 
-test("OCR path remains read-only, window-bound, memory-only, and secret-free", () => {
-  assert.doesNotMatch(
+test("OCR stays read-only except for the constrained Settings visual Get Code action", () => {
+  const visualGetCode = sourceFunctionBody(
     popupOcrSwiftSource,
+    "func clickVisualSettingsGetCode"
+  );
+  const visualCancellation = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func visualGetCodeCancellationRequested"
+  );
+  const nonVisualOcr = popupOcrSwiftSource
+    .replace(visualGetCode, "")
+    .replace(visualCancellation, "");
+  assert.doesNotMatch(
+    nonVisualOcr,
     /AXUIElementPerformAction|CGEvent|screencapture|NSTemporaryDirectory|FileManager\.default|\.png/
   );
+  assert.doesNotMatch(visualGetCode, /AXUIElementPerformAction|screencapture|NSTemporaryDirectory|FileManager\.default|\.png/);
+  assert.match(visualGetCode, /AXIsProcessTrusted\(\)/);
+  assert.match(visualGetCode, /visualGetCodeCancellationRequested\(\)/);
+  assert.match(visualGetCode, /framesAreVisuallyStable\(initialWindow\.frame, currentWindow\.frame\)/);
+  assert.match(visualGetCode, /framesAreVisuallyStable\(initialWindow\.frame, finalWindow\.frame\)/);
+  assert.match(visualGetCode, /framesAreVisuallyStable\(initialWindow\.frame, postCaptureWindow\.frame\)/);
+  assert.match(visualGetCode, /finalBoxes\.count == 1/);
+  assert.match(visualGetCode, /visualSettingsGetCodeBoxIsStable\(boxes\[0\], finalBoxes\[0\]\)/);
+  assert.match(visualGetCode, /boxes\.count == 1/);
+  assert.match(visualGetCode, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point\)/);
+  assert.match(visualGetCode, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point\)/);
+  assert.match(visualGetCode, /mouseDown\.post/);
+  assert.match(visualGetCode, /mouseUp\.post/);
+  assert.match(visualGetCode, /Output\(ok: true, code: nil, source: "vision", message: "visual_get_code_clicked"\)/);
   assert.match(
     sourceFunctionBody(popupOcrSwiftSource, "func screenCaptureCapability"),
     /if requestPermission[\s\S]*CGRequestScreenCaptureAccess\(\)/,
@@ -2310,8 +2335,19 @@ test("OCR capture is window-id-only and stays in ScreenCaptureKit memory", () =>
   assert.match(capture, /SCContentFilter\(desktopIndependentWindow: window\)/);
   assert.match(capture, /SCScreenshotManager\.captureImage/);
   assert.match(capture, /configuration\.showsCursor = false/);
-  assert.doesNotMatch(
+  const visualGetCode = sourceFunctionBody(
     popupOcrSwiftSource,
+    "func clickVisualSettingsGetCode"
+  );
+  const visualCancellation = sourceFunctionBody(
+    popupOcrSwiftSource,
+    "func visualGetCodeCancellationRequested"
+  );
+  const nonVisualOcr = popupOcrSwiftSource
+    .replace(visualGetCode, "")
+    .replace(visualCancellation, "");
+  assert.doesNotMatch(
+    nonVisualOcr,
     /\bProcess\s*\(|screencapture|waitUntilExit|NSTemporaryDirectory|FileManager\.default|\.png/
   );
 });

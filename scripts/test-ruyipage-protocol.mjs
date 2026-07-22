@@ -2637,7 +2637,11 @@ async function runNodeRunnerPendingEventBackendTimeoutPrioritySelfTest() {
     script: fileURLToPath(import.meta.url),
     cwd: root,
     args: ["--hang-after-ready-child"],
-    timeoutMs: 120,
+    // This case must observe the child `ready` event before the backend
+    // deadline races the deliberately pending handler.  A 120ms process
+    // budget is shorter than cold Node startup on some supported Windows
+    // hosts, so it was testing scheduler speed rather than runner behavior.
+    timeoutMs: 1_000,
     killGraceMs: 100,
     eventHandlerTimeoutMs: 5_000,
   });
@@ -2657,7 +2661,7 @@ async function runNodeRunnerPendingEventBackendTimeoutPrioritySelfTest() {
       "runner hung after backend timeout with a pending onEvent handler"
     ),
     (error) => {
-      assert.equal(error.message, "ruyipage backend timed out after 120ms");
+      assert.equal(error.message, "ruyipage backend timed out after 1000ms");
       return true;
     }
   );

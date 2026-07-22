@@ -148,6 +148,14 @@ function is2FAOcrHelperPrepared(options = {}) {
   );
 }
 
+// Runtime callers must use only the install-prepared Vision helper. The
+// Settings navigator consumes this path for its narrowly bound visual button
+// recovery; it never triggers a compile while a 2FA request is in flight.
+export function resolvePrepared2FAOcrHelperPath(options = {}) {
+  const binaryPath = options.binaryPath ?? OCR_BIN;
+  return is2FAOcrHelperPrepared({ ...options, binaryPath }) ? binaryPath : null;
+}
+
 export function parseOcrResult(stdout) {
   const line = String(stdout ?? "").trim().split(/\r?\n/).pop() || "";
   try {

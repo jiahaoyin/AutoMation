@@ -2379,7 +2379,6 @@ async function settingsOcrUnavailableStopsRetryingTest() {
   });
   await collector.prepare();
   const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
-  const rejected = assert.rejects(codePromise, /disposed/i);
 
   await waitForClockCondition(
     clock,
@@ -2392,18 +2391,60 @@ async function settingsOcrUnavailableStopsRetryingTest() {
     statuses.filter(({ status, source }) => status === "ocr_permission_missing" && source === "settings"),
     [{ status: "ocr_permission_missing", source: "settings", remainingSec: 30 }]
   );
-  assert.equal(
-    audits.some(
-      ({ phase, source, capability, reason }) =>
-        phase === "settings_ocr" &&
-        source === "vision" &&
-        capability === "permission_missing" &&
-        reason === "ocr_permission_missing"
-    ),
-    true
+  const permissionAudits = audits.filter(
+    ({ phase, source, capability, reason }) =>
+      phase === "settings_ocr" &&
+      source === "vision" &&
+      capability === "permission_missing" &&
+      reason === "ocr_permission_missing"
   );
+  assert.equal(permissionAudits.length, 1);
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(native.stats.settingsCancels, 0);
+  native.settingsRequests[0].resolve({ code: "246810" });
+  await clock.flush();
+  assert.equal(await codePromise, "246810");
   await collector.dispose();
-  await rejected;
+}
+
+async function settingsOcrHelperUnavailableStopsRetryingTest() {
+  const { clock, native, collector, statuses, audits } = createHarness({
+    settingsOnly: true,
+    manualFallback: false,
+    settingsOcrResults: [{ code: null, capability: "unavailable" }],
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode({ generation: 1, rejectPrevious: false });
+
+  await waitForClockCondition(
+    clock,
+    () => native.stats.settingsOcrReads.length === 1,
+    "Settings OCR worker did not start"
+  );
+  await clock.advance(1_000);
+  assert.equal(
+    native.stats.settingsOcrReads.length,
+    1,
+    "an unavailable Settings OCR helper must not retry"
+  );
+  assert.deepEqual(
+    statuses.filter(({ status, source }) => status === "ocr_helper_unavailable" && source === "settings"),
+    [{ status: "ocr_helper_unavailable", source: "settings", remainingSec: 30 }]
+  );
+  const unavailableAudits = audits.filter(
+    ({ phase, source, capability, reason }) =>
+      phase === "settings_ocr" &&
+      source === "vision" &&
+      capability === "unavailable" &&
+      reason === "ocr_helper_unavailable"
+  );
+  assert.equal(unavailableAudits.length, 1);
+  assert.equal(native.stats.settingsStarts, 1);
+  assert.equal(native.stats.settingsCancels, 0);
+  native.settingsRequests[0].resolve({ code: "864209" });
+  await clock.flush();
+  assert.equal(await codePromise, "864209");
+  await collector.dispose();
 }
 
 async function settingsOcrRetryTimerStopsWhenSettingsWinsTest() {
@@ -3927,6 +3968,7 @@ const focusedTests = {
   "settings-ocr-native-cleanup": settingsOcrWinnerWaitsForNativeAlertCleanupTest,
   "settings-ocr-retry-cleanup": settingsOcrRetryTimerStopsWhenSettingsWinsTest,
   "settings-ocr-unavailable": settingsOcrUnavailableStopsRetryingTest,
+  "settings-ocr-helper-unavailable": settingsOcrHelperUnavailableStopsRetryingTest,
   "settings-only-manual": settingsOnlyManualFallbackStartsAtNinetySecondsTest,
   "settings-only-accessibility-manual": settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest,
   "settings-only-generation": settingsOnlyGenerationTwoRejectsPreviousCodeTest,
@@ -4010,6 +4052,7 @@ await environmentCannotShortenPopupPrimaryWindowTest();
   await settingsOcrWinnerWaitsForNativeAlertCleanupTest();
   await settingsOcrRetryTimerStopsWhenSettingsWinsTest();
   await settingsOcrUnavailableStopsRetryingTest();
+  await settingsOcrHelperUnavailableStopsRetryingTest();
   await settingsOnlyManualFallbackStartsAtNinetySecondsTest();
   await settingsOnlyAccessibilityFailureKeepsManualFallbackOnScheduleTest();
   await settingsOnlyGenerationTwoRejectsPreviousCodeTest();

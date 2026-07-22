@@ -60,6 +60,52 @@ The browser action is always ruyiPage BiDi. No Playwright, Puppeteer,
 Selenium, JavaScript `dispatchEvent`, coordinate OCR click, or root-context
 keyboard fallback is used for browser input.
 
+## macOS System Settings AX Recovery
+
+System Settings is only used to obtain a code when the Apple verification
+popup is unavailable. On current macOS releases the AppleIDSettings
+ExtensionKit accessibility subtree can become empty after a confirmed
+`Two-Factor Authentication` press even though the visible `Get Verification
+Code` control is still present. The Settings helper first retries normal AX
+discovery. After a confirmed Two-Factor press, it measures the missing `Get
+Verification Code` control itself rather than treating residual Login &
+Security page chrome as recovery. It considers the visual recovery only after
+that post-press AX gap has remained stable for two seconds.
+
+The recovery is deliberately narrow:
+
+1. Before the successful Two-Factor press, it binds either the direct trusted
+   Settings window or, for a windowless AppleIDSettings extension, the unique
+   trusted System Settings host window. That owner identity remains the trust
+   anchor. If the press replaces the main window with a same-owner sheet, the
+   helper refreshes only to that owner's current focused window. The refresh
+   uses the already-confirmed owner chain rather than rereading the empty
+   ExtensionKit AX window list; it never scans or selects an arbitrary
+   on-screen window.
+2. A prepared Vision helper may make one click only. It requires both
+   Accessibility and Screen Recording, captures the bound window in memory,
+   recognizes exactly one fixed `Get Verification Code` label in English,
+   Simplified Chinese, or Traditional Chinese, and never writes a screenshot,
+   OCR text, or code to disk.
+3. It captures the bound window twice in memory. Both captures must contain
+   exactly one label in the same normalized region; the bound frame must stay
+   stable before, between, and after those captures. It then rechecks the
+   active display, topmost ownership at the click point, and AX hit-test
+   ownership immediately before posting the click. Any changed frame,
+   in-window redraw, overlay, ambiguous label, cancellation marker, or missing
+   permission stops without an action.
+4. A successful child response is not treated as success by itself. The
+   parent still waits for the normal masked verification-code alert; otherwise
+   the Settings attempt remains a fixed failure and does not publish a code.
+
+For a supervised Mac test, `2FA_SETTINGS_TWO_FACTOR_AX_UNAVAILABLE` means the
+normal AX route remained unreadable and the visual route was unavailable or
+could not prove its bound click. Check only the fixed prerequisites: the
+install-prepared `mac-2fa-popup-ocr` helper, Accessibility, Screen Recording,
+and that the System Settings window stayed foregrounded. `2FA_SETTINGS_ALERT_NOT_OPENED`
+means a visual or AX request did not produce the required masked alert within
+its bounded confirmation wait. The audit remains code-free in both cases.
+
 On failure, inspect `flow-audit.jsonl` for the `account_browser` event
 `runner_failed`. Its fixed details include:
 

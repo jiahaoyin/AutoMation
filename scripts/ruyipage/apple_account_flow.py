@@ -1725,7 +1725,7 @@ def ensure_remember_checked(
     raise RuntimeError("remember-account checkbox not found")
 
 
-def detect_shadow_root_state(root: Any) -> dict[str, bool]:
+def detect_shadow_root_state(root: Any) -> dict[str, Any]:
     try:
         raw = root.run_js(
             r"""
@@ -1736,6 +1736,7 @@ def detect_shadow_root_state(root: Any) -> dict[str, bool]:
                   hasStrongText: false,
                   semanticTargetCount: 0,
                   digitCellCount: 0,
+                  codeInputCount: 0,
                   trustPrompt: false,
                   otpRejected: false,
                   blocked: false,
@@ -1787,6 +1788,10 @@ def detect_shadow_root_state(root: Any) -> dict[str, bool]:
                 hasStrongText: strongTwoFactorText,
                 semanticTargetCount: semanticTargets.length,
                 digitCellCount: digitCells.length,
+                codeInputCount: new Set([
+                  ...semanticTargets,
+                  ...(digitCells.length === 6 ? digitCells : [])
+                ]).size,
                 trustPrompt: /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body),
                 otpRejected,
                 blocked,
@@ -1802,12 +1807,21 @@ def detect_shadow_root_state(root: Any) -> dict[str, bool]:
         evidence = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(evidence, dict):
             return {}
+        semantic_target_count = int(evidence.get("semanticTargetCount") or 0)
+        digit_cell_count = int(evidence.get("digitCellCount") or 0)
+        raw_code_input_count = evidence.get("codeInputCount")
+        code_input_count = (
+            raw_code_input_count
+            if type(raw_code_input_count) is int and raw_code_input_count >= 0
+            else None
+        )
         return {
             "twofa": classify_strong_two_factor(
                 has_strong_text=evidence.get("hasStrongText") is True,
-                semantic_target_count=int(evidence.get("semanticTargetCount") or 0),
-                digit_cell_count=int(evidence.get("digitCellCount") or 0),
+                semantic_target_count=semantic_target_count,
+                digit_cell_count=digit_cell_count,
             ),
+            "codeInputCount": code_input_count,
             "trustPrompt": evidence.get("trustPrompt") is True,
             "otpRejected": evidence.get("otpRejected") is True,
             "blocked": evidence.get("blocked") is True,
@@ -2589,7 +2603,27 @@ def is_account_manage_url(url: str) -> bool:
     )
 
 
-def confirmed_account_manage_state(page: Any) -> dict[str, Any] | None:
+def is_retiring_post_otp_child_error(state: dict[str, Any]) -> bool:
+    """Recognize an old idmsa error shell after the account root has won."""
+    code_input_count = state.get("codeInputCount")
+    return bool(
+        (state.get("error") or state.get("otpRejected"))
+        and not any(
+            bool(state.get(key))
+            for key in ("trustPrompt", "blocked", "password", "email")
+        )
+        # A missing count is not proof that the widget has disappeared. This
+        # fails closed so live Shadow DOM OTP cells can never be ignored.
+        and type(code_input_count) is int
+        and code_input_count == 0
+    )
+
+
+def confirmed_account_manage_state(
+    page: Any,
+    *,
+    allow_retiring_child_errors: bool = False,
+) -> dict[str, Any] | None:
     """Accept the account root redirect only when no live auth UI contradicts it."""
     if not browser_connection_is_alive(page):
         return None
@@ -2612,6 +2646,7 @@ def confirmed_account_manage_state(page: Any) -> dict[str, Any] | None:
         "email",
     )
     root_state: dict[str, Any] | None = None
+    root_account_session_ready = False
     for scope in iter_page_scopes(page):
         try:
             state = detect_scope_login_state(scope)
@@ -2625,12 +2660,17 @@ def confirmed_account_manage_state(page: Any) -> dict[str, Any] | None:
                 return None
             if any(bool(state.get(key)) for key in blockers):
                 return None
+            root_account_session_ready = bool(state.get("accountMarker"))
         else:
             if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
                 continue
             if not scope_has_live_frame_chain(page, scope):
                 continue
-            if any(bool(state.get(key)) for key in blockers):
+            if any(bool(state.get(key)) for key in blockers) and not (
+                allow_retiring_child_errors
+                and root_account_session_ready
+                and is_retiring_post_otp_child_error(state)
+            ):
                 return None
 
         if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
@@ -2641,7 +2681,12 @@ def confirmed_account_manage_state(page: Any) -> dict[str, Any] | None:
             shadow_roots = []
         for root in list(shadow_roots or []):
             shadow_state = detect_shadow_root_state(root)
-            if any(bool(shadow_state.get(key)) for key in blockers):
+            if any(bool(shadow_state.get(key)) for key in blockers) and not (
+                scope is not page
+                and allow_retiring_child_errors
+                and root_account_session_ready
+                and is_retiring_post_otp_child_error(shadow_state)
+            ):
                 return None
 
     if root_state is None:
@@ -2916,8 +2961,14 @@ def wait_for_signed_in(
     allow_post_otp_clicks = not (
         submitted and submission_method == "automatic"
     )
+    allow_retiring_child_errors = bool(
+        submitted and submission_method == "automatic" and otp_generation is not None
+    )
     while time.monotonic() < deadline:
-        direct_session_state = confirmed_account_manage_state(page)
+        direct_session_state = confirmed_account_manage_state(
+            page,
+            allow_retiring_child_errors=allow_retiring_child_errors,
+        )
         if direct_session_state is not None:
             return direct_session_state
         try:
@@ -2949,6 +3000,18 @@ def wait_for_signed_in(
             last_state["trusted"] = True
             return last_state
         if last_state.get("error"):
+            if (
+                allow_retiring_child_errors
+                and is_account_manage_url(str(last_state.get("href") or ""))
+                and not last_state.get("rootError")
+                and submission_transition_deadline is not None
+                and time.monotonic() < submission_transition_deadline
+            ):
+                # Account HTML can hydrate after the old idmsa child reports a
+                # generic error. The direct root-session probe above remains
+                # authoritative once the account marker appears.
+                human_pause(350, 700)
+                continue
             if otp_retry_allowed(last_state, otp_generation):
                 return {**last_state, "retry2FA": True}
             raise RuntimeError("2FA/login failed")
@@ -4362,7 +4425,7 @@ def run_cli(argv: list[str]) -> int:
             "success": False,
             "error": TOP_LEVEL_FAILURE_REASON,
         }
-        if browser_broker_mode_enabled() and browser_startup_stage in BROWSER_STARTUP_STAGES:
+        if browser_startup_stage in BROWSER_STARTUP_STAGES:
             result["failureStage"] = browser_startup_stage
         emit(result)
         print(TOP_LEVEL_FAILURE_REASON, file=sys.stderr, flush=True)
