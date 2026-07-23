@@ -1,5 +1,5 @@
 -- macOS 15 (Sequoia)：系统设置 → Apple Account 登录
--- v1.0.27：索引式 BFS（不缓存 AX 元素引用）；stderr 逐步日志；两阶段填表
+-- v1.0.28：按 AXIdentifier 精确定位登录控件；密码阶段重新解析动态 AX 路径
 -- 凭证：APPLE_SCRIPT_APPLE_ID、APPLE_SCRIPT_PASSWORD
 
 on logStep(n, msg)
@@ -25,16 +25,15 @@ on readCredentials()
 	return {appleId, applePassword}
 end readCredentials
 
--- 在 parent 下按 BFS 找第 nth 个非搜索文本框（1-based）
+-- 在 parent 下按 BFS 找精确 AXIdentifier；不缓存跨状态转换的 AX 元素引用
 -- 返回 {found, pathString}，pathString 如 "2/1/3"
 using terms from application "System Events"
-on bfsNthTextField(parentRef, wantIndex, maxDepth)
+on bfsElementWithIdentifier(parentRef, wantedIdentifier, maxDepth)
 	set tfQueueEls to {parentRef}
 	set tfQueuePaths to {""}
 	set tfQueueDepths to {0}
-	set tfCount to 0
 	set queueIndex to 1
-	repeat 250 times
+	repeat 600 times
 		if queueIndex > (count of tfQueueEls) then exit repeat
 		set curEl to item queueIndex of tfQueueEls
 		set curPath to item queueIndex of tfQueuePaths
@@ -44,52 +43,39 @@ on bfsNthTextField(parentRef, wantIndex, maxDepth)
 			set childCount to count of UI elements of curEl
 			repeat with ci from 1 to childCount
 				set childEl to UI element ci of curEl
-				set c to ""
-				set roleDesc to ""
-				set elDesc to ""
+				set identifierValue to ""
 				try
-					set c to class of childEl as text
+					set identifierValue to value of attribute "AXIdentifier" of childEl as text
 				end try
-				try
-					set roleDesc to value of attribute "AXRoleDescription" of childEl
-				end try
-				try
-					set elDesc to description of childEl
-				end try
-				if elDesc is "" then
-					try
-						set elDesc to name of childEl
-					end try
-				end if
 				set childPath to curPath
 				if childPath is "" then
 					set childPath to (ci as text)
 				else
 					set childPath to curPath & "/" & (ci as text)
 				end if
-				if c is in {"text field", "text area", "combo box"} then
-					set isSearch to false
-					if roleDesc contains "搜索" then set isSearch to true
-					if elDesc contains "搜索" then set isSearch to true
-					if not isSearch then
-						set tfCount to tfCount + 1
-						if tfCount is wantIndex then
-							return {true, childPath}
-						end if
-					end if
+				if identifierValue is wantedIdentifier then
+					return {true, childPath}
 				end if
-				if c is in {"group", "scroll area", "split group", "tab group", "splitter group"} then
-					if curDepth < maxDepth then
-						set end of tfQueueEls to childEl
-						set end of tfQueuePaths to childPath
-						set end of tfQueueDepths to (curDepth + 1)
-					end if
+				if curDepth < maxDepth then
+					set end of tfQueueEls to childEl
+					set end of tfQueuePaths to childPath
+					set end of tfQueueDepths to (curDepth + 1)
 				end if
 			end repeat
 		end try
 	end repeat
 	return {false, ""}
-end bfsNthTextField
+end bfsElementWithIdentifier
+
+-- 每一轮从 live root 重新构建路径，避免 Continue 后 System Settings 重绘造成旧引用失效
+on waitForIdentifierPath(parentRef, wantedIdentifier, maxAttempts, pauseSeconds)
+	repeat maxAttempts times
+		set identifierResult to my bfsElementWithIdentifier(parentRef, wantedIdentifier, 12)
+		if item 1 of identifierResult then return identifierResult
+		delay pauseSeconds
+	end repeat
+	return {false, ""}
+end waitForIdentifierPath
 
 on resolvePath(rootRef, pathString)
 	if pathString is "" then return rootRef
@@ -104,55 +90,128 @@ on resolvePath(rootRef, pathString)
 	return el
 end resolvePath
 
-on fillFieldAtPath(rootRef, pathString, textValue)
-	set fieldEl to my resolvePath(rootRef, pathString)
-	set the clipboard to textValue
+-- A stored child-index path is only a locator hint. Re-check its live leaf before every action.
+on resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
 	try
+		set el to my resolvePath(rootRef, pathString)
+		set identifierValue to ""
+		try
+			set identifierValue to value of attribute "AXIdentifier" of el as text
+		end try
+		if identifierValue is wantedIdentifier then return el
+	end try
+	return missing value
+end resolveIdentifierPath
+
+on fieldHasEnabledFocus(fieldEl)
+	try
+		if not (enabled of fieldEl) then return false
+		if not (focused of fieldEl) then return false
+		return true
+	end try
+	return false
+end fieldHasEnabledFocus
+
+on fillFieldAtPath(rootRef, pathString, textValue, verificationKind, wantedIdentifier)
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	if fieldEl is missing value then return {false, false}
+	try
+		if not (enabled of fieldEl) then return {false, false}
 		click fieldEl
 	on error
 		try
 			perform action "AXRaise" of fieldEl
+		on error
+			return {false, false}
 		end try
 	end try
 	delay 0.35
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	if fieldEl is missing value then return {false, false}
 	try
+		if not (enabled of fieldEl) then return {false, false}
 		set focused of fieldEl to true
+	on error
+		return {false, false}
 	end try
 	delay 0.12
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	if fieldEl is missing value then return {false, false}
+	if not (my fieldHasEnabledFocus(fieldEl)) then return {false, false}
+
+	set valueWriteAttempted to false
 	try
 		set value of fieldEl to textValue
+		set valueWriteAttempted to true
 	end try
 	delay 0.2
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	if fieldEl is missing value then
+		if valueWriteAttempted then return {true, false}
+		return {false, false}
+	end if
+	if not (my fieldHasEnabledFocus(fieldEl)) then
+		if valueWriteAttempted then return {true, false}
+		return {false, false}
+	end if
+
+	set the clipboard to textValue
 	keystroke "a" using command down
 	delay 0.08
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	if fieldEl is missing value then return {true, false}
+	if not (my fieldHasEnabledFocus(fieldEl)) then return {true, false}
 	keystroke "v" using command down
 	delay 0.45
 	set fieldVal to ""
 	try
 		set fieldVal to value of fieldEl as text
 	end try
-	return fieldVal
+	if verificationKind is "email" then
+		if fieldVal is textValue then return {true, true}
+		return {true, false}
+	end if
+	if verificationKind is "password" then
+		set minimumLength to count of textValue
+		if minimumLength > 4 then set minimumLength to 4
+		if (count of fieldVal) is greater than or equal to minimumLength then return {true, true}
+		return {true, false}
+	end if
+	return {true, false}
 end fillFieldAtPath
 
-on clickButtonNamed(targetW, btnNames)
-	repeat with btnName in btnNames
-		try
-			set b to button btnName of targetW
-			if enabled of b then
-				click b
-				return true
-			end if
-		end try
-		try
-			set b to first button of targetW whose name is btnName
-			if enabled of b then
-				click b
-				return true
-			end if
-		end try
+-- Re-find only when a re-render invalidated the saved path; never repeat a failed credential write.
+on fillIdentifierField(targetW, wantedIdentifier, textValue, verificationKind, maxAttempts, pauseSeconds)
+	repeat maxAttempts times
+		set fieldResult to my bfsElementWithIdentifier(targetW, wantedIdentifier, 12)
+		if item 1 of fieldResult then
+			set fillResult to my fillFieldAtPath(targetW, item 2 of fieldResult, textValue, verificationKind, wantedIdentifier)
+			if item 1 of fillResult then return item 2 of fillResult
+		end if
+		delay pauseSeconds
 	end repeat
 	return false
-end clickButtonNamed
+end fillIdentifierField
+
+-- LOGIN_BUTTON must be found by AXIdentifier and enabled before pressing it.
+on clickLoginButton(targetW, maxAttempts, pauseSeconds)
+	repeat maxAttempts times
+		set buttonResult to my bfsElementWithIdentifier(targetW, "LOGIN_BUTTON", 12)
+		if item 1 of buttonResult then
+			try
+				set buttonEl to my resolveIdentifierPath(targetW, item 2 of buttonResult, "LOGIN_BUTTON")
+				if buttonEl is not missing value then
+					if enabled of buttonEl then
+						click buttonEl
+						return true
+					end if
+				end if
+			end try
+		end if
+		delay pauseSeconds
+	end repeat
+	return false
+end clickLoginButton
 end using terms from
 
 on run argv
@@ -231,75 +290,52 @@ on run argv
 			set frontmost to true
 			delay 0.5
 
-			set wTitle to ""
-			try
-				set wTitle to name of targetW
-			end try
-			my logStep(4, "target window index=" & targetWinIndex & " title=" & wTitle)
+			my logStep(4, "target login window index=" & targetWinIndex)
 
-			-- BFS 找第 1 个非搜索文本框（邮箱）
-			set emailResult to my bfsNthTextField(targetW, 1, 12)
+			-- 首屏的 Apple Account 输入框由 AXIdentifier 唯一标识，不能按文本框序号猜测。
+			set emailResult to my waitForIdentifierPath(targetW, "USERNAME_TEXT_FIELD", 12, 0.25)
 			set emailFound to item 1 of emailResult
 			set emailPath to item 2 of emailResult
 			if not emailFound then
-				error "未找到登录邮箱输入框（BFS 无非搜索文本栏）"
+				error "未找到登录邮箱输入框（USERNAME_TEXT_FIELD）"
 			end if
-			my logStep(5, "found email field path=" & emailPath)
+			my logStep(5, "found USERNAME_TEXT_FIELD")
 
-			set fieldVal to my fillFieldAtPath(targetW, emailPath, appleId)
-			if fieldVal contains "@" then
-				my logStep(6, "email fill verified contains @")
-			else
-				my logStep(6, "email fill fieldVal empty or no @")
-			end if
-
-			set emailFilled to false
-			if fieldVal contains "@" then
-				if fieldVal is appleId or fieldVal contains appleId or appleId contains fieldVal then
-					set emailFilled to true
-				end if
-			end if
+			set emailFilled to my fillIdentifierField(targetW, "USERNAME_TEXT_FIELD", appleId, "email", 3, 0.15)
 			if not emailFilled then
-				error "邮箱未成功填入登录框。fieldVal=" & fieldVal
+				error "邮箱未成功填入登录框"
 			end if
 			my logStep(7, "email verified ok")
 
 			delay 0.4
-			set contNames to {"Continue", "继续", "Next", "下一步"}
-			set clickedCont to my clickButtonNamed(targetW, contNames)
+			set clickedCont to my clickLoginButton(targetW, 10, 0.2)
 			if clickedCont then
 				my logStep(8, "clicked Continue")
-				delay 2
 			else
-				my logStep(8, "Continue not found — may be single-step login")
+				error "未找到或未启用登录继续按钮（LOGIN_BUTTON）"
 			end if
 
-			-- 密码：重新 BFS 第 2 个文本框（或第 1 个若仅一个且已填邮箱）
-			set pwdResult to my bfsNthTextField(targetW, 2, 12)
+			-- Continue 后窗口会重绘；每轮从当前窗口重新解析 PASSWORD_TEXT_FIELD 的路径。
+			set pwdResult to my waitForIdentifierPath(targetW, "PASSWORD_TEXT_FIELD", 18, 0.35)
 			set pwdFound to item 1 of pwdResult
 			set pwdPath to item 2 of pwdResult
 
 			if not pwdFound then
-				set pwdResult to my bfsNthTextField(targetW, 1, 12)
-				set pwdFound to item 1 of pwdResult
-				set pwdPath to item 2 of pwdResult
+				error "未在限定时间内找到密码输入框（PASSWORD_TEXT_FIELD）"
 			end if
 
-			if pwdFound then
-				my logStep(9, "found password field path=" & pwdPath)
-				set pwdVal to my fillFieldAtPath(targetW, pwdPath, applePassword)
-				my logStep(10, "password filled len=" & (count of pwdVal))
-			else
-				my logStep(9, "password field not visible — email-only phase done")
+			my logStep(9, "found PASSWORD_TEXT_FIELD")
+			set passwordFilled to my fillIdentifierField(targetW, "PASSWORD_TEXT_FIELD", applePassword, "password", 3, 0.15)
+			if not passwordFilled then
+				error "密码未成功填入登录框"
 			end if
+			my logStep(10, "password verified ok")
 
 			delay 0.4
-			set loginNames to {"Sign In", "Sign in", "登录", "登入", "Continue", "继续", "Next", "下一步"}
-			if my clickButtonNamed(targetW, loginNames) then
+			if my clickLoginButton(targetW, 10, 0.2) then
 				my logStep(11, "clicked login/submit")
 			else
-				my logStep(11, "login button not found, pressing Return")
-				key code 36
+				error "未找到或未启用登录提交按钮（LOGIN_BUTTON）"
 			end if
 		end tell
 	end tell

@@ -52,10 +52,38 @@ export function isAxFillAvailable() {
   return process.platform === "darwin" && fs.existsSync(AX_BIN) && fs.statSync(AX_BIN).isFile();
 }
 
+function emitSafeAxHelperProgress(stderr, verbose) {
+  if (verbose === false || typeof stderr !== "string") return;
+  for (const line of stderr.split("\n")) {
+    const match = /^\[step\s+(\d+)\]/.exec(line.trim());
+    if (match) console.log("[Mac 设置] Swift AX step " + match[1] + " complete");
+  }
+}
+
+function normalizeAxFillResult(stdout, phase) {
+  try {
+    const parsed = JSON.parse(String(stdout ?? "").trim());
+    return {
+      ok: parsed?.ok === true,
+      phase,
+      message: parsed?.ok === true ? "ok" : "swift_ax_" + phase + "_failed",
+      textFieldCount: Number.isInteger(parsed?.textFieldCount)
+        ? parsed.textFieldCount
+        : null,
+    };
+  } catch {
+    return {
+      ok: false,
+      phase,
+      message: "swift_ax_" + phase + "_failed",
+      textFieldCount: null,
+    };
+  }
+}
+
 /**
  * @param {string} phase email | continue | password | dump | all
  * @param {object} [opts]
- * @param {string} [opts.value]
  * @param {Record<string,string>} [opts.env]
  * @param {boolean} [opts.verbose]
  */
@@ -63,32 +91,25 @@ export async function runAxFill(phase, opts = {}) {
   if (!isAxFillAvailable()) {
     const built = compileAxFillHelper({ quiet: true });
     if (!built.ok) {
-      throw new Error(`Swift AX helper unavailable: ${built.reason}`);
+      throw new Error("Swift AX helper unavailable");
     }
   }
 
   const args = ["--phase", phase];
-  if (opts.value) args.push("--value", opts.value);
-
-  const { stdout, stderr } = await execFileAsync(AX_BIN, args, {
-    timeout: 120_000,
-    env: { ...process.env, ...(opts.env ?? {}) },
-    maxBuffer: 2 * 1024 * 1024,
-  });
-
-  if (opts.verbose !== false && stderr?.trim()) {
-    for (const line of stderr.trim().split("\n")) {
-      console.log(`[Mac 设置] ${line}`);
-    }
-  }
-
-  let parsed = { ok: false, message: stdout?.trim() || "empty" };
+  let stdout = "";
+  let stderr = "";
   try {
-    parsed = JSON.parse(stdout.trim());
-  } catch {
-    parsed = { ok: false, message: stdout?.trim() || "invalid json" };
+    ({ stdout, stderr } = await execFileAsync(AX_BIN, args, {
+      timeout: 120_000,
+      env: { ...process.env, ...(opts.env ?? {}) },
+      maxBuffer: 2 * 1024 * 1024,
+    }));
+  } catch (error) {
+    stdout = typeof error?.stdout === "string" ? error.stdout : "";
+    stderr = typeof error?.stderr === "string" ? error.stderr : "";
   }
-  return { ...parsed, stderr: stderr?.trim() ?? "" };
+  emitSafeAxHelperProgress(stderr, opts.verbose);
+  return normalizeAxFillResult(stdout, phase);
 }
 
 /**
@@ -100,45 +121,37 @@ export async function fillViaSwiftAx(creds) {
 
   const dump = await runAxFill("dump");
   if (!dump.ok) {
-    throw new Error(`Swift AX 预检失败: ${dump.message}`);
+    throw new Error("Swift AX login preflight failed");
   }
-  console.log(
-    `[Mac 设置] 登录窗口「${dump.windowTitle ?? "?"}」发现 ${dump.textFieldCount ?? 0} 个输入框`
-  );
+  console.log("[Mac 设置] 登录窗口已就绪，发现 " + (dump.textFieldCount ?? 0) + " 个输入框");
 
   const email = await runAxFill("email", {
-    value: creds.appleId,
     env: {
       APPLE_SCRIPT_APPLE_ID: creds.appleId,
-      APPLE_SCRIPT_PASSWORD: creds.password,
     },
   });
   if (!email.ok) {
-    throw new Error(`Swift AX 填邮箱失败: ${email.message}`);
+    throw new Error("Swift AX email input failed");
   }
   console.log("[Mac 设置] ✓ 邮箱已填入");
 
   await sleep(600);
   const cont = await runAxFill("continue");
-  if (cont.ok) {
-    console.log("[Mac 设置] ✓ 已点击「继续」");
-  } else {
-    console.warn("[Mac 设置] 「继续」按钮未找到或未启用，尝试直接填密码…");
+  if (!cont.ok) {
+    throw new Error("Swift AX continue action failed");
   }
+  console.log("[Mac 设置] ✓ 已点击「继续」");
 
   await sleep(2500);
   const pwd = await runAxFill("password", {
-    value: creds.password,
     env: {
-      APPLE_SCRIPT_APPLE_ID: creds.appleId,
       APPLE_SCRIPT_PASSWORD: creds.password,
     },
   });
   if (!pwd.ok) {
-    console.warn(`[Mac 设置] Swift AX 填密码: ${pwd.message}（可能需人工完成密码步）`);
-  } else {
-    console.log("[Mac 设置] ✓ 密码已填入并提交");
+    throw new Error("Swift AX password input failed");
   }
+  console.log("[Mac 设置] ✓ 密码已填入并提交");
 
-  return { emailOk: true, passwordOk: pwd.ok };
+  return { emailOk: true, continueOk: true, passwordOk: true };
 }

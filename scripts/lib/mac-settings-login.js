@@ -59,10 +59,10 @@ async function preflightLoginWindowVisible() {
       console.log("[Mac 设置] ✓ 预检：登录窗口已就绪");
       return true;
     }
-    console.warn("[Mac 设置] 预检：登录窗口或输入框未就绪，dump 摘要:\n" + text.split("\n").slice(-5).join("\n"));
+    console.warn("[Mac 设置] 预检：登录窗口或输入框未就绪");
     return false;
-  } catch (err) {
-    console.warn("[Mac 设置] 预检 dump 失败:", err.message);
+  } catch {
+    console.warn("[Mac 设置] 预检 AX probe 失败");
     return false;
   }
 }
@@ -82,7 +82,8 @@ async function fillViaAppleScript(creds) {
 
   if (stderr?.trim()) {
     for (const line of stderr.trim().split("\n")) {
-      console.log(`[Mac 设置] ${line}`);
+      const match = /^\[step\s+(\d+)\]/.exec(line.trim());
+      if (match) console.log("[Mac 设置] AppleScript step " + match[1] + " complete");
     }
   }
   return stdout?.trim() || "ok";
@@ -133,9 +134,7 @@ export async function fillMacSettingsAppleLogin(creds) {
           await fillViaSwiftAx(creds);
           return;
         } catch (swiftErr) {
-          console.warn(
-            `[Mac 设置] Swift AX 主路径失败: ${swiftErr.message}，回退 AppleScript…`
-          );
+          console.warn("[Mac 设置] Swift AX 主路径失败，回退 AppleScript…");
         }
       } else {
         console.warn("[Mac 设置] Swift AX helper 不可用，使用 AppleScript 回退");

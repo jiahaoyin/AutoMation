@@ -55,18 +55,19 @@ async function main() {
   console.log("\n[debug] dump:mac-ui 预检…");
   try {
     const { stdout } = await execFileAsync("osascript", [DUMP_SCPT], { timeout: 30_000 });
-    console.log(stdout.trim());
-  } catch (e) {
-    console.warn("[debug] dump 失败:", e.message);
+    const ready = /login window found/.test(stdout) && /deep=[1-9]/.test(stdout);
+    console.log("[debug] AX 登录窗口状态:", ready ? "ready" : "not_ready");
+  } catch {
+    console.warn("[debug] AX 预检失败");
   }
 
   if (built.ok) {
     console.log("\n[debug] Swift AX dump…");
     try {
       const dump = await runAxFill("dump");
-      console.log(JSON.stringify(dump, null, 2));
-    } catch (e) {
-      console.warn("[debug] Swift dump 失败:", e.message);
+      console.log("[debug] Swift AX 输入框数量:", dump.textFieldCount ?? 0);
+    } catch {
+      console.warn("[debug] Swift AX 预检失败");
     }
 
     console.log("\n[debug] Swift AX 两阶段填表…");
@@ -74,8 +75,8 @@ async function main() {
       await fillViaSwiftAx(creds);
       console.log("\n[debug] ✓ Swift 路径完成");
       return;
-    } catch (e) {
-      console.warn("[debug] Swift 填表失败:", e.message);
+    } catch {
+      console.warn("[debug] Swift 填表失败");
       console.log("[debug] 回退 AppleScript…");
     }
   }
@@ -90,11 +91,16 @@ async function main() {
       APPLE_SCRIPT_PANE_OPENED: "1",
     },
   });
-  if (stderr?.trim()) console.log(stderr.trim());
-  console.log("[debug] 结果:", stdout.trim() || "ok");
+  if (stderr?.trim()) {
+    for (const line of stderr.trim().split("\n")) {
+      const match = /^\[step\s+(\d+)\]/.exec(line.trim());
+      if (match) console.log("[debug] AppleScript step " + match[1] + " complete");
+    }
+  }
+  console.log("[debug] 结果:", stdout.trim() === "ok" ? "ok" : "failed");
 }
 
-main().catch((e) => {
-  console.error("\n[debug 失败]", e.message || e);
+main().catch(() => {
+  console.error("\n[debug 失败]");
   process.exit(1);
 });
