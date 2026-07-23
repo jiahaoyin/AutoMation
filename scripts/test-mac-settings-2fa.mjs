@@ -3093,8 +3093,8 @@ function assertSettingsVisualFallbackContract(settingsSource, visualSource, node
     2,
     "the visual action must confirm the label in a fresh capture before clicking"
   );
-  assert.match(visualClick, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point\)/);
-  assert.match(visualClick, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point\)/);
+  assert.match(visualClick, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point: point\)/);
+  assert.match(visualClick, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point: point\)/);
   assert.match(visualClick, /mouseDown\.post/);
   assert.match(visualClick, /mouseUp\.post/);
   assert.match(visualClick, /Output\(ok: true, code: nil, source: "vision", message: "visual_get_code_clicked"\)/);
@@ -3138,7 +3138,7 @@ function runSettingsVisualFallbackMutationResistanceTest() {
   );
 
   const missingTopmostCheck = visualSource.replace(
-    "targetWindowIsTopmostAtPoint(postCaptureWindow, point)",
+    "targetWindowIsTopmostAtPoint(postCaptureWindow, point: point)",
     "true"
   );
   assert.notEqual(missingTopmostCheck, visualSource, "topmost mutation fixture must apply");

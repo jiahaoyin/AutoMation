@@ -2294,8 +2294,8 @@ test("OCR stays read-only except for the constrained Settings visual Get Code ac
   assert.match(visualGetCode, /finalBoxes\.count == 1/);
   assert.match(visualGetCode, /visualSettingsGetCodeBoxIsStable\(boxes\[0\], finalBoxes\[0\]\)/);
   assert.match(visualGetCode, /boxes\.count == 1/);
-  assert.match(visualGetCode, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point\)/);
-  assert.match(visualGetCode, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point\)/);
+  assert.match(visualGetCode, /targetWindowIsTopmostAtPoint\(postCaptureWindow, point: point\)/);
+  assert.match(visualGetCode, /hitTestIsBoundSettingsWindow\(postCaptureWindow, point: point\)/);
   assert.match(visualGetCode, /mouseDown\.post/);
   assert.match(visualGetCode, /mouseUp\.post/);
   assert.match(visualGetCode, /Output\(ok: true, code: nil, source: "vision", message: "visual_get_code_clicked"\)/);

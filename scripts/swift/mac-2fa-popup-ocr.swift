@@ -68,6 +68,10 @@ func axSheets(_ element: AXUIElement) -> [AXUIElement] {
     axCopy(element, "AXSheets") ?? []
 }
 
+func axParent(_ element: AXUIElement) -> AXUIElement? {
+    axCopy(element, kAXParentAttribute as String)
+}
+
 func axTexts(_ element: AXUIElement) -> [String] {
     [kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute, kAXRoleDescriptionAttribute]
         .compactMap { axString(element, $0 as String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -662,9 +666,7 @@ func hitTestIsBoundSettingsWindow(
             return false
         }
         if elementWindowID(node) == target.windowID { return true }
-        var parent: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
-              let next = parent as? AXUIElement else { break }
+        guard let next = axParent(node) else { break }
         current = next
     }
     return false
@@ -775,8 +777,8 @@ func clickVisualSettingsGetCode(
           finalBoxes.count == 1,
           visualSettingsGetCodeBoxIsStable(boxes[0], finalBoxes[0]),
           let point = screenPointForVisualBox(finalBoxes[0], in: postCaptureWindow),
-          targetWindowIsTopmostAtPoint(postCaptureWindow, point),
-          hitTestIsBoundSettingsWindow(postCaptureWindow, point),
+          targetWindowIsTopmostAtPoint(postCaptureWindow, point: point),
+          hitTestIsBoundSettingsWindow(postCaptureWindow, point: point),
           let source = CGEventSource(stateID: .hidSystemState),
           let mouseDown = CGEvent(
               mouseEventSource: source,
