@@ -1,15 +1,105 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { promptForMacSettingsSmsProviderField, resolveMacSettingsSmsProviderConfig } from "./lib/mac-settings-sms-provider.js";
+import {
+  captureMacSettingsSmsRuntimeEnv,
+  promptForMacSettingsSmsProviderField,
+  resolveMacSettingsSmsProviderConfig,
+} from "./lib/mac-settings-sms-provider.js";
+import {
+  isMacSettingsSmsRuntimeEnabled,
+  sanitizedMacSettingsChildEnv,
+  waitForMacSettingsLoginComplete,
+} from "./lib/mac-settings-login.js";
+import { sanitizedAxFillChildEnv } from "./lib/mac-settings-ax-fill.js";
 
-await assert.rejects(
-  () => resolveMacSettingsSmsProviderConfig({ env: { APPLE_AUTOMATION_SMS_PHONE: "+8613800130051" } }),
-  (error) => error?.code === "MAC_SETTINGS_SMS_PROVIDER_CONFIG_INCOMPLETE"
-);
+assert.equal(isMacSettingsSmsRuntimeEnabled({}), false);
+assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_ENABLED: "1" }), true);
+assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_PHONE: "+8613800130051" }), true);
+assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_API_URL: "https://example.test/record?token=private" }), true);
+const secretEnvFixture = {
+  PATH: "/test/bin",
+  APPLE_AUTOMATION_SMS_PHONE: "+8613800130051",
+  APPLE_AUTOMATION_SMS_API_URL: "https://example.test/record?token=private",
+  APPLE_AUTOMATION_MANUAL_SMS_CODE: "123456",
+  APPLE_SCRIPT_APPLE_ID: "fixture@example.test",
+};
+const capturedSmsEnv = captureMacSettingsSmsRuntimeEnv({ ...secretEnvFixture });
+assert.equal(capturedSmsEnv.APPLE_AUTOMATION_SMS_PHONE, "+8613800130051");
+assert.equal(capturedSmsEnv.APPLE_AUTOMATION_SMS_API_URL, "https://example.test/record?token=private");
+const parentEnvFixture = { ...secretEnvFixture };
+captureMacSettingsSmsRuntimeEnv(parentEnvFixture);
+assert.equal(Object.hasOwn(parentEnvFixture, "APPLE_AUTOMATION_SMS_PHONE"), false);
+assert.equal(Object.hasOwn(parentEnvFixture, "APPLE_AUTOMATION_SMS_API_URL"), false);
+assert.equal(Object.hasOwn(parentEnvFixture, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
+for (const sanitize of [sanitizedMacSettingsChildEnv, sanitizedAxFillChildEnv]) {
+  const childEnv = sanitize(secretEnvFixture);
+  assert.equal(childEnv.PATH, "/test/bin");
+  assert.equal(childEnv.APPLE_SCRIPT_APPLE_ID, "fixture@example.test");
+  assert.equal(Object.hasOwn(childEnv, "APPLE_AUTOMATION_SMS_PHONE"), false);
+  assert.equal(Object.hasOwn(childEnv, "APPLE_AUTOMATION_SMS_API_URL"), false);
+  assert.equal(Object.hasOwn(childEnv, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
+}
 const config = await resolveMacSettingsSmsProviderConfig({ env: { APPLE_AUTOMATION_SMS_PHONE: "+8613800130051", APPLE_AUTOMATION_SMS_API_URL: "https://example.test/record?token=private" } });
 assert.equal(config.phoneNumber, "+8613800130051");
 const prompted = await resolveMacSettingsSmsProviderConfig({ env: {}, prompt: async ({ field }) => field === "phone" ? "+8613800130051" : "https://example.test/record?token=private" });
 assert.equal(prompted.phoneNumber, "+8613800130051");
+const notices = [];
+const retries = [];
+const repaired = await resolveMacSettingsSmsProviderConfig({
+  env: { APPLE_AUTOMATION_SMS_PHONE: "+8613800130051" },
+  notify: (message) => notices.push(message),
+  prompt: async ({ field, secret }) => {
+    retries.push({ field, secret });
+    return field === "phone" ? "+8613800130052" : "https://example.test/record?token=private";
+  },
+});
+assert.equal(repaired.phoneNumber, "+8613800130052");
+assert.deepEqual(retries, [
+  { field: "phone", secret: false },
+  { field: "apiUrl", secret: true },
+]);
+assert.equal(notices.length, 1);
+await assert.rejects(
+  () => resolveMacSettingsSmsProviderConfig({ env: { APPLE_AUTOMATION_SMS_PHONE: "+8613800130051" } }),
+  (error) => error?.code === "MAC_SETTINGS_SMS_TTY_REQUIRED"
+);
 assert.equal(await promptForMacSettingsSmsProviderField({ field: "phone", secret: false }), null, "non-TTY interactive config is rejected without emitting secrets");
+let signedInChecks = 0;
+assert.deepEqual(
+  await waitForMacSettingsLoginComplete({
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0,
+    sleep: async () => {},
+    isSignedIn: async () => {
+      signedInChecks += 1;
+      return true;
+    },
+  }),
+  { signedIn: true }
+);
+assert.equal(signedInChecks, 2);
 assert.doesNotMatch(fs.readFileSync(new URL("./lib/mac-settings-sms-ax.js", import.meta.url), "utf8"), /env\.APPLE_AUTOMATION_SMS_API_URL =/);
+assert.match(fs.readFileSync(new URL("./lib/mac-settings-sms-provider.js", import.meta.url), "utf8"), /promptForSecretLine/);
+const loginSource = fs.readFileSync(new URL("./lib/mac-settings-login.js", import.meta.url), "utf8");
+assert.match(loginSource, /allowManualContinuation: false/);
+assert.match(loginSource, /sanitizedMacSettingsChildEnv\(\)/);
+assert.match(loginSource, /clearMacSettingsSmsRuntimeSecrets\(\)/);
+assert.match(loginSource, /const smsEnv = \{ \.\.\.process\.env, \.\.\.\(options\.smsEnv \?\? \{\}\) \};/);
+assert.match(
+  fs.readFileSync(new URL("./apple-id-full-flow.mjs", import.meta.url), "utf8"),
+  /captureMacSettingsSmsRuntimeEnv\(\)/
+);
+assert.match(
+  fs.readFileSync(new URL("./lib/mac-settings-ax-fill.js", import.meta.url), "utf8"),
+  /sanitizedAxFillChildEnv\(\{ \.\.\.process\.env, \.\.\.\(opts\.env \?\? \{\}\) \}\)/
+);
+assert.match(
+  fs.readFileSync(new URL("./lib/credentials.js", import.meta.url), "utf8"),
+  /RUNTIME_ONLY_SMS_ENV_KEYS[\s\S]*?APPLE_AUTOMATION_SMS_API_URL/
+);
+assert.match(
+  fs.readFileSync(new URL("../run.sh", import.meta.url), "utf8"),
+  /unset APPLE_AUTOMATION_SMS_PHONE APPLE_AUTOMATION_SMS_API_URL APPLE_AUTOMATION_MANUAL_SMS_CODE/
+);
 console.log("sms provider config: ok");

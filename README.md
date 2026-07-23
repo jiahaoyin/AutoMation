@@ -59,6 +59,16 @@ Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recor
 | `npm run package` | 本地打包 `dist/`（保留 zip） |
 | `npm run release` | patch+1 → 打包 → 上传 GitHub Releases → 清理本地 `dist/` |
 
+### 系统设置短信验证
+
+在真实 Mac 终端中，使用当前会话变量启用短信流程：
+
+```bash
+APPLE_AUTOMATION_SMS_ENABLED=1 ./run.sh --skip-browser
+```
+
+脚本会要求输入手机号和隐藏显示的私有 provider URL；两项缺任一项会提示重新输入。多号码页只选择尾号匹配的“发送短信至”控件；单号码页则先核验页面显示的尾号，再轮询一个独立六位码。填写后 Apple 自动推进，系统设置窗口保留，脚本持续等待登录状态确认。
+
 ## 发布与分发
 
 **本机发布**（打包上传至 GitHub Releases，本地不保留 zip）：
@@ -156,6 +166,7 @@ Windows 只能验证 Node/Python 逻辑、协议、语法和 source-contract，�
 ```bash
 ./install.sh
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-ax-fill.swift
+/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-sms-verification.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-click-allow.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-read.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-ocr.swift

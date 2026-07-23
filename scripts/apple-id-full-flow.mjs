@@ -23,6 +23,7 @@ import {
 } from "./lib/account-browser-flow.js";
 import { confirmOrPromptAppleCredentials } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
+import { captureMacSettingsSmsRuntimeEnv } from "./lib/mac-settings-sms-provider.js";
 import {
   createReportDir,
   writeAccountHomeAcceptanceMarker,
@@ -57,6 +58,7 @@ export function createFlowReport(runAt = new Date()) {
 }
 
 export async function main() {
+  const smsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
   console.log("[apple-automation] stage:flow_main_started");
   console.log("═══════════════════════════════════════════");
   console.log(" Apple ID 流程：Mac 系统设置 → Firefox account");
@@ -120,7 +122,7 @@ export async function main() {
       failureCode = "mac_settings_failed";
       try {
         flowAudit.write("mac_settings", "started");
-        report.phases.macSettings = await runMacSettingsLoginPhase(creds);
+        report.phases.macSettings = await runMacSettingsLoginPhase(creds, { smsEnv: smsRuntimeEnv });
         flowAudit.write("mac_settings", "completed", { success: true });
       } catch (e) {
         flowAudit.write("mac_settings", "failed", { failureStage, failureCode });

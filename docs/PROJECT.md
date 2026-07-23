@@ -194,6 +194,7 @@ macOS 15 测试机验证：
 SWIFT_MODULE_CACHE="$TMPDIR/apple-automation-swift-module-cache"
 /bin/mkdir -p "$SWIFT_MODULE_CACHE"
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-ax-fill.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-sms-verification.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-click-allow.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-read.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-ocr.swift

@@ -3,6 +3,15 @@ import { stdin as input, stdout as output } from "node:process";
 
 const SIX_DIGIT_CODE_RE = /(?<!\d)(\d{6})(?!\d)/g;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const FIXED_INCOMPLETE_CONFIG_NOTICE =
+  "[SMS] Phone number and provider URL must be entered together. Please enter both again.";
+const FIXED_INVALID_CONFIG_NOTICE =
+  "[SMS] Phone number or provider URL is invalid. Please enter both again.";
+const SMS_RUNTIME_SECRET_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+  "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+];
 
 function failure(code) {
   const error = new Error(code);
@@ -12,6 +21,18 @@ function failure(code) {
 
 function fixedString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+export function captureMacSettingsSmsRuntimeEnv(env = process.env) {
+  const captured = {};
+  if (typeof env.APPLE_AUTOMATION_SMS_ENABLED === "string") {
+    captured.APPLE_AUTOMATION_SMS_ENABLED = env.APPLE_AUTOMATION_SMS_ENABLED;
+  }
+  for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) {
+    if (typeof env[key] === "string") captured[key] = env[key];
+    delete env[key];
+  }
+  return captured;
 }
 
 export function validateSmsProviderUrl(value) {
@@ -38,9 +59,79 @@ export function validateSmsProviderPhone(value) {
   return phone;
 }
 
+async function promptForSecretLine(label) {
+  if (
+    input.isTTY !== true ||
+    output.isTTY !== true ||
+    typeof input.setRawMode !== "function"
+  ) {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const wasRaw = Boolean(input.isRaw);
+    const wasPaused = typeof input.isPaused === "function" && input.isPaused();
+    let value = "";
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      input.removeListener("data", onData);
+      input.removeListener("error", onError);
+      try {
+        input.setRawMode(wasRaw);
+      } catch {
+        // A detached terminal must not leave a secret prompt hanging.
+      }
+      if (wasPaused && typeof input.pause === "function") input.pause();
+      try {
+        output.write("\n");
+      } catch {
+        // Output closure does not change the prompt result.
+      }
+      resolve(result);
+    };
+
+    function onError() {
+      finish(null);
+    }
+
+    function onData(chunk) {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk ?? "");
+      for (const character of text) {
+        if (character === "\u0003" || character === "\u001b") {
+          finish(null);
+          return;
+        }
+        if (character === "\r" || character === "\n") {
+          finish(value);
+          return;
+        }
+        if (character === "\u007f" || character === "\b") {
+          value = value.slice(0, -1);
+          continue;
+        }
+        if (character >= " ") value += character;
+      }
+    }
+
+    try {
+      input.setRawMode(true);
+      input.on("data", onData);
+      input.once("error", onError);
+      input.resume();
+      output.write(`[SMS] ${label}: `);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
 export async function promptForMacSettingsSmsProviderField({ field, secret }) {
   if (input.isTTY !== true || output.isTTY !== true) return null;
   const label = field === "phone" ? "Trusted phone number" : "Private SMS provider HTTPS URL";
+  if (secret === true) return promptForSecretLine(`${label} (hidden)`);
   const rl = readline.createInterface({ input, output, terminal: true });
   try {
     // This runtime-only prompt never writes the value to shell history or project files.
@@ -52,41 +143,126 @@ export async function promptForMacSettingsSmsProviderField({ field, secret }) {
 
 export async function resolveMacSettingsSmsProviderConfig(options = {}) {
   const env = options.env ?? process.env;
-  const phone = fixedString(env.APPLE_AUTOMATION_SMS_PHONE);
-  const apiUrl = fixedString(env.APPLE_AUTOMATION_SMS_API_URL);
-  if (Boolean(phone) !== Boolean(apiUrl)) throw failure("MAC_SETTINGS_SMS_PROVIDER_CONFIG_INCOMPLETE");
-  if (phone && apiUrl) return { phoneNumber: validateSmsProviderPhone(phone), apiUrl: validateSmsProviderUrl(apiUrl).toString() };
   const prompt = options.prompt ?? promptForMacSettingsSmsProviderField;
-  const promptedPhone = await prompt({ field: "phone", secret: false });
-  const promptedUrl = await prompt({ field: "apiUrl", secret: true });
-  return { phoneNumber: validateSmsProviderPhone(promptedPhone), apiUrl: validateSmsProviderUrl(promptedUrl).toString() };
+  const notify = options.notify ?? ((message) => console.warn(message));
+  const canPrompt =
+    typeof options.prompt === "function" || (input.isTTY === true && output.isTTY === true);
+  let phone = fixedString(env.APPLE_AUTOMATION_SMS_PHONE);
+  let apiUrl = fixedString(env.APPLE_AUTOMATION_SMS_API_URL);
+
+  while (true) {
+    if (phone && apiUrl) {
+      try {
+        return {
+          phoneNumber: validateSmsProviderPhone(phone),
+          apiUrl: validateSmsProviderUrl(apiUrl).toString(),
+        };
+      } catch {
+        if (!canPrompt) throw failure("MAC_SETTINGS_SMS_PROVIDER_CONFIG_INVALID");
+        notify(FIXED_INVALID_CONFIG_NOTICE);
+      }
+    } else if (phone || apiUrl) {
+      if (!canPrompt) throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED");
+      notify(FIXED_INCOMPLETE_CONFIG_NOTICE);
+    } else if (!canPrompt) {
+      throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED");
+    }
+
+    const promptedPhone = await prompt({ field: "phone", secret: false });
+    const promptedUrl = await prompt({ field: "apiUrl", secret: true });
+    if (promptedPhone === null || promptedUrl === null) {
+      throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED");
+    }
+    phone = fixedString(promptedPhone);
+    apiUrl = fixedString(promptedUrl);
+  }
 }
 
-function flattenStrings(value, result = []) {
-  if (typeof value === "string") result.push(value);
-  else if (Array.isArray(value)) value.forEach((item) => flattenStrings(item, result));
-  else if (value && typeof value === "object") Object.values(value).forEach((item) => flattenStrings(item, result));
-  return result;
+function primitiveText(value) {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  return null;
 }
 
-function messageSuffixes(text) {
+function providerMessageSuffixes(text) {
   const result = new Set();
-  for (const match of text.matchAll(/(?:to|尾号|末尾|ending|\*{2,})[^\d]{0,12}(\d{2})(?!\d)/gi)) result.add(match[1]);
+  const expression =
+    /(?:to|sent\s+to|ending(?:\s+in)?|suffix|phone|mobile|number|tel|\*{2}|\u53d1\u9001(?:\u77ed\u4fe1)?\u81f3|\u5c3e\u53f7|\u672b\u5c3e)[^\d]{0,20}(\d{2})(?!\d)/gi;
+  for (const match of text.matchAll(expression)) result.add(match[1]);
+  const fullPhoneExpression =
+    /(?:phone(?:\s+number)?|mobile(?:\s+number)?|tel(?:ephone)?|cell(?:\s+number)?|\u624b\u673a(?:\u53f7)?|\u7535\u8bdd(?:\u53f7)?)[^\d]{0,20}([+\d][\d()\s.-]{1,})/gi;
+  for (const match of text.matchAll(fullPhoneExpression)) {
+    const digits = match[1].replace(/\D/g, "");
+    if (digits.length >= 2) result.add(digits.slice(-2));
+  }
   return result;
+}
+
+function isPhoneFieldName(key) {
+  return /(?:phone|mobile|number|tel|\u624b\u673a|\u53f7\u7801)/i.test(key);
+}
+
+function collectSmsMessageRecords(value) {
+  const scalar = primitiveText(value);
+  if (scalar !== null) return [{ text: scalar, suffixes: providerMessageSuffixes(scalar) }];
+  if (Array.isArray(value)) return value.flatMap(collectSmsMessageRecords);
+  if (!value || typeof value !== "object") return [];
+
+  const directParts = [];
+  const directSuffixes = new Set();
+  const nestedRecords = [];
+  for (const [key, item] of Object.entries(value)) {
+    const itemText = primitiveText(item);
+    if (itemText !== null) {
+      directParts.push(`${key}: ${itemText}`);
+      for (const suffix of providerMessageSuffixes(itemText)) directSuffixes.add(suffix);
+      if (isPhoneFieldName(key)) {
+        const digits = itemText.replace(/\D/g, "");
+        if (digits.length >= 2) directSuffixes.add(digits.slice(-2));
+      }
+      continue;
+    }
+    nestedRecords.push(...collectSmsMessageRecords(item));
+  }
+  if (directParts.length > 0) {
+    return [{ text: directParts.join("\n"), suffixes: directSuffixes }, ...nestedRecords];
+  }
+  return nestedRecords;
 }
 
 export function extractSmsVerificationCode(body, suffix) {
   const text = typeof body === "string" ? body : "";
-  const strings = (() => {
-    try { return flattenStrings(JSON.parse(text)); } catch { return [text]; }
+  const records = (() => {
+    try {
+      return collectSmsMessageRecords(JSON.parse(text));
+    } catch {
+      return collectSmsMessageRecords(text);
+    }
   })();
-  for (const item of strings) {
-    const suffixes = messageSuffixes(item);
-    if (suffixes.size !== 1 || !suffixes.has(suffix)) continue;
-    const codes = [...item.matchAll(SIX_DIGIT_CODE_RE)].map((match) => match[1]);
-    if (codes.length === 1) return codes[0];
+  const codes = new Set(
+    records.flatMap(({ text: recordText }) =>
+      [...recordText.matchAll(SIX_DIGIT_CODE_RE)].map((match) => match[1])
+    )
+  );
+  if (codes.size !== 1) return null;
+
+  const [code] = codes;
+  let associatedWithTarget = false;
+  let unassociated = false;
+  for (const record of records) {
+    if (![...record.text.matchAll(SIX_DIGIT_CODE_RE)].some((match) => match[1] === code)) {
+      continue;
+    }
+    if (record.suffixes.size === 0) {
+      unassociated = true;
+      continue;
+    }
+    if (record.suffixes.size === 1 && record.suffixes.has(suffix)) {
+      associatedWithTarget = true;
+      continue;
+    }
+    return null;
   }
-  return null;
+  return associatedWithTarget || unassociated ? code : null;
 }
 
 async function readBoundedBody(response, signal) {

@@ -2,6 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# SMS provider details are terminal-only. If a legacy shell invocation supplies
+# either detail, retain only the intent flag and collect the pair interactively
+# after bootstrap so setup and preflight children never inherit those values.
+if [[ -n "${APPLE_AUTOMATION_SMS_PHONE:-}" || -n "${APPLE_AUTOMATION_SMS_API_URL:-}" ]]; then
+  export APPLE_AUTOMATION_SMS_ENABLED=1
+fi
+unset APPLE_AUTOMATION_SMS_PHONE APPLE_AUTOMATION_SMS_API_URL APPLE_AUTOMATION_MANUAL_SMS_CODE
+
 launcher_report_root="${APPLE_AUTOMATION_REPORT_ROOT:-data/reports}"
 case "$launcher_report_root" in
   ""|*$'\n'*|*$'\r'*) exit 1 ;;

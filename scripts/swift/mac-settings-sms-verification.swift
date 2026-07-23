@@ -52,6 +52,8 @@ private let codeMarkers = [
     "authentication",
     "\u{9A8C}\u{8BC1}\u{7801}",
     "\u{9A57}\u{8B49}\u{78BC}",
+    "\u{53CC}\u{91CD}\u{8BA4}\u{8BC1}",
+    "\u{96D9}\u{91CD}\u{8A8D}\u{8B49}",
 ]
 
 private let phoneMarkers = [
@@ -351,14 +353,22 @@ private func axFrame(_ element: AXUIElement) -> CGRect? {
 }
 
 private func codeEntry(in nodes: [AXUIElement]) -> CodeEntry? {
-    let fields = nodes.filter { isTextInput($0) && isEnabled($0) && !isSearchField($0) }
+    let fields = nodes.filter {
+        isTextInput($0) &&
+            isEnabled($0) &&
+            !isSearchField($0) &&
+            axChildren($0).isEmpty
+    }
     guard !fields.isEmpty else { return nil }
 
     if fields.count == 1, isSemanticCodeField(fields[0]) {
         return .single(fields[0])
     }
 
-    let codeFields = fields.filter(isSemanticCodeField)
+    let semanticCodeFields = fields.filter(isSemanticCodeField)
+    let codeFields = semanticCodeFields.count == 6
+        ? semanticCodeFields
+        : (fields.count == 6 ? fields : [])
     guard codeFields.count == 6 else { return nil }
     let framed = codeFields.compactMap { field -> (AXUIElement, CGRect)? in
         guard let frame = axFrame(field) else { return nil }
@@ -382,24 +392,33 @@ private func hasCodeDeliverySuffix(in nodes: [AXUIElement], pid: pid_t, suffix: 
     }) else {
         return false
     }
-    let matchingDeliveryTexts = Set(texts.compactMap { text -> String? in
+    let deliverySuffixes = Set(texts.compactMap { text -> String? in
         let value = normalized(text)
-        guard phoneMarkers.contains(where: value.contains),
-              asciiDigits(in: text).hasSuffix(suffix) else {
+        guard phoneMarkers.contains(where: value.contains) else {
             return nil
         }
-        return value
+        let digits = asciiDigits(in: text)
+        guard digits.count >= 2 else { return nil }
+        return String(digits.suffix(2))
     })
-    return matchingDeliveryTexts.count == 1
+    return deliverySuffixes.count == 1 && deliverySuffixes.contains(suffix)
 }
 
-private func setFocusedValue(_ element: AXUIElement, value: String) -> Bool {
+private func setFocusedValue(
+    _ element: AXUIElement,
+    value: String,
+    transitionSuffix: String? = nil
+) -> Bool {
     _ = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     guard AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString) == .success else {
         return false
     }
-    usleep(80_000)
-    return axString(element, kAXValueAttribute as String) == value
+    usleep(transitionSuffix == nil ? 80_000 : 180_000)
+    if axString(element, kAXValueAttribute as String) == value {
+        return true
+    }
+    guard let suffix = transitionSuffix else { return false }
+    return matchingCodeEntries(suffix: suffix).isEmpty
 }
 
 private func selected(_ element: AXUIElement) -> Bool {
@@ -574,26 +593,25 @@ case "sms-code":
     let filled: Bool
     switch entries[0].1 {
     case .single(let field):
-        filled = setFocusedValue(field, value: code)
+        filled = setFocusedValue(field, value: code, transitionSuffix: suffix)
     case .six(let fields):
-        filled = zip(fields, code).allSatisfy { field, digit in
-            setFocusedValue(field, value: String(digit))
+        var wroteAllDigits = true
+        for (index, field) in fields.enumerated() {
+            let digitIndex = code.index(code.startIndex, offsetBy: index)
+            let transitionSuffix = index == fields.count - 1 ? suffix : nil
+            if !setFocusedValue(
+                field,
+                value: String(code[digitIndex]),
+                transitionSuffix: transitionSuffix
+            ) {
+                wroteAllDigits = false
+                break
+            }
         }
+        filled = wroteAllDigits
     }
     guard filled else {
         emit(false, "code_write_failed")
-    }
-    usleep(120_000)
-    let remainingEntries = matchingCodeEntries(suffix: suffix)
-    if remainingEntries.isEmpty {
-        emit(true, "code_submitted")
-    }
-    guard remainingEntries.count == 1,
-          let button = continueButton(in: remainingEntries[0].0.nodes) else {
-        emit(false, "continue_unavailable")
-    }
-    guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
-        emit(false, "continue_failed")
     }
     emit(true, "code_submitted")
 

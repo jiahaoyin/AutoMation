@@ -30,6 +30,21 @@ const AUTOMATION_CHECK_SCPT = path.resolve(
   __dirname,
   "../automation-check.applescript"
 );
+const SMS_RUNTIME_SECRET_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+  "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+];
+
+export function sanitizedMacSettingsChildEnv(env = process.env) {
+  const childEnv = { ...env };
+  for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) delete childEnv[key];
+  return childEnv;
+}
+
+function clearMacSettingsSmsRuntimeSecrets(env = process.env) {
+  for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) delete env[key];
+}
 
 /** 自动化预检：激活系统设置并尝试读取 UI 属性 */
 export async function preflightMacSettingsAutomation() {
@@ -53,7 +68,10 @@ export async function preflightMacSettingsAutomation() {
 /** 预检：登录窗口是否可见（解析 dump 脚本输出） */
 async function preflightLoginWindowVisible() {
   try {
-    const { stdout } = await execFileAsync("osascript", [DUMP_SCPT], { timeout: 25_000 });
+    const { stdout } = await execFileAsync("osascript", [DUMP_SCPT], {
+      timeout: 25_000,
+      env: sanitizedMacSettingsChildEnv(),
+    });
     const text = stdout.trim();
     if (/login window found/.test(text) && /deep=[1-9]/.test(text)) {
       console.log("[Mac 设置] ✓ 预检：登录窗口已就绪");
@@ -73,7 +91,7 @@ async function fillViaAppleScript(creds) {
   const { stdout, stderr } = await execFileAsync("osascript", [LOGIN_SCPT], {
     timeout: 180_000,
     env: {
-      ...process.env,
+      ...sanitizedMacSettingsChildEnv(),
       APPLE_SCRIPT_APPLE_ID: creds.appleId,
       APPLE_SCRIPT_PASSWORD: creds.password,
       APPLE_SCRIPT_PANE_OPENED: "1",
@@ -91,11 +109,22 @@ async function fillViaAppleScript(creds) {
 
 export async function isMacSettingsSignedIn() {
   try {
-    const { stdout } = await execFileAsync("osascript", [SIGNED_IN_SCPT], { timeout: 15_000 });
+    const { stdout } = await execFileAsync("osascript", [SIGNED_IN_SCPT], {
+      timeout: 15_000,
+      env: sanitizedMacSettingsChildEnv(),
+    });
     return stdout.trim().toLowerCase() === "yes";
   } catch {
     return false;
   }
+}
+
+export function isMacSettingsSmsRuntimeEnabled(env = process.env) {
+  return (
+    env.APPLE_AUTOMATION_SMS_ENABLED === "1" ||
+    Boolean(env.APPLE_AUTOMATION_SMS_PHONE?.trim()) ||
+    Boolean(env.APPLE_AUTOMATION_SMS_API_URL?.trim())
+  );
 }
 
 /**
@@ -111,11 +140,14 @@ export async function fillMacSettingsAppleLogin(creds) {
   await withAccessibilityRetry(
     async () => {
       console.log("[Mac 设置] 打开 Apple Account 深链…");
-      openAppleAccountSettings();
+      openAppleAccountSettings({ env: sanitizedMacSettingsChildEnv() });
       await sleep(3500);
 
       try {
-        await execFileAsync("osascript", [AUTOMATION_CHECK_SCPT], { timeout: 20_000 });
+        await execFileAsync("osascript", [AUTOMATION_CHECK_SCPT], {
+          timeout: 20_000,
+          env: sanitizedMacSettingsChildEnv(),
+        });
       } catch (err) {
         const msg = String(err?.stderr ?? err?.message ?? err);
         if (isAutomationDeniedError({ message: msg })) {
@@ -155,31 +187,36 @@ export async function fillMacSettingsAppleLogin(creds) {
  * 等待 Mac 设置中 Apple ID 完全登录（手机验证码人工 + 自动轮询 Sign Out / 邮箱）
  */
 export async function waitForMacSettingsLoginComplete(options = {}) {
+  const isSignedIn = options.isSignedIn ?? isMacSettingsSignedIn;
+  const pause = options.sleep ?? sleep;
   await waitUntil(
     "[Mac 设置] 请在系统设置中完成手机验证码（人工），脚本将等待直至检测到已登录…",
-    async () => isMacSettingsSignedIn(),
+    async () => isSignedIn(),
     {
       timeoutMs: options.timeoutMs ?? 20 * 60 * 1000,
       intervalMs: options.intervalMs ?? 2500,
-      manualHint:
-        "\n[Mac 设置] 若已确认 Apple ID 在系统设置中登录成功，按 Enter 继续…",
+      allowManualContinuation: false,
     }
   );
 
-  await sleep(1500);
-  const ok = await isMacSettingsSignedIn();
+  await pause(options.settleMs ?? 1500);
+  const ok = await isSignedIn();
   if (!ok) {
-    console.warn("[Mac 设置] 自动检测未确认登录，但已手动继续");
-  } else {
-    console.log("[Mac 设置] ✓ 已检测到 Apple ID 登录完成");
+    throw new Error("MAC_SETTINGS_LOGIN_NOT_CONFIRMED");
   }
+  console.log("[Mac 设置] ✓ 已检测到 Apple ID 登录完成");
+  return { signedIn: true };
 }
 
 /**
  * @param {{ appleId: string, password: string }} creds
+ * @param {{ smsEnv?: Record<string, string | undefined> }} [options]
  */
-export async function runMacSettingsLoginPhase(creds) {
-  const version = ensureMacOS15({ strict: false });
+export async function runMacSettingsLoginPhase(creds, options = {}) {
+  const version = ensureMacOS15({
+    strict: false,
+    env: sanitizedMacSettingsChildEnv(),
+  });
   console.log(
     `[Mac 设置] macOS ${version.productVersion}（目标 macOS 15 Sequoia）`
   );
@@ -190,20 +227,23 @@ export async function runMacSettingsLoginPhase(creds) {
     return { skipped: true, signedIn: true };
   }
 
+  const smsEnv = { ...process.env, ...(options.smsEnv ?? {}) };
+  const smsConfig = isMacSettingsSmsRuntimeEnabled(smsEnv)
+    ? await resolveMacSettingsSmsProviderConfig({ env: smsEnv })
+    : null;
+  if (smsConfig) clearMacSettingsSmsRuntimeSecrets();
+
   await fillMacSettingsAppleLogin(creds);
-  const hasSmsPhone = Boolean(process.env.APPLE_AUTOMATION_SMS_PHONE?.trim());
-  const hasSmsApiUrl = Boolean(process.env.APPLE_AUTOMATION_SMS_API_URL?.trim());
-  const supervisedSmsEnabled =
-    process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1" &&
-    (process.env.APPLE_AUTOMATION_SMS_ENABLED === "1" || hasSmsPhone || hasSmsApiUrl);
-  if (supervisedSmsEnabled) {
-    const config = await resolveMacSettingsSmsProviderConfig();
+  if (smsConfig) {
+    console.log("[Mac Settings][SMS] Waiting for the trusted destination and code entry.");
     await completeSupervisedMacSettingsSmsVerification({
-      phoneNumber: config.phoneNumber,
-      codeProvider: createSmsProviderCodePoller(config),
+      phoneNumber: smsConfig.phoneNumber,
+      codeProvider: createSmsProviderCodePoller(smsConfig),
       supervised: true,
     });
-    console.log("[Mac Settings] SMS verification code submitted.");
+    console.log(
+      "[Mac Settings][SMS] Verification code submitted. Apple will continue automatically; finish any remaining screens in System Settings."
+    );
   } else {
     console.log("\n[Mac Settings] Credentials submitted. Complete SMS verification manually if shown.");
   }

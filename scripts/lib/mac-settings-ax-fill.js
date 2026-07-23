@@ -18,6 +18,17 @@ const AX_BIN = resolveNativeHelperPath(
   path.resolve(__dirname, "../bin"),
   "mac-settings-ax-fill"
 );
+const SMS_RUNTIME_SECRET_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+  "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+];
+
+export function sanitizedAxFillChildEnv(env = process.env) {
+  const childEnv = { ...env };
+  for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) delete childEnv[key];
+  return childEnv;
+}
 
 /** 编译 Swift helper（install.sh 也会调用） */
 export function compileAxFillHelper(options = {}) {
@@ -29,7 +40,7 @@ export function compileAxFillHelper(options = {}) {
   const r = spawnSync(
     "swiftc",
     ["-O", "-o", AX_BIN, SWIFT_SRC, "-framework", "ApplicationServices", "-framework", "AppKit"],
-    { encoding: "utf-8" }
+    { encoding: "utf-8", env: sanitizedAxFillChildEnv() }
   );
   if (r.status !== 0) {
     if (!quiet) console.warn("[Mac 设置] Swift AX helper 编译失败:", r.stderr?.trim() || r.error);
@@ -101,7 +112,7 @@ export async function runAxFill(phase, opts = {}) {
   try {
     ({ stdout, stderr } = await execFileAsync(AX_BIN, args, {
       timeout: 120_000,
-      env: { ...process.env, ...(opts.env ?? {}) },
+      env: sanitizedAxFillChildEnv({ ...process.env, ...(opts.env ?? {}) }),
       maxBuffer: 2 * 1024 * 1024,
     }));
   } catch (error) {

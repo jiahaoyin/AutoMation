@@ -7,6 +7,11 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(__dirname, "../..");
+const RUNTIME_ONLY_SMS_ENV_KEYS = new Set([
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+  "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+]);
 
 export function resolveEnvPath() {
   const cwdEnv = path.join(process.cwd(), ".env");
@@ -32,6 +37,7 @@ export function loadEnvFile() {
   if (!fs.existsSync(envPath)) return envPath;
 
   const lines = fs.readFileSync(envPath, "utf-8").split(/\r?\n/);
+  let foundRuntimeOnlySmsValue = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -39,7 +45,14 @@ export function loadEnvFile() {
     if (eq <= 0) continue;
     const key = trimmed.slice(0, eq).trim();
     const val = parseEnvValue(trimmed.slice(eq + 1));
+    if (RUNTIME_ONLY_SMS_ENV_KEYS.has(key)) {
+      foundRuntimeOnlySmsValue ||= Boolean(val);
+      continue;
+    }
     if (!Object.hasOwn(process.env, key)) process.env[key] = val;
+  }
+  if (foundRuntimeOnlySmsValue && !process.env.APPLE_AUTOMATION_SMS_ENABLED) {
+    process.env.APPLE_AUTOMATION_SMS_ENABLED = "1";
   }
   return envPath;
 }

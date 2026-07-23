@@ -29,10 +29,13 @@ export async function waitUntil(message, predicate, options = {}) {
   console.log(message);
   const deadline = Date.now() + timeoutMs;
 
-  const manual = (async () => {
-    await waitForEnter(manualHint);
-    return true;
-  })();
+  const manual =
+    options.allowManualContinuation === false
+      ? new Promise(() => {})
+      : (async () => {
+          await waitForEnter(manualHint);
+          return true;
+        })();
 
   const poll = (async () => {
     while (Date.now() < deadline) {

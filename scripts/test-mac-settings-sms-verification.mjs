@@ -365,12 +365,18 @@ assert.doesNotMatch(swiftSource, /fields\.count == 1, isSemanticCodeField\(field
 assert.doesNotMatch(swiftSource, /private func hasCodeContext/);
 assert.match(swiftSource, /private func hasCodeDeliverySuffix/);
 assert.match(swiftSource, /hasCodeDeliverySuffix\(in: \$0\.nodes, pid: \$0\.pid, suffix: suffix\)/);
-assert.match(swiftSource, /matchingDeliveryTexts\.count == 1/);
-assert.match(swiftSource, /zip\(fields, code\)\.allSatisfy/);
-assert.match(swiftSource, /let codeFields = fields\.filter\(isSemanticCodeField\)/);
+assert.match(swiftSource, /deliverySuffixes\.count == 1/);
+assert.match(swiftSource, /axChildren\(\$0\)\.isEmpty/);
+assert.match(swiftSource, /let semanticCodeFields = fields\.filter\(isSemanticCodeField\)/);
+assert.match(swiftSource, /fields\.count == 6 \? fields : \[\]/);
 assert.match(swiftSource, /codeFields\.count == 6/);
-assert.match(swiftSource, /let remainingEntries = matchingCodeEntries\(suffix: suffix\)/);
-assert.match(swiftSource, /continue_unavailable/);
+assert.match(swiftSource, /transitionSuffix: suffix/);
+assert.match(swiftSource, /matchingCodeEntries\(suffix: suffix\)\.isEmpty/);
+const smsCodeCase = swiftSource.slice(
+  swiftSource.indexOf('case "sms-code"'),
+  swiftSource.indexOf("default:", swiftSource.indexOf('case "sms-code"'))
+);
+assert.doesNotMatch(smsCodeCase, /continueButton|AXUIElementPerformAction/);
 assert.match(swiftSource, /readManualCodeFromStandardInput/);
 assert.match(swiftSource, /FileHandle\.standardInput\.readDataToEndOfFile/);
 assert.doesNotMatch(swiftSource, /APPLE_AUTOMATION_MANUAL_SMS_CODE/);
