@@ -5,11 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  validateSmsProviderPhone,
+  validateSmsProviderUrl,
+} from "./mac-settings-sms-provider.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(__dirname, "../..");
 const RUNTIME_ONLY_SMS_ENV_KEYS = new Set([
-  "APPLE_AUTOMATION_SMS_PHONE",
-  "APPLE_AUTOMATION_SMS_API_URL",
   "APPLE_AUTOMATION_MANUAL_SMS_CODE",
 ]);
 
@@ -37,7 +40,6 @@ export function loadEnvFile() {
   if (!fs.existsSync(envPath)) return envPath;
 
   const lines = fs.readFileSync(envPath, "utf-8").split(/\r?\n/);
-  let foundRuntimeOnlySmsValue = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -46,13 +48,9 @@ export function loadEnvFile() {
     const key = trimmed.slice(0, eq).trim();
     const val = parseEnvValue(trimmed.slice(eq + 1));
     if (RUNTIME_ONLY_SMS_ENV_KEYS.has(key)) {
-      foundRuntimeOnlySmsValue ||= Boolean(val);
       continue;
     }
     if (!Object.hasOwn(process.env, key)) process.env[key] = val;
-  }
-  if (foundRuntimeOnlySmsValue && !process.env.APPLE_AUTOMATION_SMS_ENABLED) {
-    process.env.APPLE_AUTOMATION_SMS_ENABLED = "1";
   }
   return envPath;
 }
@@ -103,6 +101,16 @@ function upsertEnvLines(lines, entries) {
   return out;
 }
 
+function removeEnvLines(lines, keys) {
+  return lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return true;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) return true;
+    return !keys.has(trimmed.slice(0, eq).trim());
+  });
+}
+
 function readEnvDocument(file) {
   const text = fs.readFileSync(file, "utf-8");
   return {
@@ -114,9 +122,37 @@ function readEnvDocument(file) {
 function writePrivateEnvFile(envPath, lines, lineEnding) {
   const body = lines.join(lineEnding);
   const content = body.endsWith(lineEnding) ? body : `${body}${lineEnding}`;
-  if (fs.existsSync(envPath)) fs.chmodSync(envPath, 0o600);
-  fs.writeFileSync(envPath, content, { encoding: "utf8", mode: 0o600 });
-  fs.chmodSync(envPath, 0o600);
+  const directory = path.dirname(envPath);
+  const basename = path.basename(envPath);
+  let tempPath = null;
+  let descriptor = null;
+
+  try {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const candidate = path.join(
+        directory,
+        `.${basename}.${process.pid}.${Date.now()}.${attempt}.tmp`
+      );
+      try {
+        descriptor = fs.openSync(candidate, "wx", 0o600);
+        tempPath = candidate;
+        break;
+      } catch (error) {
+        if (error?.code !== "EEXIST" || attempt === 7) throw error;
+      }
+    }
+
+    fs.writeFileSync(descriptor, content, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(tempPath, envPath);
+    tempPath = null;
+    fs.chmodSync(envPath, 0o600);
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+    if (tempPath !== null && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
 }
 
 /**
@@ -136,6 +172,32 @@ export function saveCredentialsToEnv({ appleId, password }) {
   const updated = upsertEnvLines(lines, {
     APPLE_ID: appleId,
     APPLE_PASSWORD: password,
+  });
+  writePrivateEnvFile(envPath, updated, lineEnding);
+  return envPath;
+}
+
+/**
+ * 保存系统设置短信服务配置。验证码本身永远不写入 .env。
+ */
+export function saveMacSettingsSmsProviderConfig({ phoneNumber, apiUrl }) {
+  const trustedPhone = validateSmsProviderPhone(phoneNumber);
+  const providerUrl = validateSmsProviderUrl(apiUrl).toString();
+  const envPath = resolveEnvPath();
+  let lines = [];
+  let lineEnding = "\n";
+
+  if (fs.existsSync(envPath)) {
+    ({ lines, lineEnding } = readEnvDocument(envPath));
+  } else if (fs.existsSync(path.join(PACKAGE_ROOT, ".env.example"))) {
+    ({ lines, lineEnding } = readEnvDocument(path.join(PACKAGE_ROOT, ".env.example")));
+  }
+
+  const updated = upsertEnvLines(removeEnvLines(lines, RUNTIME_ONLY_SMS_ENV_KEYS), {
+    APPLE_AUTOMATION_SMS_ENABLED: "1",
+    APPLE_AUTOMATION_SMS_PHONE: trustedPhone,
+    APPLE_AUTOMATION_SMS_API_URL: providerUrl,
+    APPLE_AUTOMATION_SMS_RECONFIGURE: "0",
   });
   writePrivateEnvFile(envPath, updated, lineEnding);
   return envPath;

@@ -237,8 +237,8 @@ cd apple-id-automation-${VERSION}
 
 ## 流程说明
 
-1. **Mac 系统设置**：自动填入 Apple ID / 密码；**手机验证码需人工**在系统界面完成
-2. **等待**：脚本轮询直至检测到系统设置已登录（或按 Enter 手动确认）
+1. **Mac 系统设置**：自动填入 Apple ID / 密码；配置 `.env` 的短信 provider 后可自动完成手机验证码，未启用时在系统界面人工完成
+2. **等待**：脚本轮询直至检测到系统设置已登录
 3. **Firefox**：启动、导航、页面读取、输入、截图与关闭全部由 ruyiPage 完成，不提供其他浏览器后端
 4. **account.apple.com**：登录 → \`need_2fa\` 后 popup AX/OCR 优先 30 秒；确认 Allow 后再给 30 秒；无新码才串行回退到系统设置，最后才可隐藏终端手输 → 采集姓名、生日
 5. **输出**：\`data/reports/apple-id-flow-*/report.json\` 与 \`screenshots/\`
@@ -280,6 +280,18 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
 | \`BROWSER_PRESERVE_ON_FAILURE\` | 可选，直接运行默认 \`1\`；失败后保留 Firefox 供人工检查当前页面，设为 \`0\` 才关闭；受监督 broker 会话仍严格清理 |
 
+### 系统设置短信验证
+
+在私有 `.env` 中配置：
+
+\`\`\`bash
+APPLE_AUTOMATION_SMS_ENABLED=1
+APPLE_AUTOMATION_SMS_PHONE=+8613800130051
+APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
+\`\`\`
+
+有效的完整 pair 会直接复用，不再询问。缺失、partial 或无效时，终端会重录完整 pair 并在格式校验通过后以 \`0600\` 权限原子写回 \`.env\`。设 \`APPLE_AUTOMATION_SMS_RECONFIGURE=1\` 可替换已保存 pair；成功保存后自动改回 \`0\`。设 \`APPLE_AUTOMATION_SMS_ENABLED=0\` 可保留 pair 但禁用短信自动化。验证码不会保存到 \`.env\` 或任何诊断产物。
+
 ## 故障排查
 
 - **安装 ruyiPage 时出现 PyPI TLS 证书错误**：\`install.sh\` 始终保持 HTTPS 证书校验；仅项目管理的 macOS 虚拟环境且 pip 支持 \`truststore\` 时优先使用系统信任库，显式 \`RUYIPAGE_PYTHON\` 不承诺该行为。如处于企业代理环境，请先将代理根证书安装到 macOS 系统钥匙串，再重新执行 \`./install.sh\`。
@@ -305,7 +317,7 @@ cd apple-id-automation-${VERSION}
 function buildEnvExample(destRoot) {
   fs.writeFileSync(
     path.join(destRoot, ".env.example"),
-    `# 复制为 .env 后填写
+    `\uFEFF# 复制为 .env 后填写
 APPLE_ID=your@email.com
 APPLE_PASSWORD=your_password
 
@@ -327,6 +339,13 @@ APPLE_PASSWORD=your_password
 # BROWSER_ATTACH_ADDRESS=127.0.0.1:9222
 # name=
 # birthday=
+
+# Mac 系统设置短信验证：完整 pair 已保存时直接复用。
+APPLE_AUTOMATION_SMS_ENABLED=0
+APPLE_AUTOMATION_SMS_PHONE=
+APPLE_AUTOMATION_SMS_API_URL=
+# 设为 1 可在下一次运行时重录 pair；保存成功后自动改回 0。
+APPLE_AUTOMATION_SMS_RECONFIGURE=0
 `
   );
 }

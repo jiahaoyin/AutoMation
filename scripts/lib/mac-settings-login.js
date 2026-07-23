@@ -18,6 +18,7 @@ import {
   fillViaSwiftAx,
   isAxFillAvailable,
 } from "./mac-settings-ax-fill.js";
+import { saveMacSettingsSmsProviderConfig } from "./credentials.js";
 import { completeSupervisedMacSettingsSmsVerification } from "./mac-settings-sms-verification.js";
 import { createSmsProviderCodePoller, resolveMacSettingsSmsProviderConfig } from "./mac-settings-sms-provider.js";
 
@@ -120,8 +121,10 @@ export async function isMacSettingsSignedIn() {
 }
 
 export function isMacSettingsSmsRuntimeEnabled(env = process.env) {
+  if (env.APPLE_AUTOMATION_SMS_RECONFIGURE === "1") return true;
+  if (env.APPLE_AUTOMATION_SMS_ENABLED === "0") return false;
+  if (env.APPLE_AUTOMATION_SMS_ENABLED === "1") return true;
   return (
-    env.APPLE_AUTOMATION_SMS_ENABLED === "1" ||
     Boolean(env.APPLE_AUTOMATION_SMS_PHONE?.trim()) ||
     Boolean(env.APPLE_AUTOMATION_SMS_API_URL?.trim())
   );
@@ -231,6 +234,14 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
   const smsConfig = isMacSettingsSmsRuntimeEnabled(smsEnv)
     ? await resolveMacSettingsSmsProviderConfig({ env: smsEnv })
     : null;
+  if (smsConfig?.source === "terminal") {
+    try {
+      saveMacSettingsSmsProviderConfig(smsConfig);
+      console.log("[Mac Settings][SMS] SMS provider configuration saved to .env.");
+    } catch {
+      throw new Error("MAC_SETTINGS_SMS_CONFIG_SAVE_FAILED");
+    }
+  }
   if (smsConfig) clearMacSettingsSmsRuntimeSecrets();
 
   await fillMacSettingsAppleLogin(creds);

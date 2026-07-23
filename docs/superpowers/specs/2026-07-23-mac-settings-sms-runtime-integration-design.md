@@ -3,8 +3,9 @@
 ## Goal
 
 Make the existing System Settings SMS path usable from an explicitly interactive
-macOS terminal session.  The operator supplies a trusted phone number and its
-matching private HTTPS provider URL at runtime.  The flow selects the native
+macOS terminal session.  The trusted phone number and matching private HTTPS
+provider URL are persisted in the local `.env` configuration, then captured
+into a short-lived runtime snapshot.  The flow selects the native
 "send code to ...xx" destination by the final two digits, polls the provider
 for one isolated six-digit code, submits it through the narrow AX helper, and
 then waits for the existing signed-in confirmation.
@@ -12,17 +13,19 @@ then waits for the existing signed-in confirmation.
 ## Activation and Boundaries
 
 - The flow remains macOS-only, TTY-only, and requires explicit operator intent.
-- `APPLE_AUTOMATION_SMS_ENABLED=1` enables runtime prompting when neither SMS
-  value is present.  Supplying both SMS values also explicitly enables the
-  flow.  A partial pair is treated as an incomplete terminal entry: it emits a
-  fixed, non-secret prompt and asks for the complete pair again instead of
-  aborting the account flow.
+- `APPLE_AUTOMATION_SMS_ENABLED=1` enables the flow.  A valid saved phone/URL
+  pair is reused without prompting.  An absent, partial, or invalid pair is
+  treated as an incomplete terminal entry: it emits a fixed, non-secret prompt
+  and asks for the complete pair again instead of aborting the account flow.
+- `APPLE_AUTOMATION_SMS_RECONFIGURE=1` explicitly requests replacement input.
+  The complete validated pair is atomically written to `.env` with mode `0600`,
+  and the saved reconfigure flag is reset to `0` only after the write succeeds.
 - The existing supervised-GUI orchestration continues to work unchanged; the
   local interactive path does not require a remote orchestration flag.
-- Phone number, provider URL, provider response, and verification code stay
-  process-local.  They must not appear in reports, child argv/environments,
-  diagnostics, screenshots, or error text.  The code reaches the Swift helper
-  only through short-lived stdin.
+- The phone number and provider URL are private local `.env` configuration;
+  provider responses and verification codes stay process-local.  None of them
+  may appear in reports, child argv/environments, diagnostics, screenshots, or
+  error text.  The code reaches the Swift helper only through short-lived stdin.
 - Browser and browser 2FA logic are out of scope.  Native System Settings is
   the only surface modified by this change.
 

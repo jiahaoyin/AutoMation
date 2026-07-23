@@ -6,6 +6,7 @@
  */
 
 import { loadEnvFile } from "./lib/credentials.js";
+import { captureMacSettingsSmsRuntimeEnv } from "./lib/mac-settings-sms-provider.js";
 import { resolveFirefoxExecutable } from "./lib/firefox-runtime.js";
 import { checkEnvironmentOk } from "./lib/browser-backend.js";
 import { isMacSettingsSignedIn } from "./lib/mac-settings-login.js";
@@ -20,6 +21,7 @@ const install = process.argv.includes("--install");
 const strictPlatform = process.argv.includes("--strict-platform");
 
 loadEnvFile();
+captureMacSettingsSmsRuntimeEnv();
 
 const mac = getMacOSVersion();
 console.log("环境自检:");

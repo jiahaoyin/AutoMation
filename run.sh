@@ -2,9 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# SMS provider details are terminal-only. If a legacy shell invocation supplies
-# either detail, retain only the intent flag and collect the pair interactively
-# after bootstrap so setup and preflight children never inherit those values.
+# Never pass a shell-provided SMS pair through bootstrap or preflight children.
+# credentials.js later reads the saved .env pair as data and immediately hands it
+# to the SMS runtime snapshot, keeping child environments clear of those values.
 if [[ -n "${APPLE_AUTOMATION_SMS_PHONE:-}" || -n "${APPLE_AUTOMATION_SMS_API_URL:-}" ]]; then
   export APPLE_AUTOMATION_SMS_ENABLED=1
 fi

@@ -61,13 +61,23 @@ Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recor
 
 ### 系统设置短信验证
 
-在真实 Mac 终端中，使用当前会话变量启用短信流程：
+在 `.env` 中启用并配置短信流程：
 
 ```bash
-APPLE_AUTOMATION_SMS_ENABLED=1 ./run.sh --skip-browser
+APPLE_AUTOMATION_SMS_ENABLED=1
+APPLE_AUTOMATION_SMS_PHONE=+8613800130051
+APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
 ```
 
-脚本会要求输入手机号和隐藏显示的私有 provider URL；两项缺任一项会提示重新输入。多号码页只选择尾号匹配的“发送短信至”控件；单号码页则先核验页面显示的尾号，再轮询一个独立六位码。填写后 Apple 自动推进，系统设置窗口保留，脚本持续等待登录状态确认。
+随后运行：
+
+```bash
+./run.sh --skip-browser
+```
+
+完整的号码和 URL 会直接复用，不再显示输入提示。初次启用、缺少其中一项或值无效时，脚本会要求重新输入完整 pair，并在格式校验通过后以 `0600` 权限原子写回 `.env`。需要替换已保存配置时，将 `APPLE_AUTOMATION_SMS_RECONFIGURE=1` 写入 `.env` 后运行一次；成功保存新 pair 后该开关会自动恢复为 `0`。将 `APPLE_AUTOMATION_SMS_ENABLED=0` 可保留 pair 但禁用短信自动化。验证码不会写入 `.env`、日志、报告、截图或子进程环境。
+
+多号码页只选择尾号匹配的“发送短信至”控件；单号码页则先核验页面显示的尾号，再轮询一个独立六位码。填写后 Apple 自动推进，系统设置窗口保留，脚本持续等待登录状态确认。
 
 ## 发布与分发
 

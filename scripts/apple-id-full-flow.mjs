@@ -57,8 +57,29 @@ export function createFlowReport(runAt = new Date()) {
   };
 }
 
+function addSmsRuntimeSecrets(flowAudit, smsEnv) {
+  flowAudit.addSecrets([
+    smsEnv.APPLE_AUTOMATION_SMS_PHONE,
+    smsEnv.APPLE_AUTOMATION_SMS_API_URL,
+    smsEnv.APPLE_AUTOMATION_MANUAL_SMS_CODE,
+  ]);
+}
+
+const SMS_PROVIDER_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+];
+
+export function mergeMacSettingsSmsRuntimeEnv(initialEnv = {}, persistedEnv = {}) {
+  const persisted = { ...persistedEnv };
+  if (SMS_PROVIDER_ENV_KEYS.some((key) => Object.hasOwn(initialEnv, key))) {
+    for (const key of SMS_PROVIDER_ENV_KEYS) delete persisted[key];
+  }
+  return { ...persisted, ...initialEnv };
+}
+
 export async function main() {
-  const smsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
+  let smsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
   console.log("[apple-automation] stage:flow_main_started");
   console.log("═══════════════════════════════════════════");
   console.log(" Apple ID 流程：Mac 系统设置 → Firefox account");
@@ -70,6 +91,7 @@ export async function main() {
       console.warn("[报告] 统一诊断日志写入失败");
     },
   });
+  addSmsRuntimeSecrets(flowAudit, smsRuntimeEnv);
   console.log(`[报告] 统一诊断日志: ${flowAudit.path}`);
   const report = createFlowReport();
   let reportFile = null;
@@ -108,6 +130,9 @@ export async function main() {
     failureCode = "credential_resolution_failed";
     try {
       creds = await confirmOrPromptAppleCredentials();
+      const persistedSmsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
+      smsRuntimeEnv = mergeMacSettingsSmsRuntimeEnv(smsRuntimeEnv, persistedSmsRuntimeEnv);
+      addSmsRuntimeSecrets(flowAudit, smsRuntimeEnv);
     } catch (error) {
       flowAudit.write("flow", "credential_resolution_failed", {
         failureStage,

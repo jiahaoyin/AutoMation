@@ -10,11 +10,16 @@ import {
   readBrowserFailureStage,
   runAccountBrowserPhase,
 } from "./lib/account-browser-flow.js";
-import { createFlowFailureEnvelope, createFlowReport } from "./apple-id-full-flow.mjs";
+import {
+  createFlowFailureEnvelope,
+  createFlowReport,
+  mergeMacSettingsSmsRuntimeEnv,
+} from "./apple-id-full-flow.mjs";
 import {
   loadEnvFile,
   maskAppleId,
   parseEnvValue,
+  saveMacSettingsSmsProviderConfig,
   saveCredentialsToEnv,
   saveAppleProfileToEnv,
   shouldAutoConfirmAppleCredentials,
@@ -1316,21 +1321,35 @@ function runEnvDataParsingTest() {
   const originalCwd = process.cwd();
   const externalKey = "APPLE_AUTOMATION_TEST_EXTERNAL";
   const loadedKey = "APPLE_AUTOMATION_TEST_LOADED";
+  const smsKeys = [
+    "APPLE_AUTOMATION_SMS_ENABLED",
+    "APPLE_AUTOMATION_SMS_PHONE",
+    "APPLE_AUTOMATION_SMS_API_URL",
+    "APPLE_AUTOMATION_SMS_RECONFIGURE",
+    "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+  ];
   const originalExternal = process.env[externalKey];
   const originalLoaded = process.env[loadedKey];
+  const originalSmsValues = Object.fromEntries(smsKeys.map((key) => [key, process.env[key]]));
   try {
     fs.writeFileSync(
       envPath,
-      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
+      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
       "utf8"
     );
     fs.chmodSync(envPath, 0o644);
     process.env[externalKey] = "";
     delete process.env[loadedKey];
+    for (const key of smsKeys) delete process.env[key];
     process.chdir(tempDir);
     assert.equal(loadEnvFile(), envPath);
     assert.equal(process.env[externalKey], "");
     assert.equal(process.env[loadedKey], 'a\\b"c # $HOME');
+    assert.equal(process.env.APPLE_AUTOMATION_SMS_ENABLED, "1");
+    assert.equal(process.env.APPLE_AUTOMATION_SMS_PHONE, "+8613800130051");
+    assert.equal(process.env.APPLE_AUTOMATION_SMS_API_URL, "https://example.test/record?token=private");
+    assert.equal(process.env.APPLE_AUTOMATION_SMS_RECONFIGURE, "1");
+    assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
     assert.equal(
       saveCredentialsToEnv({ appleId: "person@example.com", password: "secret" }),
       envPath
@@ -1342,11 +1361,32 @@ function runEnvDataParsingTest() {
       }),
       envPath
     );
+    assert.equal(
+      saveMacSettingsSmsProviderConfig({
+        phoneNumber: "+8613800130052",
+        apiUrl: "https://example.test/record?token=replaced",
+      }),
+      envPath
+    );
     const saved = fs.readFileSync(envPath, "utf8");
     assert.match(saved, /^name="Test Given Test Family"$/m);
     assert.match(saved, /^birthday=2000-01-02$/m);
     assert.equal((saved.match(/^name=/gm) ?? []).length, 1);
     assert.equal((saved.match(/^birthday=/gm) ?? []).length, 1);
+    assert.match(saved, /^APPLE_AUTOMATION_SMS_ENABLED=1$/m);
+    assert.match(saved, /^APPLE_AUTOMATION_SMS_PHONE=\+8613800130052$/m);
+    assert.match(saved, /^APPLE_AUTOMATION_SMS_API_URL=https:\/\/example\.test\/record\?token=replaced$/m);
+    assert.match(saved, /^APPLE_AUTOMATION_SMS_RECONFIGURE=0$/m);
+    assert.equal((saved.match(/^APPLE_AUTOMATION_SMS_PHONE=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^APPLE_AUTOMATION_SMS_API_URL=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^APPLE_AUTOMATION_MANUAL_SMS_CODE=/gm) ?? []).length, 0);
+    const credentialsSource = fs.readFileSync(
+      new URL("./lib/credentials.js", import.meta.url),
+      "utf8"
+    );
+    assert.match(credentialsSource, /fs\.openSync\(candidate, "wx", 0o600\)/);
+    assert.match(credentialsSource, /fs\.fsyncSync\(descriptor\)/);
+    assert.match(credentialsSource, /fs\.renameSync\(tempPath, envPath\)/);
     assert.equal(saved.includes("\r\n"), true);
     assert.equal(/(?<!\r)\n/.test(saved), false);
     if (process.platform !== "win32") {
@@ -1362,9 +1402,35 @@ function runEnvDataParsingTest() {
     else process.env[externalKey] = originalExternal;
     if (originalLoaded === undefined) delete process.env[loadedKey];
     else process.env[loadedKey] = originalLoaded;
+    for (const key of smsKeys) {
+      if (originalSmsValues[key] === undefined) delete process.env[key];
+      else process.env[key] = originalSmsValues[key];
+    }
     if (fs.existsSync(envPath)) fs.unlinkSync(envPath);
     fs.rmdirSync(tempDir);
   }
+}
+
+function runSmsRuntimeEnvMergeTest() {
+  const initialPartial = {
+    APPLE_AUTOMATION_SMS_ENABLED: "1",
+    APPLE_AUTOMATION_SMS_PHONE: "+8613800130053",
+  };
+  const persistedPair = {
+    APPLE_AUTOMATION_SMS_ENABLED: "1",
+    APPLE_AUTOMATION_SMS_PHONE: "+8613800130051",
+    APPLE_AUTOMATION_SMS_API_URL: "https://example.test/record?token=stored",
+  };
+  const mergedPartial = mergeMacSettingsSmsRuntimeEnv(initialPartial, persistedPair);
+  assert.equal(mergedPartial.APPLE_AUTOMATION_SMS_PHONE, "+8613800130053");
+  assert.equal(Object.hasOwn(mergedPartial, "APPLE_AUTOMATION_SMS_API_URL"), false);
+
+  const mergedStored = mergeMacSettingsSmsRuntimeEnv({}, persistedPair);
+  assert.equal(mergedStored.APPLE_AUTOMATION_SMS_PHONE, "+8613800130051");
+  assert.equal(
+    mergedStored.APPLE_AUTOMATION_SMS_API_URL,
+    "https://example.test/record?token=stored"
+  );
 }
 
 function runFlowReportPrivacyTest() {
@@ -1491,6 +1557,7 @@ const focusedTests = {
   "mask-apple-id": () => {
     runAppleIdMaskingTest();
     runEnvDataParsingTest();
+    runSmsRuntimeEnvMergeTest();
     runFlowReportPrivacyTest();
     runFullFlowSourceContractTest();
     runSupervisedCredentialConfirmationTest();
@@ -1557,6 +1624,7 @@ runAppleIdMaskingTest();
 runBrowserFailureClassificationTest();
 runFlowFailureEnvelopeTest();
 runEnvDataParsingTest();
+runSmsRuntimeEnvMergeTest();
 runFlowReportPrivacyTest();
 runFullFlowSourceContractTest();
 runSupervisedCredentialConfirmationTest();

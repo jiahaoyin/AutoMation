@@ -12,6 +12,10 @@ const SMS_RUNTIME_SECRET_ENV_KEYS = [
   "APPLE_AUTOMATION_SMS_API_URL",
   "APPLE_AUTOMATION_MANUAL_SMS_CODE",
 ];
+const SMS_RUNTIME_CONFIG_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_ENABLED",
+  "APPLE_AUTOMATION_SMS_RECONFIGURE",
+];
 
 function failure(code) {
   const error = new Error(code);
@@ -25,8 +29,9 @@ function fixedString(value) {
 
 export function captureMacSettingsSmsRuntimeEnv(env = process.env) {
   const captured = {};
-  if (typeof env.APPLE_AUTOMATION_SMS_ENABLED === "string") {
-    captured.APPLE_AUTOMATION_SMS_ENABLED = env.APPLE_AUTOMATION_SMS_ENABLED;
+  for (const key of SMS_RUNTIME_CONFIG_ENV_KEYS) {
+    if (typeof env[key] === "string") captured[key] = env[key];
+    delete env[key];
   }
   for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) {
     if (typeof env[key] === "string") captured[key] = env[key];
@@ -57,6 +62,10 @@ export function validateSmsProviderPhone(value) {
     throw failure("MAC_SETTINGS_SMS_PHONE_INVALID");
   }
   return phone;
+}
+
+export function isMacSettingsSmsReconfigureRequested(env = process.env) {
+  return fixedString(env.APPLE_AUTOMATION_SMS_RECONFIGURE) === "1";
 }
 
 async function promptForSecretLine(label) {
@@ -147,25 +156,33 @@ export async function resolveMacSettingsSmsProviderConfig(options = {}) {
   const notify = options.notify ?? ((message) => console.warn(message));
   const canPrompt =
     typeof options.prompt === "function" || (input.isTTY === true && output.isTTY === true);
+  const forceReconfigure = isMacSettingsSmsReconfigureRequested(env);
   let phone = fixedString(env.APPLE_AUTOMATION_SMS_PHONE);
   let apiUrl = fixedString(env.APPLE_AUTOMATION_SMS_API_URL);
+  let reconfigureNoticeShown = false;
 
   while (true) {
-    if (phone && apiUrl) {
+    if (!forceReconfigure && phone && apiUrl) {
       try {
         return {
           phoneNumber: validateSmsProviderPhone(phone),
           apiUrl: validateSmsProviderUrl(apiUrl).toString(),
+          source: "stored",
         };
       } catch {
         if (!canPrompt) throw failure("MAC_SETTINGS_SMS_PROVIDER_CONFIG_INVALID");
         notify(FIXED_INVALID_CONFIG_NOTICE);
       }
-    } else if (phone || apiUrl) {
+    } else if (!forceReconfigure && (phone || apiUrl)) {
       if (!canPrompt) throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED");
       notify(FIXED_INCOMPLETE_CONFIG_NOTICE);
     } else if (!canPrompt) {
       throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED");
+    }
+
+    if (forceReconfigure && !reconfigureNoticeShown) {
+      notify("[SMS] Reconfiguration requested. Enter a replacement phone number and provider URL.");
+      reconfigureNoticeShown = true;
     }
 
     const promptedPhone = await prompt({ field: "phone", secret: false });
@@ -175,6 +192,18 @@ export async function resolveMacSettingsSmsProviderConfig(options = {}) {
     }
     phone = fixedString(promptedPhone);
     apiUrl = fixedString(promptedUrl);
+    try {
+      return {
+        phoneNumber: validateSmsProviderPhone(phone),
+        apiUrl: validateSmsProviderUrl(apiUrl).toString(),
+        source: "terminal",
+      };
+    } catch {
+      if (!canPrompt) throw failure("MAC_SETTINGS_SMS_PROVIDER_CONFIG_INVALID");
+      notify(FIXED_INVALID_CONFIG_NOTICE);
+      phone = "";
+      apiUrl = "";
+    }
   }
 }
 
