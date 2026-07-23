@@ -1994,6 +1994,28 @@ for (const helper of [
     `${helper} must be compiled before the supervised hard-failure marker`
   );
 }
+for (const helper of [
+  "mac-settings-sms-verification",
+  "mac-settings-post-sms-finalization",
+]) {
+  const helperCompileIndex = supervisedRemoteScript.indexOf(
+    `compile_supervised_helper "${helper}"`
+  );
+  assert.ok(
+    helperCompileIndex > supervisedHelperFailureIndex,
+    `${helper} must not gate the supervised account flow`
+  );
+  assert.match(
+    supervisedRemoteScript,
+    new RegExp(`${helper}[^\\n]*[\\s\\S]{0,180}rm -f -- "\\$SUPERVISED_HELPER_DIR/${helper}"`),
+    `a failed optional ${helper} compile must disable stale helper output`
+  );
+  assert.doesNotMatch(
+    supervisedRemoteScript,
+    new RegExp(`${helper}[^\\n]*\\|\\| true`),
+    `a failed optional ${helper} compile must not retain a stale helper`
+  );
+}
 assert.match(supervisedRemoteScript, /\[\[ -L "\$SUPERVISED_HELPER_DIR" \]\]/);
 assert.match(supervisedRemoteScript, /\[\[ -e "\$SUPERVISED_HELPER_DIR" && ! -d "\$SUPERVISED_HELPER_DIR" \]\]/);
 assert.match(supervisedRemoteScript, /\[\[ -L "\$SUPERVISED_HELPER_ROOT" \]\]/);
@@ -2081,7 +2103,7 @@ const supervisedSetupSlice = supervisedRemoteScript.slice(
   supervisedRemoteScript.indexOf('SUPERVISED_CONTROL_DIR='),
   supervisedSetupAbortIndex
 );
-assert.doesNotMatch(supervisedSetupSlice, /\brm\b|git\s|password|OTP/i);
+assert.doesNotMatch(supervisedSetupSlice, /git\s|password|OTP/i);
 assert.equal(
   (supervisedSetupSlice.match(/\/bin\/cat "\$REMOTE_REPO\/\.env"/g) ?? [])
     .length,

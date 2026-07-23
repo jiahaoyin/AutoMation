@@ -23,6 +23,7 @@ readonly REQUIRED_SWIFT_HELPERS=(
 readonly OPTIONAL_SWIFT_HELPERS=(
   "mac-settings-ax-fill"
   "mac-settings-sms-verification"
+  "mac-settings-post-sms-finalization"
 )
 readonly COMPILED_SWIFT_HELPERS=(
   "${REQUIRED_SWIFT_HELPERS[@]}"
@@ -170,6 +171,15 @@ cleanup_swift_helper_temp_dir() {
   /bin/rmdir "$temp_dir" 2>/dev/null || true
 }
 
+disable_optional_swift_helper() {
+  local helper="$1"
+  case "$helper" in
+    mac-settings-post-sms-finalization)
+      /bin/rm -f -- "scripts/bin/${helper}"
+      ;;
+  esac
+}
+
 compile_swift_helper() {
   local temp_dir="$1"
   local helper="$2"
@@ -252,6 +262,19 @@ compile_swift_helpers() {
           /bin/rm -f -- "$temp_dir/${optional_helper}"
         fi
         ;;
+      mac-settings-post-sms-finalization)
+        if [[ -f "scripts/swift/${optional_helper}.swift" ]] &&
+          compile_swift_helper "$temp_dir" "$optional_helper" \
+            --optional \
+            -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics \
+            -framework ScreenCaptureKit; then
+          optional_compiled+=("$optional_helper")
+        else
+          echo "警告: 可选 Swift helper 编译失败: ${optional_helper}。iPhone 解锁视觉定位将保留人工处理。" >&2
+          /bin/rm -f -- "$temp_dir/${optional_helper}"
+          disable_optional_swift_helper "$optional_helper"
+        fi
+        ;;
     esac
   done
 
@@ -268,6 +291,7 @@ compile_swift_helpers() {
     if ! /bin/mv -f -- "$temp_dir/${helper}" "scripts/bin/${helper}"; then
       echo "警告: 可选 Swift helper 无法替换: ${helper}。保留旧 helper，安装继续。" >&2
       /bin/rm -f -- "$temp_dir/${helper}"
+      disable_optional_swift_helper "$helper"
       continue
     fi
     echo "✓ ${helper} 已编译"

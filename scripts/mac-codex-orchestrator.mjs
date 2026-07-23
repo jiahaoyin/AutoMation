@@ -349,6 +349,14 @@ export function buildRemoteScript(options) {
           '    write_supervised_attestation failed 1 false HELPER_COMPILE_FAILED "$EXPECTED_HEAD"',
           "  fi",
           "fi",
+          'if (( BRIDGE_SETUP_OK == 1 )); then',
+          '  if ! compile_supervised_helper "mac-settings-sms-verification" -framework ApplicationServices -framework AppKit; then',
+          '    /bin/rm -f -- "$SUPERVISED_HELPER_DIR/mac-settings-sms-verification"',
+          '  fi',
+          '  if ! compile_supervised_helper "mac-settings-post-sms-finalization" -framework ApplicationServices -framework AppKit -framework Vision -framework CoreGraphics -framework ScreenCaptureKit; then',
+          '    /bin/rm -f -- "$SUPERVISED_HELPER_DIR/mac-settings-post-sms-finalization"',
+          '  fi',
+          "fi",
         ];
   const supervisedCredentialBoundaryCommands =
     supervisedMode === SUPERVISED_ACCOUNT_MODE

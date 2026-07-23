@@ -28,11 +28,29 @@ end readCredentials
 -- 在 parent 下按 BFS 找精确 AXIdentifier；不缓存跨状态转换的 AX 元素引用
 -- 返回 {found, pathString}，pathString 如 "2/1/3"
 using terms from application "System Events"
-on bfsElementWithIdentifier(parentRef, wantedIdentifier, maxDepth)
+on isExpectedLoginControlKind(elementRef, wantedKind)
+	try
+		set roleValue to value of attribute "AXRole" of elementRef as text
+		if wantedKind is "field" then
+			if roleValue is "AXTextField" or roleValue is "AXSecureTextField" then return true
+			set subroleValue to ""
+			try
+				set subroleValue to value of attribute "AXSubrole" of elementRef as text
+			end try
+			return subroleValue is "AXSecureTextField"
+		end if
+		if wantedKind is "button" then return roleValue is "AXButton"
+	end try
+	return false
+end isExpectedLoginControlKind
+
+on bfsUniqueElementWithIdentifier(parentRef, wantedIdentifier, wantedKind, maxDepth)
 	set tfQueueEls to {parentRef}
 	set tfQueuePaths to {""}
 	set tfQueueDepths to {0}
 	set queueIndex to 1
+	set matchCount to 0
+	set matchPath to ""
 	repeat 600 times
 		if queueIndex > (count of tfQueueEls) then exit repeat
 		set curEl to item queueIndex of tfQueueEls
@@ -53,8 +71,9 @@ on bfsElementWithIdentifier(parentRef, wantedIdentifier, maxDepth)
 				else
 					set childPath to curPath & "/" & (ci as text)
 				end if
-				if identifierValue is wantedIdentifier then
-					return {true, childPath}
+				if identifierValue is wantedIdentifier and my isExpectedLoginControlKind(childEl, wantedKind) then
+					set matchCount to matchCount + 1
+					if matchCount is 1 then set matchPath to childPath
 				end if
 				if curDepth < maxDepth then
 					set end of tfQueueEls to childEl
@@ -64,13 +83,45 @@ on bfsElementWithIdentifier(parentRef, wantedIdentifier, maxDepth)
 			end repeat
 		end try
 	end repeat
+	if matchCount is 1 then return {true, matchPath}
 	return {false, ""}
-end bfsElementWithIdentifier
+end bfsUniqueElementWithIdentifier
+
+on countElementsWithIdentifier(parentRef, wantedIdentifier, wantedKind, maxDepth)
+	set tfQueueEls to {parentRef}
+	set tfQueueDepths to {0}
+	set queueIndex to 1
+	set matchCount to 0
+	repeat 600 times
+		if queueIndex > (count of tfQueueEls) then exit repeat
+		set curEl to item queueIndex of tfQueueEls
+		set curDepth to item queueIndex of tfQueueDepths
+		set queueIndex to queueIndex + 1
+		try
+			set childCount to count of UI elements of curEl
+			repeat with ci from 1 to childCount
+				set childEl to UI element ci of curEl
+				set identifierValue to ""
+				try
+					set identifierValue to value of attribute "AXIdentifier" of childEl as text
+				end try
+				if identifierValue is wantedIdentifier and my isExpectedLoginControlKind(childEl, wantedKind) then
+					set matchCount to matchCount + 1
+				end if
+				if curDepth < maxDepth then
+					set end of tfQueueEls to childEl
+					set end of tfQueueDepths to (curDepth + 1)
+				end if
+			end repeat
+		end try
+	end repeat
+	return matchCount
+end countElementsWithIdentifier
 
 -- 每一轮从 live root 重新构建路径，避免 Continue 后 System Settings 重绘造成旧引用失效
-on waitForIdentifierPath(parentRef, wantedIdentifier, maxAttempts, pauseSeconds)
+on waitForIdentifierPath(parentRef, wantedIdentifier, wantedKind, maxAttempts, pauseSeconds)
 	repeat maxAttempts times
-		set identifierResult to my bfsElementWithIdentifier(parentRef, wantedIdentifier, 12)
+		set identifierResult to my bfsUniqueElementWithIdentifier(parentRef, wantedIdentifier, wantedKind, 12)
 		if item 1 of identifierResult then return identifierResult
 		delay pauseSeconds
 	end repeat
@@ -91,14 +142,14 @@ on resolvePath(rootRef, pathString)
 end resolvePath
 
 -- A stored child-index path is only a locator hint. Re-check its live leaf before every action.
-on resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+on resolveIdentifierPath(rootRef, pathString, wantedIdentifier, wantedKind)
 	try
 		set el to my resolvePath(rootRef, pathString)
 		set identifierValue to ""
 		try
 			set identifierValue to value of attribute "AXIdentifier" of el as text
 		end try
-		if identifierValue is wantedIdentifier then return el
+		if identifierValue is wantedIdentifier and my isExpectedLoginControlKind(el, wantedKind) then return el
 	end try
 	return missing value
 end resolveIdentifierPath
@@ -112,9 +163,33 @@ on fieldHasEnabledFocus(fieldEl)
 	return false
 end fieldHasEnabledFocus
 
+on targetWindowIsFrontmost(targetW)
+	try
+		tell application "System Events"
+			if not (frontmost of process "System Settings") then return false
+			if not (focused of targetW) then return false
+			if not (visible of targetW) then return false
+			return true
+		end tell
+	end try
+	return false
+end targetWindowIsFrontmost
+
+on targetWindowMatchesLoginState(targetW, wantedState)
+	if not (my targetWindowIsFrontmost(targetW)) then return false
+	set usernameCount to my countElementsWithIdentifier(targetW, "USERNAME_TEXT_FIELD", "field", 12)
+	set passwordCount to my countElementsWithIdentifier(targetW, "PASSWORD_TEXT_FIELD", "field", 12)
+	set buttonCount to my countElementsWithIdentifier(targetW, "LOGIN_BUTTON", "button", 12)
+	if usernameCount is not 1 or buttonCount is not 1 then return false
+	if wantedState is "email" then return passwordCount is 0
+	if wantedState is "password" then return passwordCount is 1
+	return false
+end targetWindowMatchesLoginState
+
 on fillFieldAtPath(rootRef, pathString, textValue, verificationKind, wantedIdentifier)
-	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier, "field")
 	if fieldEl is missing value then return {false, false}
+	if not (my targetWindowIsFrontmost(rootRef)) then return {false, false}
 	try
 		if not (enabled of fieldEl) then return {false, false}
 		click fieldEl
@@ -126,8 +201,9 @@ on fillFieldAtPath(rootRef, pathString, textValue, verificationKind, wantedIdent
 		end try
 	end try
 	delay 0.35
-	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier, "field")
 	if fieldEl is missing value then return {false, false}
+	if not (my targetWindowIsFrontmost(rootRef)) then return {false, false}
 	try
 		if not (enabled of fieldEl) then return {false, false}
 		set focused of fieldEl to true
@@ -135,34 +211,23 @@ on fillFieldAtPath(rootRef, pathString, textValue, verificationKind, wantedIdent
 		return {false, false}
 	end try
 	delay 0.12
-	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier, "field")
 	if fieldEl is missing value then return {false, false}
+	if not (my targetWindowIsFrontmost(rootRef)) then return {false, false}
 	if not (my fieldHasEnabledFocus(fieldEl)) then return {false, false}
 
-	set valueWriteAttempted to false
-	try
-		set value of fieldEl to textValue
-		set valueWriteAttempted to true
-	end try
-	delay 0.2
-	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
-	if fieldEl is missing value then
-		if valueWriteAttempted then return {true, false}
-		return {false, false}
-	end if
-	if not (my fieldHasEnabledFocus(fieldEl)) then
-		if valueWriteAttempted then return {true, false}
-		return {false, false}
-	end if
-
-	set the clipboard to textValue
 	keystroke "a" using command down
 	delay 0.08
-	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier)
-	if fieldEl is missing value then return {true, false}
-	if not (my fieldHasEnabledFocus(fieldEl)) then return {true, false}
-	keystroke "v" using command down
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier, "field")
+	if fieldEl is missing value then return {false, false}
+	if not (my targetWindowIsFrontmost(rootRef)) then return {false, false}
+	if not (my fieldHasEnabledFocus(fieldEl)) then return {false, false}
+	keystroke textValue
 	delay 0.45
+	set fieldEl to my resolveIdentifierPath(rootRef, pathString, wantedIdentifier, "field")
+	if fieldEl is missing value then return {true, false}
+	if not (my targetWindowIsFrontmost(rootRef)) then return {true, false}
+	if not (my fieldHasEnabledFocus(fieldEl)) then return {true, false}
 	set fieldVal to ""
 	try
 		set fieldVal to value of fieldEl as text
@@ -181,9 +246,14 @@ on fillFieldAtPath(rootRef, pathString, textValue, verificationKind, wantedIdent
 end fillFieldAtPath
 
 -- Re-find only when a re-render invalidated the saved path; never repeat a failed credential write.
-on fillIdentifierField(targetW, wantedIdentifier, textValue, verificationKind, maxAttempts, pauseSeconds)
+on fillIdentifierField(wantedState, wantedIdentifier, textValue, verificationKind, maxAttempts, pauseSeconds)
 	repeat maxAttempts times
-		set fieldResult to my bfsElementWithIdentifier(targetW, wantedIdentifier, 12)
+		set targetW to my currentFrontmostLoginWindow(wantedState, 1, 0)
+		if targetW is missing value then
+			delay pauseSeconds
+			next repeat
+		end if
+		set fieldResult to my bfsUniqueElementWithIdentifier(targetW, wantedIdentifier, "field", 12)
 		if item 1 of fieldResult then
 			set fillResult to my fillFieldAtPath(targetW, item 2 of fieldResult, textValue, verificationKind, wantedIdentifier)
 			if item 1 of fillResult then return item 2 of fillResult
@@ -194,12 +264,17 @@ on fillIdentifierField(targetW, wantedIdentifier, textValue, verificationKind, m
 end fillIdentifierField
 
 -- LOGIN_BUTTON must be found by AXIdentifier and enabled before pressing it.
-on clickLoginButton(targetW, maxAttempts, pauseSeconds)
+on clickLoginButton(wantedState, maxAttempts, pauseSeconds)
 	repeat maxAttempts times
-		set buttonResult to my bfsElementWithIdentifier(targetW, "LOGIN_BUTTON", 12)
+		set targetW to my currentFrontmostLoginWindow(wantedState, 1, 0)
+		if targetW is missing value then
+			delay pauseSeconds
+			next repeat
+		end if
+		set buttonResult to my bfsUniqueElementWithIdentifier(targetW, "LOGIN_BUTTON", "button", 12)
 		if item 1 of buttonResult then
 			try
-				set buttonEl to my resolveIdentifierPath(targetW, item 2 of buttonResult, "LOGIN_BUTTON")
+				set buttonEl to my resolveIdentifierPath(targetW, item 2 of buttonResult, "LOGIN_BUTTON", "button")
 				if buttonEl is not missing value then
 					if enabled of buttonEl then
 						click buttonEl
@@ -212,6 +287,22 @@ on clickLoginButton(targetW, maxAttempts, pauseSeconds)
 	end repeat
 	return false
 end clickLoginButton
+
+on currentFrontmostLoginWindow(wantedState, maxAttempts, pauseSeconds)
+	repeat maxAttempts times
+		try
+			tell application "System Events"
+				if frontmost of process "System Settings" then
+					repeat with candidateW in windows of process "System Settings"
+						if my targetWindowMatchesLoginState(candidateW, wantedState) then return candidateW
+					end repeat
+				end if
+			end tell
+		end try
+		delay pauseSeconds
+	end repeat
+	return missing value
+end currentFrontmostLoginWindow
 end using terms from
 
 on run argv
@@ -252,48 +343,14 @@ on run argv
 			delay 0.6
 			my logStep(3, "System Settings frontmost, windows=" & (count of windows))
 
-			set targetWinIndex to 1
-			set markers to {"一个账户", "电子邮件或电话号码", "Email or phone", "Email or Phone", "Sign in to your Apple", "尽享 Apple", "登录", "密码", "Password"}
-			repeat 15 times
-				if (count of windows) > 0 then
-					set winCount to count of windows
-					repeat with wi from 1 to winCount
-						set matched to false
-						try
-							set wName to name of window wi
-							repeat with marker in markers
-								if wName contains marker then
-									set matched to true
-									exit repeat
-								end if
-							end repeat
-						end try
-						if matched then
-							set targetWinIndex to wi
-							exit repeat
-						end if
-					end repeat
-					if matched then exit repeat
-				end if
-				my openAppleAccountPane()
-				delay 1
-			end repeat
-
-			if (count of windows) is 0 then
-				error "未找到 Apple 登录窗口（系统设置可能仍停留在辅助功能页）"
+			set targetW to my currentFrontmostLoginWindow("email", 15, 0.25)
+			if targetW is missing value then
+				error "未找到前台 Apple 登录邮箱页（USERNAME_TEXT_FIELD + LOGIN_BUTTON）"
 			end if
-
-			set targetW to window targetWinIndex
-			try
-				set index of targetW to 1
-			end try
-			set frontmost to true
-			delay 0.5
-
-			my logStep(4, "target login window index=" & targetWinIndex)
+			my logStep(4, "frontmost email login window resolved")
 
 			-- 首屏的 Apple Account 输入框由 AXIdentifier 唯一标识，不能按文本框序号猜测。
-			set emailResult to my waitForIdentifierPath(targetW, "USERNAME_TEXT_FIELD", 12, 0.25)
+			set emailResult to my waitForIdentifierPath(targetW, "USERNAME_TEXT_FIELD", "field", 12, 0.25)
 			set emailFound to item 1 of emailResult
 			set emailPath to item 2 of emailResult
 			if not emailFound then
@@ -301,14 +358,14 @@ on run argv
 			end if
 			my logStep(5, "found USERNAME_TEXT_FIELD")
 
-			set emailFilled to my fillIdentifierField(targetW, "USERNAME_TEXT_FIELD", appleId, "email", 3, 0.15)
+			set emailFilled to my fillIdentifierField("email", "USERNAME_TEXT_FIELD", appleId, "email", 3, 0.15)
 			if not emailFilled then
 				error "邮箱未成功填入登录框"
 			end if
 			my logStep(7, "email verified ok")
 
 			delay 0.4
-			set clickedCont to my clickLoginButton(targetW, 10, 0.2)
+			set clickedCont to my clickLoginButton("email", 10, 0.2)
 			if clickedCont then
 				my logStep(8, "clicked Continue")
 			else
@@ -316,7 +373,11 @@ on run argv
 			end if
 
 			-- Continue 后窗口会重绘；每轮从当前窗口重新解析 PASSWORD_TEXT_FIELD 的路径。
-			set pwdResult to my waitForIdentifierPath(targetW, "PASSWORD_TEXT_FIELD", 18, 0.35)
+			set targetW to my currentFrontmostLoginWindow("password", 18, 0.35)
+			if targetW is missing value then
+				error "未在限定时间内找到密码输入框（PASSWORD_TEXT_FIELD）"
+			end if
+			set pwdResult to my waitForIdentifierPath(targetW, "PASSWORD_TEXT_FIELD", "field", 1, 0)
 			set pwdFound to item 1 of pwdResult
 			set pwdPath to item 2 of pwdResult
 
@@ -325,14 +386,14 @@ on run argv
 			end if
 
 			my logStep(9, "found PASSWORD_TEXT_FIELD")
-			set passwordFilled to my fillIdentifierField(targetW, "PASSWORD_TEXT_FIELD", applePassword, "password", 3, 0.15)
+			set passwordFilled to my fillIdentifierField("password", "PASSWORD_TEXT_FIELD", applePassword, "password", 3, 0.15)
 			if not passwordFilled then
 				error "密码未成功填入登录框"
 			end if
 			my logStep(10, "password verified ok")
 
 			delay 0.4
-			if my clickLoginButton(targetW, 10, 0.2) then
+			if my clickLoginButton("password", 10, 0.2) then
 				my logStep(11, "clicked login/submit")
 			else
 				error "未找到或未启用登录提交按钮（LOGIN_BUTTON）"

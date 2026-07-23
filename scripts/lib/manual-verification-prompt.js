@@ -1,8 +1,11 @@
-const FIXED_PROMPT =
+const VERIFICATION_PROMPT =
   "[Verification] Enter the 6-digit verification code shown on this Mac: ";
 
+const DEVICE_PASSCODE_PROMPT =
+  "[Mac Settings] Enter the iPhone passcode in this terminal (input is hidden): ";
+
 /**
- * Read one six-digit ASCII verification code without echoing terminal input.
+ * Read a caller-bounded ASCII numeric value without echoing terminal input.
  * Returns null when the prompt is unavailable, cancelled, or timed out.
  *
  * @param {{
@@ -16,16 +19,24 @@ const FIXED_PROMPT =
  * }} options
  * @returns {Promise<string|null>}
  */
-export function promptForHiddenVerificationCode(options) {
+export function promptForHiddenNumericValue(options = {}) {
   const {
     signal,
     timeoutMs,
+    allowedLengths = [6],
+    prompt = VERIFICATION_PROMPT,
     input = process.stdin,
     output = process.stdout,
     allowPipedOutput = process.env.APPLE_AUTOMATION_SUPERVISED_GUI === "1",
     setTimeout: schedule = globalThis.setTimeout,
     clearTimeout: cancel = globalThis.clearTimeout,
-  } = options ?? {};
+  } = options;
+
+  const lengths = new Set(
+    Array.isArray(allowedLengths)
+      ? allowedLengths.filter((value) => Number.isInteger(value) && value > 0)
+      : []
+  );
 
   if (
     signal?.aborted ||
@@ -33,6 +44,9 @@ export function promptForHiddenVerificationCode(options) {
     typeof output?.write !== "function" ||
     (output?.isTTY !== true && allowPipedOutput !== true) ||
     typeof input.setRawMode !== "function" ||
+    lengths.size === 0 ||
+    typeof prompt !== "string" ||
+    prompt.length === 0 ||
     !Number.isFinite(timeoutMs) ||
     timeoutMs <= 0
   ) {
@@ -95,7 +109,7 @@ export function promptForHiddenVerificationCode(options) {
           continue;
         }
         if (character === "\r" || character === "\n") {
-          if (/^[0-9]{6}$/.test(entry)) {
+          if (/^[0-9]+$/.test(entry) && lengths.has(entry.length)) {
             finish(entry);
             return;
           }
@@ -116,11 +130,29 @@ export function promptForHiddenVerificationCode(options) {
       input.once("error", onError);
       signal?.addEventListener("abort", onAbort, { once: true });
       input.resume();
-      output.write(FIXED_PROMPT);
+      output.write(prompt);
       timeoutToken = schedule(() => finish(null), timeoutMs);
       if (typeof timeoutToken?.unref === "function") timeoutToken.unref();
     } catch {
       finish(null);
     }
+  });
+}
+
+export function promptForHiddenVerificationCode(options = {}) {
+  return promptForHiddenNumericValue({
+    ...options,
+    allowedLengths: [6],
+    prompt: VERIFICATION_PROMPT,
+  });
+}
+
+/** Read a four- or six-digit device passcode without echoing it. */
+export function promptForHiddenDevicePasscode(digits, options = {}) {
+  if (digits !== 4 && digits !== 6) return Promise.resolve(null);
+  return promptForHiddenNumericValue({
+    ...options,
+    allowedLengths: [digits],
+    prompt: DEVICE_PASSCODE_PROMPT,
   });
 }

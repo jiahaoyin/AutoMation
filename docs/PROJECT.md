@@ -171,6 +171,7 @@ Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试�
 | 记住账号控件失败 | 查看固定失败报告与脱敏状态；敏感认证页不保存全页截图，不得改成盲点或盲输 |
 | 2FA 输入框未识别 | 查看固定失败原因和 `2fa-audit.jsonl` 的安全状态，补充 ruyiPage selector；不得改成无焦点输入 |
 | macOS 取码超时 | 确认系统设置已登录同账号、终端已获辅助功能；按 audit 的固定 phase/reason 检查 popup 主阶段、OCR、Settings 串行回退和最终 manual。`--skip-mac` 不需要 Automation |
+| 短信后置弹窗未自动处理 | 仅在 `.env` 设置 `APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1` 后启用。确认当前终端拥有辅助功能；iPhone 视觉路径还需要屏幕录制。模块按同一 AX owner、visual host、CGWindowID 绑定逐个处理条款、Mac 密码、iPhone 解锁和位置页，位置只接受 `action-button-2` 的“以后”，任一身份、窗口、OCR 或 4/6 格不稳定都会保留人工操作。 |
 | OCR capability 为 `permission_missing` | 这是硬门槛；在「隐私与安全性 -> 屏幕与系统音频录制」授权实际运行主体，按 macOS 提示重开终端或 Codex 后重新运行 `./install.sh` |
 | Mac 设置登录提示 Automation 未授权 | 仅完整流程/`--skip-browser` 需要；在「隐私与安全性 → 自动化」允许当前终端控制“系统设置” |
 | 姓名或生日为空 | 查看 `03-account-information.png`，调整 ruyiPage 页面解析标签 |
@@ -195,6 +196,7 @@ SWIFT_MODULE_CACHE="$TMPDIR/apple-automation-swift-module-cache"
 /bin/mkdir -p "$SWIFT_MODULE_CACHE"
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-ax-fill.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-sms-verification.swift
+/usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-settings-post-sms-finalization.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-click-allow.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-read.swift
 /usr/bin/xcrun swiftc -module-cache-path "$SWIFT_MODULE_CACHE" -typecheck scripts/swift/mac-2fa-popup-ocr.swift

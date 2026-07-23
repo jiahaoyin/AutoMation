@@ -20,7 +20,12 @@ import {
 } from "./mac-settings-ax-fill.js";
 import { saveMacSettingsSmsProviderConfig } from "./credentials.js";
 import { completeSupervisedMacSettingsSmsVerification } from "./mac-settings-sms-verification.js";
+import { isMacSettingsSmsHelperAvailable } from "./mac-settings-sms-ax.js";
 import { createSmsProviderCodePoller, resolveMacSettingsSmsProviderConfig } from "./mac-settings-sms-provider.js";
+import {
+  completeMacSettingsPostSmsFinalization,
+  isMacSettingsPostSmsFinalizationEnabled,
+} from "./mac-settings-post-sms-finalization.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -192,9 +197,46 @@ export async function fillMacSettingsAppleLogin(creds) {
 export async function waitForMacSettingsLoginComplete(options = {}) {
   const isSignedIn = options.isSignedIn ?? isMacSettingsSignedIn;
   const pause = options.sleep ?? sleep;
+  const postSmsFinalization = options.postSmsFinalization;
+  const postSmsIntervalMs = options.postSmsIntervalMs ?? 1_500;
+  let postSmsDisabled = false;
+  let nextPostSmsAt = 0;
   await waitUntil(
     "[Mac 设置] 请在系统设置中完成手机验证码（人工），脚本将等待直至检测到已登录…",
-    async () => isSignedIn(),
+    async () => {
+      if (
+        typeof postSmsFinalization === "function" &&
+        !postSmsDisabled &&
+        Date.now() >= nextPostSmsAt
+      ) {
+        let result;
+        try {
+          result = await postSmsFinalization();
+        } catch {
+          result = { status: "manual_required" };
+        }
+        if (result?.status === "submitted") {
+          // One invocation handles one stable modal. Keep polling so a later
+          // terms/password/location sheet is processed by the same chain.
+          postSmsDisabled = false;
+          // Do not let the signed-in probe short-circuit the next modal. The
+          // native helper is the only source that can prove no post-SMS sheet
+          // remains; scan again immediately after a successful submission.
+          nextPostSmsAt = 0;
+          return false;
+        } else if (result?.status === "complete") {
+          postSmsDisabled = true;
+        } else if (result?.status === "manual_required") {
+          postSmsDisabled = true;
+          console.warn("[Mac 设置] 后置弹窗未能稳定识别，保留页面供人工完成。");
+        }
+        if (result?.status !== "submitted") {
+          nextPostSmsAt = Date.now() + Math.max(250, postSmsIntervalMs);
+        }
+      }
+      if (await isSignedIn()) return true;
+      return false;
+    },
     {
       timeoutMs: options.timeoutMs ?? 20 * 60 * 1000,
       intervalMs: options.intervalMs ?? 2500,
@@ -246,18 +288,34 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
 
   await fillMacSettingsAppleLogin(creds);
   if (smsConfig) {
-    console.log("[Mac Settings][SMS] Waiting for the trusted destination and code entry.");
-    await completeSupervisedMacSettingsSmsVerification({
-      phoneNumber: smsConfig.phoneNumber,
-      codeProvider: createSmsProviderCodePoller(smsConfig),
-      supervised: true,
-    });
-    console.log(
-      "[Mac Settings][SMS] Verification code submitted. Apple will continue automatically; finish any remaining screens in System Settings."
-    );
+    if (!isMacSettingsSmsHelperAvailable()) {
+      console.warn(
+        "[Mac Settings][SMS] Native SMS helper is unavailable; complete SMS verification manually in System Settings."
+      );
+    } else {
+      console.log("[Mac Settings][SMS] Waiting for the trusted destination and code entry.");
+      await completeSupervisedMacSettingsSmsVerification({
+        phoneNumber: smsConfig.phoneNumber,
+        codeProvider: createSmsProviderCodePoller(smsConfig),
+        supervised: true,
+      });
+      console.log(
+        "[Mac Settings][SMS] Verification code submitted. Apple will continue automatically; finish any remaining screens in System Settings."
+      );
+    }
   } else {
     console.log("\n[Mac Settings] Credentials submitted. Complete SMS verification manually if shown.");
   }
-  await waitForMacSettingsLoginComplete();
+  const postSmsEnabled = isMacSettingsPostSmsFinalizationEnabled(smsEnv);
+  await waitForMacSettingsLoginComplete({
+    postSmsFinalization: postSmsEnabled
+      ? () =>
+          completeMacSettingsPostSmsFinalization({
+            supervised: true,
+            scanTimeoutMs: 30_000,
+            pollIntervalMs: 150,
+          })
+      : undefined,
+  });
   return { skipped: false, signedIn: true };
 }

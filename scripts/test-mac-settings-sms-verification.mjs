@@ -398,4 +398,14 @@ assert.doesNotMatch(nativeRunnerSource, /https?:\/\/|\bfetch\s*\(/i);
 assert.doesNotMatch(nativeRunnerSource, /spawnSync|swiftc/);
 assert.doesNotMatch(nativeRunnerSource, /Math\.max\(1_000/);
 
+const loginSource = fs.readFileSync(
+  new URL("./lib/mac-settings-login.js", import.meta.url),
+  "utf8"
+);
+assert.match(loginSource, /isMacSettingsSmsHelperAvailable/);
+assert.match(
+  loginSource,
+  /if \(!isMacSettingsSmsHelperAvailable\(\)\)[\s\S]{0,320}complete SMS verification manually/
+);
+
 console.log("mac settings supervised sms verification: ok");

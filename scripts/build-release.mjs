@@ -37,6 +37,7 @@ export const COPY_PATHS = [
   "scripts/mac-settings-signed-in.applescript",
   "scripts/swift/mac-settings-ax-fill.swift",
   "scripts/swift/mac-settings-sms-verification.swift",
+  "scripts/swift/mac-settings-post-sms-finalization.swift",
   "scripts/swift/mac-settings-2fa-code.swift",
   "scripts/swift/mac-2fa-click-allow.swift",
   "scripts/swift/mac-2fa-popup-read.swift",
@@ -45,6 +46,8 @@ export const COPY_PATHS = [
   "scripts/lib/mac-settings-ax-fill.js",
   "scripts/lib/mac-settings-sms-ax.js",
   "scripts/lib/mac-settings-sms-verification.js",
+  "scripts/lib/mac-settings-post-sms-finalization-ax.js",
+  "scripts/lib/mac-settings-post-sms-finalization.js",
   "scripts/lib/mac-settings-sms-provider.js",
   "scripts/lib/mac-settings-2fa.js",
   "scripts/lib/browser-backend.js",
@@ -71,6 +74,7 @@ export const COPY_PATHS = [
   "scripts/test-mac-settings-sms-provider.mjs",
   "scripts/test-mac-settings-sms-provider-coordinator.mjs",
   "scripts/test-mac-settings-sms-provider-config.mjs",
+  "scripts/test-mac-settings-post-sms-finalization.mjs",
   "scripts/check-environment.mjs",
   "scripts/setup-environment.mjs",
   "scripts/preflight-2fa-permissions.mjs",
@@ -192,6 +196,7 @@ function buildPackageJson(destRoot) {
       "fill:debug": "node scripts/fill-debug.mjs",
       "test:2fa-settings": "node scripts/test-2fa-settings-code.mjs",
       "test:mac-settings-sms-verification": "node scripts/test-mac-settings-sms-verification.mjs",
+      "test:mac-settings-post-sms-finalization": "node scripts/test-mac-settings-post-sms-finalization.mjs",
     },
   };
   fs.writeFileSync(
@@ -288,9 +293,12 @@ cd apple-id-automation-${VERSION}
 APPLE_AUTOMATION_SMS_ENABLED=1
 APPLE_AUTOMATION_SMS_PHONE=+8613800130051
 APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
+APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1
 \`\`\`
 
 有效的完整 pair 会直接复用，不再询问。缺失、partial 或无效时，终端会重录完整 pair 并在格式校验通过后以 \`0600\` 权限原子写回 \`.env\`。设 \`APPLE_AUTOMATION_SMS_RECONFIGURE=1\` 可替换已保存 pair；成功保存后自动改回 \`0\`。设 \`APPLE_AUTOMATION_SMS_ENABLED=0\` 可保留 pair 但禁用短信自动化。验证码不会保存到 \`.env\` 或任何诊断产物。
+
+将 \`APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1\` 打开后，短信提交后的条款、Mac 密码、iPhone 解锁和位置弹窗会使用同一受信 AX/CGWindow 绑定逐个处理：条款勾选后点“同意”，Mac 密码写入固定测试值 \`000000\`，iPhone 用 Vision 确认 4/6 格后自动填入同长度的 \`0\`，位置只点 \`action-button-2\` 的“以后”。输入只经 stdin，不写入 \`.env\`、日志、报告、参数或环境；任何识别不稳定会保留页面供人工处理。
 
 ## 故障排查
 
@@ -346,6 +354,8 @@ APPLE_AUTOMATION_SMS_PHONE=
 APPLE_AUTOMATION_SMS_API_URL=
 # 设为 1 可在下一次运行时重录 pair；保存成功后自动改回 0。
 APPLE_AUTOMATION_SMS_RECONFIGURE=0
+# 可选：短信后处理条款、Mac 密码、iPhone 解锁和位置弹窗；iPhone 自动填 4/6 个 0，Mac 密码使用 000000。
+APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0
 `
   );
 }

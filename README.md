@@ -54,6 +54,8 @@ Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recor
 | `npm run test:2fa-allow-unit` | Allow、popup AX/OCR 与隐私 source-contract 测试 |
 | `npm run test:2fa-sidecar` | popup 优先、系统设置串行回退测试 |
 | `npm run test:2fa-settings-unit` | 可取消系统设置 helper 生命周期测试 |
+| `npm run test:mac-settings-login-selector` | 系统设置登录窗口/控件唯一性与非剪贴板输入契约测试 |
+| `npm run test:mac-settings-post-sms-finalization` | 短信后四类 modal 绑定、Vision 定位与 stdin 边界测试 |
 | `npm run test:account-browser-flow` | 浏览器运行与 2FA collector 生命周期测试 |
 | `npm run test:python-bootstrap` | Python 自动安装与提权入口合同测试 |
 | `npm run package` | 本地打包 `dist/`（保留 zip） |
@@ -67,6 +69,7 @@ Vision OCR 使用「屏幕与系统音频录制」（Screen & System Audio Recor
 APPLE_AUTOMATION_SMS_ENABLED=1
 APPLE_AUTOMATION_SMS_PHONE=+8613800130051
 APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
+APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1
 ```
 
 随后运行：
@@ -78,6 +81,8 @@ APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
 完整的号码和 URL 会直接复用，不再显示输入提示。初次启用、缺少其中一项或值无效时，脚本会要求重新输入完整 pair，并在格式校验通过后以 `0600` 权限原子写回 `.env`。需要替换已保存配置时，将 `APPLE_AUTOMATION_SMS_RECONFIGURE=1` 写入 `.env` 后运行一次；成功保存新 pair 后该开关会自动恢复为 `0`。将 `APPLE_AUTOMATION_SMS_ENABLED=0` 可保留 pair 但禁用短信自动化。验证码不会写入 `.env`、日志、报告、截图或子进程环境。
 
 多号码页只选择尾号匹配的“发送短信至”控件；单号码页则先核验页面显示的尾号，再轮询一个独立六位码。填写后 Apple 自动推进，系统设置窗口保留，脚本持续等待登录状态确认。
+
+若短信后出现条款、Mac 密码、iPhone 解锁或“查找我的 Mac”位置选择弹窗，将 `APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1` 打开。模块按 AX 树与窗口绑定逐个重新扫描：条款只勾选唯一同意框后点击“同意”，Mac 密码只向唯一密码框写入固定测试值 `000000`，iPhone 页用 Vision 确认稳定的 4/6 格后自动填入同长度的 `0`，位置页只点击 `action-button-2` 的“以后”，绝不点“允许”。所有输入只走受监督 helper 的 stdin，不写入 `.env`、报告、日志、参数或环境；绑定或识别不稳定就保留页面供人工处理。
 
 ## 发布与分发
 
@@ -177,6 +182,7 @@ Windows 只能验证 Node/Python 逻辑、协议、语法和 source-contract，�
 ./install.sh
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-ax-fill.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-sms-verification.swift
+/usr/bin/xcrun swiftc -typecheck scripts/swift/mac-settings-post-sms-finalization.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-click-allow.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-read.swift
 /usr/bin/xcrun swiftc -typecheck scripts/swift/mac-2fa-popup-ocr.swift
@@ -187,6 +193,7 @@ npm run test:2fa-allow-unit
 npm run test:2fa-sidecar
 npm run test:2fa-settings
 npm run test:2fa-settings-unit
+npm run test:mac-settings-post-sms-finalization
 npm run test:account-browser-flow
 npm run test:ruyipage-protocol
 npm run test:ruyipage-flow

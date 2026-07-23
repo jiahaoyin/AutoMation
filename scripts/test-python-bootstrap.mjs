@@ -288,6 +288,8 @@ assert.equal(
 
 const swiftHelpers = [
   "mac-settings-ax-fill",
+  "mac-settings-sms-verification",
+  "mac-settings-post-sms-finalization",
   "mac-settings-2fa-code",
   "mac-2fa-popup-read",
   "mac-2fa-popup-ocr",
@@ -302,8 +304,13 @@ const requiredSwiftHelpers = [
 const optionalSwiftHelpers = swiftHelpers.filter(
   (helper) => !requiredSwiftHelpers.includes(helper)
 );
+const staleOptionalHelpers = new Set(["mac-settings-post-sms-finalization"]);
 assert.deepEqual(readonlyArray(rootInstall, "REQUIRED_SWIFT_HELPERS"), requiredSwiftHelpers);
-assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), ["mac-settings-ax-fill"]);
+assert.deepEqual(readonlyArray(rootInstall, "OPTIONAL_SWIFT_HELPERS"), [
+  "mac-settings-ax-fill",
+  "mac-settings-sms-verification",
+  "mac-settings-post-sms-finalization",
+]);
 const installCompileFunctions = [
   "swift_product_is_executable",
   "cleanup_swift_helper_temp_dir",
@@ -313,6 +320,7 @@ const installCompileFunctions = [
   "repair_swift_toolchain_after_compile_failure",
   "compile_swift_helper",
   "compile_swift_helpers",
+  "disable_optional_swift_helper",
 ]
   .map((name) => shellFunction(rootInstall, name))
   .filter(Boolean)
@@ -402,14 +410,16 @@ function runSwiftInstallCompileHarness(failureMode = "none", failingHelper = "")
   ].join("\n");
 
   try {
-    const result = spawnSync(bash, ["-lc", script], { encoding: "utf8" });
+    const result = spawnSync(bash, ["-s"], { input: script, encoding: "utf8" });
     return {
       result,
       precreatedOutput: fs.existsSync(precreatedMarker),
       binaries: Object.fromEntries(
         swiftHelpers.map((helper) => [
           helper,
-          fs.readFileSync(path.join(binaryDir, helper), "utf8"),
+          fs.existsSync(path.join(binaryDir, helper))
+            ? fs.readFileSync(path.join(binaryDir, helper), "utf8")
+            : null,
         ])
       ),
       binaryEntries: fs.readdirSync(binaryDir).sort(),
@@ -438,8 +448,14 @@ for (const optionalHelper of optionalSwiftHelpers) {
       `optional ${optionalHelper} ${failureMode} failure blocked install`
     );
     assert.equal(outcome.precreatedOutput, false, "optional helper output must not be pre-created");
-    assert.deepEqual(outcome.binaryEntries, [...swiftHelpers].sort());
-    assert.equal(outcome.binaries[optionalHelper], `old-${optionalHelper}\n`);
+    const expectedEntries = staleOptionalHelpers.has(optionalHelper)
+      ? swiftHelpers.filter((helper) => helper !== optionalHelper).sort()
+      : [...swiftHelpers].sort();
+    assert.deepEqual(outcome.binaryEntries, expectedEntries);
+    assert.equal(
+      outcome.binaries[optionalHelper],
+      staleOptionalHelpers.has(optionalHelper) ? null : `old-${optionalHelper}\n`
+    );
     for (const helper of requiredSwiftHelpers) {
       assert.equal(outcome.binaries[helper], `new-${helper}\n`);
     }

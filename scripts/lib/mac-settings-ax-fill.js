@@ -8,7 +8,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sleep } from "./prompt.js";
 import { resolveNativeHelperPath } from "./native-helper-path.js";
 
 const execFileAsync = promisify(execFile);
@@ -146,14 +145,12 @@ export async function fillViaSwiftAx(creds) {
   }
   console.log("[Mac 设置] ✓ 邮箱已填入");
 
-  await sleep(600);
   const cont = await runAxFill("continue");
   if (!cont.ok) {
     throw new Error("Swift AX continue action failed");
   }
   console.log("[Mac 设置] ✓ 已点击「继续」");
 
-  await sleep(2500);
   const pwd = await runAxFill("password", {
     env: {
       APPLE_SCRIPT_PASSWORD: creds.password,

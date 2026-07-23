@@ -118,6 +118,52 @@ assert.deepEqual(
   { signedIn: true }
 );
 assert.equal(signedInChecks, 2);
+let finalizationSignedInChecks = 0;
+let finalizationCalls = 0;
+const finalizationResults = [{ status: "submitted" }, { status: "not_required" }];
+assert.deepEqual(
+  await waitForMacSettingsLoginComplete({
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0,
+    sleep: async () => {},
+    isSignedIn: async () => {
+      finalizationSignedInChecks += 1;
+      return finalizationSignedInChecks > 1;
+    },
+    postSmsFinalization: async () => {
+      finalizationCalls += 1;
+      return finalizationResults.shift() ?? { status: "not_required" };
+    },
+  }),
+  { signedIn: true }
+);
+assert.equal(finalizationCalls, 2);
+let signedInWithModalCalls = 0;
+let signedInWithModalStates = [
+  { status: "submitted" },
+  { status: "not_required" },
+];
+assert.deepEqual(
+  await waitForMacSettingsLoginComplete({
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0,
+    postSmsIntervalMs: 1,
+    sleep: async () => {},
+    isSignedIn: async () => true,
+    postSmsFinalization: async () => {
+      signedInWithModalCalls += 1;
+      return signedInWithModalStates.shift() ?? { status: "not_required" };
+    },
+  }),
+  { signedIn: true }
+);
+assert.equal(
+  signedInWithModalCalls,
+  2,
+  "a signed-in probe must not skip a pending modal or the follow-up no-modal scan"
+);
 assert.doesNotMatch(fs.readFileSync(new URL("./lib/mac-settings-sms-ax.js", import.meta.url), "utf8"), /env\.APPLE_AUTOMATION_SMS_API_URL =/);
 assert.match(fs.readFileSync(new URL("./lib/mac-settings-sms-provider.js", import.meta.url), "utf8"), /promptForSecretLine/);
 const loginSource = fs.readFileSync(new URL("./lib/mac-settings-login.js", import.meta.url), "utf8");
@@ -125,6 +171,8 @@ assert.match(loginSource, /allowManualContinuation: false/);
 assert.match(loginSource, /sanitizedMacSettingsChildEnv\(\)/);
 assert.match(loginSource, /clearMacSettingsSmsRuntimeSecrets\(\)/);
 assert.match(loginSource, /saveMacSettingsSmsProviderConfig\(smsConfig\)/);
+assert.match(loginSource, /postSmsFinalization:/);
+assert.match(loginSource, /scanTimeoutMs: 30_000/);
 assert.match(loginSource, /const smsEnv = \{ \.\.\.process\.env, \.\.\.\(options\.smsEnv \?\? \{\}\) \};/);
 assert.match(
   fs.readFileSync(new URL("./apple-id-full-flow.mjs", import.meta.url), "utf8"),

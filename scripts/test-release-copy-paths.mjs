@@ -117,10 +117,14 @@ for (const rel of [
   "scripts/swift/mac-2fa-click-allow.swift",
   "scripts/swift/mac-2fa-popup-read.swift",
   "scripts/swift/mac-2fa-popup-ocr.swift",
+  "scripts/swift/mac-settings-post-sms-finalization.swift",
+  "scripts/lib/mac-settings-post-sms-finalization-ax.js",
+  "scripts/lib/mac-settings-post-sms-finalization.js",
   "scripts/lib/manual-verification-prompt.js",
   "scripts/lib/manual-2fa-prompt.js",
   "scripts/test-2fa-settings-code.mjs",
   "scripts/test-mac-settings-sms-verification.mjs",
+  "scripts/test-mac-settings-post-sms-finalization.mjs",
   "scripts/preflight-2fa-permissions.mjs",
   "scripts/bootstrap-macos.sh",
 ]) {
@@ -208,6 +212,7 @@ const requiredSwiftHelpers = [
 const optionalSwiftHelpers = [
   "mac-settings-ax-fill",
   "mac-settings-sms-verification",
+  "mac-settings-post-sms-finalization",
 ];
 const compiledSwiftHelpers = [
   ...requiredSwiftHelpers,
@@ -341,6 +346,11 @@ assert.match(
   generatedInstallSh,
   /mac-2fa-popup-ocr\)[\s\S]{0,360}-framework Vision -framework CoreGraphics[\s\S]{0,120}-framework ScreenCaptureKit/,
   "the required OCR helper must compile with the ScreenCaptureKit framework"
+);
+assert.match(
+  generatedInstallSh,
+  /mac-settings-post-sms-finalization\)[\s\S]{0,420}-framework Vision -framework CoreGraphics[\s\S]{0,120}-framework ScreenCaptureKit/,
+  "the optional iPhone unlock helper must compile with Vision and ScreenCaptureKit"
 );
 for (const helper of optionalSwiftHelpers) {
   assert.match(
