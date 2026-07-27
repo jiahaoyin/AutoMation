@@ -108,7 +108,9 @@ returns `browserLogin.success=true`, with `profileCaptureState=partial` and
 `postLoginFinalizationState=partial`. Its audit record includes the fixed runner stage,
 failure code, 2FA delivery booleans, and final browser-preservation booleans. It never
 contains the original thrown message. A cleanup failure overwrites any earlier
-`completed` finalization class with `backend_cleanup_failed`.
+`completed` finalization class with `backend_cleanup_failed`. Every recognized
+failure finalization class forces the corresponding finalization state to `partial`,
+even if an upstream result accidentally supplied completed booleans.
 
 The top-level account-browser and flow audit records use fixed state tokens:
 `profileCaptureState=succeeded|partial|skipped|unknown` and

@@ -164,6 +164,13 @@ const POST_LOGIN_FINALIZATION_CLASSES = new Set([
   "collector_dispose_failed",
   "unknown",
 ]);
+const POST_LOGIN_FINALIZATION_PARTIAL_CLASSES = new Set([
+  "browser_connection_lost",
+  "browser_quit_failed",
+  "backend_cleanup_failed",
+  "runner_post_login_failed",
+  "collector_dispose_failed",
+]);
 const POST_LOGIN_RUNNER_PARTIAL_CODES = new Set([
   "backend_exit",
   "backend_timeout",
@@ -342,6 +349,10 @@ function sanitizeProfileCaptureFailureClass(value) {
 
 function sanitizePostLoginFinalizationClass(value) {
   return POST_LOGIN_FINALIZATION_CLASSES.has(value) ? value : "unknown";
+}
+
+function finalizationClassRequiresPartial(value) {
+  return POST_LOGIN_FINALIZATION_PARTIAL_CLASSES.has(value);
 }
 
 function sanitizeBrowserObservation(event) {
@@ -714,16 +725,23 @@ function sanitizePostLoginProfileCapture(profileCapture) {
 function sanitizePostLoginFinalization(finalization) {
   if (!finalization || typeof finalization !== "object") return null;
   const source = finalization;
-  const backendCleanupCompleted = source.backendCleanupCompleted !== false;
-  const collectorDisposed = source.collectorDisposed !== false;
-  const browserFinalizationCompleted = source.browserFinalizationCompleted === true;
+  const finalizationClass = sanitizePostLoginFinalizationClass(source.finalizationClass);
+  const classRequiresPartial = finalizationClassRequiresPartial(finalizationClass);
+  const backendCleanupCompleted =
+    source.backendCleanupCompleted !== false && finalizationClass !== "backend_cleanup_failed";
+  const collectorDisposed =
+    source.collectorDisposed !== false && finalizationClass !== "collector_dispose_failed";
+  const browserFinalizationCompleted =
+    source.browserFinalizationCompleted === true &&
+    finalizationClass !== "browser_connection_lost" &&
+    finalizationClass !== "browser_quit_failed";
   const browserPreservationRequested = source.browserPreservationRequested === true;
   const browserSessionPreserved = source.browserSessionPreserved === true;
-  const finalizationClass = sanitizePostLoginFinalizationClass(source.finalizationClass);
   const browserPreservationSatisfied =
     !browserPreservationRequested || browserSessionPreserved;
   return {
     success:
+      !classRequiresPartial &&
       backendCleanupCompleted &&
       collectorDisposed &&
       browserFinalizationCompleted &&

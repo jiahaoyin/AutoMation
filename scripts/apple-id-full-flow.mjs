@@ -45,6 +45,13 @@ const POST_LOGIN_FINALIZATION_CLASSES = new Set([
   "collector_dispose_failed",
   "unknown",
 ]);
+const POST_LOGIN_FINALIZATION_PARTIAL_CLASSES = new Set([
+  "browser_connection_lost",
+  "browser_quit_failed",
+  "backend_cleanup_failed",
+  "runner_post_login_failed",
+  "collector_dispose_failed",
+]);
 
 function failureToken(value) {
   return typeof value === "string" && FAILURE_TOKEN_RE.test(value) ? value : "unknown";
@@ -52,6 +59,10 @@ function failureToken(value) {
 
 function finalizationClassToken(value) {
   return POST_LOGIN_FINALIZATION_CLASSES.has(value) ? value : "unknown";
+}
+
+function finalizationClassRequiresPartial(value) {
+  return POST_LOGIN_FINALIZATION_PARTIAL_CLASSES.has(value);
 }
 
 export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = new Date()) {
@@ -115,21 +126,28 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
       : null;
   const skipped = source.skipped === true;
   const accountHomeConfirmed = browserLogin.accountHomeConfirmed === true;
-  const backendCleanupCompleted = finalization
-    ? finalization.backendCleanupCompleted !== false
+  const finalizationClass = finalization
+    ? finalizationClassToken(finalization.finalizationClass)
     : null;
-  const collectorDisposed = finalization ? finalization.collectorDisposed !== false : null;
+  const classRequiresPartial = finalizationClassRequiresPartial(finalizationClass);
+  const backendCleanupCompleted = finalization
+    ? finalization.backendCleanupCompleted !== false &&
+      finalizationClass !== "backend_cleanup_failed"
+    : null;
+  const collectorDisposed = finalization
+    ? finalization.collectorDisposed !== false &&
+      finalizationClass !== "collector_dispose_failed"
+    : null;
   const browserFinalizationCompleted = finalization
-    ? finalization.browserFinalizationCompleted === true
+    ? finalization.browserFinalizationCompleted === true &&
+      finalizationClass !== "browser_connection_lost" &&
+      finalizationClass !== "browser_quit_failed"
     : null;
   const browserPreservationRequested = finalization
     ? finalization.browserPreservationRequested === true
     : null;
   const browserSessionPreserved = finalization
     ? finalization.browserSessionPreserved === true
-    : null;
-  const finalizationClass = finalization
-    ? finalizationClassToken(finalization.finalizationClass)
     : null;
   const browserPreservationSatisfied =
     browserPreservationRequested !== true || browserSessionPreserved === true;
@@ -147,6 +165,7 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
       : !finalization
         ? "unknown"
         : backendCleanupCompleted &&
+            !classRequiresPartial &&
             collectorDisposed &&
             browserFinalizationCompleted &&
             browserPreservationSatisfied

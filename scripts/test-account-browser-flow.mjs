@@ -1084,10 +1084,10 @@ function runAccountBrowserCompletionSummaryTest() {
       browserLogin: { accountHomeConfirmed: true },
       postLoginProfileCapture: { success: false },
       postLoginFinalization: {
-        backendCleanupCompleted: false,
+        backendCleanupCompleted: true,
         collectorDisposed: true,
-        browserFinalizationCompleted: false,
-        browserPreservationRequested: true,
+        browserFinalizationCompleted: true,
+        browserPreservationRequested: false,
         browserSessionPreserved: false,
         finalizationClass: "backend_cleanup_failed",
       },
@@ -1098,8 +1098,8 @@ function runAccountBrowserCompletionSummaryTest() {
       postLoginFinalizationState: "partial",
       backendCleanupCompleted: false,
       collectorDisposed: true,
-      browserFinalizationCompleted: false,
-      browserPreservationRequested: true,
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: false,
       browserSessionPreserved: false,
       finalizationClass: "backend_cleanup_failed",
     }
@@ -1852,6 +1852,51 @@ async function runBrowserFinalizationPartialRetentionTest() {
   assert.equal(JSON.stringify({ result, entries, logs, warnings }).includes(SECRET_FIXTURE), false);
 }
 
+async function runFinalizationFailureClassInvariantTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async () => ({
+    ...successfulResult(),
+    postLoginFinalization: {
+      backendCleanupCompleted: true,
+      collectorDisposed: true,
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: false,
+      browserSessionPreserved: false,
+      finalizationClass: "backend_cleanup_failed",
+    },
+  }));
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+
+  assert.deepEqual(result.postLoginFinalization, {
+    success: false,
+    backendCleanupCompleted: false,
+    collectorDisposed: true,
+    browserFinalizationCompleted: true,
+    browserPreservationRequested: false,
+    browserSessionPreserved: false,
+    finalizationClass: "backend_cleanup_failed",
+  });
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "post_login_finalization_partial" &&
+        entry.details.backendCleanupCompleted === false &&
+        entry.details.finalizationClass === "backend_cleanup_failed"
+    )
+  );
+}
+
 function createPostLoginRunnerError({
   failureCode = "backend_exit",
   accountHomeConfirmed = true,
@@ -2358,6 +2403,7 @@ const focusedTests = {
   "collector-cleanup-partial": runPostLoginCollectorCleanupPartialTest,
   "finalization-unknown": runMissingPostLoginFinalizationRemainsUnknownTest,
   "browser-finalization-partial": runBrowserFinalizationPartialRetentionTest,
+  "finalization-class-invariant": runFinalizationFailureClassInvariantTest,
   "runner-post-login-partial": runPostLoginRunnerPartialTest,
   "runner-post-login-boundary": runPostLoginRunnerPartialBoundaryTest,
   "ready-mode": runReadyModeSanitizationTest,
@@ -2419,6 +2465,7 @@ await runCleanupErrorSanitizationTest();
 await runPostLoginCollectorCleanupPartialTest();
 await runMissingPostLoginFinalizationRemainsUnknownTest();
 await runBrowserFinalizationPartialRetentionTest();
+await runFinalizationFailureClassInvariantTest();
 await runPostLoginRunnerPartialTest();
 await runPostLoginRunnerPartialBoundaryTest();
 await runFailureStageRetentionTest();
