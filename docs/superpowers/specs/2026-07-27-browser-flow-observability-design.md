@@ -27,9 +27,13 @@ post-login boundary.
 Python emits only fixed tokens and booleans through the existing JSONL protocol:
 
 - `browser_stage`: `stage`, `previousStage`, and `transition=entered`.
-- `browser_observation`: `checkpoint`, `pageKind`, `connectionAlive`,
-  `sessionConfirmed`, `accountHomeConfirmed`, `twofaVisible`, `inputReady`,
-  `codeInputCount`, and `authenticationError`.
+- `browser_observation`: `checkpoint`, bounded `generation=0|1|2`, `pageKind`,
+  `connectionAlive`, `inspectionAvailable`, `sessionConfirmed`,
+  `accountHomeConfirmed`, `twofaVisible`, `inputReady`, `codeInputCount`,
+  `authenticationError`, `rootManageUrl`, `rootAccountMarker`,
+  `rootAuthenticationError`, `retiringChildError`, and `childAuthUiPresent`.
+  `childAuthUiPresent` means a live editable password, email, trust, or OTP control;
+  an old frame title with no editable control is not reported as live authentication UI.
 - `profile_capture_started`, `profile_capture_completed`, or
   `profile_capture_failed`: fixed failure stage/class and browser-preservation state.
 - `screenshot_capture` or `screenshot_failed`: fixed `account_home` or
@@ -72,16 +76,19 @@ The audit stream is ordered by the same process boundaries as the terminal outpu
 1. flow launch, environment setup, credential resolution, and optional macOS phase;
 2. account-browser runtime resolution and backend startup;
 3. each `browser_stage` transition plus a redacted `browser_observation` at login,
-   2FA wait, account home, personal-information page, profile readiness, or profile
-   capture failure;
+   2FA wait, every post-OTP transition observation, account home, personal-information
+   page, profile readiness, or profile capture failure;
 4. account-home confirmation, screenshot checkpoint, profile capture, and browser
    finalization;
 5. collector disposal, acceptance-marker state, and terminal flow completion or a
    fixed failure envelope.
 
 Every lifecycle record carries only allowlisted tokens, booleans, bounded counts, or
-fixed stage/class enums. The report and audit intentionally omit all credentials, OTPs,
-profile values, raw page text, URLs, screenshot paths, and exception messages.
+fixed stage/class enums. A transient post-OTP ruyiPage inspection failure emits the same
+`twofa_transition` checkpoint with `inspectionAvailable=false`; that explicitly means
+state inspection was unavailable rather than that every authentication control was absent.
+The report and audit intentionally omit all credentials, OTPs, profile values, raw page
+text, URLs, screenshot paths, and exception messages.
 
 ## Result Contract
 

@@ -259,15 +259,22 @@ async function runFlowAuditForwardingTest() {
     await options.onEvent?.({
       event: "status",
       status: "browser_observation",
-      checkpoint: "twofa_wait",
-      pageKind: "two_factor",
+      checkpoint: "twofa_transition",
+      generation: 1,
+      pageKind: "account_manage",
       connectionAlive: true,
-      sessionConfirmed: false,
+      inspectionAvailable: false,
+      sessionConfirmed: true,
       accountHomeConfirmed: false,
       twofaVisible: true,
       inputReady: true,
       codeInputCount: 6,
       authenticationError: false,
+      rootManageUrl: true,
+      rootAccountMarker: false,
+      rootAuthenticationError: false,
+      retiringChildError: true,
+      childAuthUiPresent: false,
       secret: SECRET_FIXTURE,
     });
     await options.onEvent?.({
@@ -376,15 +383,22 @@ async function runFlowAuditForwardingTest() {
     )?.details,
     {
       status: "browser_observation",
-      checkpoint: "twofa_wait",
-      pageKind: "two_factor",
+      checkpoint: "twofa_transition",
+      generation: 1,
+      pageKind: "account_manage",
       connectionAlive: true,
-      sessionConfirmed: false,
+      inspectionAvailable: false,
+      sessionConfirmed: true,
       accountHomeConfirmed: false,
       twofaVisible: true,
       inputReady: true,
       codeInputCount: 6,
       authenticationError: false,
+      rootManageUrl: true,
+      rootAccountMarker: false,
+      rootAuthenticationError: false,
+      retiringChildError: true,
+      childAuthUiPresent: false,
     }
   );
   assert.ok(
@@ -1541,7 +1555,7 @@ async function runBrowserStageTerminalOutputTest() {
   );
   assert.ok(
     logs.includes(
-      "[ruyipage] observation:account_information:page:account_information:session:1:home:1:alive:1:twofa:0:input:0:cells:0:auth_error:0"
+      "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:retiring_child:0:child_auth:0"
     )
   );
   assert.ok(logs.includes("[ruyipage] status:screenshot_capture:checkpoint:account_home"));

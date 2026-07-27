@@ -146,18 +146,64 @@ class BrowserObservationTests(unittest.TestCase):
                 "event": "status",
                 "status": "browser_observation",
                 "checkpoint": "profile_ready",
+                "generation": 0,
                 "pageKind": "account_information",
                 "connectionAlive": True,
+                "inspectionAvailable": True,
                 "sessionConfirmed": True,
                 "accountHomeConfirmed": True,
                 "twofaVisible": False,
                 "inputReady": False,
                 "codeInputCount": 6,
                 "authenticationError": False,
+                "rootManageUrl": False,
+                "rootAccountMarker": False,
+                "rootAuthenticationError": False,
+                "retiringChildError": False,
+                "childAuthUiPresent": False,
             },
         )
         self.assertNotIn("person@example.com", json.dumps(emit_event.call_args.args[0]))
         self.assertNotIn("123456", json.dumps(emit_event.call_args.args[0]))
+
+    def test_transition_observation_accepts_only_fixed_non_secret_flags(self):
+        page = object()
+        state = {
+            "trusted": False,
+            "rootManageUrl": True,
+            "rootAccountMarker": False,
+            "rootError": False,
+            "retiringChildError": True,
+            "childAuthUiPresent": True,
+            "inspectionAvailable": False,
+            "email": "person@example.com",
+            "otp": "123456",
+        }
+        with patch(
+            "apple_account_flow.scope_location_url",
+            return_value="https://account.apple.com/account/manage",
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive", return_value=True
+        ), patch("apple_account_flow.emit") as emit_event:
+            account_flow.emit_browser_observation(
+                "twofa_transition",
+                page,
+                state,
+                account_home_confirmed=False,
+                generation=1,
+            )
+
+        event = emit_event.call_args.args[0]
+        self.assertEqual(event["checkpoint"], "twofa_transition")
+        self.assertEqual(event["generation"], 1)
+        self.assertFalse(event["inspectionAvailable"])
+        self.assertTrue(event["rootManageUrl"])
+        self.assertFalse(event["rootAccountMarker"])
+        self.assertFalse(event["rootAuthenticationError"])
+        self.assertTrue(event["retiringChildError"])
+        self.assertTrue(event["childAuthUiPresent"])
+        self.assertNotIn("person@example.com", json.dumps(event))
+        self.assertNotIn("123456", json.dumps(event))
 
 
 class ExistingBrowserAttachTests(unittest.TestCase):
@@ -2487,6 +2533,21 @@ class BrowserFlowTests(unittest.TestCase):
             calls.append(("fill_security_code", code, kwargs.get("fields")))
             return target
 
+        def confirm_signed_in(*_args, **kwargs):
+            observer = kwargs.get("transition_observer")
+            self.assertTrue(callable(observer))
+            observer(
+                {
+                    "trusted": True,
+                    "rootManageUrl": True,
+                    "rootAccountMarker": False,
+                    "rootError": False,
+                    "retiringChildError": True,
+                    "childAuthUiPresent": False,
+                }
+            )
+            return {"trusted": True}
+
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
@@ -2540,7 +2601,7 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.click_two_factor_submit",
         ) as click_submit, patch(
             "apple_account_flow.wait_for_signed_in",
-            return_value={"trusted": True},
+            side_effect=confirm_signed_in,
         ) as wait_signed_in, patch(
             "apple_account_flow.take_screenshot",
             return_value=None,
@@ -2604,11 +2665,50 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertIs(twofa_progress[6]["submitted"], True)
         self.assertIs(twofa_progress[7]["submitted"], True)
         click_submit.assert_not_called()
-        wait_signed_in.assert_called_once_with(
-            root,
-            submitted=True,
-            otp_generation=1,
-            submission_method="automatic",
+        wait_signed_in.assert_called_once()
+        self.assertEqual(wait_signed_in.call_args.args, (root,))
+        self.assertEqual(
+            {
+                key: value
+                for key, value in wait_signed_in.call_args.kwargs.items()
+                if key != "transition_observer"
+            },
+            {
+                "submitted": True,
+                "otp_generation": 1,
+                "submission_method": "automatic",
+            },
+        )
+        self.assertTrue(callable(wait_signed_in.call_args.kwargs["transition_observer"]))
+        transition_observation = next(
+            call.args[0]
+            for call in emit_event.call_args_list
+            if call.args[0].get("event") == "status"
+            and call.args[0].get("status") == "browser_observation"
+            and call.args[0].get("checkpoint") == "twofa_transition"
+        )
+        self.assertEqual(
+            transition_observation,
+            {
+                "event": "status",
+                "status": "browser_observation",
+                "checkpoint": "twofa_transition",
+                "generation": 1,
+                "pageKind": "unknown",
+                "connectionAlive": False,
+                "inspectionAvailable": True,
+                "sessionConfirmed": True,
+                "accountHomeConfirmed": False,
+                "twofaVisible": False,
+                "inputReady": False,
+                "codeInputCount": 0,
+                "authenticationError": False,
+                "rootManageUrl": True,
+                "rootAccountMarker": False,
+                "rootAuthenticationError": False,
+                "retiringChildError": True,
+                "childAuthUiPresent": False,
+            },
         )
 
     def test_browser_flow_does_not_launch_a_second_browser_for_an_active_profile(self):
@@ -4265,7 +4365,132 @@ class TwoFactorStateTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertTrue(state["trusted"])
 
-    def test_automatic_post_otp_wait_allows_manage_shell_to_hydrate_before_child_error_fails(self):
+
+    def test_automatic_post_otp_wait_rejects_live_shadow_password_or_email(self):
+        for field in ("password", "email"):
+            with self.subTest(field=field):
+                page, shadow_root = self.manage_shell_with_shadow_error(code_input_count=0)
+                shadow_root.state["shadowEvidence"][field] = True
+
+                self.assertIsNone(
+                    account_flow.confirmed_account_manage_state(
+                        page,
+                        allow_retiring_child_errors=True,
+                    )
+                )
+                state = account_flow.detect_login_state(page)
+                self.assertTrue(state["childAuthUiPresent"])
+                self.assertFalse(account_flow.has_confirmed_account_session(state))
+
+    def test_shadow_auth_detection_requires_an_enabled_editable_control(self):
+        class CapturingShadowRoot:
+            def __init__(self):
+                self.script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(
+                    {
+                        "hasStrongText": False,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "error": False,
+                    }
+                )
+
+        shadow_root = CapturingShadowRoot()
+        state = account_flow.detect_shadow_root_state(shadow_root)
+
+        self.assertFalse(state["password"])
+        self.assertFalse(state["email"])
+        self.assertIn("!el.disabled", shadow_root.script)
+        self.assertIn("el.getAttribute('aria-disabled') !== 'true'", shadow_root.script)
+
+    def test_direct_email_detector_checks_autocomplete_and_name_independently(self):
+        class CapturingScope:
+            def __init__(self):
+                self.script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(
+                    {
+                        "href": "https://idmsa.apple.com/appleauth/auth/signin",
+                        "hasStrongTwoFactorText": False,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "password": False,
+                        "email": True,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "error": True,
+                    }
+                )
+
+        scope = CapturingScope()
+        state = account_flow.detect_scope_login_state(scope)
+
+        self.assertTrue(state["email"])
+        self.assertIn("const autocomplete =", scope.script)
+        self.assertIn("autocomplete === 'email'", scope.script)
+        self.assertIn("autocomplete === 'username'", scope.script)
+        self.assertIn("/accountname|username/.test(name)", scope.script)
+
+    def test_automatic_post_otp_wait_rejects_live_direct_email_error(self):
+        frame = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": True,
+                "codeInputCount": 0,
+            }
+        )
+        frame_host = FakeElement(attrs={"src": frame.state["href"]})
+        page = FakePage(
+            {"css:iframe": [frame_host]},
+            frames=[frame],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+        )
+        frame.parent = page
+        page.states = FakeStates(alive=True)
+
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+        state = account_flow.detect_login_state(page)
+        self.assertTrue(state["childAuthUiPresent"])
+        self.assertFalse(account_flow.has_confirmed_account_session(state))
+
+    def test_automatic_post_otp_wait_accepts_manage_shell_before_account_marker_hydrates(self):
         frame = FakePage(
             state={
                 "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
@@ -4301,25 +4526,72 @@ class TwoFactorStateTests(unittest.TestCase):
         )
         frame.parent = page
         page.states = FakeStates(alive=True)
-        pauses = 0
+        transition_states = []
 
-        def hydrate_after_one_pause(*_args):
-            nonlocal pauses
-            pauses += 1
-            page.state["accountMarker"] = True
-
-        with patch("apple_account_flow.human_pause", hydrate_after_one_pause):
+        with patch(
+            "apple_account_flow.human_pause",
+            side_effect=AssertionError("stable account/manage redirect should not wait for hydration"),
+        ):
             state = wait_for_signed_in(
                 page,
                 timeout_s=0.05,
                 submitted=True,
                 otp_generation=1,
                 submission_method="automatic",
+                transition_observer=transition_states.append,
             )
 
-        self.assertGreaterEqual(pauses, 1)
         self.assertTrue(state["trusted"])
+        self.assertEqual(len(transition_states), 1)
+        observation = transition_states[0]
+        self.assertTrue(observation["rootManageUrl"])
+        self.assertFalse(observation["rootAccountMarker"])
+        self.assertFalse(observation["rootError"])
+        self.assertTrue(observation["retiringChildError"])
+        self.assertFalse(observation["childAuthUiPresent"])
+        self.assertTrue(observation["inspectionAvailable"])
+        self.assertEqual(observation["generation"], 1)
 
+    def test_automatic_post_otp_wait_without_marker_still_rejects_live_shadow_otp(self):
+        page, _shadow_root = self.manage_shell_with_shadow_error(code_input_count=6)
+        page.state["accountMarker"] = False
+
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+
+    def test_automatic_post_otp_wait_without_marker_keeps_root_and_trust_blockers_closed(self):
+        root_error_page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": True,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+                "accountMarker": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            }
+        )
+        root_error_page.states = FakeStates(alive=True)
+        trust_page = self.nested_opaque_manage_shell(trust_prompt=True)
+        trust_page.state["accountMarker"] = False
+        trust_page.states = FakeStates(alive=True)
+
+        for page in (root_error_page, trust_page):
+            with self.subTest(page=page is trust_page):
+                self.assertIsNone(
+                    account_flow.confirmed_account_manage_state(
+                        page,
+                        allow_retiring_child_errors=True,
+                    )
+                )
     def test_submitted_wait_does_not_accept_a_manage_shell_with_root_error(self):
         page = FakePage(
             state={
@@ -4571,6 +4843,7 @@ class TwoFactorStateTests(unittest.TestCase):
             "trusted": True,
             "error": False,
         }
+        transition_states = []
         with patch(
             "apple_account_flow.detect_login_state",
             side_effect=[
@@ -4587,9 +4860,76 @@ class TwoFactorStateTests(unittest.TestCase):
                 submitted=True,
                 otp_generation=1,
                 submission_method="enter",
+                transition_observer=transition_states.append,
             )
 
         self.assertTrue(state["trusted"])
+        self.assertFalse(transition_states[0]["inspectionAvailable"])
+        self.assertEqual(transition_states[0]["generation"], 1)
+        self.assertTrue(transition_states[-1]["inspectionAvailable"])
+        self.assertEqual(transition_states[-1]["generation"], 1)
+
+    def test_root_unreadable_child_readable_state_fails_closed_and_marks_observation_unavailable(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trusted": False,
+                "error": False,
+                "codeInputCount": 0,
+            }
+        )
+        child = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify/phone",
+                "twofa": True,
+                "trusted": False,
+                "error": False,
+                "codeInputCount": 0,
+            },
+            parent=page,
+        )
+        page.frames = [child]
+        page.states = FakeStates(alive=True)
+        original_detect_scope = account_flow.detect_scope_login_state
+
+        def root_unreadable(scope):
+            if scope is page:
+                raise RuntimeError("root scope unavailable")
+            return original_detect_scope(scope)
+
+        with patch(
+            "apple_account_flow.detect_scope_login_state",
+            side_effect=root_unreadable,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unable to inspect login page state through ruyiPage",
+            ):
+                detect_login_state(page)
+
+        transition_states = []
+        monotonic_values = iter((0.0, 0.0, 0.0, 1.0))
+        with patch(
+            "apple_account_flow.detect_scope_login_state",
+            side_effect=root_unreadable,
+        ), patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            with self.assertRaisesRegex(RuntimeError, "2FA submit state could not be confirmed"):
+                wait_for_signed_in(
+                    page,
+                    timeout_s=0.5,
+                    submitted=True,
+                    otp_generation=1,
+                    submission_method="automatic",
+                    transition_observer=transition_states.append,
+                )
+
+        self.assertEqual(len(transition_states), 1)
+        self.assertFalse(transition_states[0]["inspectionAvailable"])
+        self.assertEqual(transition_states[0]["generation"], 1)
 
     def test_first_generation_requires_an_explicit_otp_rejection_for_retry(self):
         state = {

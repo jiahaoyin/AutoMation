@@ -124,6 +124,7 @@ const RUYIPAGE_STAGE_TRANSITIONS = new Set(["entered"]);
 const RUYIPAGE_OBSERVATION_CHECKPOINTS = new Set([
   "login_state",
   "twofa_wait",
+  "twofa_transition",
   "account_home",
   "account_information",
   "profile_ready",
@@ -358,8 +359,10 @@ function finalizationClassRequiresPartial(value) {
 function sanitizeBrowserObservation(event) {
   return {
     checkpoint: sanitizeBrowserObservationCheckpoint(event?.checkpoint),
+    generation: sanitizeTwoFactorGeneration(event?.generation),
     pageKind: sanitizeBrowserPageKind(event?.pageKind),
     connectionAlive: event?.connectionAlive === true,
+    inspectionAvailable: event?.inspectionAvailable !== false,
     sessionConfirmed: event?.sessionConfirmed === true,
     accountHomeConfirmed: event?.accountHomeConfirmed === true,
     twofaVisible: event?.twofaVisible === true,
@@ -368,6 +371,11 @@ function sanitizeBrowserObservation(event) {
       ? event.codeInputCount
       : 0,
     authenticationError: event?.authenticationError === true,
+    rootManageUrl: event?.rootManageUrl === true,
+    rootAccountMarker: event?.rootAccountMarker === true,
+    rootAuthenticationError: event?.rootAuthenticationError === true,
+    retiringChildError: event?.retiringChildError === true,
+    childAuthUiPresent: event?.childAuthUiPresent === true,
   };
 }
 
@@ -1173,7 +1181,7 @@ export async function runAccountBrowserPhase(
         } else if (event.event === "status" && event.status === "browser_observation") {
           const observation = sanitizeBrowserObservation(event);
           console.log(
-            `[ruyipage] observation:${observation.checkpoint}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}`
+            `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
           );
         } else if (
           event.event === "status" &&

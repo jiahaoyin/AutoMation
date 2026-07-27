@@ -191,6 +191,7 @@ BROWSER_OBSERVATION_CHECKPOINTS = frozenset(
     {
         "login_state",
         "twofa_wait",
+        "twofa_transition",
         "account_home",
         "account_information",
         "profile_ready",
@@ -400,10 +401,13 @@ def emit_browser_observation(
     state: dict[str, Any] | None,
     *,
     account_home_confirmed: bool,
+    generation: int = 0,
 ) -> None:
     """Emit a fixed, non-secret browser checkpoint for audit correlation."""
     if checkpoint not in BROWSER_OBSERVATION_CHECKPOINTS:
         raise RuntimeError("browser observation checkpoint is invalid")
+    if isinstance(generation, bool) or generation not in (0, 1, 2):
+        raise RuntimeError("browser observation generation is invalid")
     source = state if isinstance(state, dict) else {}
     try:
         session_confirmed = has_confirmed_account_session(source)
@@ -415,14 +419,21 @@ def emit_browser_observation(
             "event": "status",
             "status": "browser_observation",
             "checkpoint": checkpoint,
+            "generation": generation,
             "pageKind": classify_browser_page_kind(page, source),
             "connectionAlive": browser_connection_is_alive(page),
+            "inspectionAvailable": source.get("inspectionAvailable") is not False,
             "sessionConfirmed": session_confirmed,
             "accountHomeConfirmed": account_home_confirmed is True,
             "twofaVisible": bool(source.get("twofa") or source.get("twofaVisible")),
             "inputReady": source.get("inputReady") is True,
             "codeInputCount": code_input_count if code_input_count in (1, 6) else 0,
             "authenticationError": source.get("error") is True,
+            "rootManageUrl": source.get("rootManageUrl") is True,
+            "rootAccountMarker": source.get("rootAccountMarker") is True,
+            "rootAuthenticationError": source.get("rootError") is True,
+            "retiringChildError": source.get("retiringChildError") is True,
+            "childAuthUiPresent": source.get("childAuthUiPresent") is True,
         }
     )
 
@@ -1968,6 +1979,8 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                   semanticTargetCount: 0,
                   digitCellCount: 0,
                   codeInputCount: 0,
+                  password: false,
+                  email: false,
                   trustPrompt: false,
                   otpRejected: false,
                   blocked: false,
@@ -1979,7 +1992,8 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 const rect = el.getBoundingClientRect();
                 const style = el.ownerDocument?.defaultView?.getComputedStyle(el);
                 return rect.width > 2 && rect.height > 2 &&
-                  style?.display !== 'none' && style?.visibility !== 'hidden';
+                  style?.display !== 'none' && style?.visibility !== 'hidden' &&
+                  !el.disabled && el.getAttribute('aria-disabled') !== 'true';
               };
               const isEditableTextInput = (el) => {
                 if (el.tagName !== 'INPUT') return true;
@@ -1998,6 +2012,19 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
               const targets = [...shadowRoot.querySelectorAll('input, [role="textbox"], [contenteditable="true"]')]
                 .filter(visible)
                 .filter(isEditableTextInput);
+              const password = targets.some((el) =>
+                el.tagName === 'INPUT' &&
+                String(el.type || '').toLowerCase() === 'password'
+              );
+              const email = targets.some((el) => {
+                const type = String(el.type || '').toLowerCase();
+                const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase();
+                const name = String(el.getAttribute('name') || '').toLowerCase();
+                return (el.tagName === 'INPUT' && type === 'email') ||
+                  autocomplete === 'username' ||
+                  autocomplete === 'email' ||
+                  /accountname|username/.test(name);
+              });
               const semantics = (el) => /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
                 el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
                 el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('class'),
@@ -2023,6 +2050,8 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                   ...semanticTargets,
                   ...(digitCells.length === 6 ? digitCells : [])
                 ]).size,
+                password,
+                email,
                 trustPrompt: /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body),
                 otpRejected,
                 blocked,
@@ -2053,6 +2082,8 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 digit_cell_count=digit_cell_count,
             ),
             "codeInputCount": code_input_count,
+            "password": evidence.get("password") is True,
+            "email": evidence.get("email") is True,
             "trustPrompt": evidence.get("trustPrompt") is True,
             "otpRejected": evidence.get("otpRejected") is True,
             "blocked": evidence.get("blocked") is True,
@@ -2697,8 +2728,18 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             (el.tagName === 'INPUT' || otpSemantics(el))
           );
           const href = location.href;
-          const password = inputs.some((el) => el.type === 'password');
-          const email = inputs.some((el) => el.type === 'email' || /accountName|username/i.test(el.name || el.autocomplete || ''));
+          const password = inputs.some((el) =>
+            String(el.type || '').toLowerCase() === 'password'
+          );
+          const email = inputs.some((el) => {
+            const type = String(el.type || '').toLowerCase();
+            const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase();
+            const name = String(el.getAttribute('name') || '').toLowerCase();
+            return type === 'email' ||
+              autocomplete === 'username' ||
+              autocomplete === 'email' ||
+              /accountname|username/.test(name);
+          });
           const normalizedBody = body.replace(/\s+/g, ' ');
           const otpRejected = /__OTP_REJECTION_PATTERN__/i.test(normalizedBody);
           const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
@@ -2834,15 +2875,24 @@ def is_account_manage_url(url: str) -> bool:
     )
 
 
+def has_live_auth_controls(state: dict[str, Any]) -> bool:
+    """Return whether a scope still exposes an editable authentication control."""
+    code_input_count = state.get("codeInputCount")
+    return bool(
+        state.get("password")
+        or state.get("email")
+        or state.get("trustPrompt")
+        or (type(code_input_count) is int and code_input_count > 0)
+    )
+
+
 def is_retiring_post_otp_child_error(state: dict[str, Any]) -> bool:
     """Recognize an old idmsa error shell after the account root has won."""
     code_input_count = state.get("codeInputCount")
     return bool(
         (state.get("error") or state.get("otpRejected"))
-        and not any(
-            bool(state.get(key))
-            for key in ("trustPrompt", "blocked", "password", "email")
-        )
+        and not state.get("blocked")
+        and not has_live_auth_controls(state)
         # A missing count is not proof that the widget has disappeared. This
         # fails closed so live Shadow DOM OTP cells can never be ignored.
         and type(code_input_count) is int
@@ -2863,7 +2913,7 @@ def confirmed_account_manage_state(
         return None
 
     # The URL can change before account-page text has hydrated, so do not
-    # require an account marker here.  We do still query the root and every
+    # require an account marker here. We still query the root again and every
     # live trusted child context for explicit authentication UI or errors.
     # Retired/unreadable child frames are intentionally ignored: they are a
     # normal part of Apple's post-OTP iframe teardown.
@@ -2877,7 +2927,10 @@ def confirmed_account_manage_state(
         "email",
     )
     root_state: dict[str, Any] | None = None
-    root_account_session_ready = False
+    root_redirect_ready = False
+    root_account_marker = False
+    retiring_child_error = False
+    child_auth_ui_present = False
     for scope in iter_page_scopes(page):
         try:
             state = detect_scope_login_state(scope)
@@ -2887,22 +2940,32 @@ def confirmed_account_manage_state(
             continue
         if scope is page:
             root_state = state
+            # This is the second independent root read after current_url above.
+            # A matching account/manage URL plus no root blocker is the narrow
+            # post-OTP redirect anchor, even before account HTML hydrates.
             if not is_account_manage_url(str(state.get("href") or "")):
                 return None
             if any(bool(state.get(key)) for key in blockers):
                 return None
-            root_account_session_ready = bool(state.get("accountMarker"))
+            root_redirect_ready = True
+            root_account_marker = bool(state.get("accountMarker"))
         else:
             if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
                 continue
             if not scope_has_live_frame_chain(page, scope):
                 continue
-            if any(bool(state.get(key)) for key in blockers) and not (
-                allow_retiring_child_errors
-                and root_account_session_ready
-                and is_retiring_post_otp_child_error(state)
-            ):
+            child_auth_ui_present = child_auth_ui_present or has_live_auth_controls(state)
+            if state.get("blocked") or has_live_auth_controls(state):
                 return None
+            if state.get("error") or state.get("otpRejected"):
+                retiring = is_retiring_post_otp_child_error(state)
+                if not (
+                    allow_retiring_child_errors
+                    and root_redirect_ready
+                    and retiring
+                ):
+                    return None
+                retiring_child_error = True
 
         if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
             continue
@@ -2912,28 +2975,43 @@ def confirmed_account_manage_state(
             shadow_roots = []
         for root in list(shadow_roots or []):
             shadow_state = detect_shadow_root_state(root)
-            if any(bool(shadow_state.get(key)) for key in blockers) and not (
-                scope is not page
-                and allow_retiring_child_errors
-                and root_account_session_ready
-                and is_retiring_post_otp_child_error(shadow_state)
-            ):
+            if scope is page:
+                if any(bool(shadow_state.get(key)) for key in blockers):
+                    return None
+                continue
+            if not scope_has_live_frame_chain(page, scope):
+                continue
+            child_auth_ui_present = child_auth_ui_present or has_live_auth_controls(shadow_state)
+            if shadow_state.get("blocked") or has_live_auth_controls(shadow_state):
                 return None
+            if shadow_state.get("error") or shadow_state.get("otpRejected"):
+                retiring = is_retiring_post_otp_child_error(shadow_state)
+                if not (
+                    allow_retiring_child_errors
+                    and root_redirect_ready
+                    and retiring
+                ):
+                    return None
+                retiring_child_error = True
 
-    if root_state is None:
+    if root_state is None or child_auth_ui_present:
         return None
     return {
         **root_state,
         "href": current_url,
         "accountManage": True,
+        "rootManageUrl": True,
+        "rootAccountMarker": root_account_marker,
+        "retiringChildError": retiring_child_error,
+        "childAuthUiPresent": child_auth_ui_present,
         "rootSessionTrusted": True,
         "rootError": False,
         "trusted": True,
     }
 
-
 def detect_login_state(page: Any) -> dict[str, Any]:
     scope_states: list[tuple[Any, dict[str, Any]]] = []
+    root_state: dict[str, Any] | None = None
     for scope in iter_page_scopes(page):
         try:
             state = detect_scope_login_state(scope)
@@ -2956,17 +3034,34 @@ def detect_login_state(page: Any) -> dict[str, Any]:
                         "otpRejected",
                         "blocked",
                         "error",
+                        "password",
+                        "email",
                     ):
                         if shadow_state.get(key):
                             state = {**state, key: True}
+                    shadow_code_input_count = shadow_state.get("codeInputCount")
+                    scope_code_input_count = state.get("codeInputCount")
+                    if (
+                        type(shadow_code_input_count) is int
+                        and shadow_code_input_count > 0
+                        and (
+                            type(scope_code_input_count) is not int
+                            or shadow_code_input_count > scope_code_input_count
+                        )
+                    ):
+                        state = {**state, "codeInputCount": shadow_code_input_count}
             scope_states.append((scope, state))
+            # The top-level document is the only authoritative source for
+            # rootManageUrl/rootError. A readable child cannot substitute for
+            # an unreadable root and make the observation look complete.
+            if scope is page:
+                root_state = state
 
-    if not scope_states:
+    if root_state is None:
         raise RuntimeError("unable to inspect login page state through ruyiPage")
 
-    root_scope, root_state = scope_states[0]
     root_href = str(root_state.get("href") or "")
-    root_is_account_manage = root_scope is page and is_account_manage_url(root_href)
+    root_is_account_manage = is_account_manage_url(root_href)
     apple_states = [
         state
         for _scope, state in scope_states
@@ -2994,27 +3089,25 @@ def detect_login_state(page: Any) -> dict[str, Any]:
     root_error = any(
         bool(root_state.get(key)) for key in ("error", "otpRejected", "blocked")
     )
-    has_descendant_login_or_trust_ui = any(
+    has_live_descendant_auth_controls = any(
         is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
-        and bool(state.get(key))
         and scope_has_live_frame_chain(page, scope)
-        for scope, state in scope_states
-        if scope is not page
-        for key in ("email", "password", "trustPrompt")
-    )
-    has_live_descendant_two_factor_ui = any(
-        is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
-        and bool(state.get("twofa"))
-        and scope_has_live_frame_chain(page, scope)
+        and has_live_auth_controls(state)
         for scope, state in scope_states
         if scope is not page
     )
-    has_live_descendant_error = any(
-        is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+    live_descendant_error_states = [
+        state
+        for scope, state in scope_states
+        if scope is not page
+        and is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+        and scope_has_live_frame_chain(page, scope)
         and any(bool(state.get(key)) for key in ("error", "otpRejected", "blocked"))
-        and scope_has_live_frame_chain(page, scope)
-        for scope, state in scope_states
-        if scope is not page
+    ]
+    has_live_descendant_error = bool(live_descendant_error_states)
+    has_retiring_child_error = bool(live_descendant_error_states) and all(
+        is_retiring_post_otp_child_error(state)
+        for state in live_descendant_error_states
     )
     # After OTP submission, the top-level account shell is authoritative.
     # Retiring idmsa frames can retain a verification widget or generic error
@@ -3025,8 +3118,7 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         and root_state.get("accountMarker")
         and not root_has_auth_ui
         and not root_error
-        and not has_descendant_login_or_trust_ui
-        and not has_live_descendant_two_factor_ui
+        and not has_live_descendant_auth_controls
         and not has_live_descendant_error
     )
     legacy_session_trusted = bool(
@@ -3034,8 +3126,7 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         and root_is_account_manage
         and has_apple_account_marker
         and not root_error
-        and not has_descendant_login_or_trust_ui
-        and not has_live_descendant_two_factor_ui
+        and not has_live_descendant_auth_controls
         and not has_live_descendant_error
     )
     twofa_visible = any(bool(state.get("twofa")) for state in two_factor_states)
@@ -3060,12 +3151,15 @@ def detect_login_state(page: Any) -> dict[str, Any]:
             or legacy_session_trusted
         ),
         "rootError": root_error,
+        "rootManageUrl": root_is_account_manage,
+        "rootAccountMarker": bool(root_state.get("accountMarker")),
         "rootSessionTrusted": root_session_trusted,
+        "retiringChildError": has_retiring_child_error,
+        "childAuthUiPresent": has_live_descendant_auth_controls,
         "password": any(bool(state.get("password")) for state in apple_states),
         "email": any(bool(state.get("email")) for state in apple_states),
         "codeInputCount": code_input_count,
     }
-
 
 def has_confirmed_account_session(state: dict[str, Any]) -> bool:
     """Accept root-session evidence without letting retired 2FA frames win."""
@@ -3179,7 +3273,9 @@ def wait_for_signed_in(
     submitted: bool = False,
     otp_generation: int | None = None,
     submission_method: str | None = None,
+    transition_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    """Wait for the signed-in root and surface redacted post-OTP observations."""
     if otp_generation is not None:
         validate_otp_generation(otp_generation)
     deadline = time.monotonic() + timeout_s
@@ -3195,12 +3291,21 @@ def wait_for_signed_in(
     allow_retiring_child_errors = bool(
         submitted and submission_method == "automatic" and otp_generation is not None
     )
+
+    def observe_transition(state: dict[str, Any]) -> None:
+        if transition_observer is not None:
+            observation = dict(state) if isinstance(state, dict) else {}
+            observation["inspectionAvailable"] = observation.get("inspectionAvailable") is not False
+            observation["generation"] = otp_generation if otp_generation is not None else 0
+            transition_observer(observation)
+
     while time.monotonic() < deadline:
         direct_session_state = confirmed_account_manage_state(
             page,
             allow_retiring_child_errors=allow_retiring_child_errors,
         )
         if direct_session_state is not None:
+            observe_transition(direct_session_state)
             return direct_session_state
         try:
             last_state = detect_login_state(page)
@@ -3212,6 +3317,7 @@ def wait_for_signed_in(
             # Firefox can retire the old frame before ruyiPage exposes the
             # replacement. A single unreadable poll after OTP submission is
             # not evidence that the browser flow failed.
+            observe_transition({"inspectionAvailable": False})
             if (
                 submission_transition_deadline is not None
                 and time.monotonic() >= submission_transition_deadline
@@ -3219,6 +3325,7 @@ def wait_for_signed_in(
                 raise RuntimeError("2FA submit state could not be confirmed") from error
             human_pause(350, 700)
             continue
+        observe_transition(last_state)
         if otp_generation is not None and not is_apple_url(
             str(last_state.get("href") or "")
         ):
@@ -3240,7 +3347,7 @@ def wait_for_signed_in(
             ):
                 # Account HTML can hydrate after the old idmsa child reports a
                 # generic error. The direct root-session probe above remains
-                # authoritative once the account marker appears.
+                # authoritative once the root redirect is stable.
                 human_pause(350, 700)
                 continue
             if otp_retry_allowed(last_state, otp_generation):
@@ -3261,7 +3368,6 @@ def wait_for_signed_in(
                 )
         human_pause(600, 1100)
     raise RuntimeError("account session was not confirmed after 2FA")
-
 
 def is_personal_information_scope(page: Any, scope: Any) -> bool:
     if scope is not page or getattr(scope, "parent", None) is not None:
@@ -4520,6 +4626,13 @@ def _browser_flow(args: argparse.Namespace) -> int:
                             submitted=True,
                             otp_generation=generation,
                             submission_method="automatic",
+                            transition_observer=lambda transition_state: emit_browser_observation(
+                                "twofa_transition",
+                                page,
+                                transition_state,
+                                account_home_confirmed=False,
+                                generation=generation,
+                            ),
                         )
                     except Exception:
                         emit_two_factor_progress("handoff_failed", generation=generation)
