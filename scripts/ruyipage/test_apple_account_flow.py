@@ -3439,9 +3439,12 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             "trustPrompt": False,
             "otpRejected": False,
             "blocked": False,
-            "hardAuthenticationError": False,
-            "rootHardAuthenticationError": False,
+            "hardAuthenticationError": True,
+            "rootHardAuthenticationError": True,
             "childAuthUiPresent": False,
+            "activeAuthUiPresent": False,
+            "activeOtpRejected": False,
+            "activeBlocked": False,
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
@@ -9206,7 +9209,7 @@ class PersonalInformationTests(unittest.TestCase):
                 "trustPrompt": False,
                 "otpRejected": False,
                 "blocked": False,
-                "hardAuthenticationError": False,
+                "hardAuthenticationError": True,
                 "genericAuthText": True,
                 "securityFeatureCopy": False,
                 "error": True,
@@ -9226,6 +9229,8 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertFalse(state["rootError"])
         self.assertFalse(state["twofa"])
         self.assertFalse(state["activeAuthUiPresent"])
+        self.assertTrue(state["hardAuthenticationError"])
+        self.assertTrue(state["rootHardAuthenticationError"])
 
     def test_profile_confirmation_fails_closed_for_live_authentication_state(self):
         blockers = (
@@ -9268,13 +9273,35 @@ class PersonalInformationTests(unittest.TestCase):
                 "activeAuthUiPresent": False,
                 "activeOtpRejected": False,
                 "activeBlocked": False,
-                "hardAuthenticationError": False,
-                "rootHardAuthenticationError": False,
+                "hardAuthenticationError": True,
+                "rootHardAuthenticationError": True,
             }
         )
 
         self.assertTrue(state["trusted"])
         self.assertFalse(state["twofa"])
+        self.assertTrue(state["hardAuthenticationError"])
+        self.assertTrue(state["rootHardAuthenticationError"])
+
+    def test_explicit_active_authentication_signals_still_fail_closed(self):
+        for active_key in (
+            "activeAuthUiPresent",
+            "activeOtpRejected",
+            "activeBlocked",
+        ):
+            state = {
+                "activeAuthUiPresent": False,
+                "activeOtpRejected": False,
+                "activeBlocked": False,
+                "hardAuthenticationError": True,
+                "rootHardAuthenticationError": True,
+            }
+            state[active_key] = True
+            with self.subTest(active_key=active_key), self.assertRaisesRegex(
+                RuntimeError,
+                "authentication error",
+            ):
+                account_flow.confirmed_personal_information_state(state)
 
     def test_root_password_control_is_reported_as_active_profile_auth_ui(self):
         page = FakePage(

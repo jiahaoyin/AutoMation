@@ -3895,8 +3895,6 @@ def profile_state_has_hard_authentication_blocker(state: dict[str, Any]) -> bool
             state.get("activeAuthUiPresent")
             or state.get("activeOtpRejected")
             or state.get("activeBlocked")
-            or state.get("hardAuthenticationError")
-            or state.get("rootHardAuthenticationError")
         )
     return bool(
         has_live_auth_controls(state)
