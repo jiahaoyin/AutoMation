@@ -2363,6 +2363,13 @@ function runAccountManageSecurityCardDetectorTest() {
     pageText: "Account Security Unable to sign in with two-factor authentication",
     cardText: "Account Security Unable to sign in with two-factor authentication",
   });
+  const plainErrorBesideStaticCard = createAccountSecurityDetectorFixture({
+    pageText:
+      "Account Security Two-Factor Authentication Trusted Phone Number Unable to sign in with two-factor authentication",
+    cardText: "Account Security Two-Factor Authentication Trusted Phone Number",
+    assertiveErrorText: "Unable to sign in with two-factor authentication",
+    assertiveErrorAttributes: {},
+  });
   const assertiveErrorBesideStaticCard = createAccountSecurityDetectorFixture({
     pageText:
       "Account Security Two-Factor Authentication Trusted Phone Number Unable to sign in with two-factor authentication",
@@ -2391,6 +2398,13 @@ function runAccountManageSecurityCardDetectorTest() {
       liveError.window
     )
   );
+  const rootPlainError = JSON.parse(
+    rootDetector(
+      plainErrorBesideStaticCard.document,
+      { href: "https://account.apple.com/account/manage" },
+      plainErrorBesideStaticCard.window
+    )
+  );
   const rootAssertiveError = JSON.parse(
     rootDetector(
       assertiveErrorBesideStaticCard.document,
@@ -2409,6 +2423,8 @@ function runAccountManageSecurityCardDetectorTest() {
   assert.equal(rootStatic.securityFeatureCopy, true);
   assert.equal(rootError.genericAuthText, true);
   assert.equal(rootError.securityFeatureCopy, false);
+  assert.equal(rootPlainError.securityFeatureCopy, true);
+  assert.equal(rootPlainError.hardAuthenticationError, true);
   assert.equal(rootAssertiveError.securityFeatureCopy, true);
   assert.equal(rootAssertiveError.hardAuthenticationError, true);
   assert.equal(rootAriaLiveError.securityFeatureCopy, true);
@@ -2416,6 +2432,9 @@ function runAccountManageSecurityCardDetectorTest() {
 
   const shadowStatic = JSON.parse(shadowDetector.call(staticSecurityCard.shadowRoot));
   const shadowError = JSON.parse(shadowDetector.call(liveError.shadowRoot));
+  const shadowPlainError = JSON.parse(
+    shadowDetector.call(plainErrorBesideStaticCard.shadowRoot)
+  );
   const shadowAssertiveError = JSON.parse(
     shadowDetector.call(assertiveErrorBesideStaticCard.shadowRoot)
   );
@@ -2426,6 +2445,8 @@ function runAccountManageSecurityCardDetectorTest() {
   assert.equal(shadowStatic.securityFeatureCopy, true);
   assert.equal(shadowError.genericAuthText, true);
   assert.equal(shadowError.securityFeatureCopy, false);
+  assert.equal(shadowPlainError.securityFeatureCopy, true);
+  assert.equal(shadowPlainError.hardAuthenticationError, true);
   assert.equal(shadowAssertiveError.securityFeatureCopy, true);
   assert.equal(shadowAssertiveError.hardAuthenticationError, true);
   assert.equal(shadowAriaLiveError.securityFeatureCopy, true);

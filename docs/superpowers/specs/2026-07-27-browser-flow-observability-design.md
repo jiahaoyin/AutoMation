@@ -37,7 +37,9 @@ Python emits only fixed tokens and booleans through the existing JSONL protocol:
   text paired with account-security or trusted-device/phone context), with no
   hard authentication error or live authentication control. A generic recovery
   phrase alone remains a blocker; an assertive live error remains a hard blocker
-  even if a static security card is also visible.
+  even if a static security card is also visible. A non-recovery `Unable to
+  sign in` message is also a hard blocker; only the bounded account
+  recovery copy may be normalized.
   The `account_home` checkpoint reuses the last confirmed root-session snapshot;
   it never substitutes a synthetic trusted-only state.
   `childAuthUiPresent` means a live editable password, email, trust, or OTP control;
