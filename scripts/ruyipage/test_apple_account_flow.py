@@ -159,6 +159,7 @@ class BrowserObservationTests(unittest.TestCase):
                 "rootManageUrl": False,
                 "rootAccountMarker": False,
                 "rootAuthenticationError": False,
+                "rootSecurityCopyOnly": False,
                 "retiringChildError": False,
                 "childAuthUiPresent": False,
             },
@@ -173,6 +174,7 @@ class BrowserObservationTests(unittest.TestCase):
             "rootManageUrl": True,
             "rootAccountMarker": False,
             "rootError": False,
+            "rootSecurityCopyOnly": True,
             "retiringChildError": True,
             "childAuthUiPresent": True,
             "inspectionAvailable": False,
@@ -200,6 +202,7 @@ class BrowserObservationTests(unittest.TestCase):
         self.assertTrue(event["rootManageUrl"])
         self.assertFalse(event["rootAccountMarker"])
         self.assertFalse(event["rootAuthenticationError"])
+        self.assertTrue(event["rootSecurityCopyOnly"])
         self.assertTrue(event["retiringChildError"])
         self.assertTrue(event["childAuthUiPresent"])
         self.assertNotIn("person@example.com", json.dumps(event))
@@ -2534,19 +2537,19 @@ class BrowserFlowTests(unittest.TestCase):
             return target
 
         def confirm_signed_in(*_args, **kwargs):
+            confirmed_state = {
+                "trusted": True,
+                "rootManageUrl": True,
+                "rootAccountMarker": True,
+                "rootError": False,
+                "rootSecurityCopyOnly": True,
+                "retiringChildError": True,
+                "childAuthUiPresent": False,
+            }
             observer = kwargs.get("transition_observer")
             self.assertTrue(callable(observer))
-            observer(
-                {
-                    "trusted": True,
-                    "rootManageUrl": True,
-                    "rootAccountMarker": False,
-                    "rootError": False,
-                    "retiringChildError": True,
-                    "childAuthUiPresent": False,
-                }
-            )
-            return {"trusted": True}
+            observer(confirmed_state)
+            return confirmed_state
 
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
@@ -2704,8 +2707,40 @@ class BrowserFlowTests(unittest.TestCase):
                 "codeInputCount": 0,
                 "authenticationError": False,
                 "rootManageUrl": True,
-                "rootAccountMarker": False,
+                "rootAccountMarker": True,
                 "rootAuthenticationError": False,
+                "rootSecurityCopyOnly": True,
+                "retiringChildError": True,
+                "childAuthUiPresent": False,
+            },
+        )
+        account_home_observation = next(
+            call.args[0]
+            for call in emit_event.call_args_list
+            if call.args[0].get("event") == "status"
+            and call.args[0].get("status") == "browser_observation"
+            and call.args[0].get("checkpoint") == "account_home"
+        )
+        self.assertEqual(
+            account_home_observation,
+            {
+                "event": "status",
+                "status": "browser_observation",
+                "checkpoint": "account_home",
+                "generation": 0,
+                "pageKind": "unknown",
+                "connectionAlive": False,
+                "inspectionAvailable": True,
+                "sessionConfirmed": True,
+                "accountHomeConfirmed": True,
+                "twofaVisible": False,
+                "inputReady": False,
+                "codeInputCount": 0,
+                "authenticationError": False,
+                "rootManageUrl": True,
+                "rootAccountMarker": True,
+                "rootAuthenticationError": False,
+                "rootSecurityCopyOnly": True,
                 "retiringChildError": True,
                 "childAuthUiPresent": False,
             },
@@ -4086,8 +4121,315 @@ class StrongTwoFactorClassifierTests(unittest.TestCase):
         )
         self.assertFalse(state["twofa"])
 
+    def test_manage_security_copy_only_neutralizes_generic_twofa_and_error_text(self):
+        class ManageSecurityCopyScope:
+            def __init__(self):
+                self.script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(
+                    {
+                        "href": "https://account.apple.com/account/manage",
+                        "hasStrongTwoFactorText": True,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": False,
+                        "genericAuthText": True,
+                        "securityFeatureCopy": True,
+                        "error": True,
+                        "accountManage": True,
+                        "accountMarker": True,
+                    }
+                )
+
+        scope = ManageSecurityCopyScope()
+        state = account_flow.detect_scope_login_state(scope)
+
+        self.assertTrue(state["securityCopyOnly"])
+        self.assertTrue(state["securityFeatureCopy"])
+        self.assertFalse(state["twofa"])
+        self.assertFalse(state["error"])
+        self.assertTrue(state["trusted"])
+        self.assertIn("const genericAuthText", scope.script)
+        self.assertIn("const hardAuthenticationError", scope.script)
+        self.assertIn("const securityFeatureCopy", scope.script)
+        self.assertIn("hasStaticAccountSecurityFeatureCard", scope.script)
+
+    def test_manage_security_copy_does_not_neutralize_a_hard_authentication_error(self):
+        class ManageHardErrorScope:
+            def run_js(self, _script):
+                return json.dumps(
+                    {
+                        "href": "https://account.apple.com/account/manage",
+                        "hasStrongTwoFactorText": True,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": True,
+                        "genericAuthText": True,
+                        "securityFeatureCopy": True,
+                        "error": True,
+                        "accountManage": True,
+                        "accountMarker": True,
+                    }
+                )
+
+        state = account_flow.detect_scope_login_state(ManageHardErrorScope())
+
+        self.assertFalse(state.get("securityCopyOnly", False))
+        self.assertTrue(state["error"])
+        self.assertFalse(state["trusted"])
+
+    def test_manage_generic_auth_text_without_security_feature_copy_remains_an_error(self):
+        class ManageGenericAuthScope:
+            def run_js(self, _script):
+                return json.dumps(
+                    {
+                        "href": "https://account.apple.com/account/manage",
+                        "hasStrongTwoFactorText": False,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": False,
+                        "genericAuthText": True,
+                        "securityFeatureCopy": False,
+                        "error": True,
+                        "accountManage": True,
+                        "accountMarker": True,
+                    }
+                )
+
+        state = account_flow.detect_scope_login_state(ManageGenericAuthScope())
+
+        self.assertFalse(state["securityFeatureCopy"])
+        self.assertFalse(state.get("securityCopyOnly", False))
+        self.assertTrue(state["error"])
+        self.assertFalse(state["trusted"])
+
 
 class TwoFactorStateTests(unittest.TestCase):
+    def test_submitted_wait_accepts_account_manage_security_copy_without_live_auth_ui(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "hasStrongTwoFactorText": True,
+                "semanticTargetCount": 0,
+                "digitCellCount": 0,
+                "codeInputCount": 0,
+                "password": False,
+                "email": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+                "genericAuthText": True,
+                "securityFeatureCopy": True,
+                "error": True,
+                "accountManage": True,
+                "accountMarker": True,
+            }
+        )
+        page.states = FakeStates(alive=True)
+        transition_states = []
+
+        with patch(
+            "apple_account_flow.human_pause",
+            side_effect=AssertionError("security-copy-only management page should confirm immediately"),
+        ):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                transition_observer=transition_states.append,
+            )
+
+        self.assertTrue(state["trusted"])
+        self.assertTrue(state["rootSecurityCopyOnly"])
+        self.assertFalse(state["rootError"])
+        self.assertEqual(len(transition_states), 1)
+        self.assertTrue(transition_states[0]["rootSecurityCopyOnly"])
+        self.assertFalse(transition_states[0]["error"])
+        self.assertFalse(transition_states[0]["twofa"])
+
+    def test_submitted_wait_accepts_account_manage_security_copy_in_root_shadow(self):
+        shadow_root = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": True,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 0,
+                    "codeInputCount": 0,
+                    "password": False,
+                    "email": False,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "genericAuthText": True,
+                    "securityFeatureCopy": True,
+                    "error": True,
+                }
+            }
+        )
+        page = FakePage(
+            shadow_roots=[shadow_root],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "hasStrongTwoFactorText": False,
+                "semanticTargetCount": 0,
+                "digitCellCount": 0,
+                "codeInputCount": 0,
+                "password": False,
+                "email": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+                "genericAuthText": False,
+                "error": False,
+                "accountManage": True,
+                "accountMarker": True,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        state = wait_for_signed_in(
+            page,
+            timeout_s=0.05,
+            submitted=True,
+            otp_generation=1,
+            submission_method="automatic",
+        )
+
+        self.assertTrue(state["trusted"])
+        self.assertTrue(state["rootSecurityCopyOnly"])
+        self.assertFalse(state["rootError"])
+
+    def test_submitted_wait_rejects_root_strong_auth_text_without_security_feature_copy(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "hasStrongTwoFactorText": True,
+                "semanticTargetCount": 0,
+                "digitCellCount": 0,
+                "codeInputCount": 0,
+                "password": False,
+                "email": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+                "hardAuthenticationError": False,
+                "genericAuthText": True,
+                "securityFeatureCopy": False,
+                "error": True,
+                "accountManage": True,
+                "accountMarker": True,
+            }
+        )
+        page.states = FakeStates(alive=True)
+        observations = []
+
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
+            wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                transition_observer=observations.append,
+            )
+
+        self.assertEqual(len(observations), 1)
+        self.assertTrue(observations[0]["rootError"])
+        self.assertFalse(observations[0]["trusted"])
+        self.assertFalse(observations[0]["rootSecurityCopyOnly"])
+
+    def test_submitted_wait_rejects_root_shadow_strong_auth_text_without_security_feature_copy(self):
+        shadow_root = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": True,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 0,
+                    "codeInputCount": 0,
+                    "password": False,
+                    "email": False,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "hardAuthenticationError": False,
+                    "genericAuthText": True,
+                    "securityFeatureCopy": False,
+                    "error": True,
+                }
+            }
+        )
+        page = FakePage(
+            shadow_roots=[shadow_root],
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "hasStrongTwoFactorText": False,
+                "semanticTargetCount": 0,
+                "digitCellCount": 0,
+                "codeInputCount": 0,
+                "password": False,
+                "email": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+                "hardAuthenticationError": False,
+                "genericAuthText": False,
+                "error": False,
+                "accountManage": True,
+                "accountMarker": True,
+            },
+        )
+        page.states = FakeStates(alive=True)
+        observations = []
+
+        self.assertIsNone(
+            account_flow.confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=True,
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "2FA/login failed"):
+            wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                transition_observer=observations.append,
+            )
+
+        self.assertEqual(len(observations), 1)
+        self.assertTrue(observations[0]["rootError"])
+        self.assertFalse(observations[0]["trusted"])
+        self.assertFalse(observations[0]["rootSecurityCopyOnly"])
+
     def test_submitted_wait_accepts_account_manage_url_before_dom_hydration(self):
         page = FakePage(state={"href": "https://account.apple.com/account/manage"})
         with patch(

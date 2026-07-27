@@ -432,6 +432,7 @@ def emit_browser_observation(
             "rootManageUrl": source.get("rootManageUrl") is True,
             "rootAccountMarker": source.get("rootAccountMarker") is True,
             "rootAuthenticationError": source.get("rootError") is True,
+            "rootSecurityCopyOnly": source.get("rootSecurityCopyOnly") is True,
             "retiringChildError": source.get("retiringChildError") is True,
             "childAuthUiPresent": source.get("childAuthUiPresent") is True,
         }
@@ -1984,6 +1985,9 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                   trustPrompt: false,
                   otpRejected: false,
                   blocked: false,
+                  hardAuthenticationError: false,
+                  genericAuthText: false,
+                  securityFeatureCopy: false,
                   error: false
                 });
               }
@@ -2039,9 +2043,62 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 if (typeof el.innerText === 'string') return el.innerText;
                 return el.children.length === 0 ? (el.textContent || '') : '';
               }).join('\n');
+              const hasStaticAccountSecurityFeatureCard = () => {
+                const featurePattern = /two[-\s]?factor|two[-\s]?step|\u53cc\u91cd\u8ba4\u8bc1|\u96d9\u91cd\u9a57\u8b49|\u96d9\u91cd\u8a8d\u8b49/i;
+                const contextPattern = /account security|trusted (?:phone|device)|\u8d26\u6237\u5b89\u5168|\u5e33\u6236\u5b89\u5168|\u53d7\u4fe1\u4efb(?:\u7535\u8bdd|\u96fb\u8a71|\u8bbe\u5907|\u8a2d\u5099)/i;
+                const failurePattern = /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i;
+                const textFor = (el) => String(
+                  typeof el?.innerText === 'string' ? el.innerText : (el?.textContent || '')
+                ).replace(/\s+/g, ' ').trim();
+                const isAssertive = (el) => {
+                  let current = el;
+                  for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                    const role = String(current.getAttribute('role') || '').toLowerCase();
+                    const live = String(current.getAttribute('aria-live') || '').toLowerCase();
+                    if (role === 'alert' || live === 'assertive') return true;
+                  }
+                  return false;
+                };
+                return visibleTextElements.some((leaf) => {
+                  if (!featurePattern.test(textFor(leaf))) return false;
+                  let current = leaf;
+                  for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+                    if (!visible(current) || isAssertive(current)) continue;
+                    const cardText = textFor(current);
+                    if (failurePattern.test(cardText)) continue;
+                    if (featurePattern.test(cardText) && contextPattern.test(cardText)) return true;
+                  }
+                  return false;
+                });
+              };
               const normalizedBody = body.replace(/\s+/g, ' ');
               const otpRejected = /__OTP_REJECTION_PATTERN__/i.test(normalizedBody);
               const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
+              const assertiveAuthenticationError = visibleTextElements.some((el) => {
+                const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
+                if (!/unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i.test(text)) return false;
+                let current = el;
+                for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                  const role = String(current.getAttribute('role') || '').toLowerCase();
+                  const live = String(current.getAttribute('aria-live') || '').toLowerCase();
+                  if (role === 'alert' || live === 'assertive') return true;
+                }
+                return false;
+              });
+              const unableToSignInPattern = /unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i;
+              const recoveryOnlyUnableToSignIn = /(?:unable to sign in)[\s\S]{0,180}\b(?:recover|recovery)\b|\u65e0\u6cd5\u767b\u5f55[\s\S]{0,60}(?:\u6062\u590d|\u5fa9\u539f)|\u7121\u6cd5\u767b\u5165[\s\S]{0,60}(?:\u6062\u5fa9|\u5fa9\u539f)/i;
+              const nonRecoveryUnableToSignIn = visibleTextElements.some((el) => {
+                const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
+                return unableToSignInPattern.test(text) && !recoveryOnlyUnableToSignIn.test(text);
+              });
+              const hardAuthenticationError =
+                /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(body) ||
+                assertiveAuthenticationError ||
+                nonRecoveryUnableToSignIn;
+              const genericAuthText =
+                hardAuthenticationError ||
+                unableToSignInPattern.test(body);
+              const securityFeatureCopy = hasStaticAccountSecurityFeatureCard();
               return JSON.stringify({
                 hasStrongText: strongTwoFactorText,
                 semanticTargetCount: semanticTargets.length,
@@ -2055,8 +2112,10 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 trustPrompt: /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body),
                 otpRejected,
                 blocked,
-                error: otpRejected || blocked ||
-                  /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|无法登录|無法登入|错误|錯誤|不正确|不正確|无效|無效/i.test(body)
+                hardAuthenticationError,
+                genericAuthText,
+                securityFeatureCopy,
+                error: otpRejected || blocked || genericAuthText
               });
             }
             """.replace("__OTP_REJECTION_PATTERN__", OTP_REJECTION_JS_PATTERN)
@@ -2081,6 +2140,11 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 semantic_target_count=semantic_target_count,
                 digit_cell_count=digit_cell_count,
             ),
+            "hasStrongText": evidence.get("hasStrongText") is True,
+            "securityFeatureCopy": evidence.get("securityFeatureCopy") is True,
+            "hardAuthenticationError": evidence.get("hardAuthenticationError")
+            is True,
+            "genericAuthText": evidence.get("genericAuthText") is True,
             "codeInputCount": code_input_count,
             "password": evidence.get("password") is True,
             "email": evidence.get("email") is True,
@@ -2706,6 +2770,9 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
               s.visibility !== 'hidden' && !el.disabled &&
               el.getAttribute('aria-disabled') !== 'true';
           };
+          const visibleTextElements = [...document.querySelectorAll('*')]
+            .filter(visible)
+            .filter((el) => !['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT'].includes(el.tagName));
           const isEditableTextInput = (el) => {
             if (el.tagName !== 'INPUT') return true;
             return ['text', 'search', 'tel', 'url', 'email', 'password', 'number']
@@ -2740,13 +2807,65 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
               autocomplete === 'email' ||
               /accountname|username/.test(name);
           });
+          const hasStaticAccountSecurityFeatureCard = () => {
+            const featurePattern = /two[-\s]?factor|two[-\s]?step|\u53cc\u91cd\u8ba4\u8bc1|\u96d9\u91cd\u9a57\u8b49|\u96d9\u91cd\u8a8d\u8b49/i;
+            const contextPattern = /account security|trusted (?:phone|device)|\u8d26\u6237\u5b89\u5168|\u5e33\u6236\u5b89\u5168|\u53d7\u4fe1\u4efb(?:\u7535\u8bdd|\u96fb\u8a71|\u8bbe\u5907|\u8a2d\u5099)/i;
+            const failurePattern = /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i;
+            const textFor = (el) => String(
+              typeof el?.innerText === 'string' ? el.innerText : (el?.textContent || '')
+            ).replace(/\s+/g, ' ').trim();
+            const isAssertive = (el) => {
+              let current = el;
+              for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+                const role = String(current.getAttribute('role') || '').toLowerCase();
+                const live = String(current.getAttribute('aria-live') || '').toLowerCase();
+                if (role === 'alert' || live === 'assertive') return true;
+              }
+              return false;
+            };
+            return visibleTextElements.some((leaf) => {
+              if (!featurePattern.test(textFor(leaf))) return false;
+              let current = leaf;
+              for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+                if (!visible(current) || isAssertive(current)) continue;
+                const cardText = textFor(current);
+                if (failurePattern.test(cardText)) continue;
+                if (featurePattern.test(cardText) && contextPattern.test(cardText)) return true;
+              }
+              return false;
+            });
+          };
           const normalizedBody = body.replace(/\s+/g, ' ');
           const otpRejected = /__OTP_REJECTION_PATTERN__/i.test(normalizedBody);
           const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
-          const error = otpRejected || blocked ||
-            /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|unable to sign in|无法登录|無法登入|错误|錯誤|不正确|不正確|无效|無效/i.test(body);
-          const strongTwoFactorText = /two-factor|verification code|security code|one-time code|双重认证|雙重認證|验证码|驗證碼/i.test(body);
-          const trustPrompt = /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body);
+          const assertiveAuthenticationError = visibleTextElements.some((el) => {
+            const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
+            if (!/unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i.test(text)) return false;
+            let current = el;
+            for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+              const role = String(current.getAttribute('role') || '').toLowerCase();
+              const live = String(current.getAttribute('aria-live') || '').toLowerCase();
+              if (role === 'alert' || live === 'assertive') return true;
+            }
+            return false;
+          });
+          const unableToSignInPattern = /unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i;
+          const recoveryOnlyUnableToSignIn = /(?:unable to sign in)[\s\S]{0,180}\b(?:recover|recovery)\b|\u65e0\u6cd5\u767b\u5f55[\s\S]{0,60}(?:\u6062\u590d|\u5fa9\u539f)|\u7121\u6cd5\u767b\u5165[\s\S]{0,60}(?:\u6062\u5fa9|\u5fa9\u539f)/i;
+          const nonRecoveryUnableToSignIn = visibleTextElements.some((el) => {
+            const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
+            return unableToSignInPattern.test(text) && !recoveryOnlyUnableToSignIn.test(text);
+          });
+          const hardAuthenticationError =
+            /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(body) ||
+            assertiveAuthenticationError ||
+            nonRecoveryUnableToSignIn;
+          const genericAuthText =
+            hardAuthenticationError ||
+            unableToSignInPattern.test(body);
+          const error = otpRejected || blocked || genericAuthText;
+          const strongTwoFactorText = /two-factor|verification code|security code|one-time code|\u53cc\u91cd\u8ba4\u8bc1|\u96d9\u91cd\u9a57\u8b49|\u96d9\u91cd\u8a8d\u8b49|\u9a8c\u8bc1\u7801|\u9a57\u8b49\u78bc/i.test(body);
+          const securityFeatureCopy = hasStaticAccountSecurityFeatureCard();
+          const trustPrompt = /trust this browser|\u4fe1\u4efb\u6b64\u6d4f\u89c8\u5668|\u4fe1\u4efb\u6b64\u700f\u89bd\u5668/i.test(body);
           const accountMarker =
             /personal information|个人信息|個人資料|sign out|退出|account security|账户安全|帳戶安全/i.test(body);
           return {
@@ -2758,6 +2877,9 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             error,
             otpRejected,
             blocked,
+            hardAuthenticationError,
+            genericAuthText,
+            securityFeatureCopy,
             accountManage: /account\.apple\.com\/account\/manage/i.test(href),
             accountMarker,
             password,
@@ -2779,6 +2901,9 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
         semantic_target_count=int(state.get("semanticTargetCount") or 0),
         digit_cell_count=int(state.get("digitCellCount") or 0),
     )
+    state["securityFeatureCopy"] = state.get("securityFeatureCopy") is True
+    if state.get("accountManage") is True:
+        state = normalize_account_manage_security_copy_state(state)
     if "accountManage" in state:
         state["trusted"] = bool(
             state.get("accountManage")
@@ -2786,6 +2911,9 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             and not state.get("password")
             and not state.get("email")
             and not state["twofa"]
+            and not state.get("error")
+            and not state.get("otpRejected")
+            and not state.get("blocked")
         )
     return state
 
@@ -2886,6 +3014,25 @@ def has_live_auth_controls(state: dict[str, Any]) -> bool:
     )
 
 
+def normalize_account_manage_security_copy_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Ignore account-manage prose that merely describes security features."""
+    has_security_copy = state.get("securityFeatureCopy") is True
+    if not (
+        has_security_copy
+        and not state.get("hardAuthenticationError")
+        and not state.get("otpRejected")
+        and not state.get("blocked")
+        and not has_live_auth_controls(state)
+    ):
+        return state
+    return {
+        **state,
+        "twofa": False,
+        "error": False,
+        "securityCopyOnly": True,
+    }
+
+
 def is_retiring_post_otp_child_error(state: dict[str, Any]) -> bool:
     """Recognize an old idmsa error shell after the account root has won."""
     code_input_count = state.get("codeInputCount")
@@ -2929,6 +3076,7 @@ def confirmed_account_manage_state(
     root_state: dict[str, Any] | None = None
     root_redirect_ready = False
     root_account_marker = False
+    root_security_copy_only = False
     retiring_child_error = False
     child_auth_ui_present = False
     for scope in iter_page_scopes(page):
@@ -2949,6 +3097,7 @@ def confirmed_account_manage_state(
                 return None
             root_redirect_ready = True
             root_account_marker = bool(state.get("accountMarker"))
+            root_security_copy_only = bool(state.get("securityCopyOnly"))
         else:
             if not is_trusted_two_factor_scope(scope, str(state.get("href") or "")):
                 continue
@@ -2976,6 +3125,12 @@ def confirmed_account_manage_state(
         for root in list(shadow_roots or []):
             shadow_state = detect_shadow_root_state(root)
             if scope is page:
+                if root_redirect_ready:
+                    shadow_state = normalize_account_manage_security_copy_state(shadow_state)
+                    root_security_copy_only = (
+                        root_security_copy_only
+                        or shadow_state.get("securityCopyOnly") is True
+                    )
                 if any(bool(shadow_state.get(key)) for key in blockers):
                     return None
                 continue
@@ -3002,6 +3157,7 @@ def confirmed_account_manage_state(
         "accountManage": True,
         "rootManageUrl": True,
         "rootAccountMarker": root_account_marker,
+        "rootSecurityCopyOnly": root_security_copy_only,
         "retiringChildError": retiring_child_error,
         "childAuthUiPresent": child_auth_ui_present,
         "rootSessionTrusted": True,
@@ -3028,6 +3184,12 @@ def detect_login_state(page: Any) -> dict[str, Any]:
                     shadow_roots = []
                 for root in list(shadow_roots or []):
                     shadow_state = detect_shadow_root_state(root)
+                    if scope is page and is_account_manage_url(
+                        str(state.get("href") or "")
+                    ):
+                        shadow_state = normalize_account_manage_security_copy_state(
+                            shadow_state
+                        )
                     for key in (
                         "twofa",
                         "trustPrompt",
@@ -3050,6 +3212,8 @@ def detect_login_state(page: Any) -> dict[str, Any]:
                         )
                     ):
                         state = {**state, "codeInputCount": shadow_code_input_count}
+                    if shadow_state.get("securityCopyOnly") is True:
+                        state = {**state, "securityCopyOnly": True}
             scope_states.append((scope, state))
             # The top-level document is the only authoritative source for
             # rootManageUrl/rootError. A readable child cannot substitute for
@@ -3153,6 +3317,7 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         "rootError": root_error,
         "rootManageUrl": root_is_account_manage,
         "rootAccountMarker": bool(root_state.get("accountMarker")),
+        "rootSecurityCopyOnly": root_state.get("securityCopyOnly") is True,
         "rootSessionTrusted": root_session_trusted,
         "retiringChildError": has_retiring_child_error,
         "childAuthUiPresent": has_live_descendant_auth_controls,
@@ -4485,6 +4650,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             raise RuntimeError("login page reported an authentication error")
         set_browser_startup_stage("login_state_detected")
         skipped_login = has_confirmed_account_session(initial_state)
+        confirmed_login_state = initial_state
         if skipped_login:
             initial_state["trusted"] = True
         skipped_2fa = skipped_login
@@ -4562,6 +4728,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             )
             if login_state.get("trusted"):
                 skipped_2fa = True
+                confirmed_login_state = login_state
                 set_browser_startup_stage("signed_in")
             else:
                 for generation in (1, 2):
@@ -4650,6 +4817,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                         "transition_confirmed",
                         generation=generation,
                     )
+                    confirmed_login_state = signed_in_state
                     set_browser_startup_stage("signed_in")
                     break
         else:
@@ -4660,7 +4828,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
         emit_browser_observation(
             "account_home",
             page,
-            {"trusted": True},
+            confirmed_login_state,
             account_home_confirmed=True,
         )
         screenshots["afterLogin"] = take_screenshot(

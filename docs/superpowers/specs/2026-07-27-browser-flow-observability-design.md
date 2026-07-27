@@ -31,7 +31,15 @@ Python emits only fixed tokens and booleans through the existing JSONL protocol:
   `connectionAlive`, `inspectionAvailable`, `sessionConfirmed`,
   `accountHomeConfirmed`, `twofaVisible`, `inputReady`, `codeInputCount`,
   `authenticationError`, `rootManageUrl`, `rootAccountMarker`,
-  `rootAuthenticationError`, `retiringChildError`, and `childAuthUiPresent`.
+  `rootAuthenticationError`, `rootSecurityCopyOnly`, `retiringChildError`, and
+  `childAuthUiPresent`. `rootSecurityCopyOnly` is true only when the root or a
+  root Shadow DOM contains a visible account-security feature card (two-factor
+  text paired with account-security or trusted-device/phone context), with no
+  hard authentication error or live authentication control. A generic recovery
+  phrase alone remains a blocker; an assertive live error remains a hard blocker
+  even if a static security card is also visible.
+  The `account_home` checkpoint reuses the last confirmed root-session snapshot;
+  it never substitutes a synthetic trusted-only state.
   `childAuthUiPresent` means a live editable password, email, trust, or OTP control;
   an old frame title with no editable control is not reported as live authentication UI.
 - `profile_capture_started`, `profile_capture_completed`, or

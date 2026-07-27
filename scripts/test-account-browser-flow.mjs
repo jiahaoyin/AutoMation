@@ -273,6 +273,7 @@ async function runFlowAuditForwardingTest() {
       rootManageUrl: true,
       rootAccountMarker: false,
       rootAuthenticationError: false,
+      rootSecurityCopyOnly: true,
       retiringChildError: true,
       childAuthUiPresent: false,
       secret: SECRET_FIXTURE,
@@ -397,6 +398,7 @@ async function runFlowAuditForwardingTest() {
       rootManageUrl: true,
       rootAccountMarker: false,
       rootAuthenticationError: false,
+      rootSecurityCopyOnly: true,
       retiringChildError: true,
       childAuthUiPresent: false,
     }
@@ -1555,7 +1557,7 @@ async function runBrowserStageTerminalOutputTest() {
   );
   assert.ok(
     logs.includes(
-      "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:retiring_child:0:child_auth:0"
+      "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:root_security_copy:0:retiring_child:0:child_auth:0"
     )
   );
   assert.ok(logs.includes("[ruyipage] status:screenshot_capture:checkpoint:account_home"));
@@ -2280,6 +2282,156 @@ function runFullFlowSourceContractTest() {
   );
 }
 
+function readEmbeddedRuyiPageJavaScript(pythonSource, functionName) {
+  const functionStart = pythonSource.indexOf(`def ${functionName}(`);
+  assert.ok(functionStart >= 0, `missing Python function ${functionName}`);
+  const stringStart = pythonSource.indexOf('r"""', functionStart);
+  assert.ok(stringStart >= 0, `missing embedded JavaScript for ${functionName}`);
+  const bodyStart = pythonSource.indexOf("\n", stringStart) + 1;
+  const bodyEnd = pythonSource.indexOf(
+    '""".replace("__OTP_REJECTION_PATTERN__"',
+    bodyStart
+  );
+  assert.ok(bodyEnd > bodyStart, `unterminated embedded JavaScript for ${functionName}`);
+  return pythonSource.slice(bodyStart, bodyEnd).replace(
+    "__OTP_REJECTION_PATTERN__",
+    "never-match"
+  );
+}
+
+function createAccountSecurityDetectorFixture({
+  pageText,
+  cardText,
+  assertiveErrorText = null,
+  assertiveErrorAttributes = { role: "alert" },
+}) {
+  const style = { display: "block", visibility: "visible" };
+  const ownerDocument = {
+    defaultView: { getComputedStyle: () => style },
+  };
+  const createElement = (text, parentElement = null, attributes = {}) => ({
+    innerText: text,
+    textContent: text,
+    parentElement,
+    ownerDocument,
+    tagName: "DIV",
+    disabled: false,
+    getBoundingClientRect: () => ({ width: 200, height: 30 }),
+    getAttribute: (name) => attributes[name] ?? null,
+  });
+  const page = createElement(pageText);
+  const card = createElement(cardText, page);
+  const feature = createElement("\u53cc\u91cd\u8ba4\u8bc1", card);
+  const elements = [feature, card, page];
+  if (assertiveErrorText) {
+    elements.unshift(createElement(assertiveErrorText, page, assertiveErrorAttributes));
+  }
+  return {
+    window: { getComputedStyle: () => style },
+    document: {
+      body: { innerText: pageText },
+      querySelectorAll: (selector) => (selector === "*" ? elements : []),
+    },
+    shadowRoot: {
+      querySelectorAll: (selector) => (selector === "*" ? elements : []),
+    },
+  };
+}
+
+function runAccountManageSecurityCardDetectorTest() {
+  const pythonSource = fs.readFileSync(
+    new URL("./ruyipage/apple_account_flow.py", import.meta.url),
+    "utf8"
+  );
+  const rootScript = readEmbeddedRuyiPageJavaScript(
+    pythonSource,
+    "detect_scope_login_state"
+  );
+  const shadowScript = readEmbeddedRuyiPageJavaScript(
+    pythonSource,
+    "detect_shadow_root_state"
+  );
+  const rootDetector = new Function("document", "location", "window", rootScript);
+  const shadowDetector = new Function(`return (${shadowScript});`)();
+  const staticSecurityCard = createAccountSecurityDetectorFixture({
+    pageText:
+      "\u767b\u5f55\u4e0e\u5b89\u5168 \u7ba1\u7406\u4e0e\u767b\u5f55\u8d26\u6237\u3001\u8d26\u6237\u5b89\u5168\u4ee5\u53ca\u65e0\u6cd5\u767b\u5f55\u65f6\u8fdb\u884c\u6570\u636e\u6062\u590d\u6709\u5173\u7684\u8bbe\u7f6e\u3002 \u8d26\u6237\u5b89\u5168 \u53cc\u91cd\u8ba4\u8bc1 1\u4e2a\u53d7\u4fe1\u4efb\u7535\u8bdd\u53f7\u7801 1\u53f0\u53d7\u4fe1\u4efb\u8bbe\u5907",
+    cardText:
+      "\u8d26\u6237\u5b89\u5168 \u53cc\u91cd\u8ba4\u8bc1 1\u4e2a\u53d7\u4fe1\u4efb\u7535\u8bdd\u53f7\u7801 1\u53f0\u53d7\u4fe1\u4efb\u8bbe\u5907",
+  });
+  const liveError = createAccountSecurityDetectorFixture({
+    pageText: "Account Security Unable to sign in with two-factor authentication",
+    cardText: "Account Security Unable to sign in with two-factor authentication",
+  });
+  const assertiveErrorBesideStaticCard = createAccountSecurityDetectorFixture({
+    pageText:
+      "Account Security Two-Factor Authentication Trusted Phone Number Unable to sign in with two-factor authentication",
+    cardText: "Account Security Two-Factor Authentication Trusted Phone Number",
+    assertiveErrorText: "Unable to sign in with two-factor authentication",
+  });
+  const ariaLiveErrorBesideStaticCard = createAccountSecurityDetectorFixture({
+    pageText:
+      "Account Security Two-Factor Authentication Trusted Phone Number Unable to sign in with two-factor authentication",
+    cardText: "Account Security Two-Factor Authentication Trusted Phone Number",
+    assertiveErrorText: "Unable to sign in with two-factor authentication",
+    assertiveErrorAttributes: { "aria-live": "assertive" },
+  });
+
+  const rootStatic = JSON.parse(
+    rootDetector(
+      staticSecurityCard.document,
+      { href: "https://account.apple.com/account/manage" },
+      staticSecurityCard.window
+    )
+  );
+  const rootError = JSON.parse(
+    rootDetector(
+      liveError.document,
+      { href: "https://account.apple.com/account/manage" },
+      liveError.window
+    )
+  );
+  const rootAssertiveError = JSON.parse(
+    rootDetector(
+      assertiveErrorBesideStaticCard.document,
+      { href: "https://account.apple.com/account/manage" },
+      assertiveErrorBesideStaticCard.window
+    )
+  );
+  const rootAriaLiveError = JSON.parse(
+    rootDetector(
+      ariaLiveErrorBesideStaticCard.document,
+      { href: "https://account.apple.com/account/manage" },
+      ariaLiveErrorBesideStaticCard.window
+    )
+  );
+  assert.equal(rootStatic.genericAuthText, true);
+  assert.equal(rootStatic.securityFeatureCopy, true);
+  assert.equal(rootError.genericAuthText, true);
+  assert.equal(rootError.securityFeatureCopy, false);
+  assert.equal(rootAssertiveError.securityFeatureCopy, true);
+  assert.equal(rootAssertiveError.hardAuthenticationError, true);
+  assert.equal(rootAriaLiveError.securityFeatureCopy, true);
+  assert.equal(rootAriaLiveError.hardAuthenticationError, true);
+
+  const shadowStatic = JSON.parse(shadowDetector.call(staticSecurityCard.shadowRoot));
+  const shadowError = JSON.parse(shadowDetector.call(liveError.shadowRoot));
+  const shadowAssertiveError = JSON.parse(
+    shadowDetector.call(assertiveErrorBesideStaticCard.shadowRoot)
+  );
+  const shadowAriaLiveError = JSON.parse(
+    shadowDetector.call(ariaLiveErrorBesideStaticCard.shadowRoot)
+  );
+  assert.equal(shadowStatic.genericAuthText, true);
+  assert.equal(shadowStatic.securityFeatureCopy, true);
+  assert.equal(shadowError.genericAuthText, true);
+  assert.equal(shadowError.securityFeatureCopy, false);
+  assert.equal(shadowAssertiveError.securityFeatureCopy, true);
+  assert.equal(shadowAssertiveError.hardAuthenticationError, true);
+  assert.equal(shadowAriaLiveError.securityFeatureCopy, true);
+  assert.equal(shadowAriaLiveError.hardAuthenticationError, true);
+}
+
 function runSupervisedCredentialConfirmationTest() {
   assert.equal(
     shouldAutoConfirmAppleCredentials({ APPLE_AUTOMATION_SUPERVISED_GUI: "1" }),
@@ -2434,6 +2586,7 @@ const focusedTests = {
   "manual-unavailable-status": runSupervisedManualUnavailableStatusTest,
   "settings-status": runSupervisedSettingsStatusWhitelistTest,
   "failure-stage": runFailureStageRetentionTest,
+  "security-card-detector": runAccountManageSecurityCardDetectorTest,
   "failure-envelope": () => {
     runFlowFailureEnvelopeTest();
     runAccountBrowserCompletionSummaryTest();
@@ -2491,6 +2644,7 @@ runEnvDataParsingTest();
 runSmsRuntimeEnvMergeTest();
 runFlowReportPrivacyTest();
 runFullFlowSourceContractTest();
+runAccountManageSecurityCardDetectorTest();
 runSupervisedCredentialConfirmationTest();
 runReportRootOverrideTest();
 runAcceptanceMarkerTest();

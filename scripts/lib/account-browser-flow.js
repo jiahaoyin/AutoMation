@@ -374,6 +374,7 @@ function sanitizeBrowserObservation(event) {
     rootManageUrl: event?.rootManageUrl === true,
     rootAccountMarker: event?.rootAccountMarker === true,
     rootAuthenticationError: event?.rootAuthenticationError === true,
+    rootSecurityCopyOnly: event?.rootSecurityCopyOnly === true,
     retiringChildError: event?.retiringChildError === true,
     childAuthUiPresent: event?.childAuthUiPresent === true,
   };
@@ -1181,7 +1182,7 @@ export async function runAccountBrowserPhase(
         } else if (event.event === "status" && event.status === "browser_observation") {
           const observation = sanitizeBrowserObservation(event);
           console.log(
-            `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
+            `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:root_security_copy:${observation.rootSecurityCopyOnly ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
           );
         } else if (
           event.event === "status" &&
