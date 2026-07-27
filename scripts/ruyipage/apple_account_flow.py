@@ -25,6 +25,23 @@ from urllib.parse import urljoin, urlsplit
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
 PERSONAL_INFORMATION_PATH = "/account/manage/section/information"
+ACCOUNT_SIGN_IN_PATH = "/sign-in"
+PROFILE_NAVIGATION_LINK_SELECTORS = (
+    "css:a[href]",
+    "css:a",
+    "css:button",
+    "css:[role='link']",
+    "css:[role='link'][href]",
+)
+PROFILE_NAVIGATION_LABELS = frozenset(
+    {
+        "personal information",
+        "\u4e2a\u4eba\u4fe1\u606f",
+        "\u500b\u4eba\u8cc7\u6599",
+    }
+)
+PROFILE_NAVIGATION_WAIT_TIMEOUT_S = 12.0
+PROFILE_REAUTHENTICATION_LIMIT = 1
 PROFILE_CARD_SELECTORS = (
     "css:button.button.button-bare",
     "css:button[class*='button-bare']",
@@ -116,6 +133,7 @@ APPLE_AUTH_HOSTS = frozenset(
         "idmsa.apple.com",
     }
 )
+ACCOUNT_SIGN_IN_HOSTS = frozenset({"account.apple.com", "appleid.apple.com"})
 OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
 SCREENSHOT_CHECKPOINTS = frozenset({"account_information"})
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
@@ -215,6 +233,7 @@ PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
         "profile_session_unconfirmed",
         "profile_element_unavailable",
         "profile_page_unready",
+        "profile_reauthentication_exhausted",
         "profile_data_incomplete",
         "browser_connection_lost",
         "profile_capture_failed",
@@ -384,6 +403,8 @@ def classify_browser_page_kind(page: Any, state: dict[str, Any] | None) -> str:
         return "account_information"
     if current_url and is_account_manage_url(current_url):
         return "account_manage"
+    if current_url and is_account_sign_in_url(current_url):
+        return "sign_in"
     if source.get("error") is True:
         return "authentication_error"
     if source.get("twofa") is True or source.get("twofaVisible") is True:
@@ -442,6 +463,11 @@ def emit_browser_observation(
 def classify_profile_capture_failure(error: Exception) -> str:
     """Use fixed failure classes instead of forwarding page or exception text."""
     message = str(error).lower()
+    if (
+        "repeated reauthentication" in message
+        or "exhausted the 2fa generation limit" in message
+    ):
+        return "profile_reauthentication_exhausted"
     if "personal information page reported an authentication error" in message:
         return "profile_authentication_error"
     if "personal information page did not confirm" in message:
@@ -2087,10 +2113,37 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
               });
               const unableToSignInPattern = /unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i;
               const recoveryOnlyUnableToSignIn = /(?:unable to sign in)[\s\S]{0,180}\b(?:recover|recovery)\b|\u65e0\u6cd5\u767b\u5f55[\s\S]{0,60}(?:\u6062\u590d|\u5fa9\u539f)|\u7121\u6cd5\u767b\u5165[\s\S]{0,60}(?:\u6062\u5fa9|\u5fa9\u539f)/i;
-              const nonRecoveryUnableToSignIn = visibleTextElements.some((el) => {
+              const recoveryContextFor = (el) => {
+                const context = [];
+                let current = el;
+                for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+                  if (!visible(current)) continue;
+                  const text = String(
+                    typeof current.innerText === 'string' ? current.innerText : (current.textContent || '')
+                  ).replace(/\s+/g, ' ').trim();
+                  if (text && text.length <= 720) context.push(text);
+                }
+                for (const sibling of [el.previousElementSibling, el.nextElementSibling]) {
+                  if (!sibling || !visible(sibling)) continue;
+                  const text = String(
+                    typeof sibling.innerText === 'string' ? sibling.innerText : (sibling.textContent || '')
+                  ).replace(/\s+/g, ' ').trim();
+                  if (text && text.length <= 240) context.push(text);
+                }
+                return context.join('\n');
+              };
+              const unableToSignInElements = visibleTextElements.filter((el) => {
                 const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
-                return unableToSignInPattern.test(text) && !recoveryOnlyUnableToSignIn.test(text);
+                return unableToSignInPattern.test(text);
               });
+              const unableToSignInLeaves = unableToSignInElements.filter((el) =>
+                !unableToSignInElements.some((candidate) =>
+                  candidate !== el && typeof el.contains === 'function' && el.contains(candidate)
+                )
+              );
+              const nonRecoveryUnableToSignIn = unableToSignInLeaves.some((el) =>
+                !recoveryOnlyUnableToSignIn.test(recoveryContextFor(el))
+              );
               const hardAuthenticationError =
                 /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(body) ||
                 assertiveAuthenticationError ||
@@ -2851,10 +2904,37 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
           });
           const unableToSignInPattern = /unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i;
           const recoveryOnlyUnableToSignIn = /(?:unable to sign in)[\s\S]{0,180}\b(?:recover|recovery)\b|\u65e0\u6cd5\u767b\u5f55[\s\S]{0,60}(?:\u6062\u590d|\u5fa9\u539f)|\u7121\u6cd5\u767b\u5165[\s\S]{0,60}(?:\u6062\u5fa9|\u5fa9\u539f)/i;
-          const nonRecoveryUnableToSignIn = visibleTextElements.some((el) => {
+          const recoveryContextFor = (el) => {
+            const context = [];
+            let current = el;
+            for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+              if (!visible(current)) continue;
+              const text = String(
+                typeof current.innerText === 'string' ? current.innerText : (current.textContent || '')
+              ).replace(/\s+/g, ' ').trim();
+              if (text && text.length <= 720) context.push(text);
+            }
+            for (const sibling of [el.previousElementSibling, el.nextElementSibling]) {
+              if (!sibling || !visible(sibling)) continue;
+              const text = String(
+                typeof sibling.innerText === 'string' ? sibling.innerText : (sibling.textContent || '')
+              ).replace(/\s+/g, ' ').trim();
+              if (text && text.length <= 240) context.push(text);
+            }
+            return context.join('\n');
+          };
+          const unableToSignInElements = visibleTextElements.filter((el) => {
             const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
-            return unableToSignInPattern.test(text) && !recoveryOnlyUnableToSignIn.test(text);
+            return unableToSignInPattern.test(text);
           });
+          const unableToSignInLeaves = unableToSignInElements.filter((el) =>
+            !unableToSignInElements.some((candidate) =>
+              candidate !== el && typeof el.contains === 'function' && el.contains(candidate)
+            )
+          );
+          const nonRecoveryUnableToSignIn = unableToSignInLeaves.some((el) =>
+            !recoveryOnlyUnableToSignIn.test(recoveryContextFor(el))
+          );
           const hardAuthenticationError =
             /\berror\b|something went wrong|incorrect|invalid|expired|wrong password|try again|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(body) ||
             assertiveAuthenticationError ||
@@ -2880,7 +2960,15 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             hardAuthenticationError,
             genericAuthText,
             securityFeatureCopy,
-            accountManage: /account\.apple\.com\/account\/manage/i.test(href),
+            accountManage: (() => {
+              const currentUrl = new URL(href);
+              return currentUrl.protocol === 'https:' &&
+                currentUrl.hostname === 'account.apple.com' &&
+                (
+                  currentUrl.pathname === '/account/manage' ||
+                  currentUrl.pathname.startsWith('/account/manage/')
+                );
+            })(),
             accountMarker,
             password,
             email,
@@ -3003,6 +3091,33 @@ def is_account_manage_url(url: str) -> bool:
     )
 
 
+def is_account_manage_root_url(url: str) -> bool:
+    parsed = parse_valid_apple_url(url)
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() == "account.apple.com"
+        and parsed.path == "/account/manage"
+    )
+
+
+def is_account_sign_in_url(url: str) -> bool:
+    parsed = parse_valid_apple_url(url)
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() in ACCOUNT_SIGN_IN_HOSTS
+        and parsed.path == ACCOUNT_SIGN_IN_PATH
+    )
+
+
+def is_personal_information_url(url: str) -> bool:
+    parsed = parse_valid_apple_url(url)
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() == "account.apple.com"
+        and parsed.path == PERSONAL_INFORMATION_PATH
+    )
+
+
 def has_live_auth_controls(state: dict[str, Any]) -> bool:
     """Return whether a scope still exposes an editable authentication control."""
     code_input_count = state.get("codeInputCount")
@@ -3011,6 +3126,20 @@ def has_live_auth_controls(state: dict[str, Any]) -> bool:
         or state.get("email")
         or state.get("trustPrompt")
         or (type(code_input_count) is int and code_input_count > 0)
+    )
+
+
+def is_recoverable_account_sign_in_state(
+    page: Any,
+    state: dict[str, Any],
+) -> bool:
+    return bool(
+        is_account_sign_in_url(scope_location_url(page))
+        and (state.get("email") is True or state.get("password") is True)
+        and state.get("blocked") is not True
+        and state.get("otpRejected") is not True
+        and state.get("activeBlocked") is not True
+        and state.get("activeOtpRejected") is not True
     )
 
 
@@ -3563,15 +3692,210 @@ def wait_for_signed_in(
         human_pause(600, 1100)
     raise RuntimeError("account session was not confirmed after 2FA")
 
+def profile_navigation_link_summary(link: Any) -> dict[str, Any]:
+    raw = link.run_js(
+        r"""
+        function () {
+          // ruyipage-profile-navigation-link-summary
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          const domIdentity = (() => {
+            const parts = [];
+            let current = this;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 12; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          return JSON.stringify({
+            visible,
+            href: String(this.href || this.getAttribute('href') || ''),
+            domIdentity,
+            label: String(
+              this.getAttribute('aria-label') ||
+              this.innerText ||
+              this.textContent ||
+              ''
+            ).replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+          });
+        }
+        """
+    )
+    result = parse_profile_query_result(raw, "navigation link")
+    return {
+        "visible": result.get("visible") is True,
+        "href": str(result.get("href") or "").strip(),
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+        "label": " ".join(str(result.get("label") or "").split()).casefold(),
+    }
+
+
+def resolve_personal_information_navigation_link(
+    page: Any,
+) -> tuple[Any, Any] | None:
+    if not is_account_manage_root_url(scope_location_url(page)):
+        return None
+    exact_candidates: list[tuple[Any, Any]] = []
+    semantic_candidates: list[tuple[Any, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in PROFILE_NAVIGATION_LINK_SELECTORS:
+            for link in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(link):
+                    continue
+                try:
+                    summary = profile_navigation_link_summary(link)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        summary["domIdentity"]
+                        or element_stability_signature(scope, link),
+                        summary["href"],
+                        summary["label"],
+                    )
+                except Exception:
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if summary["visible"] and is_personal_information_url(
+                    summary["href"]
+                ):
+                    exact_candidates.append((scope, link))
+                    continue
+                if (
+                    summary["visible"]
+                    and summary["label"] in PROFILE_NAVIGATION_LABELS
+                ):
+                    semantic_candidates.append((scope, link))
+    if len(exact_candidates) == 1:
+        return exact_candidates[0]
+    return semantic_candidates[0] if len(semantic_candidates) == 1 else None
+
+
+def wait_for_profile_navigation_result(
+    page: Any,
+    timeout_s: float = PROFILE_NAVIGATION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] | None = None,
+) -> str:
+    if pause is None:
+        pause = human_pause
+    deadline = time.monotonic() + max(0, timeout_s)
+    while time.monotonic() < deadline:
+        current_url = scope_location_url(page)
+        if is_personal_information_url(current_url):
+            return "account_information"
+        if is_account_sign_in_url(current_url):
+            return "sign_in"
+        if not is_apple_url(current_url):
+            raise RuntimeError(
+                "personal information navigation left the verified Apple HTTPS origin"
+            )
+        pause(180, 420)
+    return "unconfirmed"
+
+
+def navigate_to_personal_information(
+    page: Any,
+    *,
+    navigation_attempt: int,
+) -> str:
+    if isinstance(navigation_attempt, bool) or navigation_attempt not in (1, 2):
+        raise RuntimeError("personal information navigation attempt is invalid")
+    emit(
+        {
+            "event": "status",
+            "status": "profile_navigation_started",
+            "attempt": navigation_attempt,
+        }
+    )
+    if is_personal_information_url(scope_location_url(page)):
+        emit(
+            {
+                "event": "status",
+                "status": "profile_navigation_arrived",
+                "route": "existing",
+                "attempt": navigation_attempt,
+            }
+        )
+        return "account_information"
+
+    resolved_link = resolve_personal_information_navigation_link(page)
+    if resolved_link is not None:
+        scope, link = resolved_link
+        emit(
+            {
+                "event": "status",
+                "status": "profile_navigation_sidebar_link_resolved",
+                "attempt": navigation_attempt,
+            }
+        )
+        human_click(scope, link)
+        emit(
+            {
+                "event": "status",
+                "status": "profile_navigation_sidebar_click_sent",
+                "attempt": navigation_attempt,
+            }
+        )
+        wait_for_document_settle(page)
+        route = "sidebar"
+        result = wait_for_profile_navigation_result(page)
+        if result == "unconfirmed":
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_navigation_direct_fallback",
+                    "attempt": navigation_attempt,
+                    "after": "sidebar_unconfirmed",
+                }
+            )
+            page.get(ACCOUNT_INFORMATION_URL)
+            wait_for_document_settle(page, timeout_s=20)
+            route = "sidebar_then_direct"
+            result = wait_for_profile_navigation_result(page)
+    else:
+        emit(
+            {
+                "event": "status",
+                "status": "profile_navigation_direct_fallback",
+                "attempt": navigation_attempt,
+            }
+        )
+        page.get(ACCOUNT_INFORMATION_URL)
+        wait_for_document_settle(page, timeout_s=20)
+        route = "direct"
+        result = wait_for_profile_navigation_result(page)
+    emit(
+        {
+            "event": "status",
+            "status": (
+                "profile_navigation_arrived"
+                if result == "account_information"
+                else "profile_navigation_sign_in_redirect"
+                if result == "sign_in"
+                else "profile_navigation_unconfirmed"
+            ),
+            "route": route,
+            "attempt": navigation_attempt,
+        }
+    )
+    return result
+
+
 def is_personal_information_scope(page: Any, scope: Any) -> bool:
     if scope is not page or getattr(scope, "parent", None) is not None:
         return False
-    parsed = parse_valid_apple_url(scope_location_url(scope))
-    return bool(
-        parsed is not None
-        and (parsed.hostname or "").lower() == "account.apple.com"
-        and parsed.path == PERSONAL_INFORMATION_PATH
-    )
+    return is_personal_information_url(scope_location_url(scope))
 
 
 def parse_profile_query_result(raw: Any, label: str) -> dict[str, Any]:
@@ -4697,6 +5021,314 @@ def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
         runtime_subprocess.Popen = original_popen
 
 
+def ensure_two_factor_preparation(
+    authentication_context: dict[str, Any],
+) -> None:
+    if authentication_context.get("twofaPrepared") is True:
+        return
+    request_two_factor_preparation()
+    authentication_context["twofaPrepared"] = True
+
+
+def complete_account_authentication(
+    page: Any,
+    apple_id: str,
+    password: str,
+    Keys: Any,
+    *,
+    account_home_confirmed: bool,
+    authentication_context: dict[str, Any],
+) -> dict[str, Any]:
+    initial_state = detect_login_state(page)
+    initial_state = settle_trust_state(
+        page,
+        initial_state,
+        deadline=time.monotonic() + 5.0,
+    )
+    emit_browser_observation(
+        "login_state",
+        page,
+        initial_state,
+        account_home_confirmed=account_home_confirmed,
+    )
+    recoverable_sign_in = is_recoverable_account_sign_in_state(page, initial_state)
+    if initial_state.get("error") and not has_confirmed_account_session(
+        initial_state
+    ) and not recoverable_sign_in:
+        raise RuntimeError("login page reported an authentication error")
+    if recoverable_sign_in:
+        initial_state = {
+            **initial_state,
+            "error": False,
+            "rootError": False,
+            "twofa": False,
+            "twofaVisible": False,
+        }
+    set_browser_startup_stage("login_state_detected")
+    skipped_login = has_confirmed_account_session(initial_state)
+    confirmed_login_state = initial_state
+    if skipped_login:
+        initial_state["trusted"] = True
+    skipped_2fa = skipped_login
+    remember_checked: bool | None = None
+
+    if not skipped_login:
+        if initial_state.get("twofa"):
+            set_browser_startup_stage("twofa_prepare")
+            ensure_two_factor_preparation(authentication_context)
+        else:
+            if not should_resume_at_password(initial_state):
+                set_browser_startup_stage("email_wait")
+                email_scope, email = wait_for_element(
+                    page,
+                    EMAIL_SELECTORS,
+                    timeout_s=45,
+                )
+                set_browser_startup_stage("email_input")
+                input_and_verify(
+                    email_scope,
+                    email,
+                    apple_id,
+                    "email",
+                    Keys,
+                    root_page=page,
+                )
+                set_browser_startup_stage("email_submit")
+                submit_element_with_enter(
+                    page,
+                    email_scope,
+                    email,
+                    Keys,
+                )
+                wait_for_document_settle(page)
+
+            set_browser_startup_stage("password_wait")
+            password_scope, password_field = wait_for_element(
+                page,
+                PASSWORD_SELECTORS,
+                timeout_s=45,
+                stable_observations=2,
+            )
+            set_browser_startup_stage("password_input")
+            input_and_verify(
+                password_scope,
+                password_field,
+                password,
+                "password",
+                Keys,
+                root_page=page,
+            )
+            set_browser_startup_stage("remember_account")
+            remember_checked = ensure_remember_checked(page)
+            set_browser_startup_stage("twofa_prepare")
+            ensure_two_factor_preparation(authentication_context)
+            set_browser_startup_stage("password_submit")
+            submit_element_with_enter(
+                page,
+                password_scope,
+                password_field,
+                Keys,
+                min_ms=420,
+                max_ms=900,
+                password_value=password,
+            )
+            wait_for_document_settle(page)
+
+        set_browser_startup_stage("twofa_page_wait")
+        login_state = wait_for_2fa_or_session(page)
+        emit_browser_observation(
+            "twofa_wait",
+            page,
+            login_state,
+            account_home_confirmed=account_home_confirmed,
+        )
+        if login_state.get("trusted"):
+            skipped_2fa = True
+            confirmed_login_state = login_state
+            set_browser_startup_stage("signed_in")
+        else:
+            next_generation = authentication_context.get("nextGeneration")
+            if isinstance(next_generation, bool) or next_generation not in (1, 2):
+                raise RuntimeError("2FA generation limit exhausted")
+            for generation in range(next_generation, 3):
+                set_browser_startup_stage("twofa_code_wait")
+                emit(
+                    {
+                        "event": "need_2fa",
+                        "generation": generation,
+                        "state": {
+                            "href": sanitized_apple_url(
+                                str(login_state.get("href") or "")
+                            ),
+                            "twofaVisible": bool(
+                                login_state.get("twofaVisible")
+                                or login_state.get("twofa")
+                            ),
+                            "inputReady": bool(login_state.get("inputReady")),
+                            "codeInputCount": login_state.get("codeInputCount"),
+                            "elapsedMs": max(
+                                0,
+                                int(login_state.get("elapsedMs") or 0),
+                            ),
+                        },
+                    }
+                )
+                code = validate_two_factor_code_command(
+                    read_command(),
+                    generation,
+                )
+                authentication_context["nextGeneration"] = generation + 1
+                add_diagnostic_secret(code)
+                set_browser_startup_stage("twofa_input")
+                emit_two_factor_progress("code_received", generation=generation)
+                try:
+                    emit_two_factor_progress("target_waiting", generation=generation)
+                    fields = wait_for_otp_target(page)
+                    emit_two_factor_progress(
+                        "target_resolved",
+                        generation=generation,
+                        target_count=len(fields),
+                    )
+                    emit_two_factor_progress("input_started", generation=generation)
+                    fill_security_code(page, code, Keys, fields=fields)
+                    emit_two_factor_progress("input_completed", generation=generation)
+                    emit_two_factor_progress("submit_started", generation=generation)
+                    # Apple submits a verified code as soon as the final digit
+                    # lands. A second click or Enter can interrupt the redirect.
+                    submitted = True
+                    emit_two_factor_progress(
+                        "submit_sent",
+                        generation=generation,
+                        submitted=submitted,
+                    )
+                    human_pause(900, 1600)
+                    emit_two_factor_progress(
+                        "transition_waiting",
+                        generation=generation,
+                        submitted=submitted,
+                    )
+                    signed_in_state = wait_for_signed_in(
+                        page,
+                        submitted=True,
+                        otp_generation=generation,
+                        submission_method="automatic",
+                        transition_observer=lambda transition_state: emit_browser_observation(
+                            "twofa_transition",
+                            page,
+                            transition_state,
+                            account_home_confirmed=account_home_confirmed,
+                            generation=generation,
+                        ),
+                    )
+                except Exception:
+                    emit_two_factor_progress("handoff_failed", generation=generation)
+                    raise
+                if signed_in_state.get("retry2FA"):
+                    if generation != 1:
+                        raise RuntimeError("2FA/login failed")
+                    emit_two_factor_progress(
+                        "transition_retry_requested",
+                        generation=generation,
+                    )
+                    login_state = signed_in_state
+                    continue
+                emit_two_factor_progress(
+                    "transition_confirmed",
+                    generation=generation,
+                )
+                confirmed_login_state = signed_in_state
+                set_browser_startup_stage("signed_in")
+                break
+    else:
+        set_browser_startup_stage("signed_in")
+
+    return {
+        "confirmedState": confirmed_login_state,
+        "skippedLogin": skipped_login,
+        "skipped2FA": skipped_2fa,
+        "rememberAccount": remember_checked,
+    }
+
+
+def reach_personal_information_page(
+    page: Any,
+    apple_id: str,
+    password: str,
+    Keys: Any,
+    authentication_context: dict[str, Any],
+) -> dict[str, Any] | None:
+    reauthentication_count = 0
+    reauthentication: dict[str, Any] | None = None
+    for navigation_attempt in (1, 2):
+        navigation_result = navigate_to_personal_information(
+            page,
+            navigation_attempt=navigation_attempt,
+        )
+        if navigation_result == "account_information":
+            return reauthentication
+        if navigation_result != "sign_in":
+            raise RuntimeError(
+                "personal information navigation did not confirm the target page"
+            )
+        if reauthentication_count >= PROFILE_REAUTHENTICATION_LIMIT:
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_reauthentication_exhausted",
+                    "attempt": reauthentication_count,
+                }
+            )
+            raise RuntimeError(
+                "personal information navigation required repeated reauthentication"
+            )
+        reauthentication_count += 1
+        emit(
+            {
+                "event": "status",
+                "status": "profile_reauthentication_started",
+                "attempt": reauthentication_count,
+            }
+        )
+        try:
+            reauthentication = complete_account_authentication(
+                page,
+                apple_id,
+                password,
+                Keys,
+                account_home_confirmed=True,
+                authentication_context=authentication_context,
+            )
+        except RuntimeError as reauthentication_error:
+            if str(reauthentication_error) == "2FA generation limit exhausted":
+                emit(
+                    {
+                        "event": "status",
+                        "status": "profile_reauthentication_twofa_exhausted",
+                        "attempt": reauthentication_count,
+                    }
+                )
+                raise RuntimeError(
+                    "personal information reauthentication exhausted the 2FA generation limit"
+                ) from reauthentication_error
+            raise
+        emit(
+            {
+                "event": "status",
+                "status": "profile_reauthentication_completed",
+                "attempt": reauthentication_count,
+            }
+        )
+        emit_browser_observation(
+            "account_home",
+            page,
+            reauthentication["confirmedState"],
+            account_home_confirmed=True,
+        )
+    raise RuntimeError(
+        "personal information navigation did not confirm the target page"
+    )
+
+
 def browser_flow(args: argparse.Namespace) -> int:
     begin_browser_flow_run()
     try:
@@ -4705,6 +5337,25 @@ def browser_flow(args: argparse.Namespace) -> int:
         # Covers pre-browser failures such as credential, URL, or runtime setup.
         emit_browser_failure_once()
         raise
+
+
+def inspect_profile_failure_state(page: Any) -> dict[str, Any]:
+    """Best-effort current-page evidence for a profile-stage failure."""
+    if not browser_connection_is_alive(page):
+        return {"inspectionAvailable": False}
+    try:
+        state = detect_login_state(page)
+        state = settle_trust_state(
+            page,
+            state,
+            deadline=time.monotonic() + 1.0,
+            hydration_timeout_s=1.0,
+        )
+    except Exception:
+        return {"inspectionAvailable": False}
+    if not isinstance(state, dict):
+        return {"inspectionAvailable": False}
+    return {**state, "inspectionAvailable": True}
 
 
 def _browser_flow(args: argparse.Namespace) -> int:
@@ -4777,196 +5428,22 @@ def _browser_flow(args: argparse.Namespace) -> int:
             human_pause(900, 1800)
         set_browser_startup_stage("login_page_loaded")
 
-        initial_state = detect_login_state(page)
-        initial_state = settle_trust_state(
+        authentication_context: dict[str, Any] = {
+            "twofaPrepared": False,
+            "nextGeneration": 1,
+        }
+        authentication = complete_account_authentication(
             page,
-            initial_state,
-            deadline=time.monotonic() + 5.0,
-        )
-        emit_browser_observation(
-            "login_state",
-            page,
-            initial_state,
+            apple_id,
+            password,
+            Keys,
             account_home_confirmed=False,
+            authentication_context=authentication_context,
         )
-        if initial_state.get("error") and not has_confirmed_account_session(
-            initial_state
-        ):
-            raise RuntimeError("login page reported an authentication error")
-        set_browser_startup_stage("login_state_detected")
-        skipped_login = has_confirmed_account_session(initial_state)
-        confirmed_login_state = initial_state
-        if skipped_login:
-            initial_state["trusted"] = True
-        skipped_2fa = skipped_login
-        remember_checked: bool | None = None
-
-        if not skipped_login:
-            if initial_state.get("twofa"):
-                set_browser_startup_stage("twofa_prepare")
-                request_two_factor_preparation()
-            else:
-                if not should_resume_at_password(initial_state):
-                    set_browser_startup_stage("email_wait")
-                    email_scope, email = wait_for_element(
-                        page,
-                        EMAIL_SELECTORS,
-                        timeout_s=45,
-                    )
-                    set_browser_startup_stage("email_input")
-                    input_and_verify(
-                        email_scope,
-                        email,
-                        apple_id,
-                        "email",
-                        Keys,
-                        root_page=page,
-                    )
-                    set_browser_startup_stage("email_submit")
-                    submit_element_with_enter(
-                        page,
-                        email_scope,
-                        email,
-                        Keys,
-                    )
-                    wait_for_document_settle(page)
-
-                set_browser_startup_stage("password_wait")
-                password_scope, password_field = wait_for_element(
-                    page,
-                    PASSWORD_SELECTORS,
-                    timeout_s=45,
-                    stable_observations=2,
-                )
-                set_browser_startup_stage("password_input")
-                input_and_verify(
-                    password_scope,
-                    password_field,
-                    password,
-                    "password",
-                    Keys,
-                    root_page=page,
-                )
-                set_browser_startup_stage("remember_account")
-                remember_checked = ensure_remember_checked(page)
-                set_browser_startup_stage("twofa_prepare")
-                request_two_factor_preparation()
-                set_browser_startup_stage("password_submit")
-                submit_element_with_enter(
-                    page,
-                    password_scope,
-                    password_field,
-                    Keys,
-                    min_ms=420,
-                    max_ms=900,
-                    password_value=password,
-                )
-                wait_for_document_settle(page)
-
-            set_browser_startup_stage("twofa_page_wait")
-            login_state = wait_for_2fa_or_session(page)
-            emit_browser_observation(
-                "twofa_wait",
-                page,
-                login_state,
-                account_home_confirmed=False,
-            )
-            if login_state.get("trusted"):
-                skipped_2fa = True
-                confirmed_login_state = login_state
-                set_browser_startup_stage("signed_in")
-            else:
-                for generation in (1, 2):
-                    set_browser_startup_stage("twofa_code_wait")
-                    emit(
-                        {
-                            "event": "need_2fa",
-                            "generation": generation,
-                            "state": {
-                                "href": sanitized_apple_url(
-                                    str(login_state.get("href") or "")
-                                ),
-                                "twofaVisible": bool(
-                                    login_state.get("twofaVisible")
-                                    or login_state.get("twofa")
-                                ),
-                                "inputReady": bool(login_state.get("inputReady")),
-                                "codeInputCount": login_state.get("codeInputCount"),
-                                "elapsedMs": max(
-                                    0,
-                                    int(login_state.get("elapsedMs") or 0),
-                                ),
-                            },
-                        }
-                    )
-                    code = validate_two_factor_code_command(
-                        read_command(),
-                        generation,
-                    )
-                    add_diagnostic_secret(code)
-                    set_browser_startup_stage("twofa_input")
-                    emit_two_factor_progress("code_received", generation=generation)
-                    try:
-                        emit_two_factor_progress("target_waiting", generation=generation)
-                        fields = wait_for_otp_target(page)
-                        emit_two_factor_progress(
-                            "target_resolved",
-                            generation=generation,
-                            target_count=len(fields),
-                        )
-                        emit_two_factor_progress("input_started", generation=generation)
-                        fill_security_code(page, code, Keys, fields=fields)
-                        emit_two_factor_progress("input_completed", generation=generation)
-                        emit_two_factor_progress("submit_started", generation=generation)
-                        # Apple submits a verified code as soon as the final
-                        # digit lands. A second click or Enter can race the
-                        # retiring iframe and interrupt the account redirect.
-                        submitted = True
-                        emit_two_factor_progress(
-                            "submit_sent",
-                            generation=generation,
-                            submitted=submitted,
-                        )
-                        human_pause(900, 1600)
-                        emit_two_factor_progress(
-                            "transition_waiting",
-                            generation=generation,
-                            submitted=submitted,
-                        )
-                        signed_in_state = wait_for_signed_in(
-                            page,
-                            submitted=True,
-                            otp_generation=generation,
-                            submission_method="automatic",
-                            transition_observer=lambda transition_state: emit_browser_observation(
-                                "twofa_transition",
-                                page,
-                                transition_state,
-                                account_home_confirmed=False,
-                                generation=generation,
-                            ),
-                        )
-                    except Exception:
-                        emit_two_factor_progress("handoff_failed", generation=generation)
-                        raise
-                    if signed_in_state.get("retry2FA"):
-                        if generation != 1:
-                            raise RuntimeError("2FA/login failed")
-                        emit_two_factor_progress(
-                            "transition_retry_requested",
-                            generation=generation,
-                        )
-                        login_state = signed_in_state
-                        continue
-                    emit_two_factor_progress(
-                        "transition_confirmed",
-                        generation=generation,
-                    )
-                    confirmed_login_state = signed_in_state
-                    set_browser_startup_stage("signed_in")
-                    break
-        else:
-            set_browser_startup_stage("signed_in")
+        confirmed_login_state = authentication["confirmedState"]
+        skipped_login = authentication["skippedLogin"]
+        skipped_2fa = authentication["skipped2FA"]
+        remember_checked = authentication["rememberAccount"]
 
         emit({"event": "status", "status": "account_home_confirmed"})
         account_home_confirmed = True
@@ -4977,7 +5454,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             account_home_confirmed=True,
         )
         personal_info: dict[str, str] = {}
-        profile_state: dict[str, Any] = {"trusted": True}
+        profile_state: dict[str, Any] = {"inspectionAvailable": False}
         post_login_profile_capture: dict[str, Any] = {
             "success": False,
             "failureStage": "unknown",
@@ -4989,9 +5466,22 @@ def _browser_flow(args: argparse.Namespace) -> int:
         try:
             set_browser_startup_stage("account_information")
             emit({"event": "status", "status": "profile_capture_started"})
-            page.get(ACCOUNT_INFORMATION_URL)
-            page.wait.doc_loaded(timeout=20)
-            human_pause(1200, 2400)
+            reauthentication = reach_personal_information_page(
+                page,
+                apple_id,
+                password,
+                Keys,
+                authentication_context,
+            )
+            if reauthentication is not None:
+                confirmed_login_state = reauthentication["confirmedState"]
+                if (
+                    remember_checked is None
+                    and reauthentication["rememberAccount"] is not None
+                ):
+                    remember_checked = reauthentication["rememberAccount"]
+
+            human_pause(700, 1400)
             profile_state = detect_login_state(page)
             profile_state = settle_trust_state(
                 page,
@@ -5046,6 +5536,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
         except Exception as profile_error:
             failure_stage = browser_startup_stage
             failure_class = classify_profile_capture_failure(profile_error)
+            profile_state = inspect_profile_failure_state(page)
             browser_alive = browser_connection_is_alive(page)
             browser_preservation_requested = (
                 preserve_on_success or preserve_on_failure

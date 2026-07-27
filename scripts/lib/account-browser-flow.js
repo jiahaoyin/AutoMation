@@ -85,6 +85,17 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "profile_screenshot_saved",
   "profile_birthday_collected",
   "profile_name_collected",
+  "profile_navigation_started",
+  "profile_navigation_sidebar_link_resolved",
+  "profile_navigation_sidebar_click_sent",
+  "profile_navigation_direct_fallback",
+  "profile_navigation_arrived",
+  "profile_navigation_sign_in_redirect",
+  "profile_navigation_unconfirmed",
+  "profile_reauthentication_started",
+  "profile_reauthentication_completed",
+  "profile_reauthentication_exhausted",
+  "profile_reauthentication_twofa_exhausted",
   "input_progress",
   "remember_progress",
   "twofa_progress",
@@ -115,6 +126,10 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   browser_profile_attach_required:
     "[!] Firefox Profile 正在使用，但控制连接不可用；没有启动第二个浏览器",
   account_home_confirmed: "[✓] 已确认 Apple 账户登录成功",
+  profile_navigation_sidebar_click_sent: "[→] 正在通过账户侧栏打开个人信息",
+  profile_navigation_direct_fallback: "[→] 正在使用个人信息网址继续打开",
+  profile_reauthentication_started: "[→] 个人信息页面要求重新验证，正在恢复登录",
+  profile_reauthentication_completed: "[✓] Apple 登录状态已恢复",
   profile_page_ready: "[✓] 个人信息页面已就绪",
   profile_birthday_collected: "[✓] 已读取出生日期",
   profile_name_collected: "[✓] 已读取姓名",
@@ -134,6 +149,15 @@ const RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES = Object.freeze({
   password_submit: "[✓] Apple 登录信息已提交",
 });
 const RUYIPAGE_STAGE_TRANSITIONS = new Set(["entered"]);
+const RUYIPAGE_PROFILE_NAVIGATION_ROUTES = new Set([
+  "existing",
+  "sidebar",
+  "direct",
+  "sidebar_then_direct",
+]);
+const RUYIPAGE_PROFILE_NAVIGATION_FALLBACKS = new Set([
+  "sidebar_unconfirmed",
+]);
 const RUYIPAGE_OBSERVATION_CHECKPOINTS = new Set([
   "login_state",
   "twofa_wait",
@@ -158,6 +182,7 @@ const RUYIPAGE_PAGE_KINDS = new Set([
 ]);
 const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
   "profile_authentication_error",
+  "profile_reauthentication_exhausted",
   "profile_session_unconfirmed",
   "profile_element_unavailable",
   "profile_page_unready",
@@ -343,6 +368,14 @@ function sanitizeBrowserFailureStage(stage) {
 
 function sanitizeStageTransition(value) {
   return RUYIPAGE_STAGE_TRANSITIONS.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileNavigationRoute(value) {
+  return RUYIPAGE_PROFILE_NAVIGATION_ROUTES.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileNavigationFallback(value) {
+  return RUYIPAGE_PROFILE_NAVIGATION_FALLBACKS.has(value) ? value : "unknown";
 }
 
 function sanitizeBrowserObservationCheckpoint(value) {
@@ -979,7 +1012,20 @@ function auditRuyiPageEvent(flowAudit, event) {
       details.browserPreservationRequested =
         event.browserPreservationRequested === true;
     }
-    if (Number.isInteger(event.attempt)) details.attempt = event.attempt;
+    if (
+      event.status.startsWith("profile_navigation_") ||
+      event.status.startsWith("profile_reauthentication_")
+    ) {
+      details.attempt = event.attempt === 1 || event.attempt === 2 ? event.attempt : 0;
+      if (Object.hasOwn(event, "route")) {
+        details.route = sanitizeProfileNavigationRoute(event.route);
+      }
+      if (Object.hasOwn(event, "after")) {
+        details.after = sanitizeProfileNavigationFallback(event.after);
+      }
+    } else if (Number.isInteger(event.attempt)) {
+      details.attempt = event.attempt;
+    }
     writeFlowAudit(flowAudit, "ruyipage", "status", details);
     return;
   }

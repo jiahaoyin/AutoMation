@@ -921,6 +921,17 @@ class FakeElement:
                     },
                 )
             )
+        if "ruyipage-profile-navigation-link-summary" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "profileNavigationLink",
+                    {
+                        "visible": self.states.is_displayed,
+                        "href": self.attrs.get("href", ""),
+                        "label": self.text,
+                    },
+                )
+            )
         if "ruyipage-otp-length-check" in script:
             expected = re.search(r"value\.length === (\d+)", script)
             return bool(expected and len(str(self.value)) == int(expected.group(1)))
@@ -2276,7 +2287,7 @@ class BrowserFlowTests(unittest.TestCase):
                 return lambda *_args, **_kwargs: None
 
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         args = parse_args(["--report-dir", "test-report"])
@@ -2353,7 +2364,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_browser_flow_stops_before_2fa_when_password_input_fails(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         email = FakeElement()
@@ -2449,7 +2460,7 @@ class BrowserFlowTests(unittest.TestCase):
             parent=root,
         )
         root.frames = [frame]
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
 
@@ -2515,7 +2526,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_browser_flow_waits_for_a_fresh_otp_target_after_receiving_the_code(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         email = FakeElement()
@@ -2546,6 +2557,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "retiringChildError": True,
                 "childAuthUiPresent": False,
             }
+            root.state["href"] = "https://account.apple.com/account/manage"
             observer = kwargs.get("transition_observer")
             self.assertTrue(callable(observer))
             observer(confirmed_state)
@@ -2697,7 +2709,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "status": "browser_observation",
                 "checkpoint": "twofa_transition",
                 "generation": 1,
-                "pageKind": "unknown",
+                "pageKind": "account_manage",
                 "connectionAlive": False,
                 "inspectionAvailable": True,
                 "sessionConfirmed": True,
@@ -2728,7 +2740,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "status": "browser_observation",
                 "checkpoint": "account_home",
                 "generation": 0,
-                "pageKind": "unknown",
+                "pageKind": "account_manage",
                 "connectionAlive": False,
                 "inspectionAvailable": True,
                 "sessionConfirmed": True,
@@ -2829,7 +2841,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_browser_flow_retries_once_after_an_explicit_first_code_rejection(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         email = FakeElement()
@@ -2923,7 +2935,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_browser_flow_does_not_submit_when_twofa_input_cannot_be_verified(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
 
@@ -2971,7 +2983,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_recovered_password_page_skips_email_and_resumes_login(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         password = FakeElement(attrs={"type": "password"})
@@ -3052,7 +3064,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "error": False,
             }
         )
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         otp = FakeElement(attrs={"autocomplete": "one-time-code", "tagName": "INPUT"})
@@ -3156,7 +3168,7 @@ class BrowserFlowTests(unittest.TestCase):
 
     def test_browser_flow_never_requests_a_third_code(self):
         root = FakePage(state={"href": "https://account.apple.com/sign-in"})
-        root.get = lambda *_: None
+        root.get = lambda url: root.state.__setitem__("href", url)
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
 
@@ -3226,7 +3238,11 @@ class BrowserFlowTests(unittest.TestCase):
             },
         )
         trust.on_click = lambda: setattr(root, "_shadow_roots", [])
-        root.get = lambda *_: None
+        root.get = lambda url: (
+            root.state.__setitem__("href", url)
+            if url == account_flow.ACCOUNT_INFORMATION_URL
+            else None
+        )
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
 
@@ -3275,6 +3291,7 @@ class BrowserFlowTests(unittest.TestCase):
         def navigate(url):
             get_calls.append(url)
             if len(get_calls) == 2:
+                root.state["href"] = url
                 root._shadow_roots = [shadow_root]
 
         root.get = navigate
@@ -3318,14 +3335,20 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         def __init__(self, secret, *, quit_fails=False):
             self.secret = secret
             self.quit_fails = quit_fails
+            self.current_url = "about:blank"
             self.wait = type(
                 "FakeWait",
                 (),
                 {"doc_loaded": lambda *_args, **_kwargs: None},
             )()
 
-        def get(self, _url):
-            return None
+        def get(self, url):
+            self.current_url = url
+
+        def run_js(self, script):
+            if "location.href" in script:
+                return self.current_url
+            raise RuntimeError("unexpected JavaScript query")
 
         def screenshot(self, path, *, full_page):
             self.assert_full_page = full_page
@@ -3487,6 +3510,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
             def get(self, url):
                 self.urls.append(url)
+                super().get(url)
 
             def screenshot(self, path, *, full_page):
                 order.append("screenshot")
@@ -9189,6 +9213,769 @@ class PersonalInformationTests(unittest.TestCase):
             }
         )
         return name_card, birthday_card
+
+    def test_account_sign_in_url_requires_an_exact_trusted_https_login_route(self):
+        for url in (
+            "https://account.apple.com/sign-in?returnUrl=%2Faccount%2Fmanage",
+            "https://appleid.apple.com/sign-in",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(account_flow.is_account_sign_in_url(url))
+        for url in (
+            "http://account.apple.com/sign-in",
+            "http://appleid.apple.com/sign-in",
+            "https://account.apple.com/account/sign-in",
+            "https://account.apple.com/sign-in/extra",
+            "https://appleid.apple.com/sign-in/extra",
+            "https://account.apple.com.evil.example/sign-in",
+            "https://appleid.apple.com.evil.example/sign-in",
+            "https://account.apple.com/account/manage?returnUrl=/sign-in",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(account_flow.is_account_sign_in_url(url))
+
+    def test_split_recovery_copy_uses_local_dom_context_before_hard_error(self):
+        class InspectingScope:
+            script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(
+                    {
+                        "href": "https://account.apple.com/account/manage",
+                        "hasStrongTwoFactorText": True,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": False,
+                        "genericAuthText": True,
+                        "securityFeatureCopy": True,
+                        "error": True,
+                        "accountManage": True,
+                        "accountMarker": True,
+                    }
+                )
+
+        scope = InspectingScope()
+        state = account_flow.detect_scope_login_state(scope)
+
+        self.assertTrue(state["trusted"])
+        self.assertFalse(state["error"])
+        self.assertIn("const recoveryContextFor = (el)", scope.script)
+        self.assertIn("el.previousElementSibling", scope.script)
+        self.assertIn("el.nextElementSibling", scope.script)
+        self.assertIn("current.parentElement", scope.script)
+        self.assertIn("const unableToSignInLeaves", scope.script)
+        self.assertIn("el.contains(candidate)", scope.script)
+
+        class InspectingShadowRoot:
+            script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return json.dumps(
+                    {
+                        "hasStrongText": True,
+                        "semanticTargetCount": 0,
+                        "digitCellCount": 0,
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": False,
+                        "genericAuthText": True,
+                        "securityFeatureCopy": True,
+                        "error": True,
+                    }
+                )
+
+        root = InspectingShadowRoot()
+        shadow_state = account_flow.detect_shadow_root_state(root)
+
+        self.assertFalse(shadow_state["hardAuthenticationError"])
+        self.assertIn("const recoveryContextFor = (el)", root.script)
+        self.assertIn("el.previousElementSibling", root.script)
+        self.assertIn("const unableToSignInLeaves", root.script)
+
+    def test_login_state_uses_the_url_path_not_return_url_for_account_manage(self):
+        class InspectingScope:
+            script = ""
+
+            def run_js(self, script):
+                self.script = script
+                return serialize_scope_state(
+                    {
+                        "href": (
+                            "https://account.apple.com/sign-in"
+                            "?returnUrl=%2Faccount%2Fmanage%2Fsection%2Finformation"
+                        ),
+                        "accountManage": False,
+                        "accountMarker": False,
+                        "error": False,
+                    }
+                )
+
+        scope = InspectingScope()
+        state = account_flow.detect_scope_login_state(scope)
+
+        self.assertFalse(state["accountManage"])
+        self.assertIn("currentUrl.pathname === '/account/manage'", scope.script)
+        self.assertNotIn(
+            "accountManage: /account\\.apple\\.com\\/account\\/manage/i.test(href)",
+            scope.script,
+        )
+
+    def test_profile_navigation_prefers_the_authenticated_sidebar_link(self):
+        link = FakeElement(
+            attrs={
+                "id": "personal-information-link",
+                "href": account_flow.ACCOUNT_INFORMATION_URL,
+                "profileNavigationLink": {
+                    "visible": True,
+                    "href": account_flow.ACCOUNT_INFORMATION_URL,
+                },
+            }
+        )
+
+        class NavigationPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    {
+                        "css:a[href]": [link],
+                        "css:[role='link'][href]": [link],
+                    },
+                    state={
+                        "href": "https://account.apple.com/account/manage",
+                    },
+                )
+                self.get_calls = []
+                link.on_click = lambda: self.state.__setitem__(
+                    "href",
+                    account_flow.ACCOUNT_INFORMATION_URL,
+                )
+
+            def get(self, url):
+                self.get_calls.append(url)
+                raise AssertionError("direct navigation must not run when the sidebar link exists")
+
+        page = NavigationPage()
+        with patch(
+            "apple_account_flow.human_click",
+            side_effect=lambda scope, element: scope.actions.human_click(element).perform(),
+        ), patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "account_information")
+        self.assertEqual(page.get_calls, [])
+        self.assertIn(("human_click", link), page.actions.calls)
+        statuses = [call.args[0]["status"] for call in emit_event.call_args_list]
+        self.assertIn("profile_navigation_sidebar_link_resolved", statuses)
+        self.assertIn("profile_navigation_sidebar_click_sent", statuses)
+        self.assertIn("profile_navigation_arrived", statuses)
+        self.assertNotIn("profile_navigation_direct_fallback", statuses)
+
+    def test_profile_navigation_uses_direct_url_only_as_a_fallback(self):
+        class NavigationPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    state={"href": "https://account.apple.com/account/manage"}
+                )
+                self.get_calls = []
+
+            def get(self, url):
+                self.get_calls.append(url)
+                self.state["href"] = url
+
+        page = NavigationPage()
+        with patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "account_information")
+        self.assertEqual(page.get_calls, [account_flow.ACCOUNT_INFORMATION_URL])
+        statuses = [call.args[0]["status"] for call in emit_event.call_args_list]
+        self.assertIn("profile_navigation_direct_fallback", statuses)
+        self.assertIn("profile_navigation_arrived", statuses)
+
+    def test_profile_navigation_accepts_one_fixed_localized_semantic_button(self):
+        for label in ("Personal Information", "个人信息", "個人資料"):
+            with self.subTest(label=label):
+                button = FakeElement(
+                    text=label,
+                    attrs={
+                        "id": "personal-information-button",
+                        "profileNavigationLink": {
+                            "visible": True,
+                            "href": "",
+                            "label": label.casefold(),
+                        },
+                    },
+                )
+
+                class NavigationPage(FakePage):
+                    def __init__(self):
+                        super().__init__(
+                            buttons=[button],
+                            state={
+                                "href": "https://account.apple.com/account/manage",
+                            },
+                        )
+                        self.get_calls = []
+                        button.on_click = lambda: self.state.__setitem__(
+                            "href",
+                            account_flow.ACCOUNT_INFORMATION_URL,
+                        )
+
+                    def get(self, url):
+                        self.get_calls.append(url)
+
+                page = NavigationPage()
+                with patch(
+                    "apple_account_flow.human_click",
+                    side_effect=lambda scope, element: scope.actions.human_click(
+                        element
+                    ).perform(),
+                ), patch("apple_account_flow.wait_for_document_settle"), patch(
+                    "apple_account_flow.emit"
+                ):
+                    result = account_flow.navigate_to_personal_information(
+                        page,
+                        navigation_attempt=1,
+                    )
+
+                self.assertEqual(result, "account_information")
+                self.assertEqual(page.get_calls, [])
+                self.assertIn(("human_click", button), page.actions.calls)
+
+    def test_sidebar_click_without_a_transition_uses_the_direct_url_fallback(self):
+        link = FakeElement(
+            attrs={
+                "id": "personal-information-link",
+                "profileNavigationLink": {
+                    "visible": True,
+                    "href": account_flow.ACCOUNT_INFORMATION_URL,
+                    "label": "personal information",
+                },
+            }
+        )
+
+        class NavigationPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    {"css:a[href]": [link]},
+                    state={"href": "https://account.apple.com/account/manage"},
+                )
+                self.get_calls = []
+
+            def get(self, url):
+                self.get_calls.append(url)
+                self.state["href"] = url
+
+        page = NavigationPage()
+        with patch(
+            "apple_account_flow.human_click",
+            side_effect=lambda scope, element: scope.actions.human_click(
+                element
+            ).perform(),
+        ), patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.wait_for_profile_navigation_result",
+            side_effect=["unconfirmed", "account_information"],
+        ), patch("apple_account_flow.emit") as emit_event:
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "account_information")
+        self.assertEqual(page.get_calls, [account_flow.ACCOUNT_INFORMATION_URL])
+        self.assertIn(("human_click", link), page.actions.calls)
+        fallback_event = next(
+            call.args[0]
+            for call in emit_event.call_args_list
+            if call.args[0].get("status") == "profile_navigation_direct_fallback"
+        )
+        self.assertEqual(fallback_event["after"], "sidebar_unconfirmed")
+
+    def test_ambiguous_semantic_profile_buttons_fall_back_to_the_exact_url(self):
+        buttons = [
+            FakeElement(
+                text="Personal Information",
+                attrs={
+                    "id": f"personal-information-{index}",
+                    "profileNavigationLink": {
+                        "visible": True,
+                        "href": "",
+                        "label": "personal information",
+                    },
+                },
+            )
+            for index in range(2)
+        ]
+
+        class NavigationPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    buttons=buttons,
+                    state={"href": "https://account.apple.com/account/manage"},
+                )
+                self.get_calls = []
+
+            def get(self, url):
+                self.get_calls.append(url)
+                self.state["href"] = url
+
+        page = NavigationPage()
+        with patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.emit"
+        ):
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "account_information")
+        self.assertEqual(page.get_calls, [account_flow.ACCOUNT_INFORMATION_URL])
+        self.assertEqual(page.actions.calls, [])
+
+    def test_ambiguous_exact_profile_links_fall_back_to_the_exact_url(self):
+        links = [
+            FakeElement(
+                text="Personal Information",
+                attrs={
+                    "profileNavigationLink": {
+                        "visible": True,
+                        "href": account_flow.ACCOUNT_INFORMATION_URL,
+                        "domIdentity": f"html:0/body:1/nav:0/a:{index}",
+                        "label": "personal information",
+                    },
+                },
+            )
+            for index in range(2)
+        ]
+
+        class NavigationPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    {"css:a[href]": links},
+                    state={"href": "https://account.apple.com/account/manage"},
+                )
+                self.get_calls = []
+
+            def get(self, url):
+                self.get_calls.append(url)
+                self.state["href"] = url
+
+        page = NavigationPage()
+        with patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.emit"
+        ):
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "account_information")
+        self.assertEqual(page.get_calls, [account_flow.ACCOUNT_INFORMATION_URL])
+        self.assertEqual(page.actions.calls, [])
+
+    def test_profile_navigation_reports_the_exact_sign_in_redirect(self):
+        class RedirectingPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    state={"href": "https://account.apple.com/account/manage"}
+                )
+
+            def get(self, _url):
+                self.state["href"] = (
+                    "https://account.apple.com/sign-in"
+                    "?returnUrl=%2Faccount%2Fmanage%2Fsection%2Finformation"
+                )
+
+        page = RedirectingPage()
+        with patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            result = account_flow.navigate_to_personal_information(
+                page,
+                navigation_attempt=1,
+            )
+
+        self.assertEqual(result, "sign_in")
+        self.assertIn(
+            "profile_navigation_sign_in_redirect",
+            [call.args[0]["status"] for call in emit_event.call_args_list],
+        )
+
+    def test_profile_navigation_reports_the_appleid_sign_in_redirect(self):
+        page = FakePage(
+            state={
+                "href": (
+                    "https://appleid.apple.com/sign-in"
+                    "?returnUrl=https%3A%2F%2Faccount.apple.com%2Faccount%2Fmanage"
+                    "%2Fsection%2Finformation"
+                )
+            }
+        )
+
+        self.assertEqual(
+            account_flow.wait_for_profile_navigation_result(
+                page,
+                timeout_s=0.05,
+                pause=lambda *_: None,
+            ),
+            "sign_in",
+        )
+
+    def test_profile_failure_observation_refreshes_current_sign_in_state(self):
+        page = FakePage(state={"href": "https://appleid.apple.com/sign-in"})
+        page.states = FakeStates(alive=True)
+        current_state = {
+            "href": "https://appleid.apple.com/sign-in",
+            "trusted": False,
+            "email": True,
+            "password": False,
+            "error": False,
+        }
+        events = []
+
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=current_state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.emit", side_effect=events.append):
+            observed = account_flow.inspect_profile_failure_state(page)
+            account_flow.emit_browser_observation(
+                "profile_capture_failed",
+                page,
+                observed,
+                account_home_confirmed=True,
+            )
+
+        self.assertTrue(observed["inspectionAvailable"])
+        observation = events[-1]
+        self.assertEqual(observation["pageKind"], "sign_in")
+        self.assertFalse(observation["sessionConfirmed"])
+        self.assertTrue(observation["inspectionAvailable"])
+
+    def test_profile_failure_observation_marks_an_unreadable_page(self):
+        page = FakePage(state={"href": "https://appleid.apple.com/sign-in"})
+        page.states = FakeStates(alive=True)
+        with patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=RuntimeError("stale browsing context"),
+        ):
+            observed = account_flow.inspect_profile_failure_state(page)
+
+        self.assertEqual(observed, {"inspectionAvailable": False})
+
+    def test_profile_reauthentication_runs_once_then_retries_sidebar_navigation(self):
+        reauthentication = {
+            "confirmedState": {"trusted": True},
+            "skippedLogin": False,
+            "skipped2FA": True,
+            "rememberAccount": True,
+        }
+        authentication_context = {"twofaPrepared": True, "nextGeneration": 2}
+        with patch(
+            "apple_account_flow.navigate_to_personal_information",
+            side_effect=["sign_in", "account_information"],
+        ) as navigate, patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value=reauthentication,
+        ) as authenticate, patch(
+            "apple_account_flow.emit_browser_observation"
+        ) as observation, patch("apple_account_flow.emit") as emit_event:
+            result = account_flow.reach_personal_information_page(
+                object(),
+                "person@example.com",
+                "password",
+                FakeKeys,
+                authentication_context,
+            )
+
+        self.assertIs(result, reauthentication)
+        self.assertEqual(navigate.call_count, 2)
+        authenticate.assert_called_once_with(
+            unittest.mock.ANY,
+            "person@example.com",
+            "password",
+            FakeKeys,
+            account_home_confirmed=True,
+            authentication_context=authentication_context,
+        )
+        observation.assert_called_once()
+        statuses = [call.args[0]["status"] for call in emit_event.call_args_list]
+        self.assertEqual(
+            statuses,
+            [
+                "profile_reauthentication_started",
+                "profile_reauthentication_completed",
+            ],
+        )
+
+    def test_profile_reauthentication_stops_after_the_second_sign_in_redirect(self):
+        reauthentication = {
+            "confirmedState": {"trusted": True},
+            "skippedLogin": False,
+            "skipped2FA": True,
+            "rememberAccount": None,
+        }
+        with patch(
+            "apple_account_flow.navigate_to_personal_information",
+            side_effect=["sign_in", "sign_in"],
+        ) as navigate, patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value=reauthentication,
+        ) as authenticate, patch(
+            "apple_account_flow.emit_browser_observation"
+        ), patch("apple_account_flow.emit") as emit_event, self.assertRaisesRegex(
+            RuntimeError,
+            "repeated reauthentication",
+        ):
+            account_flow.reach_personal_information_page(
+                object(),
+                "person@example.com",
+                "password",
+                FakeKeys,
+                {"twofaPrepared": True, "nextGeneration": 2},
+            )
+
+        self.assertEqual(navigate.call_count, 2)
+        self.assertEqual(authenticate.call_count, 1)
+        self.assertIn(
+            "profile_reauthentication_exhausted",
+            [call.args[0]["status"] for call in emit_event.call_args_list],
+        )
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(
+                RuntimeError(
+                    "personal information navigation required repeated reauthentication"
+                )
+            ),
+            "profile_reauthentication_exhausted",
+        )
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(
+                RuntimeError(
+                    "personal information reauthentication exhausted the 2FA generation limit"
+                )
+            ),
+            "profile_reauthentication_exhausted",
+        )
+        self.assertIn(
+            "profile_reauthentication_exhausted",
+            account_flow.PROFILE_CAPTURE_FAILURE_CLASSES,
+        )
+
+    def test_reauthentication_continues_with_generation_two_without_repreparing(self):
+        initial_state = {
+            "href": "https://account.apple.com/sign-in",
+            "twofa": True,
+            "twofaVisible": True,
+            "error": False,
+        }
+        authentication_context = {"twofaPrepared": True, "nextGeneration": 2}
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.has_confirmed_account_session",
+            return_value=False,
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation"
+        ) as prepare, patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_code", "generation": 2, "code": "123456"},
+        ), patch(
+            "apple_account_flow.wait_for_otp_target",
+            return_value=[FakeElement()],
+        ), patch(
+            "apple_account_flow.fill_security_code"
+        ), patch(
+            "apple_account_flow.wait_for_signed_in",
+            return_value={"trusted": True},
+        ), patch(
+            "apple_account_flow.emit_browser_observation"
+        ), patch(
+            "apple_account_flow.set_browser_startup_stage"
+        ), patch(
+            "apple_account_flow.human_pause"
+        ), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            result = account_flow.complete_account_authentication(
+                FakePage(state=initial_state),
+                "person@example.com",
+                "password",
+                FakeKeys,
+                account_home_confirmed=True,
+                authentication_context=authentication_context,
+            )
+
+        prepare.assert_not_called()
+        self.assertEqual(authentication_context["nextGeneration"], 3)
+        self.assertTrue(result["confirmedState"]["trusted"])
+        need_2fa = [
+            call.args[0]
+            for call in emit_event.call_args_list
+            if call.args[0].get("event") == "need_2fa"
+        ]
+        self.assertEqual([event["generation"] for event in need_2fa], [2])
+
+    def test_reauthentication_never_requests_a_third_two_factor_code(self):
+        initial_state = {
+            "href": "https://account.apple.com/sign-in",
+            "twofa": True,
+            "error": False,
+        }
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.has_confirmed_account_session",
+            return_value=False,
+        ), patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation"
+        ) as prepare, patch(
+            "apple_account_flow.read_command"
+        ) as read_command, patch(
+            "apple_account_flow.emit_browser_observation"
+        ), patch(
+            "apple_account_flow.set_browser_startup_stage"
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "generation limit exhausted",
+        ):
+            account_flow.complete_account_authentication(
+                FakePage(state=initial_state),
+                "person@example.com",
+                "password",
+                FakeKeys,
+                account_home_confirmed=True,
+                authentication_context={"twofaPrepared": True, "nextGeneration": 3},
+            )
+
+        prepare.assert_not_called()
+        read_command.assert_not_called()
+
+    def test_exact_sign_in_with_stale_error_and_live_fields_resumes_credentials(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/sign-in"
+                "?returnUrl=%2Faccount%2Fmanage%2Fsection%2Finformation",
+            }
+        )
+        email = FakeElement()
+        password = FakeElement(attrs={"type": "password"})
+        initial_state = {
+            "href": page.state["href"],
+            "email": True,
+            "password": False,
+            "twofa": True,
+            "twofaVisible": True,
+            "error": True,
+            "rootError": True,
+            "hardAuthenticationError": True,
+            "blocked": False,
+            "otpRejected": False,
+        }
+        authentication_context = {"twofaPrepared": False, "nextGeneration": 1}
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.has_confirmed_account_session",
+            return_value=False,
+        ), patch(
+            "apple_account_flow.wait_for_element",
+            side_effect=[(page, email), (page, password)],
+        ), patch(
+            "apple_account_flow.input_and_verify"
+        ) as input_value, patch(
+            "apple_account_flow.submit_element_with_enter"
+        ), patch(
+            "apple_account_flow.ensure_remember_checked",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation"
+        ) as prepare, patch(
+            "apple_account_flow.wait_for_document_settle"
+        ), patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value={"trusted": True},
+        ), patch(
+            "apple_account_flow.emit_browser_observation"
+        ), patch(
+            "apple_account_flow.set_browser_startup_stage"
+        ):
+            result = account_flow.complete_account_authentication(
+                page,
+                "person@example.com",
+                "password",
+                FakeKeys,
+                account_home_confirmed=True,
+                authentication_context=authentication_context,
+            )
+
+        self.assertEqual(
+            [call.args[3] for call in input_value.call_args_list],
+            ["email", "password"],
+        )
+        prepare.assert_called_once_with()
+        self.assertTrue(authentication_context["twofaPrepared"])
+        self.assertTrue(result["confirmedState"]["trusted"])
+
+    def test_stale_sign_in_error_is_not_recoverable_when_blocked_or_rejected(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/sign-in"}
+        )
+        for blocker in ("blocked", "otpRejected", "activeBlocked", "activeOtpRejected"):
+            state = {
+                "email": True,
+                "password": False,
+                "blocked": False,
+                "otpRejected": False,
+                "activeBlocked": False,
+                "activeOtpRejected": False,
+            }
+            state[blocker] = True
+            with self.subTest(blocker=blocker):
+                self.assertFalse(
+                    account_flow.is_recoverable_account_sign_in_state(page, state)
+                )
 
     def test_stable_information_cards_override_stale_account_security_text(self):
         name_card, birthday_card = self.stable_profile_cards()

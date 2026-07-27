@@ -1661,6 +1661,143 @@ async function runConciseBrowserProgressTest() {
   );
 }
 
+async function runProfileNavigationRecoveryProgressTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const events = [
+    { event: "status", status: "profile_navigation_started", attempt: 1 },
+    {
+      event: "status",
+      status: "profile_navigation_direct_fallback",
+      attempt: 1,
+      after: "sidebar_unconfirmed",
+      url: SECRET_FIXTURE,
+    },
+    {
+      event: "status",
+      status: "profile_navigation_sign_in_redirect",
+      attempt: 1,
+      route: "sidebar_then_direct",
+      url: SECRET_FIXTURE,
+    },
+    {
+      event: "status",
+      status: "profile_reauthentication_started",
+      attempt: 1,
+      url: SECRET_FIXTURE,
+    },
+    {
+      event: "status",
+      status: "profile_reauthentication_completed",
+      attempt: 1,
+      url: SECRET_FIXTURE,
+    },
+    { event: "status", status: "profile_navigation_started", attempt: 2 },
+    {
+      event: "status",
+      status: "profile_navigation_sidebar_click_sent",
+      attempt: 2,
+    },
+    {
+      event: "status",
+      status: "profile_navigation_arrived",
+      attempt: 2,
+      route: "sidebar",
+      url: SECRET_FIXTURE,
+    },
+  ];
+  const harness = createRuntime(async (options) => {
+    for (const event of events) await options.onEvent(event);
+    return successfulResult();
+  });
+
+  const logs = await captureConsole("log", () =>
+    runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
+  );
+  const progress = [
+    "[→] 正在使用个人信息网址继续打开",
+    "[→] 个人信息页面要求重新验证，正在恢复登录",
+    "[✓] Apple 登录状态已恢复",
+    "[→] 正在通过账户侧栏打开个人信息",
+  ];
+  let previousIndex = -1;
+  for (const message of progress) {
+    const index = logs.indexOf(message);
+    assert.ok(index > previousIndex, `missing profile recovery progress: ${message}`);
+    previousIndex = index;
+  }
+
+  const statusDetails = entries
+    .filter(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        (entry.details.status.startsWith("profile_navigation_") ||
+          entry.details.status.startsWith("profile_reauthentication_"))
+    )
+    .map((entry) => entry.details);
+  assert.deepEqual(statusDetails, [
+    { status: "profile_navigation_started", attempt: 1 },
+    {
+      status: "profile_navigation_direct_fallback",
+      attempt: 1,
+      after: "sidebar_unconfirmed",
+    },
+    {
+      status: "profile_navigation_sign_in_redirect",
+      attempt: 1,
+      route: "sidebar_then_direct",
+    },
+    { status: "profile_reauthentication_started", attempt: 1 },
+    { status: "profile_reauthentication_completed", attempt: 1 },
+    { status: "profile_navigation_started", attempt: 2 },
+    { status: "profile_navigation_sidebar_click_sent", attempt: 2 },
+    {
+      status: "profile_navigation_arrived",
+      attempt: 2,
+      route: "sidebar",
+    },
+  ]);
+  assert.equal(
+    JSON.stringify({ entries, logs }).includes(SECRET_FIXTURE),
+    false,
+    "profile navigation audit and terminal output must not retain raw URLs"
+  );
+
+  const partialHarness = createRuntime(async () => ({
+    ...successfulResult(),
+    postLoginProfileCapture: {
+      success: false,
+      failureStage: "account_information",
+      failureClass: "profile_reauthentication_exhausted",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: true,
+    },
+    personalInfo: {},
+  }));
+  let partial;
+  const partialWarnings = await captureConsole("warn", async () => {
+    await captureConsole("log", async () => {
+      partial = await runAccountBrowserPhase(params, partialHarness.runtime);
+    });
+  });
+  assert.equal(
+    partial.postLoginProfileCapture.failureClass,
+    "profile_reauthentication_exhausted"
+  );
+  assert.equal(partialWarnings.length, 1);
+  assert.equal(partialWarnings[0].includes(SECRET_FIXTURE), false);
+}
+
 async function runBrowserStageTerminalOutputTest() {
   const entries = [];
   const flowAudit = {
@@ -2855,6 +2992,7 @@ const focusedTests = {
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
   "post-home-profile-failure": runPostHomeProfileFailureRetentionTest,
   "concise-browser-progress": runConciseBrowserProgressTest,
+  "profile-navigation-recovery": runProfileNavigationRecoveryProgressTest,
   "browser-stage-terminal": runBrowserStageTerminalOutputTest,
   "collector-cleanup-partial": runPostLoginCollectorCleanupPartialTest,
   "finalization-unknown": runMissingPostLoginFinalizationRemainsUnknownTest,
@@ -2916,6 +3054,7 @@ await runPostHomeProfileFailureRetentionTest();
 await runProfilePersistenceFailureReturnsPartialTest();
 await runMissingProfileResultReturnsPartialTest();
 await runConciseBrowserProgressTest();
+await runProfileNavigationRecoveryProgressTest();
 await runBrowserStageTerminalOutputTest();
 await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
