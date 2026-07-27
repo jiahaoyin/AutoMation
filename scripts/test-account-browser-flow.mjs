@@ -9,6 +9,7 @@ import {
   readBrowserFailureCode,
   readBrowserFailureStage,
   runAccountBrowserPhase,
+  shouldMirrorTerminalDiagnostics,
 } from "./lib/account-browser-flow.js";
 import {
   createFlowFailureEnvelope,
@@ -81,6 +82,9 @@ function createRuntime(runBackend, options = {}) {
     },
     shouldPrintCapturedProfile() {
       return options.shouldPrintCapturedProfile === true;
+    },
+    isTerminalDebugEnabled() {
+      return options.terminalDebug === true;
     },
   };
   return {
@@ -597,8 +601,7 @@ async function runPasswordBidiInputProgressTest() {
     otp: "123456",
     traceback: SECRET_FIXTURE,
   };
-  const harness = createRuntime(async (options) => {
-    for (const event of [
+  const inputEvents = [
       {
         event: "status",
         status: "input_progress",
@@ -654,11 +657,14 @@ async function runPasswordBidiInputProgressTest() {
         route: "owner?token=secret",
         ...unsafeDetails,
       },
-    ]) {
+    ];
+  const runBackend = async (options) => {
+    for (const event of inputEvents) {
       await options.onEvent(event);
     }
     return successfulResult();
-  });
+  };
+  const harness = createRuntime(runBackend);
 
   const logs = await captureConsole("log", () =>
     runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
@@ -725,13 +731,30 @@ async function runPasswordBidiInputProgressTest() {
       .map((entry) => entry.details),
     []
   );
+  assert.equal(
+    logs.some((line) => line.startsWith("[ruyipage] status:input:")),
+    false,
+    "default terminal must keep input progress in the audit only"
+  );
+
+  const debugHarness = createRuntime(runBackend, { terminalDebug: true });
+  const debugLogs = await captureConsole("log", () =>
+    runAccountBrowserPhase(params, debugHarness.runtime)
+  );
   for (const token of tokens) {
-    assert.equal(logs.filter((line) => line === `[ruyipage] status:${token}`).length, 1);
+    assert.equal(
+      debugLogs.filter((line) => line === `[ruyipage] status:${token}`).length,
+      1
+    );
   }
-  assert.ok(logs.includes("[ruyipage] status:input:email:owner_bidi_fallback_started:owner"));
-  assert.ok(logs.includes("[ruyipage] status:input:password:owner_bidi_unknown:owner"));
-  assert.ok(logs.includes("[ruyipage] status:input:password:owner_bidi_typed:none"));
-  assert.equal(logs.join(" ").includes(SECRET_FIXTURE), false);
+  assert.ok(
+    debugLogs.includes("[ruyipage] status:input:email:owner_bidi_fallback_started:owner")
+  );
+  assert.ok(
+    debugLogs.includes("[ruyipage] status:input:password:owner_bidi_unknown:owner")
+  );
+  assert.ok(debugLogs.includes("[ruyipage] status:input:password:owner_bidi_typed:none"));
+  assert.equal(JSON.stringify({ logs, debugLogs }).includes(SECRET_FIXTURE), false);
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
   assert.equal(JSON.stringify(entries).includes("123456"), false);
   assert.equal(JSON.stringify(entries).includes("owner?token=secret"), false);
@@ -864,10 +887,10 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
   ]);
   assert.deepEqual(
-    logs.filter((line) => !line.startsWith("[Firefox]") && !line.startsWith("[2FA]")),
+    logs.filter((line) => !line.startsWith("[2FA]")),
     [
-      "[ruyipage] status:runtime_resolving",
-      "[ruyipage] status:backend_starting",
+      "[→] 浏览器自动化：ruyipage",
+      "[→] 正在启动 Firefox 浏览器",
     ]
   );
   assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
@@ -965,7 +988,7 @@ async function runFailureDisposalTest() {
       }
     );
   });
-  assert.ok(logs.includes("[ruyipage] status:node-failure:unknown"));
+  assert.ok(logs.includes("[×] 浏览器流程失败（unknown）"));
   assert.deepEqual(harness.calls, ["prepare", "dispose"]);
   assert.equal(harness.collectorCount, 1);
 }
@@ -1223,8 +1246,9 @@ async function runProfilePersistenceAndAuditRedactionTest() {
 
   assert.deepEqual(storedProfiles, [profile]);
   assert.deepEqual(auditSecrets, [profile.name, profile.birthday]);
-  assert.ok(logs.some((line) => line.includes(profile.name)));
-  assert.ok(logs.some((line) => line.includes(profile.birthday)));
+  assert.ok(logs.includes("[✓] 已写入 .env：name、birthday"));
+  assert.ok(logs.includes(`[✓] 姓名：${profile.name}`));
+  assert.ok(logs.includes(`[✓] 出生日期：${profile.birthday}`));
   const auditText = JSON.stringify(auditEntries);
   assert.equal(auditText.includes(profile.name), false);
   assert.equal(auditText.includes(profile.birthday), false);
@@ -1278,7 +1302,7 @@ async function runBrowserResultMetadataAllowlistTest() {
     personalInfo: profile,
     screenshots: {
       afterLogin: "/private/run/02-ruyipage-after-login.png",
-      personalInformation: "/private/run/03-account-information.png",
+      personalInformation: "/private/run/02-account-information.png",
       extra: SECRET_FIXTURE,
     },
     unexpected: SECRET_FIXTURE,
@@ -1296,8 +1320,7 @@ async function runBrowserResultMetadataAllowlistTest() {
     rememberAccount: false,
   });
   assert.deepEqual(result.screenshots, {
-    afterLogin: "02-ruyipage-after-login.png",
-    personalInformation: "03-account-information.png",
+    personalInformation: "02-account-information.png",
   });
   assert.deepEqual(result.postLoginProfileCapture, {
     success: true,
@@ -1414,7 +1437,12 @@ async function runPostHomeProfileFailureRetentionTest() {
   assert.equal(partial?.details.failureStage, "profile_name");
   assert.equal(partial?.details.failureClass, "profile_data_incomplete");
   assert.equal(partial?.details.browserPreserved, true);
-  assert.ok(warnings.some((line) => line.includes("profile_capture_partial")));
+  const profileWarnings = warnings.filter((line) =>
+    line.includes("个人资料采集未完成")
+  );
+  assert.equal(profileWarnings.length, 1);
+  assert.ok(profileWarnings[0].includes("profile_name"));
+  assert.ok(profileWarnings[0].includes("profile_data_incomplete"));
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
 }
 
@@ -1462,7 +1490,7 @@ async function runProfilePersistenceFailureReturnsPartialTest() {
         entry.details.failureClass === "profile_persistence_failed"
     )
   );
-  assert.ok(warnings.some((line) => line.includes("profile_capture_partial")));
+  assert.deepEqual(warnings, ["[!] 个人资料写入 .env 失败，详情已写入日志"]);
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
 }
 
@@ -1497,6 +1525,142 @@ async function runMissingProfileResultReturnsPartialTest() {
   );
 }
 
+async function runConciseBrowserProgressTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const emittedEvents = [
+    { event: "ready", mode: "ruyipage-only" },
+    {
+      event: "status",
+      status: "browser_stage",
+      stage: "email_input",
+      previousStage: "login_state_detected",
+      transition: "entered",
+    },
+    {
+      event: "status",
+      status: "browser_stage",
+      stage: "email_submit",
+      previousStage: "email_input",
+      transition: "entered",
+    },
+    {
+      event: "status",
+      status: "browser_stage",
+      stage: "password_input",
+      previousStage: "password_wait",
+      transition: "entered",
+    },
+    {
+      event: "status",
+      status: "browser_stage",
+      stage: "password_submit",
+      previousStage: "twofa_prepare",
+      transition: "entered",
+    },
+    { event: "prepare_2fa" },
+    { event: "need_2fa", generation: 1, state: {} },
+    {
+      event: "status",
+      status: "twofa_progress",
+      phase: "input_started",
+      generation: 1,
+    },
+    {
+      event: "status",
+      status: "twofa_progress",
+      phase: "input_completed",
+      generation: 1,
+    },
+    {
+      event: "status",
+      status: "twofa_progress",
+      phase: "transition_waiting",
+      generation: 1,
+    },
+    {
+      event: "status",
+      status: "twofa_progress",
+      phase: "transition_confirmed",
+      generation: 1,
+    },
+    { event: "status", status: "account_home_confirmed" },
+    { event: "status", status: "profile_capture_started" },
+    { event: "status", status: "profile_page_ready" },
+    {
+      event: "status",
+      status: "screenshot_capture",
+      checkpoint: "account_information",
+    },
+    { event: "status", status: "profile_birthday_collected" },
+    { event: "status", status: "profile_name_collected" },
+    { event: "status", status: "profile_capture_completed" },
+    {
+      event: "status",
+      status: "browser_session_preserved",
+      preserved: true,
+      profileCaptureSuccess: true,
+    },
+  ];
+  const harness = createRuntime(async (options) => {
+    for (const event of emittedEvents) {
+      await options.onEvent(event);
+    }
+    return successfulResult();
+  });
+
+  const logs = await captureConsole("log", () =>
+    runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
+  );
+  const expectedProgress = [
+    "[→] 浏览器自动化：ruyipage",
+    "[→] 正在启动 Firefox 浏览器",
+    "[✓] Firefox 浏览器已就绪",
+    "[→] 正在填写 Apple ID",
+    "[✓] Apple ID 已填写",
+    "[→] 正在填写 Apple 密码",
+    "[✓] Apple 登录信息已提交",
+    "[→] 正在准备 Apple 验证码监听",
+    "[→] 正在获取 Apple 验证码",
+    "[→] 正在填写 Apple 验证码",
+    "[✓] Apple 验证码已填写",
+    "[→] 正在确认 Apple 登录状态",
+    "[✓] Apple 验证已通过",
+    "[✓] 已确认 Apple 账户登录成功",
+    "[→] 正在打开个人信息页面",
+    "[✓] 个人信息页面已就绪",
+    "[✓] 已保存个人信息页面截图",
+    "[✓] 已读取出生日期",
+    "[✓] 已读取姓名",
+    "[✓] 个人资料采集完成",
+    "[✓] 已保留 Firefox 窗口和账户标签页",
+  ];
+  let previousIndex = -1;
+  for (const message of expectedProgress) {
+    const index = logs.indexOf(message);
+    assert.ok(index > previousIndex, `missing or out-of-order terminal progress: ${message}`);
+    previousIndex = index;
+  }
+  assert.equal(
+    logs.some((line) => line.startsWith("[ruyipage]")),
+    false,
+    "default terminal must not mirror low-level ruyiPage records"
+  );
+  assert.equal(
+    entries.filter((entry) => entry.source === "ruyipage").length,
+    emittedEvents.length + 2,
+    "the audit must retain every backend event plus runtime/backend startup records"
+  );
+}
+
 async function runBrowserStageTerminalOutputTest() {
   const entries = [];
   const flowAudit = {
@@ -1508,7 +1672,7 @@ async function runBrowserStageTerminalOutputTest() {
       entries.push({ source, event, details });
     },
   };
-  const harness = createRuntime(async (options) => {
+  const runBackend = async (options) => {
     await options.onEvent({
       event: "status",
       status: "browser_stage",
@@ -1532,7 +1696,7 @@ async function runBrowserStageTerminalOutputTest() {
     await options.onEvent({
       event: "status",
       status: "screenshot_capture",
-      checkpoint: "account_home",
+      checkpoint: "account_information",
       path: SECRET_FIXTURE,
     });
     await options.onEvent({
@@ -1542,7 +1706,8 @@ async function runBrowserStageTerminalOutputTest() {
       error: SECRET_FIXTURE,
     });
     return successfulResult();
-  });
+  };
+  const harness = createRuntime(runBackend);
 
   let logs;
   const warnings = await captureConsole("warn", async () => {
@@ -1550,20 +1715,47 @@ async function runBrowserStageTerminalOutputTest() {
       runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
     );
   });
+  assert.equal(
+    logs.some((line) => line.startsWith("[ruyipage] stage:")),
+    false
+  );
+  assert.equal(
+    logs.some((line) => line.startsWith("[ruyipage] observation:")),
+    false
+  );
+  assert.ok(logs.includes("[✓] 已保存个人信息页面截图"));
+  assert.deepEqual(warnings, ["[!] 个人信息页面截图保存失败，详情已写入日志"]);
+
+  const debugHarness = createRuntime(runBackend, { terminalDebug: true });
+  let debugLogs;
+  const debugWarnings = await captureConsole("warn", async () => {
+    debugLogs = await captureConsole("log", () =>
+      runAccountBrowserPhase(params, debugHarness.runtime)
+    );
+  });
   assert.ok(
-    logs.includes(
+    debugLogs.includes(
       "[ruyipage] stage:account_information:from:signed_in:transition:entered"
     )
   );
   assert.ok(
-    logs.includes(
+    debugLogs.includes(
       "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:root_security_copy:0:retiring_child:0:child_auth:0"
     )
   );
-  assert.ok(logs.includes("[ruyipage] status:screenshot_capture:checkpoint:account_home"));
   assert.ok(
-    warnings.includes("[ruyipage] status:screenshot_failed:checkpoint:account_information")
+    debugLogs.includes(
+      "[ruyipage] status:screenshot_capture:checkpoint:account_information"
+    )
   );
+  assert.ok(
+    debugLogs.includes(
+      "[ruyipage] status:screenshot_failed:checkpoint:account_information"
+    )
+  );
+  assert.deepEqual(debugWarnings, [
+    "[!] 个人信息页面截图保存失败，详情已写入日志",
+  ]);
   assert.deepEqual(
     entries
       .filter(
@@ -1574,11 +1766,16 @@ async function runBrowserStageTerminalOutputTest() {
       )
       .map((entry) => entry.details),
     [
-      { status: "screenshot_capture", checkpoint: "account_home" },
+      { status: "screenshot_capture", checkpoint: "account_information" },
       { status: "screenshot_failed", checkpoint: "account_information" },
     ]
   );
-  assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+  assert.equal(
+    JSON.stringify({ entries, logs, warnings, debugLogs, debugWarnings }).includes(
+      SECRET_FIXTURE
+    ),
+    false
+  );
 }
 
 async function runWarningSanitizationTest() {
@@ -1590,7 +1787,7 @@ async function runWarningSanitizationTest() {
   const warnings = await captureConsole("warn", () =>
     runAccountBrowserPhase(params, harness.runtime)
   );
-  assert.deepEqual(warnings, ["[ruyipage] backend warning"]);
+  assert.deepEqual(warnings, ["[!] 浏览器后端报告异常，详情已写入日志"]);
   assert.equal(warnings.join(" ").includes(SECRET_FIXTURE), false);
 }
 
@@ -1602,8 +1799,27 @@ async function runEnvironmentWarningSanitizationTest() {
   const logs = await captureConsole("log", () =>
     runAccountBrowserPhase(params, harness.runtime)
   );
-  assert.ok(logs.includes("[Firefox] 环境提示: browser environment warning"));
+  assert.ok(logs.includes("[!] Firefox 环境提示：详情已写入日志"));
   assert.equal(logs.some((line) => line.includes(SECRET_FIXTURE)), false);
+}
+
+function runTerminalDiagnosticModeTest() {
+  assert.equal(shouldMirrorTerminalDiagnostics({}), false);
+  for (const value of ["1", "true", "yes", "on", " TRUE "]) {
+    assert.equal(
+      shouldMirrorTerminalDiagnostics({ APPLE_AUTOMATION_TERMINAL_DEBUG: value }),
+      true
+    );
+  }
+  assert.equal(
+    shouldMirrorTerminalDiagnostics({ APPLE_AUTOMATION_TERMINAL_DEBUG: "0" }),
+    false
+  );
+  assert.equal(
+    shouldMirrorTerminalDiagnostics({ APPLE_AUTOMATION_SUPERVISED_GUI: "1" }),
+    true,
+    "the supervised bridge must keep receiving the redacted machine protocol"
+  );
 }
 
 async function runReadyModeSanitizationTest() {
@@ -1630,17 +1846,17 @@ async function runReadyModeSanitizationTest() {
       failureStage: SECRET_FIXTURE,
     });
     return successfulResult();
-  });
+  }, { terminalDebug: true });
 
   const logs = await captureConsole("log", () =>
     runAccountBrowserPhase(params, harness.runtime)
   );
-  const readyLogs = logs.filter((line) => line.includes("[ruyipage] 浏览器已就绪"));
+  const readyLogs = logs.filter((line) => line.startsWith("[ruyipage] ready:mode:"));
   assert.deepEqual(
     {
       count: readyLogs.length,
-      mappedUnknownCount: readyLogs.filter((line) => line.endsWith("(browser)")).length,
-      preservedKnown: readyLogs.some((line) => line.endsWith("(ruyipage-only)")),
+      mappedUnknownCount: readyLogs.filter((line) => line.endsWith(":browser")).length,
+      preservedKnown: readyLogs.some((line) => line.endsWith(":ruyipage-only")),
       leaked: logs.some((line) => line.includes(READY_MODE_SECRET)),
     },
     { count: 4, mappedUnknownCount: 3, preservedKnown: true, leaked: false }
@@ -1668,7 +1884,7 @@ async function runCleanupErrorSanitizationTest() {
       /backend failed/
     );
   });
-  assert.deepEqual(warnings, ["[2FA] collector cleanup failed"]);
+  assert.deepEqual(warnings, ["[×] 验证码监听器收尾失败"]);
   assert.equal(warnings.join(" ").includes(SECRET_FIXTURE), false);
 }
 
@@ -1724,11 +1940,10 @@ async function runPostLoginCollectorCleanupPartialTest() {
     )
   );
   assert.equal(logs.some((line) => line.includes("status:node-failure")), false);
-  assert.ok(
-    warnings.includes("[2FA] collector cleanup partial after account-home confirmation")
-  );
-  assert.ok(
-    warnings.some((line) => line.includes("post_login_finalization_partial"))
+  assert.deepEqual(
+    warnings,
+    ["[!] 登录已成功，验证码监听器收尾未完全完成，详情已写入日志"],
+    "collector disposal must keep both audit records while emitting one concise post-login warning"
   );
   assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
 }
@@ -1813,7 +2028,7 @@ async function runBrowserFinalizationPartialRetentionTest() {
         rawFinalization: SECRET_FIXTURE,
       },
     };
-  });
+  }, { terminalDebug: true });
 
   let result;
   let logs;
@@ -1838,10 +2053,13 @@ async function runBrowserFinalizationPartialRetentionTest() {
   );
   assert.ok(
     warnings.includes(
-      "[ruyipage] status:browser_finalization_partial:completed:0:preserve_requested:1:preserved:0:class:unknown"
+      "[!] 浏览器收尾未完全完成，详情已写入日志"
     )
   );
-  assert.ok(warnings.some((line) => line.includes("post_login_finalization_partial")));
+  assert.equal(
+    warnings.filter((line) => line.includes("浏览器收尾未完全完成")).length,
+    1
+  );
   assert.deepEqual(
     entries
       .filter(
@@ -2029,7 +2247,7 @@ async function runPostLoginRunnerPartialTest() {
   );
   assert.ok(
     warnings.includes(
-      "[ruyipage] runner_post_login_partial:stage:profile_capture:code:backend_exit:preserve_requested:1:preserved:1:browser_finalized:0"
+      "[!] 登录已成功，后续浏览器处理未完成（阶段：profile_capture，原因：backend_exit）"
     )
   );
   assert.equal(logs.some((line) => line.includes("status:node-failure")), false);
@@ -2106,26 +2324,30 @@ function runEnvDataParsingTest() {
   const originalCwd = process.cwd();
   const externalKey = "APPLE_AUTOMATION_TEST_EXTERNAL";
   const loadedKey = "APPLE_AUTOMATION_TEST_LOADED";
-  const smsKeys = [
+  const ignoredEnvKeys = [
     "APPLE_AUTOMATION_SMS_ENABLED",
     "APPLE_AUTOMATION_SMS_PHONE",
     "APPLE_AUTOMATION_SMS_API_URL",
     "APPLE_AUTOMATION_SMS_RECONFIGURE",
     "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+    "APPLE_AUTOMATION_SUPERVISED_GUI",
+    "APPLE_AUTOMATION_TERMINAL_DEBUG",
   ];
   const originalExternal = process.env[externalKey];
   const originalLoaded = process.env[loadedKey];
-  const originalSmsValues = Object.fromEntries(smsKeys.map((key) => [key, process.env[key]]));
+  const originalIgnoredValues = Object.fromEntries(
+    ignoredEnvKeys.map((key) => [key, process.env[key]])
+  );
   try {
     fs.writeFileSync(
       envPath,
-      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
+      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nAPPLE_AUTOMATION_SUPERVISED_GUI=1\r\nAPPLE_AUTOMATION_TERMINAL_DEBUG=true\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
       "utf8"
     );
     fs.chmodSync(envPath, 0o644);
     process.env[externalKey] = "";
     delete process.env[loadedKey];
-    for (const key of smsKeys) delete process.env[key];
+    for (const key of ignoredEnvKeys) delete process.env[key];
     process.chdir(tempDir);
     assert.equal(loadEnvFile(), envPath);
     assert.equal(process.env[externalKey], "");
@@ -2135,6 +2357,8 @@ function runEnvDataParsingTest() {
     assert.equal(process.env.APPLE_AUTOMATION_SMS_API_URL, "https://example.test/record?token=private");
     assert.equal(process.env.APPLE_AUTOMATION_SMS_RECONFIGURE, "1");
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
+    assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_SUPERVISED_GUI"), false);
+    assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_TERMINAL_DEBUG"), false);
     assert.equal(
       saveCredentialsToEnv({ appleId: "person@example.com", password: "secret" }),
       envPath
@@ -2187,9 +2411,9 @@ function runEnvDataParsingTest() {
     else process.env[externalKey] = originalExternal;
     if (originalLoaded === undefined) delete process.env[loadedKey];
     else process.env[loadedKey] = originalLoaded;
-    for (const key of smsKeys) {
-      if (originalSmsValues[key] === undefined) delete process.env[key];
-      else process.env[key] = originalSmsValues[key];
+    for (const key of ignoredEnvKeys) {
+      if (originalIgnoredValues[key] === undefined) delete process.env[key];
+      else process.env[key] = originalIgnoredValues[key];
     }
     if (fs.existsSync(envPath)) fs.unlinkSync(envPath);
     fs.rmdirSync(tempDir);
@@ -2269,6 +2493,23 @@ function runFullFlowSourceContractTest() {
   assert.match(source, /REAL_ACCOUNT_HOME_CONFIRMED/);
   assert.match(source, /\[apple-automation\] stage:flow_main_started/);
   assert.match(source, /\[apple-automation\] stage:credentials_ready/);
+  assert.match(
+    source,
+    /if \(mirrorDiagnostics\) \{\s*console\.log\("\[apple-automation\] stage:flow_main_started"\);\s*\}/
+  );
+  assert.match(
+    source,
+    /if \(mirrorDiagnostics\) \{\s*console\.log\("\[apple-automation\] stage:credentials_ready"\);\s*\}/
+  );
+  assert.match(
+    source,
+    /if \(mirrorDiagnostics\) \{[\s\S]*?\[apple-automation\] failure_stage:[\s\S]*?\[apple-automation\] audit_path:/
+  );
+  assert.match(
+    source,
+    /\[×\] 流程失败（阶段：\$\{report\.failure\.failureStage\}，原因：\$\{report\.failure\.failureCode\}）/
+  );
+  assert.doesNotMatch(source, /\[failed\] Apple ID flow failed/);
   assert.match(source, /flowAudit\.addSecrets\(\[creds\.appleId, creds\.password\]\)/);
   assert.match(source, /auditFile:\s*"flow-audit\.jsonl"/);
   assert.match(source, /flowAudit\.write\("flow", "credential_resolution_failed", \{/);
@@ -2514,6 +2755,7 @@ function runAcceptanceMarkerFailureIsNonfatalTest() {
       throw new Error(SECRET_FIXTURE);
     },
     flowAudit,
+    mirrorDiagnostics: false,
     logger: {
       log(line) {
         logs.push(line);
@@ -2533,13 +2775,14 @@ function runAcceptanceMarkerFailureIsNonfatalTest() {
     },
   ]);
   assert.deepEqual(logs, []);
-  assert.deepEqual(warnings, ["[apple-automation] status:acceptance_marker_partial:home:1"]);
+  assert.deepEqual(warnings, ["[!] 登录验收标记写入失败，详情已写入日志"]);
   assert.equal(
     recordAccountHomeAcceptanceMarker(false, {
       writeMarker() {
         throw new Error("must not run");
       },
       flowAudit,
+      mirrorDiagnostics: false,
       logger: {
         log(line) {
           logs.push(line);
@@ -2556,7 +2799,32 @@ function runAcceptanceMarkerFailureIsNonfatalTest() {
     event: "acceptance_marker_skipped",
     details: { accountHomeConfirmed: false },
   });
-  assert.equal(logs.at(-1), "[apple-automation] status:acceptance_marker_skipped:home:0");
+  assert.deepEqual(logs, []);
+
+  const diagnosticLogs = [];
+  const diagnosticWarnings = [];
+  assert.equal(
+    recordAccountHomeAcceptanceMarker(true, {
+      writeMarker() {
+        throw new Error(SECRET_FIXTURE);
+      },
+      flowAudit,
+      mirrorDiagnostics: true,
+      logger: {
+        log(line) {
+          diagnosticLogs.push(line);
+        },
+        warn(line) {
+          diagnosticWarnings.push(line);
+        },
+      },
+    }),
+    "partial"
+  );
+  assert.deepEqual(diagnosticLogs, []);
+  assert.deepEqual(diagnosticWarnings, [
+    "[apple-automation] status:acceptance_marker_partial:home:1",
+  ]);
   assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
 }
 
@@ -2586,6 +2854,7 @@ const focusedTests = {
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
   "post-home-profile-failure": runPostHomeProfileFailureRetentionTest,
+  "concise-browser-progress": runConciseBrowserProgressTest,
   "browser-stage-terminal": runBrowserStageTerminalOutputTest,
   "collector-cleanup-partial": runPostLoginCollectorCleanupPartialTest,
   "finalization-unknown": runMissingPostLoginFinalizationRemainsUnknownTest,
@@ -2593,6 +2862,7 @@ const focusedTests = {
   "finalization-class-invariant": runFinalizationFailureClassInvariantTest,
   "runner-post-login-partial": runPostLoginRunnerPartialTest,
   "runner-post-login-boundary": runPostLoginRunnerPartialBoundaryTest,
+  "terminal-diagnostic-mode": runTerminalDiagnosticModeTest,
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
   "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
@@ -2645,9 +2915,11 @@ await runBrowserResultMetadataAllowlistTest();
 await runPostHomeProfileFailureRetentionTest();
 await runProfilePersistenceFailureReturnsPartialTest();
 await runMissingProfileResultReturnsPartialTest();
+await runConciseBrowserProgressTest();
 await runBrowserStageTerminalOutputTest();
 await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
+runTerminalDiagnosticModeTest();
 await runReadyModeSanitizationTest();
 await runCleanupErrorSanitizationTest();
 await runPostLoginCollectorCleanupPartialTest();

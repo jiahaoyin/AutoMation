@@ -15,6 +15,11 @@ export const PACKAGE_ROOT = path.resolve(__dirname, "../..");
 const RUNTIME_ONLY_SMS_ENV_KEYS = new Set([
   "APPLE_AUTOMATION_MANUAL_SMS_CODE",
 ]);
+const ENV_FILE_IGNORED_KEYS = new Set([
+  ...RUNTIME_ONLY_SMS_ENV_KEYS,
+  "APPLE_AUTOMATION_SUPERVISED_GUI",
+  "APPLE_AUTOMATION_TERMINAL_DEBUG",
+]);
 
 export function resolveEnvPath() {
   const cwdEnv = path.join(process.cwd(), ".env");
@@ -47,7 +52,7 @@ export function loadEnvFile() {
     if (eq <= 0) continue;
     const key = trimmed.slice(0, eq).trim();
     const val = parseEnvValue(trimmed.slice(eq + 1));
-    if (RUNTIME_ONLY_SMS_ENV_KEYS.has(key)) {
+    if (ENV_FILE_IGNORED_KEYS.has(key)) {
       continue;
     }
     if (!Object.hasOwn(process.env, key)) process.env[key] = val;

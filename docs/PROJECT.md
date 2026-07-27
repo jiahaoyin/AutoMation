@@ -88,8 +88,9 @@ TTY 且手输未被明确禁用，才隐藏读取手输验证码。手输默认�
 - `BROWSER_PRESERVE_ON_FAILURE=1`：直接运行 `./run.sh` 时失败后默认保留 Firefox，便于核对当前 Apple 页面；设置为 `0` 才关闭。受监督 broker 会话仍严格清理。
 - `BROWSER_PRESERVE_ON_SUCCESS=1`：直接运行成功后默认保留 Firefox 窗口和已登录标签页；设为 `0` 才在 Python 结束时关闭。
 - `BROWSER_ATTACH_EXISTING=1`：下次直接运行时优先用 ruyiPage 接管现有 `account.apple.com` 标签页，并检测已登录状态；`BROWSER_ATTACH_ADDRESS` 可显式指定调试地址。
-- 个人信息页会保存 `screenshots/03-account-information.png`，从姓名卡弹窗读取名与姓、从资料卡读取出生日期。值仅写入 `.env` 的小写 `name`、`birthday`，交互终端用于核对，audit 和 `report.json` 仅保留是否采集成功。
+- 登录成功后精确访问 `https://account.apple.com/account/manage/section/information`，在姓名/生日两张卡连续稳定后保存唯一截图 `screenshots/02-account-information.png`。流程先读取生日，再点击姓名卡并从结构化弹窗字段读取名与姓；值仅写入 `.env` 的小写 `name`、`birthday`，交互终端用于核对，audit 和 `report.json` 仅保留是否采集成功。
 - OTP 不会输出到终端、audit、报告、截图或错误文本；使用固定状态与交接阶段排查取码和填码问题。
+- 普通终端只显示 `[→]`、`[✓]`、`[!]`、`[×]` 进度；每条脱敏 backend 事件仍完整写入 `flow-audit.jsonl`。排查时以 shell/export 运行时开关设置 `APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac`，在终端额外镜像脱敏机器协议；该开关不从 `.env` 读取，受监督验收会自动启用协议。
 
 权限分层：
 
@@ -147,7 +148,7 @@ npm run test:account-browser-flow
 9. 全窗 OCR 只接受 `NNN NNN`；中心连续六位需同一 window ID 两次独立捕获一致。Screen Recording 缺失时安装和 Firefox 登录都不启动，直到授权完成。
 10. 验证码只写入已识别的单框或六格控件。已验证的 popup 码不能因原生弹窗关闭失败而被扣留；关闭属于尽力清理并保留固定状态。
 11. 第一代只有在可信 Apple 页明确 OTP 错误/无效/过期时才可被第二代替换；第二代重新走 popup 主阶段，但沿用 240 秒期限与 Settings 两次总预算，旧码不再复用。captcha、锁定和未知错误停止。
-12. 登录后访问个人信息页并生成 `02-ruyipage-after-login.png`、`03-account-information.png`。
+12. 登录后精确访问个人信息页，仅在姓名/生日两张卡稳定后生成 `02-account-information.png`；截图先于姓名弹窗打开。
 13. `report.json` 中 `browserLogin.backend` 为 `ruyipage`，仅记录资料采集/落盘状态和固定截图文件名，不包含账号、姓名或生日。
 
 第 11 项已完成：ruyiPage、runner、`account-browser-flow` 和 collector 透传 generation，
@@ -157,7 +158,7 @@ npm run test:account-browser-flow
 cleanup 也已接入。OTP 不会显示在终端，且绝不写入 audit、报告、截图或错误文本；通过固定
 交接阶段排查取码、投递、输入、提交和登录状态确认问题。
 
-Windows 发布门槛包括 Python 126 项、ruyipage flow/protocol、sidecar、
+Windows 发布门槛包括 Python 290 项、ruyipage flow/protocol、sidecar、
 account-browser-flow、Allow 61 项、permissions、release 和 mac-codex contract；每个待发布
 提交都必须重新执行，不能沿用旧提交的 PASS。这些结果只证明逻辑、协议与 source-contract；
 Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试机验收。
@@ -174,7 +175,7 @@ Swift typecheck/TCC 和 macOS 15 原生 UI 必须以同一精确提交在测试�
 | 短信后置弹窗未自动处理 | 仅在 `.env` 设置 `APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1` 后启用。确认当前终端拥有辅助功能；iPhone 视觉路径还需要屏幕录制。模块按同一 AX owner、visual host、CGWindowID 绑定逐个处理条款、Mac 密码、iPhone 解锁和位置页，位置只接受 `action-button-2` 的“以后”，任一身份、窗口、OCR 或 4/6 格不稳定都会保留人工操作。 |
 | OCR capability 为 `permission_missing` | 这是硬门槛；在「隐私与安全性 -> 屏幕与系统音频录制」授权实际运行主体，按 macOS 提示重开终端或 Codex 后重新运行 `./install.sh` |
 | Mac 设置登录提示 Automation 未授权 | 仅完整流程/`--skip-browser` 需要；在「隐私与安全性 → 自动化」允许当前终端控制“系统设置” |
-| 姓名或生日为空 | 查看 `03-account-information.png`，调整 ruyiPage 页面解析标签 |
+| 姓名或生日为空 | 查看 `02-account-information.png` 和 `flow-audit.jsonl`；需要终端同步机器协议时用 `APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac` |
 
 ## 10. 安全边界
 

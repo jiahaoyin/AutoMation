@@ -3343,6 +3343,8 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         personal_info,
         events,
         event_sink=None,
+        wait_ready_side_effect=None,
+        collect_side_effect=None,
     ):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
@@ -3364,10 +3366,10 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             side_effect=lambda _page, state, **_kwargs: state,
         ), patch(
             "apple_account_flow.wait_for_profile_capture_ready",
-            return_value=None,
+            side_effect=wait_ready_side_effect or (lambda _page: None),
         ), patch(
             "apple_account_flow.collect_personal_info",
-            return_value=personal_info,
+            side_effect=collect_side_effect or (lambda _page: personal_info),
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -3388,7 +3390,13 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 self.run_late_flow(
                     report_dir,
                     page,
-                    {"trusted": False, "error": True},
+                    {
+                        "trusted": False,
+                        "error": True,
+                        "rootError": True,
+                        "hardAuthenticationError": True,
+                        "rootHardAuthenticationError": True,
+                    },
                     {"name": "Test Given Test Family", "birthday": "2000-01-02"},
                     events,
                 ),
@@ -3397,7 +3405,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
             self.assertEqual(
                 sorted(path.name for path in report_dir.rglob("*.png")),
-                ["02-ruyipage-after-login.png"],
+                [],
             )
             result = next(event for event in events if event.get("event") == "result")
             self.assertTrue(result["success"])
@@ -3407,7 +3415,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 result["postLoginProfileCapture"],
                 {
                     "success": False,
-                    "failureStage": "account_information",
+                    "failureStage": "profile_capture",
                     "failureClass": "profile_authentication_error",
                     "browserAlive": False,
                     "browserPreserved": False,
@@ -3415,6 +3423,114 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 },
             )
             self.assertNotIn(secret, json.dumps(events))
+
+    def test_stable_information_anchor_overrides_stale_text_only_auth_copy(self):
+        secret = "person@example.com OTP 123456"
+        events = []
+        stale_state = {
+            "trusted": False,
+            "error": True,
+            "rootError": True,
+            "twofa": True,
+            "twofaVisible": True,
+            "codeInputCount": 0,
+            "password": False,
+            "email": False,
+            "trustPrompt": False,
+            "otpRejected": False,
+            "blocked": False,
+            "hardAuthenticationError": False,
+            "rootHardAuthenticationError": False,
+            "childAuthUiPresent": False,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            page = self.DiskScreenshotPage(secret)
+
+            self.assertEqual(
+                self.run_late_flow(
+                    report_dir,
+                    page,
+                    stale_state,
+                    {
+                        "name": "Test Given Test Family",
+                        "birthday": "2000-01-02",
+                    },
+                    events,
+                    wait_ready_side_effect=lambda _page: (
+                        account_flow.confirmed_personal_information_state(
+                            stale_state
+                        )
+                    ),
+                ),
+                0,
+            )
+
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertTrue(result["postLoginProfileCapture"]["success"])
+            self.assertEqual(
+                sorted(path.name for path in report_dir.rglob("*.png")),
+                ["02-account-information.png"],
+            )
+            self.assertNotIn(secret, json.dumps(events))
+
+    def test_information_screenshot_is_after_cards_and_before_profile_collection(self):
+        order = []
+
+        class OrderedScreenshotPage(self.DiskScreenshotPage):
+            def __init__(self, secret):
+                super().__init__(secret)
+                self.urls = []
+
+            def get(self, url):
+                self.urls.append(url)
+
+            def screenshot(self, path, *, full_page):
+                order.append("screenshot")
+                super().screenshot(path, full_page=full_page)
+
+        final_state = {"trusted": True, "error": False}
+        personal_info = {
+            "name": "Test Given Test Family",
+            "birthday": "2000-01-02",
+        }
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            page = OrderedScreenshotPage("redacted screenshot")
+
+            def cards_ready(_page):
+                order.append("cards_ready")
+                return account_flow.confirmed_personal_information_state(
+                    final_state
+                )
+
+            def collect(_page):
+                order.extend(("birthday_read", "name_modal_opened"))
+                return personal_info
+
+            self.assertEqual(
+                self.run_late_flow(
+                    Path(temp_dir),
+                    page,
+                    final_state,
+                    personal_info,
+                    events,
+                    wait_ready_side_effect=cards_ready,
+                    collect_side_effect=collect,
+                ),
+                0,
+            )
+
+        self.assertEqual(
+            order,
+            [
+                "cards_ready",
+                "screenshot",
+                "birthday_read",
+                "name_modal_opened",
+            ],
+        )
+        self.assertEqual(page.urls[-1], account_flow.ACCOUNT_INFORMATION_URL)
 
     def test_personal_info_parse_failure_is_a_profile_partial_result(self):
         secret = "person@example.com OTP 123456"
@@ -3436,7 +3552,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
             self.assertEqual(
                 sorted(path.name for path in report_dir.rglob("*.png")),
-                ["02-ruyipage-after-login.png", "03-account-information.png"],
+                ["02-account-information.png"],
             )
             result = next(event for event in events if event.get("event") == "result")
             self.assertEqual(
@@ -3482,7 +3598,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
             self.assertEqual(
                 sorted(path.name for path in report_dir.rglob("*.png")),
-                ["02-ruyipage-after-login.png", "03-account-information.png"],
+                ["02-account-information.png"],
             )
             self.assertEqual(page.quit_calls, 0)
             self.assertIn(
@@ -3639,7 +3755,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 sorted(path.name for path in report_dir.rglob("*.png")),
-                ["02-ruyipage-after-login.png", "03-account-information.png"],
+                ["02-account-information.png"],
             )
             self.assertIn(
                 {
@@ -3736,15 +3852,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             screenshots = sorted(path.name for path in report_dir.rglob("*.png"))
             self.assertEqual(
                 screenshots,
-                ["02-ruyipage-after-login.png", "03-account-information.png"],
-            )
-            self.assertIn(
-                {
-                    "event": "status",
-                    "status": "screenshot_capture",
-                    "checkpoint": "account_home",
-                },
-                events,
+                ["02-account-information.png"],
             )
             self.assertIn(
                 {
@@ -3772,8 +3880,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             screenshots_dir = report_dir / "screenshots"
             screenshots_dir.mkdir(parents=True)
             older_files = (
-                screenshots_dir / "02-ruyipage-after-login.png",
-                screenshots_dir / "03-account-information.png",
+                screenshots_dir / "02-account-information.png",
             )
             for path in older_files:
                 path.write_text("older run", encoding="utf-8")
@@ -3792,7 +3899,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
             self.assertEqual(
                 [path.read_text(encoding="utf-8") for path in older_files],
-                ["older run", "older run"],
+                ["older run"],
             )
 
     def test_screenshot_failure_emits_only_a_fixed_safe_reason(self):
@@ -3818,7 +3925,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             result = account_flow.take_screenshot(
                 FailingScreenshotPage(),
                 FakePath(),
-                checkpoint="account_home",
+                checkpoint="account_information",
             )
 
         self.assertIsNone(result)
@@ -3827,7 +3934,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             {
                 "event": "status",
                 "status": "screenshot_failed",
-                "checkpoint": "account_home",
+                "checkpoint": "account_information",
             },
         )
         self.assertNotIn(self.SECRET_SENTINEL, json.dumps(emit_event.call_args.args[0]))
@@ -9054,6 +9161,163 @@ class BrowserBrokerLaunchTests(unittest.TestCase):
 
 
 class PersonalInformationTests(unittest.TestCase):
+    @staticmethod
+    def stable_profile_cards():
+        name_card = FakeElement(
+            attrs={
+                "id": "name-card",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        birthday_card = FakeElement(
+            attrs={
+                "id": "birthday-card",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                },
+            }
+        )
+        return name_card, birthday_card
+
+    def test_stable_information_cards_override_stale_account_security_text(self):
+        name_card, birthday_card = self.stable_profile_cards()
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+            },
+            state={
+                "href": account_flow.ACCOUNT_INFORMATION_URL,
+                "hasStrongTwoFactorText": True,
+                "semanticTargetCount": 0,
+                "digitCellCount": 0,
+                "codeInputCount": 0,
+                "password": False,
+                "email": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+                "hardAuthenticationError": False,
+                "genericAuthText": True,
+                "securityFeatureCopy": False,
+                "error": True,
+                "accountManage": True,
+                "accountMarker": True,
+            },
+        )
+
+        state = account_flow.wait_for_profile_capture_ready(
+            page,
+            pause=lambda *_: None,
+        )
+
+        self.assertTrue(state["trusted"])
+        self.assertTrue(state["rootSessionTrusted"])
+        self.assertFalse(state["error"])
+        self.assertFalse(state["rootError"])
+        self.assertFalse(state["twofa"])
+        self.assertFalse(state["activeAuthUiPresent"])
+
+    def test_profile_confirmation_fails_closed_for_live_authentication_state(self):
+        blockers = (
+            {"password": True},
+            {"email": True},
+            {"trustPrompt": True},
+            {"codeInputCount": 6},
+            {"otpRejected": True},
+            {"blocked": True},
+            {"hardAuthenticationError": True},
+            {"rootHardAuthenticationError": True},
+            {"childAuthUiPresent": True},
+        )
+        for blocker in blockers:
+            with self.subTest(blocker=blocker), self.assertRaisesRegex(
+                RuntimeError,
+                "authentication error",
+            ):
+                account_flow.confirmed_personal_information_state(
+                    {
+                        "codeInputCount": 0,
+                        "password": False,
+                        "email": False,
+                        "trustPrompt": False,
+                        "otpRejected": False,
+                        "blocked": False,
+                        "hardAuthenticationError": False,
+                        "rootHardAuthenticationError": False,
+                        "childAuthUiPresent": False,
+                        **blocker,
+                    }
+                )
+
+    def test_retired_auth_control_counts_do_not_override_live_profile_cards(self):
+        state = account_flow.confirmed_personal_information_state(
+            {
+                "codeInputCount": 6,
+                "password": True,
+                "otpRejected": True,
+                "activeAuthUiPresent": False,
+                "activeOtpRejected": False,
+                "activeBlocked": False,
+                "hardAuthenticationError": False,
+                "rootHardAuthenticationError": False,
+            }
+        )
+
+        self.assertTrue(state["trusted"])
+        self.assertFalse(state["twofa"])
+
+    def test_root_password_control_is_reported_as_active_profile_auth_ui(self):
+        page = FakePage(
+            state={
+                "href": account_flow.ACCOUNT_INFORMATION_URL,
+                "password": True,
+                "email": False,
+                "trustPrompt": False,
+                "codeInputCount": 0,
+                "otpRejected": False,
+                "blocked": False,
+                "hardAuthenticationError": False,
+                "error": False,
+                "accountManage": True,
+                "accountMarker": True,
+            }
+        )
+
+        state = detect_login_state(page)
+
+        self.assertTrue(state["activeAuthUiPresent"])
+        with self.assertRaisesRegex(RuntimeError, "authentication error"):
+            account_flow.confirmed_personal_information_state(state)
+
+    def test_profile_card_snapshot_requires_exact_information_route(self):
+        name_card, birthday_card = self.stable_profile_cards()
+        elements = {
+            "css:button.button.button-bare": [name_card],
+            "css:button[class*='button-bare']": [name_card],
+            "css:.card": [birthday_card],
+        }
+        for url in (
+            "https://account.apple.com/account/manage",
+            "https://account.apple.com/account/manage/section/security",
+            "http://account.apple.com/account/manage/section/information",
+            "https://evil.example/account/manage/section/information",
+        ):
+            with self.subTest(url=url):
+                page = FakePage(elements, state={"href": url})
+                self.assertIsNone(
+                    account_flow.profile_capture_card_snapshot(page)
+                )
+
     def test_waits_for_hydrated_birthday_value_before_accepting_the_card(self):
         birthday_card = FakeElement()
         summaries = [

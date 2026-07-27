@@ -245,14 +245,19 @@ cd apple-id-automation-${VERSION}
 1. **Mac 系统设置**：自动填入 Apple ID / 密码；配置 `.env` 的短信 provider 后可自动完成手机验证码，未启用时在系统界面人工完成
 2. **等待**：脚本轮询直至检测到系统设置已登录
 3. **Firefox**：启动、导航、页面读取、输入、截图与关闭全部由 ruyiPage 完成，不提供其他浏览器后端
-4. **account.apple.com**：登录 → \`need_2fa\` 后 popup AX/OCR 优先 30 秒；确认 Allow 后再给 30 秒；无新码才串行回退到系统设置，最后才可隐藏终端手输 → 采集姓名、生日
-5. **输出**：\`data/reports/apple-id-flow-*/report.json\` 与 \`screenshots/\`
+4. **account.apple.com**：登录 → \`need_2fa\` 后 popup AX/OCR 优先 30 秒；确认 Allow 后再给 30 秒；无新码才串行回退到系统设置，最后才可隐藏终端手输
+5. **个人信息**：精确访问 \`/account/manage/section/information\`，姓名/生日卡稳定后保存 \`02-account-information.png\`，先读取生日，再打开姓名弹窗
+6. **输出**：姓名、生日写入私有 \`.env\` 的 \`name\`、\`birthday\`；完整脱敏事件写入 \`flow-audit.jsonl\`
 
 2FA 按严格串行顺序处理：popup 主阶段拿到有效新码后会立即交给 ruyiPage，Settings 和
 手输不会启动；Settings 最多两次（每次最多 60 秒、间隔 5 秒），手输只会在 Settings
 有界尝试结束后且不早于首次取码 90 秒出现。两代验证码共享 240 秒期限和 Settings 总预算。
 终端不显示 OTP；验证码绝不写入 audit、报告、截图或错误文本。取码后的交接阶段通过固定
 状态记录，便于定位 stdin 投递、目标解析、输入、提交或登录状态确认失败。
+普通终端只显示简洁业务进度；使用
+\`APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac\` 可额外镜像脱敏机器协议。该开关
+只接受 shell/export 运行时值，\`.env\` 中的同名项会忽略。
+姓名和生日只出现在私有 \`.env\` 与直接交互终端，report/audit 仅记录落盘状态。
 
 ## 命令
 
@@ -284,6 +289,9 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_2FA_MANUAL_FALLBACK\` | 可选，默认 \`1\`；仅在 Settings 有界尝试结束后、且不早于首次取码 90 秒时允许在真实 TTY 隐藏手输验证码 |
 | \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
 | \`BROWSER_PRESERVE_ON_FAILURE\` | 可选，直接运行默认 \`1\`；失败后保留 Firefox 供人工检查当前页面，设为 \`0\` 才关闭；受监督 broker 会话仍严格清理 |
+| \`BROWSER_PRESERVE_ON_SUCCESS\` | 可选，默认 \`1\`；成功后保留已登录 Firefox 窗口、标签页和持久 Profile |
+| \`APPLE_AUTOMATION_TERMINAL_DEBUG\` | shell/export 运行时开关，设为 \`1\` 时终端镜像脱敏机器协议；不从 \`.env\` 读取，完整日志始终写入 \`flow-audit.jsonl\` |
+| \`name\` / \`birthday\` | 个人信息页成功采集后自动写入；不要手动放入日志或报告 |
 
 ### 系统设置短信验证
 
@@ -312,7 +320,7 @@ APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1
 - **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
 - **屏幕录制未授权**：在「隐私与安全性 -> 屏幕与系统音频录制」允许实际运行主体；按 macOS 提示重开终端或 Codex 后重新运行 \`./install.sh\`
 - **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能和屏幕录制权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
-- **姓名/生日为空**：查看 \`screenshots/03-account-information.png\`，可能需更新页面解析
+- **姓名/生日为空**：查看 \`screenshots/02-account-information.png\` 和 \`flow-audit.jsonl\`；需要同步机器协议时设置 \`APPLE_AUTOMATION_TERMINAL_DEBUG=1\`
 
 ## 安全
 
@@ -345,8 +353,10 @@ APPLE_PASSWORD=your_password
 # BROWSER_PRESERVE_ON_SUCCESS=1
 # BROWSER_ATTACH_EXISTING=1
 # BROWSER_ATTACH_ADDRESS=127.0.0.1:9222
-# name=
-# birthday=
+# 终端诊断仅接受 shell/export 运行时开关，不从 .env 读取：
+# APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
+# name=                              # 已登录个人信息页采集后写入
+# birthday=                          # 已登录个人信息页采集后写入
 
 # Mac 系统设置短信验证：完整 pair 已保存时直接复用。
 APPLE_AUTOMATION_SMS_ENABLED=0

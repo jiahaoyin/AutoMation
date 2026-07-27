@@ -402,12 +402,36 @@ assert.match(generatedRunSh, /\/bin\/chmod 600 "\$launcher_audit_path"/);
 assert.match(
   generatedRunSh,
   /\{"timestamp":"%s","stage":"%s","exitCode":%d\}/,
-  "launcher audit records must contain only timestamp, stage, and exitCode"
+  "normal launcher audit records must contain fixed timestamp, stage, and exitCode fields"
 );
 assert.match(
   generatedRunSh,
-  /printf '\[apple-automation\] stage:%s\\n' "\$1"/,
-  "launcher progress must use the fixed stdout format"
+  /\{"timestamp":"%s","stage":"%s","exitCode":%d,"failedStage":"%s"\}/,
+  "launcher failure records must preserve the last fixed stage alongside the exit code"
+);
+assert.match(
+  generatedRunSh,
+  /launcher_normalize_flag\(\) \{[\s\S]*launcher_trim_value[\s\S]*\/usr\/bin\/tr '\[:upper:\]' '\[:lower:\]'/,
+  "launcher debug parsing must trim and lowercase values like the Node diagnostic parser"
+);
+assert.match(
+  generatedRunSh,
+  /terminal_debug="\$\(launcher_normalize_flag "\$\{APPLE_AUTOMATION_TERMINAL_DEBUG:-\}"\)"[\s\S]*supervised_gui="\$\(launcher_trim_value "\$\{APPLE_AUTOMATION_SUPERVISED_GUI:-\}"\)"/,
+  "launcher must mirror the Node runtime and supervised diagnostic switches"
+);
+assert.match(
+  generatedRunSh,
+  /launcher_pre_audit_failure\(\) \{\s*printf '\[×\] 启动失败（阶段：launcher_entered，退出码：1）\\n' >&2 \|\| true\s*printf '\[日志\] 启动审计尚未创建\\n' >&2 \|\| true\s*exit 1\s*\}/,
+  "launcher failures before audit creation must still produce a fixed terminal summary"
+);
+assert.ok(
+  (generatedRunSh.match(/\blauncher_pre_audit_failure\b/g) ?? []).length >= 6,
+  "every launcher audit initialization failure path must use the fixed early summary"
+);
+assert.match(
+  generatedRunSh,
+  /launcher_terminal_debug_enabled[\s\S]*printf '\[apple-automation\] stage:%s\\n' "\$1"/,
+  "launcher machine progress must use the fixed stdout format only in diagnostic mode"
 );
 for (const stage of launcherAuditStages) {
   assert.match(
@@ -418,8 +442,13 @@ for (const stage of launcherAuditStages) {
 }
 assert.match(
   generatedRunSh,
-  /launcher_audit_record failure "\$exit_code" \|\| true/,
-  "launcher failures must be recorded with the process exit code"
+  /launcher_audit_record failure "\$exit_code" "\$failed_stage" \|\| true/,
+  "launcher failures must be recorded with the process exit code and current stage"
+);
+assert.match(
+  generatedRunSh,
+  /if \[\[ "\$failed_stage" != "apple_flow_exec" \]\]; then\s*printf '\[×\] 启动失败（阶段：%s，退出码：%d）\\n' "\$failed_stage" "\$exit_code" >&2 \|\| true\s*printf '\[日志\] %s\\n' "\$launcher_audit_path" >&2 \|\| true\s*fi/,
+  "launcher failures must stay concise without duplicating the Apple flow report and audit summary"
 );
 assert.doesNotMatch(generatedRunSh, /\btee\b/, "launcher must not tee raw process output");
 assert.doesNotMatch(
@@ -467,12 +496,17 @@ const bootstrapSource = rootRunSh.indexOf(
 );
 assert.ok(
   launcherAuditPathPrint >= 0 && launcherAuditPathPrint < bootstrapSource,
-  "launcher audit path must be printed before bootstrap source execution"
+  "diagnostic launcher audit path must be available before bootstrap source execution"
 );
-assert.doesNotMatch(
-  rootRunSh.slice(0, launcherAuditPathPrint),
-  /(?:^|\n)\s*(?:echo|printf)\b/,
-  "launcher audit path must be the first terminal output"
+assert.match(
+  rootRunSh,
+  /if launcher_terminal_debug_enabled; then\s*printf '%s\\n' "\$launcher_audit_path"\s*fi/,
+  "default launcher output must hide the internal audit path while diagnostic mode retains it"
+);
+assert.match(
+  rootRunSh,
+  /launcher_stage\(\) \{\s*launcher_current_stage="\$1"\s*launcher_audit_record "\$1" 0\s*if launcher_terminal_debug_enabled; then\s*printf '\[apple-automation\] stage:%s\\n' "\$1"\s*fi\s*\}/,
+  "launcher stages must retain the current fixed stage, audit it, and only mirror it in diagnostic mode"
 );
 assert.match(rootRunSh, /--skip-browser/);
 assert.match(rootRunSh, /--skip-mac/);
@@ -522,12 +556,18 @@ assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
 assert.match(envExample, /BROWSER_2FA_MANUAL_FALLBACK=1/);
 assert.match(envExample, /BROWSER_2FA_POLL_MS=800/);
+assert.match(envExample, /APPLE_AUTOMATION_TERMINAL_DEBUG=1/);
+assert.match(envExample, /name=.*个人信息页采集后写入/);
+assert.match(envExample, /birthday=.*个人信息页采集后写入/);
 assert.doesNotMatch(envExample, /BROWSER_2FA_POPUP_WAIT_MS/);
 
 const releaseBuilder = fs.readFileSync(new URL("./build-release.mjs", import.meta.url), "utf-8");
 assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
 assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
 assert.match(releaseBuilder, /BROWSER_2FA_MANUAL_FALLBACK=1/);
+assert.match(releaseBuilder, /APPLE_AUTOMATION_TERMINAL_DEBUG=1/);
+assert.match(releaseBuilder, /02-account-information\.png/);
+assert.doesNotMatch(releaseBuilder, /03-account-information\.png/);
 assert.match(
   releaseBuilder,
   /BROWSER_2FA_MANUAL_FALLBACK[^\n]*默认[^\n]*1/,

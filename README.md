@@ -128,11 +128,25 @@ BROWSER_PRESERVE_ON_FAILURE=1  # 失败时保留 Firefox 现场；超时或外�
 BROWSER_PRESERVE_ON_SUCCESS=1  # 成功后保留已登录窗口和标签页
 BROWSER_ATTACH_EXISTING=1      # 下次运行优先接管现有 account.apple.com 标签页
 BROWSER_ATTACH_ADDRESS=127.0.0.1:9222  # 可选：显式 ruyiPage 接管地址
+# 终端诊断仅接受 shell/export 运行时开关，不从 .env 读取：
+# APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
 ```
+
+登录成功后，ruyiPage 会精确访问
+`https://account.apple.com/account/manage/section/information`。姓名与生日卡连续稳定后，
+保存唯一截图 `screenshots/02-account-information.png`，先读取生日，再打开姓名弹窗；
+采集值写入 `.env` 的 `name`、`birthday`，交互终端会直接显示两项供核对。Firefox 窗口、
+标签页和持久 Profile 默认保留，下一次运行优先接管现有登录态。
+
+普通终端只显示简洁业务进度；完整脱敏事件始终写入 `flow-audit.jsonl`。需要同步查看
+底层 `browser_stage`、`input_progress`、`twofa_progress` 和 `browser_observation` 时，
+使用 `APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac`。该开关只接受 shell/export
+运行时值，`.env` 中的同名项会忽略；调试模式不会打印密码、
+OTP、Cookie、原始页面正文、姓名或生日到日志。
 
 ## 2FA 获取与恢复顺序
 
@@ -161,7 +175,7 @@ popup 读到并校验六位验证码后会立即交给网页流程；关闭原�
 sidecar `onStatus` 已接入外层终端，只显示固定阶段提示，包括 Settings 第 1/2 次、
 5 秒重试、手动 Allow、隐藏手输、OCR 权限缺失、获胜来源和 240 秒超时；不插入
 OTP、原始 AX/OCR/stderr 或完整 Apple ID。主控 fresh Windows 验证已通过 Python
-126/126、ruyipage flow、protocol、sidecar、account-browser-flow、Allow 61/61、
+290/290、ruyipage flow、protocol、sidecar、account-browser-flow、Allow 61/61、
 permissions 和 release，四路最终专项复审均为 PASS。该证据覆盖逻辑与 source-contract，不代表 Swift 编译、
 TCC 或 macOS 15 原生 UI 已验收。
 
@@ -212,6 +226,7 @@ AX/OCR/stderr、完整 Apple ID 或认证页面正文；认证失败不得保存
 - `.env` 含账号密码，**勿提交 git**
 - `data/` 含 Firefox Profile 与报告，注意保管
 - 敏感认证失败只保留固定失败原因和脱敏安全审计，不保存认证页全页截图
+- 姓名和生日只保存在私有 `.env` 并在直接交互终端显示；`report.json` 和 audit 仅记录落盘布尔状态
 
 ## 版本
 

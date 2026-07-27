@@ -20,7 +20,7 @@ const ALLOWED_READY_MODES = new Set([
   "ignore-signals-self-test",
 ]);
 
-const FIXED_ENVIRONMENT_WARNING = "[Firefox] 环境提示: browser environment warning";
+const FIXED_ENVIRONMENT_WARNING = "[!] Firefox 环境提示：详情已写入日志";
 const TWO_FACTOR_TIMEOUT_MS = 240_000;
 const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
   popup_primary: "[2FA] 优先等待 Apple 验证弹窗，暂不启动系统设置取码。",
@@ -55,6 +55,7 @@ const TWO_FACTOR_WINNER_MESSAGES = Object.freeze({
   manual: "[2FA] 已使用终端手动输入的验证码。",
 });
 const SUPERVISED_TWO_FACTOR_STATUS_PREFIX = "[2FA] status:";
+const TERMINAL_DEBUG_ENV = "APPLE_AUTOMATION_TERMINAL_DEBUG";
 const RUYIPAGE_STARTUP_STATUSES = new Set([
   "broker_credentials_received",
   "browser_url_validated",
@@ -108,17 +109,29 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
   "twofa_code_delivery_acknowledged",
 ]);
 const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
-  browser_session_attached: "[ruyipage] ♻ 已接管现有 Apple 账户标签页",
-  browser_blank_tab_attached: "[ruyipage] ♻ 已接管现有 Firefox 空白标签页",
-  browser_login_tab_created: "[ruyipage] ♻ 已在现有 Firefox 中新建登录标签页",
+  browser_session_attached: "[✓] 已接管现有 Apple 账户标签页",
+  browser_blank_tab_attached: "[→] 已接管 Firefox 空白标签页",
+  browser_login_tab_created: "[→] 已在 Firefox 中新建登录标签页",
   browser_profile_attach_required:
-    "[ruyipage] 已发现正在使用的 Firefox Profile，但控制连接不可用；未启动第二个浏览器",
-  account_home_confirmed: "[ruyipage] ✓ 已确认 Apple 账户登录态",
-  profile_page_ready: "[ruyipage] ✓ 个人信息页面已就绪",
-  profile_screenshot_saved: "[ruyipage] ✓ 已保存个人信息页面截图",
-  profile_birthday_collected: "[ruyipage] ✓ 已读取出生日期",
-  profile_name_collected: "[ruyipage] ✓ 已读取姓名",
-  browser_session_preserved: "[ruyipage] ✓ 已保留 Firefox 窗口和账户标签页",
+    "[!] Firefox Profile 正在使用，但控制连接不可用；没有启动第二个浏览器",
+  account_home_confirmed: "[✓] 已确认 Apple 账户登录成功",
+  profile_page_ready: "[✓] 个人信息页面已就绪",
+  profile_birthday_collected: "[✓] 已读取出生日期",
+  profile_name_collected: "[✓] 已读取姓名",
+  browser_session_preserved: "[✓] 已保留 Firefox 窗口和账户标签页",
+});
+const RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES = Object.freeze({
+  input_started: "[→] 正在填写 Apple 验证码",
+  input_completed: "[✓] Apple 验证码已填写",
+  transition_waiting: "[→] 正在确认 Apple 登录状态",
+  transition_confirmed: "[✓] Apple 验证已通过",
+  handoff_failed: "[×] 验证码提交未确认，详情已写入日志",
+});
+const RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES = Object.freeze({
+  email_input: "[→] 正在填写 Apple ID",
+  email_submit: "[✓] Apple ID 已填写",
+  password_input: "[→] 正在填写 Apple 密码",
+  password_submit: "[✓] Apple 登录信息已提交",
 });
 const RUYIPAGE_STAGE_TRANSITIONS = new Set(["entered"]);
 const RUYIPAGE_OBSERVATION_CHECKPOINTS = new Set([
@@ -405,8 +418,24 @@ function annotateBrowserRunFailure(error, override = null, failureStage = "unkno
       /* The fixed status line remains sufficient for non-extensible errors. */
     }
   }
-  console.log(`[ruyipage] status:node-failure:${code}`);
+  if (shouldMirrorTerminalDiagnostics()) {
+    console.log(`[ruyipage] status:node-failure:${code}`);
+  } else {
+    console.log(`[×] 浏览器流程失败（${code}）`);
+  }
   return error;
+}
+
+function terminalDebugEnabled(env = process.env) {
+  const value = String(env?.[TERMINAL_DEBUG_ENV] ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+export function shouldMirrorTerminalDiagnostics(env = process.env) {
+  return (
+    terminalDebugEnabled(env) ||
+    String(env?.APPLE_AUTOMATION_SUPERVISED_GUI ?? "").trim() === "1"
+  );
 }
 
 function sanitizeReadyMode(mode) {
@@ -670,9 +699,9 @@ function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile)
   flowAudit?.addSecrets?.([name, birthday]);
   saveProfile({ name, birthday });
   if (printProfile === true) {
-    console.log("[账号资料] ✓ 已写入 .env");
-    console.log(`[账号资料] 姓名: ${name}`);
-    console.log(`[账号资料] 出生日期: ${birthday}`);
+    console.log("[✓] 已写入 .env：name、birthday");
+    console.log(`[✓] 姓名：${name}`);
+    console.log(`[✓] 出生日期：${birthday}`);
   }
   return { collected: true, nameStored: true, birthdayStored: true };
 }
@@ -681,8 +710,7 @@ function sanitizeScreenshotMetadata(screenshots) {
   const source = screenshots && typeof screenshots === "object" ? screenshots : {};
   const result = {};
   const expectedFiles = {
-    afterLogin: "02-ruyipage-after-login.png",
-    personalInformation: "03-account-information.png",
+    personalInformation: "02-account-information.png",
   };
   for (const [key, expectedFile] of Object.entries(expectedFiles)) {
     const value = source[key];
@@ -1074,6 +1102,10 @@ export async function runAccountBrowserPhase(
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
   const saveProfile = runtime.saveAppleProfileToEnv ?? saveAppleProfileToEnv;
   const shouldPrintProfile = runtime.shouldPrintCapturedProfile ?? shouldPrintCapturedProfile;
+  const showTerminalDebug =
+    typeof runtime.isTerminalDebugEnabled === "function"
+      ? runtime.isTerminalDebugEnabled()
+      : shouldMirrorTerminalDiagnostics();
 
   const summary = getEnvironmentSummary();
   writeFlowAudit(flowAudit, "account_browser", "environment", {
@@ -1081,7 +1113,7 @@ export async function runAccountBrowserPhase(
     backendReason: summary.backendReason,
     warnings: summary.warnings,
   });
-  console.log(`[Firefox] 浏览器后端: ${summary.backend} (${summary.backendReason})`);
+  console.log(`[→] 浏览器自动化：${summary.backend}`);
   for (const _warning of summary.warnings) {
     console.log(FIXED_ENVIRONMENT_WARNING);
   }
@@ -1096,7 +1128,7 @@ export async function runAccountBrowserPhase(
     granted: axOk,
   });
   if (!axOk) {
-    console.warn("[2FA] 警告: 辅助功能未授权，系统设置取码可能失败");
+    console.warn("[!] 辅助功能未授权，系统设置取码可能失败");
   }
 
   const collector = createCollector({
@@ -1132,11 +1164,20 @@ export async function runAccountBrowserPhase(
   let collectorDisposed = true;
   let lastFailureStage = "unknown";
   let reportedFailureStage = null;
+  let reportedProfilePartial = false;
+  let reportedFinalizationPartial = false;
+  const reportedTerminalProgress = new Set();
+  const reportTerminalProgress = (key, message) => {
+    if (reportedTerminalProgress.has(key)) return;
+    reportedTerminalProgress.add(key);
+    console.log(message);
+  };
   try {
-    console.log("[ruyipage] status:runtime_resolving");
+    console.log("[→] 正在启动 Firefox 浏览器");
+    if (showTerminalDebug) console.log("[ruyipage] status:runtime_resolving");
     writeFlowAudit(flowAudit, "ruyipage", "runtime_resolving");
     const runner = createRunner({ sanitizeResult: sanitizeAccountBrowserBackendResult });
-    console.log("[ruyipage] status:backend_starting");
+    if (showTerminalDebug) console.log("[ruyipage] status:backend_starting");
     writeFlowAudit(flowAudit, "ruyipage", "backend_starting");
     result = sanitizeAccountBrowserBackendResult(await runner.run({
       creds,
@@ -1163,52 +1204,78 @@ export async function runAccountBrowserPhase(
         }
         auditRuyiPageEvent(flowAudit, event);
         if (event.event === "ready") {
-          console.log(`[ruyipage] 浏览器已就绪 (${sanitizeReadyMode(event.mode)})`);
+          console.log("[✓] Firefox 浏览器已就绪");
+          if (showTerminalDebug) {
+            console.log(`[ruyipage] ready:mode:${sanitizeReadyMode(event.mode)}`);
+          }
         } else if (
           event.event === "status" &&
           RUYIPAGE_STARTUP_STATUSES.has(event.status)
         ) {
-          console.log(`[ruyipage] status:${event.status}`);
+          if (showTerminalDebug) console.log(`[ruyipage] status:${event.status}`);
         } else if (inputStatusLine) {
-          console.log(`[ruyipage] status:${inputStatusLine}`);
+          if (showTerminalDebug) console.log(`[ruyipage] status:${inputStatusLine}`);
         } else if (twoFactorHandoffLine) {
-          console.log(`[ruyipage] status:${twoFactorHandoffLine}`);
+          if (showTerminalDebug) console.log(`[ruyipage] status:${twoFactorHandoffLine}`);
+          const phase =
+            event.event === "status" && event.status === "twofa_progress"
+              ? sanitizeTwoFactorProgressPhase(event.phase)
+              : "unknown";
+          if (Object.hasOwn(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES, phase)) {
+            console.log(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES[phase]);
+          }
         } else if (event.event === "status" && event.status === "browser_stage") {
-          console.log(
-            `[ruyipage] stage:${sanitizeBrowserFailureStage(event.stage)}:from:${sanitizeBrowserFailureStage(
-              event.previousStage
-            )}:transition:${sanitizeStageTransition(event.transition)}`
-          );
+          const stage = sanitizeBrowserFailureStage(event.stage);
+          if (showTerminalDebug) {
+            console.log(
+              `[ruyipage] stage:${stage}:from:${sanitizeBrowserFailureStage(
+                event.previousStage
+              )}:transition:${sanitizeStageTransition(event.transition)}`
+            );
+          }
+          if (Object.hasOwn(RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES, stage)) {
+            reportTerminalProgress(
+              `browser-stage:${stage}`,
+              RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES[stage]
+            );
+          }
         } else if (event.event === "status" && event.status === "browser_observation") {
-          const observation = sanitizeBrowserObservation(event);
-          console.log(
-            `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:root_security_copy:${observation.rootSecurityCopyOnly ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
-          );
+          if (showTerminalDebug) {
+            const observation = sanitizeBrowserObservation(event);
+            console.log(
+              `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:root_security_copy:${observation.rootSecurityCopyOnly ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
+            );
+          }
         } else if (
           event.event === "status" &&
           (event.status === "screenshot_capture" || event.status === "screenshot_failed")
         ) {
-          const output = `[ruyipage] status:${event.status}:checkpoint:${sanitizeScreenshotCheckpoint(
-            event.checkpoint
-          )}`;
-          if (event.status === "screenshot_failed") console.warn(output);
-          else console.log(output);
+          const checkpoint = sanitizeScreenshotCheckpoint(event.checkpoint);
+          if (showTerminalDebug) {
+            console.log(`[ruyipage] status:${event.status}:checkpoint:${checkpoint}`);
+          }
+          if (event.status === "screenshot_failed") {
+            console.warn("[!] 个人信息页面截图保存失败，详情已写入日志");
+          } else if (checkpoint === "account_information") {
+            console.log("[✓] 已保存个人信息页面截图");
+          }
         } else if (event.event === "status" && event.status === "profile_capture_started") {
-          console.log("[ruyipage] status:profile_capture_started");
+          console.log("[→] 正在打开个人信息页面");
         } else if (event.event === "status" && event.status === "profile_capture_completed") {
-          console.log("[ruyipage] status:profile_capture_completed");
+          console.log("[✓] 个人资料采集完成");
         } else if (event.event === "status" && event.status === "profile_capture_failed") {
+          const stage = sanitizeBrowserFailureStage(event.failureStage);
+          const failureClass = sanitizeProfileCaptureFailureClass(event.failureClass);
+          reportedProfilePartial = true;
           console.warn(
-            `[ruyipage] profile_capture_partial:stage:${sanitizeBrowserFailureStage(
-              event.failureStage
-            )}:class:${sanitizeProfileCaptureFailureClass(
-              event.failureClass
-            )}:alive:${event.browserAlive === true ? 1 : 0}:preserve_requested:${event.browserPreservationRequested === true ? 1 : 0}`
+            `[!] 个人资料采集未完成（阶段：${stage}，原因：${failureClass}），详情已写入日志`
           );
         } else if (event.event === "status" && event.status === "browser_finalization_started") {
-          console.log(
-            `[ruyipage] status:browser_finalization_started:preserve_requested:${event.browserPreservationRequested === true ? 1 : 0}`
-          );
+          if (showTerminalDebug) {
+            console.log(
+              `[ruyipage] status:browser_finalization_started:preserve_requested:${event.browserPreservationRequested === true ? 1 : 0}`
+            );
+          }
         } else if (
           event.event === "status" &&
           (event.status === "browser_finalization_completed" ||
@@ -1223,8 +1290,11 @@ export async function runAccountBrowserPhase(
             }:preserved:${finalization.browserSessionPreserved ? 1 : 0}:class:${
               finalization.finalizationClass
             }`;
-          if (event.status === "browser_finalization_partial") console.warn(output);
-          else console.log(output);
+          if (showTerminalDebug) console.log(output);
+          if (event.status === "browser_finalization_partial") {
+            reportedFinalizationPartial = true;
+            console.warn("[!] 浏览器收尾未完全完成，详情已写入日志");
+          }
         } else if (
           event.event === "status" &&
           Object.hasOwn(RUYIPAGE_PROFILE_STATUS_MESSAGES, event.status)
@@ -1232,9 +1302,9 @@ export async function runAccountBrowserPhase(
           console.log(RUYIPAGE_PROFILE_STATUS_MESSAGES[event.status]);
         } else if (event.event === "status" && event.status === "browser_preserved") {
           if (event.preserved === true) {
-            console.warn("[ruyipage] 流程失败，Firefox 已保留供人工核对当前页面");
+            console.warn("[!] 流程未完成，Firefox 已保留供核对");
           } else {
-            console.warn("[ruyipage] Firefox 保留状态未确认，不作为可检查页面处理");
+            console.warn("[!] Firefox 保留状态未确认");
           }
         } else if (
           event.event === "status" &&
@@ -1243,7 +1313,10 @@ export async function runAccountBrowserPhase(
         ) {
           if (eventFailureStage !== reportedFailureStage) {
             reportedFailureStage = eventFailureStage;
-            console.log(`[ruyipage] status:failure:${eventFailureStage}`);
+            if (showTerminalDebug) {
+              console.log(`[ruyipage] status:failure:${eventFailureStage}`);
+            }
+            console.log(`[×] 浏览器流程失败（阶段：${eventFailureStage}）`);
           }
         } else if (
           event.event === "result" &&
@@ -1252,14 +1325,17 @@ export async function runAccountBrowserPhase(
         ) {
           if (eventFailureStage !== reportedFailureStage) {
             reportedFailureStage = eventFailureStage;
-            console.log(`[ruyipage] status:failure:${eventFailureStage}`);
+            if (showTerminalDebug) {
+              console.log(`[ruyipage] status:failure:${eventFailureStage}`);
+            }
+            console.log(`[×] 浏览器流程失败（阶段：${eventFailureStage}）`);
           }
         } else if (event.event === "warning") {
-          console.warn("[ruyipage] backend warning");
+          console.warn("[!] 浏览器后端报告异常，详情已写入日志");
         } else if (event.event === "prepare_2fa") {
-          console.log("[ruyipage] 密码提交前预备 macOS 2FA 监听...");
+          console.log("[→] 正在准备 Apple 验证码监听");
         } else if (event.event === "need_2fa") {
-          console.log("[ruyipage] 页面已确认进入 2FA，等待首个可用验证码...");
+          console.log("[→] 正在获取 Apple 验证码");
         }
       },
       async prepare2FA() {
@@ -1307,7 +1383,7 @@ export async function runAccountBrowserPhase(
         finalizationClass: "runner_post_login_failed",
       });
       console.warn(
-        `[ruyipage] runner_post_login_partial:stage:${failureStage}:code:${failureCode}:preserve_requested:${result.postLoginFinalization.browserPreservationRequested ? 1 : 0}:preserved:${result.postLoginFinalization.browserSessionPreserved ? 1 : 0}:browser_finalized:${result.postLoginFinalization.browserFinalizationCompleted ? 1 : 0}`
+        `[!] 登录已成功，后续浏览器处理未完成（阶段：${failureStage}，原因：${failureCode}）`
       );
     } else {
       writeFlowAuditError(
@@ -1338,9 +1414,12 @@ export async function runAccountBrowserPhase(
         writeFlowAudit(flowAudit, "two_factor", "collector_dispose_partial", {
           accountHomeConfirmed: true,
         });
-        console.warn("[2FA] collector cleanup partial after account-home confirmation");
+        if (!reportedFinalizationPartial) {
+          reportedFinalizationPartial = true;
+          console.warn("[!] 登录已成功，验证码监听器收尾未完全完成，详情已写入日志");
+        }
       } else {
-        console.warn("[2FA] collector cleanup failed");
+        console.warn("[×] 验证码监听器收尾失败");
       }
     }
   }
@@ -1383,9 +1462,11 @@ export async function runAccountBrowserPhase(
     writeFlowAudit(flowAudit, "account_browser", "post_login_finalization_partial", {
       ...postLoginFinalization,
     });
-    console.warn(
-      `[ruyipage] post_login_finalization_partial:backend_cleanup:${postLoginFinalization.backendCleanupCompleted ? 1 : 0}:collector_disposed:${postLoginFinalization.collectorDisposed ? 1 : 0}:browser_finalized:${postLoginFinalization.browserFinalizationCompleted ? 1 : 0}:preserve_requested:${postLoginFinalization.browserPreservationRequested ? 1 : 0}:preserved:${postLoginFinalization.browserSessionPreserved ? 1 : 0}:class:${postLoginFinalization.finalizationClass}`
-    );
+    if (!reportedFinalizationPartial) {
+      console.warn(
+        `[!] 浏览器收尾未完全完成（原因：${postLoginFinalization.finalizationClass}），详情已写入日志`
+      );
+    }
   }
   const partialProfileResult = () => ({
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
@@ -1404,9 +1485,11 @@ export async function runAccountBrowserPhase(
     writeFlowAudit(flowAudit, "account_browser", "profile_capture_partial", {
       ...postLoginProfileCapture,
     });
-    console.warn(
-      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
-    );
+    if (!reportedProfilePartial) {
+      console.warn(
+        `[!] 个人资料采集未完成（阶段：${postLoginProfileCapture.failureStage}，原因：${postLoginProfileCapture.failureClass}），详情已写入日志`
+      );
+    }
     return partialProfileResult();
   }
 
@@ -1423,9 +1506,7 @@ export async function runAccountBrowserPhase(
     writeFlowAuditError(flowAudit, "account_browser", "profile_result_invalid", error, {
       ...postLoginProfileCapture,
     });
-    console.warn(
-      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
-    );
+    console.warn("[!] 个人资料结果不完整，详情已写入日志");
     return partialProfileResult();
   }
 
@@ -1447,9 +1528,7 @@ export async function runAccountBrowserPhase(
     writeFlowAuditError(flowAudit, "account_browser", "profile_persistence_failed", error, {
       ...postLoginProfileCapture,
     });
-    console.warn(
-      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
-    );
+    console.warn("[!] 个人资料写入 .env 失败，详情已写入日志");
     return partialProfileResult();
   }
   writeFlowAudit(flowAudit, "account_browser", "profile_persisted", {

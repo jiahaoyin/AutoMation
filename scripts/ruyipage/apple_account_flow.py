@@ -117,7 +117,7 @@ APPLE_AUTH_HOSTS = frozenset(
     }
 )
 OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
-SCREENSHOT_CHECKPOINTS = frozenset({"account_home", "account_information"})
+SCREENSHOT_CHECKPOINTS = frozenset({"account_information"})
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
@@ -3196,6 +3196,7 @@ def detect_login_state(page: Any) -> dict[str, Any]:
                         "otpRejected",
                         "blocked",
                         "error",
+                        "hardAuthenticationError",
                         "password",
                         "email",
                     ):
@@ -3253,6 +3254,7 @@ def detect_login_state(page: Any) -> dict[str, Any]:
     root_error = any(
         bool(root_state.get(key)) for key in ("error", "otpRejected", "blocked")
     )
+    root_hard_authentication_error = bool(root_state.get("hardAuthenticationError"))
     has_live_descendant_auth_controls = any(
         is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
         and scope_has_live_frame_chain(page, scope)
@@ -3269,6 +3271,28 @@ def detect_login_state(page: Any) -> dict[str, Any]:
         and any(bool(state.get(key)) for key in ("error", "otpRejected", "blocked"))
     ]
     has_live_descendant_error = bool(live_descendant_error_states)
+    active_auth_ui_present = bool(
+        has_live_auth_controls(root_state)
+        or has_live_descendant_auth_controls
+    )
+    active_otp_rejected = bool(
+        root_state.get("otpRejected")
+        or any(state.get("otpRejected") for state in live_descendant_error_states)
+    )
+    active_blocked = bool(
+        root_state.get("blocked")
+        or any(state.get("blocked") for state in live_descendant_error_states)
+    )
+    hard_authentication_error = bool(
+        root_hard_authentication_error
+        or any(
+            scope is not page
+            and is_trusted_two_factor_scope(scope, str(state.get("href") or ""))
+            and scope_has_live_frame_chain(page, scope)
+            and state.get("hardAuthenticationError")
+            for scope, state in scope_states
+        )
+    )
     has_retiring_child_error = bool(live_descendant_error_states) and all(
         is_retiring_post_otp_child_error(state)
         for state in live_descendant_error_states
@@ -3315,6 +3339,11 @@ def detect_login_state(page: Any) -> dict[str, Any]:
             or legacy_session_trusted
         ),
         "rootError": root_error,
+        "hardAuthenticationError": hard_authentication_error,
+        "rootHardAuthenticationError": root_hard_authentication_error,
+        "activeAuthUiPresent": active_auth_ui_present,
+        "activeOtpRejected": active_otp_rejected,
+        "activeBlocked": active_blocked,
         "rootManageUrl": root_is_account_manage,
         "rootAccountMarker": bool(root_state.get("accountMarker")),
         "rootSecurityCopyOnly": root_state.get("securityCopyOnly") is True,
@@ -3852,9 +3881,130 @@ def wait_for_profile_name_modal(
     raise RuntimeError("personal information name modal was not found")
 
 
-def wait_for_profile_capture_ready(page: Any) -> None:
-    wait_for_profile_card(page, "birthday")
-    wait_for_profile_card(page, "name")
+def profile_state_has_hard_authentication_blocker(state: dict[str, Any]) -> bool:
+    has_active_state = all(
+        key in state
+        for key in (
+            "activeAuthUiPresent",
+            "activeOtpRejected",
+            "activeBlocked",
+        )
+    )
+    if has_active_state:
+        return bool(
+            state.get("activeAuthUiPresent")
+            or state.get("activeOtpRejected")
+            or state.get("activeBlocked")
+            or state.get("hardAuthenticationError")
+            or state.get("rootHardAuthenticationError")
+        )
+    return bool(
+        has_live_auth_controls(state)
+        or state.get("childAuthUiPresent")
+        or state.get("otpRejected")
+        or state.get("blocked")
+        or state.get("hardAuthenticationError")
+        or state.get("rootHardAuthenticationError")
+    )
+
+
+def confirmed_personal_information_state(
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    if profile_state_has_hard_authentication_blocker(state):
+        raise RuntimeError(
+            "personal information page reported an authentication error"
+        )
+    # The exact information route plus two stable visible profile cards is the
+    # authoritative post-login anchor. Account-security prose left behind by
+    # the SPA is text-only and must not turn that structural state into 2FA.
+    return {
+        **state,
+        "trusted": True,
+        "rootSessionTrusted": True,
+        "rootManageUrl": True,
+        "rootError": False,
+        "error": False,
+        "twofa": False,
+        "twofaVisible": False,
+    }
+
+
+def profile_capture_card_snapshot(
+    page: Any,
+) -> tuple[tuple[Any, ...], tuple[Any, Any, dict[str, Any]], tuple[Any, Any, dict[str, Any]]] | None:
+    if not is_personal_information_scope(page, page):
+        return None
+    birthday = resolve_profile_card(page, "birthday")
+    name = resolve_profile_card(page, "name")
+    if birthday is None or name is None or not is_personal_information_scope(page, page):
+        return None
+    birthday_scope, birthday_card, birthday_summary = birthday
+    name_scope, name_card, _name_summary = name
+    birthday_signature = element_stability_signature(
+        birthday_scope,
+        birthday_card,
+    )
+    name_signature = element_stability_signature(name_scope, name_card)
+    if birthday_signature == name_signature:
+        raise RuntimeError("personal information profile cards are ambiguous")
+    signature = (
+        birthday_signature,
+        normalize_profile_value(
+            birthday_summary.get("birthdayValue"),
+            "birthday",
+        ),
+        name_signature,
+    )
+    return signature, birthday, name
+
+
+def wait_for_profile_capture_ready(
+    page: Any,
+    timeout_s: float = PROFILE_CARD_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    if pause is None:
+        pause = human_pause
+    deadline = time.monotonic() + timeout_s
+    previous_signature: tuple[Any, ...] | None = None
+    stable_observations = 0
+    authentication_blocked = False
+    while time.monotonic() < deadline:
+        state: dict[str, Any] | None = None
+        try:
+            state = detect_login_state(page)
+        except Exception:
+            pass
+        if state is None or profile_state_has_hard_authentication_blocker(state):
+            authentication_blocked = (
+                state is not None
+                and profile_state_has_hard_authentication_blocker(state)
+            )
+            previous_signature = None
+            stable_observations = 0
+        else:
+            authentication_blocked = False
+            snapshot = profile_capture_card_snapshot(page)
+            if snapshot is not None:
+                signature, _birthday, _name = snapshot
+                stable_observations = (
+                    stable_observations + 1
+                    if signature == previous_signature
+                    else 1
+                )
+                previous_signature = signature
+                if stable_observations >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                    return confirmed_personal_information_state(state)
+            else:
+                previous_signature = None
+                stable_observations = 0
+        pause(180, 420)
+    if authentication_blocked:
+        raise RuntimeError(
+            "personal information page reported an authentication error"
+        )
+    raise RuntimeError("personal information page was not ready")
 
 
 def collect_personal_info(page: Any) -> dict[str, Any]:
@@ -4594,10 +4744,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
         opts.set_human_algorithm("windmouse")
 
     screenshots_dir = report_dir / "screenshots"
-    success_screenshot_paths = (
-        screenshots_dir / "02-ruyipage-after-login.png",
-        screenshots_dir / "03-account-information.png",
-    )
+    success_screenshot_path = screenshots_dir / "02-account-information.png"
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     account_home_confirmed = False
@@ -4831,14 +4978,6 @@ def _browser_flow(args: argparse.Namespace) -> int:
             confirmed_login_state,
             account_home_confirmed=True,
         )
-        screenshots["afterLogin"] = take_screenshot(
-            page,
-            success_screenshot_paths[0],
-            checkpoint="account_home",
-        )
-        if screenshots["afterLogin"] is not None:
-            generated_screenshot_paths.append(success_screenshot_paths[0])
-
         personal_info: dict[str, str] = {}
         profile_state: dict[str, Any] = {"trusted": True}
         post_login_profile_capture: dict[str, Any] = {
@@ -4861,27 +5000,19 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 profile_state,
                 deadline=time.monotonic() + 5.0,
             )
-            if not has_confirmed_account_session(profile_state):
-                direct_session_state = confirmed_account_manage_state(page)
-                if direct_session_state is not None:
-                    profile_state = direct_session_state
             emit_browser_observation(
                 "account_information",
                 page,
                 profile_state,
                 account_home_confirmed=True,
             )
-            if profile_state.get("error") and not has_confirmed_account_session(
-                profile_state
-            ):
-                raise RuntimeError("personal information page reported an authentication error")
-            if not has_confirmed_account_session(profile_state):
-                raise RuntimeError(
-                    "personal information page did not confirm an authenticated Apple session"
-                )
-            profile_state["trusted"] = True
             set_browser_startup_stage("profile_capture")
-            wait_for_profile_capture_ready(page)
+            ready_state = wait_for_profile_capture_ready(page)
+            profile_state = (
+                ready_state
+                if isinstance(ready_state, dict)
+                else confirmed_personal_information_state(profile_state)
+            )
             emit({"event": "status", "status": "profile_page_ready"})
             emit_browser_observation(
                 "profile_ready",
@@ -4891,11 +5022,11 @@ def _browser_flow(args: argparse.Namespace) -> int:
             )
             screenshots["personalInformation"] = take_screenshot(
                 page,
-                success_screenshot_paths[1],
+                success_screenshot_path,
                 checkpoint="account_information",
             )
             if screenshots["personalInformation"] is not None:
-                generated_screenshot_paths.append(success_screenshot_paths[1])
+                generated_screenshot_paths.append(success_screenshot_path)
                 emit({"event": "status", "status": "profile_screenshot_saved"})
             set_browser_startup_stage("profile_birthday")
             personal_info = collect_personal_info(page)

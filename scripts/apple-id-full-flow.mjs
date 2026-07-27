@@ -20,6 +20,7 @@ import {
   readBrowserFailureCode,
   readBrowserFailureStage,
   runAccountBrowserPhase,
+  shouldMirrorTerminalDiagnostics,
 } from "./lib/account-browser-flow.js";
 import { confirmOrPromptAppleCredentials } from "./lib/credentials.js";
 import { runMacSettingsLoginPhase } from "./lib/mac-settings-login.js";
@@ -87,13 +88,16 @@ export function recordAccountHomeAcceptanceMarker(
     writeMarker = writeAccountHomeAcceptanceMarker,
     flowAudit = null,
     logger = console,
+    mirrorDiagnostics = shouldMirrorTerminalDiagnostics(),
   } = {}
 ) {
   if (accountHomeConfirmed !== true) {
     flowAudit?.write?.("flow", "acceptance_marker_skipped", {
       accountHomeConfirmed: false,
     });
-    logger.log("[apple-automation] status:acceptance_marker_skipped:home:0");
+    if (mirrorDiagnostics) {
+      logger.log("[apple-automation] status:acceptance_marker_skipped:home:0");
+    }
     return "skipped";
   }
   try {
@@ -101,13 +105,21 @@ export function recordAccountHomeAcceptanceMarker(
     flowAudit?.write?.("flow", "acceptance_marker_completed", {
       accountHomeConfirmed: true,
     });
-    logger.log("[验收] REAL_ACCOUNT_HOME_CONFIRMED");
+    logger.log(
+      mirrorDiagnostics
+        ? "[验收] REAL_ACCOUNT_HOME_CONFIRMED"
+        : "[✓] 登录验收已确认"
+    );
     return "completed";
   } catch {
     flowAudit?.write?.("flow", "acceptance_marker_partial", {
       accountHomeConfirmed: true,
     });
-    logger.warn("[apple-automation] status:acceptance_marker_partial:home:1");
+    if (mirrorDiagnostics) {
+      logger.warn("[apple-automation] status:acceptance_marker_partial:home:1");
+    } else {
+      logger.warn("[!] 登录验收标记写入失败，详情已写入日志");
+    }
     return "partial";
   }
 }
@@ -203,7 +215,10 @@ export function mergeMacSettingsSmsRuntimeEnv(initialEnv = {}, persistedEnv = {}
 
 export async function main() {
   let smsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
-  console.log("[apple-automation] stage:flow_main_started");
+  const mirrorDiagnostics = shouldMirrorTerminalDiagnostics();
+  if (mirrorDiagnostics) {
+    console.log("[apple-automation] stage:flow_main_started");
+  }
   console.log("═══════════════════════════════════════════");
   console.log(" Apple ID 流程：Mac 系统设置 → Firefox account");
   console.log("═══════════════════════════════════════════\n");
@@ -264,7 +279,9 @@ export async function main() {
       throw error;
     }
     flowAudit.addSecrets([creds.appleId, creds.password]);
-    console.log("[apple-automation] stage:credentials_ready");
+    if (mirrorDiagnostics) {
+      console.log("[apple-automation] stage:credentials_ready");
+    }
     if (!skipMac) {
       failureStage = "mac_settings";
       failureCode = "mac_settings_failed";
@@ -306,9 +323,11 @@ export async function main() {
           success: true,
           ...browserCompletion,
         });
-        console.log(
-          `[apple-automation] status:account_browser_completed:home:${browserCompletion.accountHomeConfirmed ? 1 : 0}:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}`
-        );
+        if (mirrorDiagnostics) {
+          console.log(
+            `[apple-automation] status:account_browser_completed:home:${browserCompletion.accountHomeConfirmed ? 1 : 0}:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}`
+          );
+        }
         if (browserCompletion.profileCaptureState === "partial") {
           flowAudit.write("account_browser", "profile_capture_partial", {
             failureStage: profileCapture?.failureStage,
@@ -316,9 +335,11 @@ export async function main() {
             browserAlive: profileCapture?.browserAlive === true,
             browserPreserved: profileCapture?.browserPreserved === true,
           });
-          console.warn(
-            `[apple-automation] status:browser_login_succeeded_profile_capture_partial:stage:${profileCapture?.failureStage ?? "unknown"}:class:${profileCapture?.failureClass ?? "unknown"}:preserved:${profileCapture?.browserPreserved === true ? 1 : 0}`
-          );
+          if (mirrorDiagnostics) {
+            console.warn(
+              `[apple-automation] status:browser_login_succeeded_profile_capture_partial:stage:${profileCapture?.failureStage ?? "unknown"}:class:${profileCapture?.failureClass ?? "unknown"}:preserved:${profileCapture?.browserPreserved === true ? 1 : 0}`
+            );
+          }
         }
         if (browserCompletion.postLoginFinalizationState === "partial") {
           flowAudit.write("account_browser", "post_login_finalization_partial", {
@@ -329,9 +350,11 @@ export async function main() {
             browserSessionPreserved: browserCompletion.browserSessionPreserved,
             finalizationClass: browserCompletion.finalizationClass,
           });
-          console.warn(
-            `[apple-automation] status:browser_login_succeeded_post_login_finalization_partial:backend_cleanup:${browserCompletion.backendCleanupCompleted ? 1 : 0}:collector_disposed:${browserCompletion.collectorDisposed ? 1 : 0}:browser_finalized:${browserCompletion.browserFinalizationCompleted ? 1 : 0}:preserve_requested:${browserCompletion.browserPreservationRequested ? 1 : 0}:preserved:${browserCompletion.browserSessionPreserved ? 1 : 0}:class:${browserCompletion.finalizationClass}`
-          );
+          if (mirrorDiagnostics) {
+            console.warn(
+              `[apple-automation] status:browser_login_succeeded_post_login_finalization_partial:backend_cleanup:${browserCompletion.backendCleanupCompleted ? 1 : 0}:collector_disposed:${browserCompletion.collectorDisposed ? 1 : 0}:browser_finalized:${browserCompletion.browserFinalizationCompleted ? 1 : 0}:preserve_requested:${browserCompletion.browserPreservationRequested ? 1 : 0}:preserved:${browserCompletion.browserSessionPreserved ? 1 : 0}:class:${browserCompletion.finalizationClass}`
+            );
+          }
         }
       } catch (e) {
         failureStage = readBrowserFailureStage(e);
@@ -362,7 +385,9 @@ export async function main() {
       console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
       report.phases.accountBrowser = { skipped: true };
       flowAudit.write("account_browser", "skipped");
-      console.log("[apple-automation] status:account_browser_skipped");
+      if (mirrorDiagnostics) {
+        console.log("[apple-automation] status:account_browser_skipped");
+      }
     }
 
     failureStage = "report_write";
@@ -371,7 +396,7 @@ export async function main() {
     flowAudit.write("flow", "report_written", { file: "report.json" });
     const acceptanceMarkerState = recordAccountHomeAcceptanceMarker(
       report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true,
-      { flowAudit }
+      { flowAudit, mirrorDiagnostics }
     );
     const browserCompletion = summarizeAccountBrowserCompletion(report.phases.accountBrowser);
     flowAudit.write("flow", "completed", {
@@ -379,9 +404,11 @@ export async function main() {
       ...browserCompletion,
       acceptanceMarkerState,
     });
-    console.log(
-      `[apple-automation] status:flow_completed:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}:acceptance_marker:${acceptanceMarkerState}`
-    );
+    if (mirrorDiagnostics) {
+      console.log(
+        `[apple-automation] status:flow_completed:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}:acceptance_marker:${acceptanceMarkerState}`
+      );
+    }
   } catch (e) {
     report.error = "Apple ID flow failed";
     report.failure = createFlowFailureEnvelope(failureStage, failureCode);
@@ -391,13 +418,18 @@ export async function main() {
       failureCode: report.failure.failureCode,
       reportFile: "report.json",
     });
-    console.error(`[apple-automation] failure_stage:${report.failure.failureStage}`);
-    console.error(`[apple-automation] failure_code:${report.failure.failureCode}`);
-    console.error(`[apple-automation] failed_at:${report.failure.failedAt}`);
-    console.error(`[apple-automation] report_path:${reportFile}`);
-    console.error(`[apple-automation] audit_path:${flowAudit.path}`);
-    console.error(`\n[报告] 失败报告已保存: ${reportFile}`);
-    console.error(`[报告] 统一诊断日志: ${flowAudit.path}`);
+    if (mirrorDiagnostics) {
+      console.error(`[apple-automation] failure_stage:${report.failure.failureStage}`);
+      console.error(`[apple-automation] failure_code:${report.failure.failureCode}`);
+      console.error(`[apple-automation] failed_at:${report.failure.failedAt}`);
+      console.error(`[apple-automation] report_path:${reportFile}`);
+      console.error(`[apple-automation] audit_path:${flowAudit.path}`);
+    }
+    console.error(
+      `\n[×] 流程失败（阶段：${report.failure.failureStage}，原因：${report.failure.failureCode}）`
+    );
+    console.error(`[报告] ${reportFile}`);
+    console.error(`[日志] ${flowAudit.path}`);
     throw e;
   } finally {
     flowAudit.close();
@@ -416,7 +448,6 @@ if (
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
 ) {
   main().catch(() => {
-    console.error("\n[failed] Apple ID flow failed");
     process.exitCode = 1;
   });
 }
