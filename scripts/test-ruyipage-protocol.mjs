@@ -49,6 +49,93 @@ if (process.argv.includes("--exit-with-live-descendant-child")) {
   await new Promise(() => {});
 }
 
+if (process.argv.includes("--post-login-preserved-result-child")) {
+  const events = [
+    { event: "ready", mode: "ruyipage-only" },
+    { event: "status", status: "account_home_confirmed" },
+    {
+      event: "status",
+      status: "browser_finalization_started",
+      browserPreservationRequested: true,
+    },
+    { event: "status", status: "browser_session_preserved", preserved: true },
+    {
+      event: "status",
+      status: "browser_finalization_completed",
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
+    },
+    {
+      event: "result",
+      success: true,
+      browserLogin: {
+        success: true,
+        backend: "ruyipage",
+        accountHomeConfirmed: true,
+      },
+      postLoginFinalization: {
+        browserFinalizationCompleted: true,
+        browserPreservationRequested: true,
+        browserSessionPreserved: true,
+      },
+    },
+  ];
+  process.stdout.write(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, () => {
+    process.exit(0);
+  });
+  await new Promise(() => {});
+}
+
+if (process.argv.includes("--post-login-preserved-timeout-child")) {
+  const events = [
+    { event: "ready", mode: "ruyipage-only" },
+    { event: "status", status: "account_home_confirmed" },
+    {
+      event: "status",
+      status: "browser_finalization_started",
+      browserPreservationRequested: true,
+    },
+    { event: "status", status: "browser_session_preserved", preserved: true },
+    {
+      event: "status",
+      status: "browser_finalization_completed",
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
+    },
+  ];
+  process.stdout.write(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+  setInterval(() => {}, 1_000);
+  await new Promise(() => {});
+}
+
+if (process.argv.includes("--post-login-failure-preserved-result-child")) {
+  const events = [
+    { event: "ready", mode: "ruyipage-only" },
+    { event: "status", status: "account_home_confirmed" },
+    {
+      event: "status",
+      status: "browser_preserved",
+      failureStage: "profile_capture",
+      preserved: true,
+    },
+    {
+      event: "result",
+      success: true,
+      browserLogin: {
+        success: true,
+        backend: "ruyipage",
+        accountHomeConfirmed: true,
+      },
+    },
+  ];
+  process.stdout.write(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`, () => {
+    process.exit(0);
+  });
+  await new Promise(() => {});
+}
+
 if (process.argv.includes("--invalid-json-child")) {
   process.stdout.write(`{${SECRET_CHILD_OUTPUT}\n`, () => process.exit(0));
   await new Promise(() => {});
@@ -1951,6 +2038,101 @@ async function runNodeRunnerNormalCloseDescendantCleanupFailureSelfTest() {
   }
 }
 
+async function runNodeRunnerPostLoginCleanupPartialSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--post-login-preserved-result-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 30,
+    childStopperOptions: {
+      schedule() {
+        throw new Error("test cleanup scheduler failure");
+      },
+    },
+  });
+
+  const result = await withRejectGuard(
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+    }),
+    1_000,
+    "post-login cleanup partial did not settle"
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.browserLogin?.accountHomeConfirmed, true);
+  assert.deepEqual(result.postLoginFinalization, {
+    backendCleanupCompleted: false,
+    browserFinalizationCompleted: true,
+    browserPreservationRequested: true,
+    browserSessionPreserved: true,
+    finalizationClass: "backend_cleanup_failed",
+  });
+  assert.equal(JSON.stringify(result).includes(SECRET_CHILD_OUTPUT), false);
+}
+
+async function runNodeRunnerPostLoginTimeoutClearsPreservationSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--post-login-preserved-timeout-child"],
+    timeoutMs: 1_000,
+    killGraceMs: 100,
+  });
+
+  await assert.rejects(
+    withRejectGuard(
+      runner.run({
+        creds: FIXTURE_CREDS,
+        reportDir: "data/reports/protocol-test",
+      }),
+      3_000,
+      "post-login timeout did not settle"
+    ),
+    (error) => {
+      assert.equal(error?.message, "ruyipage backend timed out after 1000ms");
+      assert.equal(error?.ruyiPageFailureContext?.accountHomeConfirmed, true);
+      assert.equal(error?.ruyiPageFailureContext?.browserPreservationRequested, true);
+      assert.equal(error?.ruyiPageFailureContext?.browserPreserved, false);
+      assert.equal(error?.ruyiPageFailureContext?.browserSessionPreserved, false);
+      assert.equal(error?.ruyiPageFailureContext?.browserFinalizationCompleted, false);
+      return true;
+    }
+  );
+}
+
+async function runNodeRunnerFailurePreservationDoesNotMaskCleanupSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--post-login-failure-preserved-result-child"],
+    timeoutMs: 2_000,
+    killGraceMs: 30,
+    childStopperOptions: {
+      schedule() {
+        throw new Error("test cleanup scheduler failure");
+      },
+    },
+  });
+
+  await assert.rejects(
+    withRejectGuard(
+      runner.run({
+        creds: FIXTURE_CREDS,
+        reportDir: "data/reports/protocol-test",
+      }),
+      1_000,
+      "failure-preserved cleanup incorrectly settled as a successful partial"
+    ),
+    (error) => error?.message === "ruyipage backend cleanup failed"
+  );
+}
+
 async function runNodeRunnerGenerationProtocolSelfTest() {
   const requests = [];
   const runner = createRuyiPageBackendRunner({
@@ -2022,7 +2204,10 @@ async function runNodeRunnerSecondGenerationStateResetTest() {
     accountHomeConfirmed: false,
     browserPreserved: false,
     browserSessionPreserved: false,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: false,
     directBrowserPreservationRequested: true,
+    directPostLoginRecoveryEligible: true,
     browserErrorClass: "unknown",
     backendExitCode: null,
     cleanupFailed: false,
@@ -2293,7 +2478,10 @@ async function runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest() {
     accountHomeConfirmed: false,
     browserPreserved: false,
     browserSessionPreserved: false,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: false,
     directBrowserPreservationRequested: isDirectBrowserFailurePreservationEnabled(),
+    directPostLoginRecoveryEligible: true,
     browserErrorClass: "twofa_input_unconfirmed",
     backendExitCode: 1,
     cleanupFailed: false,
@@ -3190,6 +3378,10 @@ const focusedTests = {
   "runner-cleanup-failure": runNodeRunnerCleanupFailureWithoutChildExitSelfTest,
   "normal-close-descendant": runNodeRunnerNormalCloseDescendantCleanupSelfTest,
   "normal-close-cleanup-failure": runNodeRunnerNormalCloseDescendantCleanupFailureSelfTest,
+  "post-login-cleanup-partial": runNodeRunnerPostLoginCleanupPartialSelfTest,
+  "post-login-timeout-preservation": runNodeRunnerPostLoginTimeoutClearsPreservationSelfTest,
+  "post-login-failure-preservation":
+    runNodeRunnerFailurePreservationDoesNotMaskCleanupSelfTest,
   "timeout-config": runBackendTimeoutConfigTest,
   "callback-on-event-secret": runNodeRunnerOnEventFailureSelfTest,
   "callback-prepare-secret": runNodeRunnerPreparationFailureSelfTest,
@@ -3243,6 +3435,9 @@ await runNodeRunnerProcessGroupSettlementSelfTest();
 await runNodeRunnerCleanupFailureWithoutChildExitSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupSelfTest();
 await runNodeRunnerNormalCloseDescendantCleanupFailureSelfTest();
+await runNodeRunnerPostLoginCleanupPartialSelfTest();
+await runNodeRunnerPostLoginTimeoutClearsPreservationSelfTest();
+await runNodeRunnerFailurePreservationDoesNotMaskCleanupSelfTest();
 await runNodeRunnerGenerationProtocolSelfTest();
 await runNodeRunnerSecondGenerationStateResetTest();
 await runNodeRunnerInvalidGenerationSelfTest();

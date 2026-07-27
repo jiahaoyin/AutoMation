@@ -36,9 +36,22 @@ const skipMac = process.argv.includes("--skip-mac");
 const skipBrowser = process.argv.includes("--skip-browser");
 const skipSetup = process.argv.includes("--skip-setup");
 const FAILURE_TOKEN_RE = /^[a-z0-9_]{1,96}$/;
+const POST_LOGIN_FINALIZATION_CLASSES = new Set([
+  "completed",
+  "browser_connection_lost",
+  "browser_quit_failed",
+  "backend_cleanup_failed",
+  "runner_post_login_failed",
+  "collector_dispose_failed",
+  "unknown",
+]);
 
 function failureToken(value) {
   return typeof value === "string" && FAILURE_TOKEN_RE.test(value) ? value : "unknown";
+}
+
+function finalizationClassToken(value) {
+  return POST_LOGIN_FINALIZATION_CLASSES.has(value) ? value : "unknown";
 }
 
 export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = new Date()) {
@@ -54,6 +67,97 @@ export function createFlowReport(runAt = new Date()) {
   return {
     runAt: runAt.toISOString(),
     phases: {},
+  };
+}
+
+export function recordAccountHomeAcceptanceMarker(
+  accountHomeConfirmed,
+  {
+    writeMarker = writeAccountHomeAcceptanceMarker,
+    flowAudit = null,
+    logger = console,
+  } = {}
+) {
+  if (accountHomeConfirmed !== true) {
+    flowAudit?.write?.("flow", "acceptance_marker_skipped", {
+      accountHomeConfirmed: false,
+    });
+    logger.log("[apple-automation] status:acceptance_marker_skipped:home:0");
+    return "skipped";
+  }
+  try {
+    writeMarker();
+    flowAudit?.write?.("flow", "acceptance_marker_completed", {
+      accountHomeConfirmed: true,
+    });
+    logger.log("[验收] REAL_ACCOUNT_HOME_CONFIRMED");
+    return "completed";
+  } catch {
+    flowAudit?.write?.("flow", "acceptance_marker_partial", {
+      accountHomeConfirmed: true,
+    });
+    logger.warn("[apple-automation] status:acceptance_marker_partial:home:1");
+    return "partial";
+  }
+}
+
+export function summarizeAccountBrowserCompletion(accountBrowser) {
+  const source = accountBrowser && typeof accountBrowser === "object" ? accountBrowser : {};
+  const browserLogin =
+    source.browserLogin && typeof source.browserLogin === "object" ? source.browserLogin : {};
+  const profileCapture =
+    source.postLoginProfileCapture && typeof source.postLoginProfileCapture === "object"
+      ? source.postLoginProfileCapture
+      : null;
+  const finalization =
+    source.postLoginFinalization && typeof source.postLoginFinalization === "object"
+      ? source.postLoginFinalization
+      : null;
+  const skipped = source.skipped === true;
+  const accountHomeConfirmed = browserLogin.accountHomeConfirmed === true;
+  const backendCleanupCompleted = finalization
+    ? finalization.backendCleanupCompleted !== false
+    : null;
+  const collectorDisposed = finalization ? finalization.collectorDisposed !== false : null;
+  const browserFinalizationCompleted = finalization
+    ? finalization.browserFinalizationCompleted === true
+    : null;
+  const browserPreservationRequested = finalization
+    ? finalization.browserPreservationRequested === true
+    : null;
+  const browserSessionPreserved = finalization
+    ? finalization.browserSessionPreserved === true
+    : null;
+  const finalizationClass = finalization
+    ? finalizationClassToken(finalization.finalizationClass)
+    : null;
+  const browserPreservationSatisfied =
+    browserPreservationRequested !== true || browserSessionPreserved === true;
+  return {
+    accountHomeConfirmed,
+    profileCaptureState: skipped
+      ? "skipped"
+      : profileCapture?.success === true
+        ? "succeeded"
+        : accountHomeConfirmed
+          ? "partial"
+          : "unknown",
+    postLoginFinalizationState: skipped
+      ? "skipped"
+      : !finalization
+        ? "unknown"
+        : backendCleanupCompleted &&
+            collectorDisposed &&
+            browserFinalizationCompleted &&
+            browserPreservationSatisfied
+          ? "completed"
+          : "partial",
+    backendCleanupCompleted,
+    collectorDisposed,
+    browserFinalizationCompleted,
+    browserPreservationRequested,
+    browserSessionPreserved,
+    finalizationClass,
   };
 }
 
@@ -175,7 +279,41 @@ export async function main() {
           reportDir,
           flowAudit,
         });
-        flowAudit.write("account_browser", "completed", { success: true });
+        const browserCompletion = summarizeAccountBrowserCompletion(
+          report.phases.accountBrowser
+        );
+        const profileCapture = report.phases.accountBrowser?.postLoginProfileCapture;
+        flowAudit.write("account_browser", "completed", {
+          success: true,
+          ...browserCompletion,
+        });
+        console.log(
+          `[apple-automation] status:account_browser_completed:home:${browserCompletion.accountHomeConfirmed ? 1 : 0}:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}`
+        );
+        if (browserCompletion.profileCaptureState === "partial") {
+          flowAudit.write("account_browser", "profile_capture_partial", {
+            failureStage: profileCapture?.failureStage,
+            failureClass: profileCapture?.failureClass,
+            browserAlive: profileCapture?.browserAlive === true,
+            browserPreserved: profileCapture?.browserPreserved === true,
+          });
+          console.warn(
+            `[apple-automation] status:browser_login_succeeded_profile_capture_partial:stage:${profileCapture?.failureStage ?? "unknown"}:class:${profileCapture?.failureClass ?? "unknown"}:preserved:${profileCapture?.browserPreserved === true ? 1 : 0}`
+          );
+        }
+        if (browserCompletion.postLoginFinalizationState === "partial") {
+          flowAudit.write("account_browser", "post_login_finalization_partial", {
+            backendCleanupCompleted: browserCompletion.backendCleanupCompleted,
+            collectorDisposed: browserCompletion.collectorDisposed,
+            browserFinalizationCompleted: browserCompletion.browserFinalizationCompleted,
+            browserPreservationRequested: browserCompletion.browserPreservationRequested,
+            browserSessionPreserved: browserCompletion.browserSessionPreserved,
+            finalizationClass: browserCompletion.finalizationClass,
+          });
+          console.warn(
+            `[apple-automation] status:browser_login_succeeded_post_login_finalization_partial:backend_cleanup:${browserCompletion.backendCleanupCompleted ? 1 : 0}:collector_disposed:${browserCompletion.collectorDisposed ? 1 : 0}:browser_finalized:${browserCompletion.browserFinalizationCompleted ? 1 : 0}:preserve_requested:${browserCompletion.browserPreservationRequested ? 1 : 0}:preserved:${browserCompletion.browserSessionPreserved ? 1 : 0}:class:${browserCompletion.finalizationClass}`
+          );
+        }
       } catch (e) {
         failureStage = readBrowserFailureStage(e);
         failureCode = readBrowserFailureCode(e);
@@ -205,17 +343,26 @@ export async function main() {
       console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
       report.phases.accountBrowser = { skipped: true };
       flowAudit.write("account_browser", "skipped");
+      console.log("[apple-automation] status:account_browser_skipped");
     }
 
     failureStage = "report_write";
     failureCode = "report_write_failed";
     reportFile = writeReport(reportDir, report);
     flowAudit.write("flow", "report_written", { file: "report.json" });
-    if (report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true) {
-      writeAccountHomeAcceptanceMarker();
-      console.log("[验收] REAL_ACCOUNT_HOME_CONFIRMED");
-    }
-    flowAudit.write("flow", "completed", { success: true });
+    const acceptanceMarkerState = recordAccountHomeAcceptanceMarker(
+      report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true,
+      { flowAudit }
+    );
+    const browserCompletion = summarizeAccountBrowserCompletion(report.phases.accountBrowser);
+    flowAudit.write("flow", "completed", {
+      success: true,
+      ...browserCompletion,
+      acceptanceMarkerState,
+    });
+    console.log(
+      `[apple-automation] status:flow_completed:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}:acceptance_marker:${acceptanceMarkerState}`
+    );
   } catch (e) {
     report.error = "Apple ID flow failed";
     report.failure = createFlowFailureEnvelope(failureStage, failureCode);

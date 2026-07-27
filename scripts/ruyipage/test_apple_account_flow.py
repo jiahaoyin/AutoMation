@@ -88,21 +88,76 @@ class BrowserStageRecorderTests(unittest.TestCase):
     def test_emits_fixed_browser_stage_events(self):
         set_stage = getattr(account_flow, "set_browser_startup_stage", None)
         self.assertIsNotNone(set_stage)
-        with patch("apple_account_flow.emit") as emit_event:
+        with patch.object(account_flow, "browser_startup_stage", "not_started"), patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
             set_stage("email_wait")
             set_stage("password_input")
 
         self.assertEqual(
             [call.args[0] for call in emit_event.call_args_list],
             [
-                {"event": "status", "status": "browser_stage", "stage": "email_wait"},
+                {
+                    "event": "status",
+                    "status": "browser_stage",
+                    "stage": "email_wait",
+                    "previousStage": "not_started",
+                    "transition": "entered",
+                },
                 {
                     "event": "status",
                     "status": "browser_stage",
                     "stage": "password_input",
+                    "previousStage": "email_wait",
+                    "transition": "entered",
                 },
             ],
         )
+
+
+class BrowserObservationTests(unittest.TestCase):
+    def test_emits_only_fixed_non_secret_browser_observation(self):
+        page = object()
+        state = {
+            "trusted": True,
+            "twofa": False,
+            "inputReady": False,
+            "codeInputCount": 6,
+            "error": False,
+            "email": "person@example.com",
+            "otp": "123456",
+        }
+        with patch(
+            "apple_account_flow.scope_location_url",
+            return_value=account_flow.ACCOUNT_INFORMATION_URL,
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive", return_value=True
+        ), patch("apple_account_flow.emit") as emit_event:
+            account_flow.emit_browser_observation(
+                "profile_ready",
+                page,
+                state,
+                account_home_confirmed=True,
+            )
+
+        self.assertEqual(
+            emit_event.call_args.args[0],
+            {
+                "event": "status",
+                "status": "browser_observation",
+                "checkpoint": "profile_ready",
+                "pageKind": "account_information",
+                "connectionAlive": True,
+                "sessionConfirmed": True,
+                "accountHomeConfirmed": True,
+                "twofaVisible": False,
+                "inputReady": False,
+                "codeInputCount": 6,
+                "authenticationError": False,
+            },
+        )
+        self.assertNotIn("person@example.com", json.dumps(emit_event.call_args.args[0]))
+        self.assertNotIn("123456", json.dumps(emit_event.call_args.args[0]))
 
 
 class ExistingBrowserAttachTests(unittest.TestCase):
@@ -2166,6 +2221,76 @@ class InputTests(unittest.TestCase):
 
 
 class BrowserFlowTests(unittest.TestCase):
+    def test_direct_mode_emits_complete_early_browser_stage_sequence(self):
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        root = FakePage(state={"href": "https://account.apple.com/sign-in"})
+        root.get = lambda *_: None
+        root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        root.quit = lambda: None
+        args = parse_args(["--report-dir", "test-report"])
+        events = []
+        with patch.dict(
+            os.environ,
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+                account_flow.BROWSER_BROKER_MODE_ENV: "0",
+            },
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            side_effect=[{"trusted": True, "error": False}, {"trusted": True, "error": False}],
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.collect_personal_info",
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
+        ), patch("apple_account_flow.human_pause", return_value=None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            self.assertEqual(browser_flow(args), 0)
+
+        stages = [
+            event["stage"]
+            for event in events
+            if event.get("event") == "status" and event.get("status") == "browser_stage"
+        ]
+        self.assertEqual(
+            stages[:6],
+            [
+                "not_started",
+                "credentials_received",
+                "url_validated",
+                "runtime_importing",
+                "runtime_imported",
+                "browser_constructing",
+            ],
+        )
+        self.assertIn("browser_ready", stages)
+        self.assertFalse(
+            any(
+                event.get("status") in {
+                    "broker_credentials_received",
+                    "browser_url_validated",
+                    "browser_runtime_imported",
+                }
+                for event in events
+            )
+        )
+
     def test_password_resume_requires_password_without_email(self):
         cases = (
             ({"password": True, "email": False}, True),
@@ -3075,7 +3200,15 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             if self.quit_fails:
                 raise RuntimeError("quit failed")
 
-    def run_late_flow(self, report_dir, page, final_state, personal_info, events):
+    def run_late_flow(
+        self,
+        report_dir,
+        page,
+        final_state,
+        personal_info,
+        events,
+        event_sink=None,
+    ):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
                 return lambda *_args, **_kwargs: None
@@ -3105,46 +3238,76 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             return_value=None,
         ), patch(
             "apple_account_flow.emit",
-            side_effect=events.append,
+            side_effect=event_sink or events.append,
         ):
             return browser_flow(args)
 
-    def test_late_authentication_failure_removes_success_screenshot_from_disk(self):
+    def test_late_authentication_failure_is_a_profile_partial_result(self):
         secret = "person@example.com OTP 123456"
         events = []
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
             page = self.DiskScreenshotPage(secret)
 
-            with self.assertRaisesRegex(RuntimeError, "authentication error"):
+            self.assertEqual(
                 self.run_late_flow(
                     report_dir,
                     page,
                     {"trusted": False, "error": True},
                     {"name": "Test Given Test Family", "birthday": "2000-01-02"},
                     events,
-                )
+                ),
+                0,
+            )
 
-            self.assertEqual(list(report_dir.rglob("*.png")), [])
+            self.assertEqual(
+                sorted(path.name for path in report_dir.rglob("*.png")),
+                ["02-ruyipage-after-login.png"],
+            )
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertTrue(result["success"])
+            self.assertTrue(result["browserLogin"]["accountHomeConfirmed"])
+            self.assertEqual(result["personalInfo"], {})
+            self.assertEqual(
+                result["postLoginProfileCapture"],
+                {
+                    "success": False,
+                    "failureStage": "account_information",
+                    "failureClass": "profile_authentication_error",
+                    "browserAlive": False,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": True,
+                },
+            )
             self.assertNotIn(secret, json.dumps(events))
 
-    def test_personal_info_parse_failure_removes_success_screenshot_from_disk(self):
+    def test_personal_info_parse_failure_is_a_profile_partial_result(self):
         secret = "person@example.com OTP 123456"
         events = []
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
             page = self.DiskScreenshotPage(secret)
 
-            with self.assertRaisesRegex(RuntimeError, "name and birthday"):
+            self.assertEqual(
                 self.run_late_flow(
                     report_dir,
                     page,
                     {"trusted": True, "error": False},
                     {"name": None, "birthday": None},
                     events,
-                )
+                ),
+                0,
+            )
 
-            self.assertEqual(list(report_dir.rglob("*.png")), [])
+            self.assertEqual(
+                sorted(path.name for path in report_dir.rglob("*.png")),
+                ["02-ruyipage-after-login.png", "03-account-information.png"],
+            )
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertEqual(
+                result["postLoginProfileCapture"]["failureClass"],
+                "profile_data_incomplete",
+            )
             self.assertNotIn(secret, json.dumps(events))
 
     def test_profile_capture_failure_keeps_personal_information_screenshot_and_browser(self):
@@ -3170,13 +3333,16 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     "BROWSER_PRESERVE_ON_SUCCESS": "1",
                 },
                 clear=False,
-            ), self.assertRaisesRegex(RuntimeError, "name and birthday"):
-                self.run_late_flow(
-                    report_dir,
-                    page,
-                    {"trusted": True, "error": False},
-                    {"name": None, "birthday": None},
-                    events,
+            ):
+                self.assertEqual(
+                    self.run_late_flow(
+                        report_dir,
+                        page,
+                        {"trusted": True, "error": False},
+                        {"name": None, "birthday": None},
+                        events,
+                    ),
+                    0,
                 )
 
             self.assertEqual(
@@ -3187,31 +3353,231 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             self.assertIn(
                 {
                     "event": "status",
-                    "status": "browser_preserved",
-                    "failureStage": "profile_birthday",
+                    "status": "browser_session_preserved",
                     "preserved": True,
+                    "profileCaptureSuccess": False,
                 },
                 events,
             )
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertEqual(result["personalInfo"], {})
+            self.assertEqual(
+                result["postLoginProfileCapture"],
+                {
+                    "success": False,
+                    "failureStage": "profile_birthday",
+                    "failureClass": "profile_data_incomplete",
+                    "browserAlive": True,
+                    "browserPreserved": True,
+                    "browserPreservationRequested": True,
+                },
+            )
+            self.assertLess(
+                events.index(
+                    {
+                        "event": "status",
+                        "status": "browser_session_preserved",
+                        "preserved": True,
+                        "profileCaptureSuccess": False,
+                    }
+                ),
+                events.index(result),
+            )
             self.assertNotIn(secret, json.dumps(events))
 
-    def test_quit_failure_removes_all_success_screenshots_from_disk(self):
+    def test_profile_capture_does_not_claim_preservation_after_connection_disappears(self):
+        class FlappingProfilePage(self.DiskScreenshotPage):
+            def __init__(self, secret):
+                super().__init__(secret)
+                self.is_alive = True
+                self.quit_calls = 0
+
+            @property
+            def states(self):
+                return type("FakeStates", (), {"is_alive": self.is_alive})()
+
+            def quit(self):
+                self.quit_calls += 1
+                super().quit()
+
+        secret = "person@example.com OTP 123456"
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            page = FlappingProfilePage(secret)
+
+            def record(event):
+                events.append(event)
+                if event.get("status") == "profile_capture_failed":
+                    page.is_alive = False
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BROWSER_PRESERVE_ON_FAILURE": "1",
+                    "BROWSER_PRESERVE_ON_SUCCESS": "1",
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    self.run_late_flow(
+                        report_dir,
+                        page,
+                        {"trusted": True, "error": False},
+                        {"name": None, "birthday": None},
+                        events,
+                        event_sink=record,
+                    ),
+                    0,
+                )
+
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertTrue(
+                result["postLoginProfileCapture"]["browserPreservationRequested"]
+            )
+            self.assertFalse(result["postLoginProfileCapture"]["browserPreserved"])
+            self.assertEqual(page.quit_calls, 0)
+            self.assertEqual(
+                result["postLoginFinalization"],
+                {
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": True,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_connection_lost",
+                },
+            )
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "browser_finalization_partial",
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": True,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_connection_lost",
+                },
+                events,
+            )
+            self.assertNotIn(
+                "browser_session_preserved",
+                [event.get("status") for event in events],
+            )
+            self.assertNotIn(secret, json.dumps(events))
+
+    def test_quit_failure_after_account_home_keeps_success_screenshots_and_reports_partial_finalization(self):
         secret = "person@example.com OTP 123456"
         events = []
         with tempfile.TemporaryDirectory() as temp_dir:
             report_dir = Path(temp_dir)
             page = self.DiskScreenshotPage(secret, quit_fails=True)
+            page.states = FakeStates(alive=True)
 
-            with self.assertRaisesRegex(RuntimeError, "quit failed"):
-                self.run_late_flow(
-                    report_dir,
-                    page,
-                    {"trusted": True, "error": False},
-                    {"name": "Test Given Test Family", "birthday": "2000-01-02"},
-                    events,
+            with patch.dict(
+                os.environ,
+                {
+                    "BROWSER_PRESERVE_ON_FAILURE": "0",
+                    "BROWSER_PRESERVE_ON_SUCCESS": "0",
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    self.run_late_flow(
+                        report_dir,
+                        page,
+                        {"trusted": True, "error": False},
+                        {"name": "Test Given Test Family", "birthday": "2000-01-02"},
+                        events,
+                    ),
+                    0,
                 )
 
-            self.assertEqual(list(report_dir.rglob("*.png")), [])
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertTrue(result["success"])
+            self.assertTrue(result["browserLogin"]["accountHomeConfirmed"])
+            self.assertEqual(
+                result["postLoginFinalization"],
+                {
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": False,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_quit_failed",
+                },
+            )
+            self.assertEqual(
+                sorted(path.name for path in report_dir.rglob("*.png")),
+                ["02-ruyipage-after-login.png", "03-account-information.png"],
+            )
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "browser_finalization_partial",
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": False,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_quit_failed",
+                },
+                events,
+            )
+            self.assertNotIn(secret, json.dumps(events))
+
+    def test_post_login_disconnect_without_preservation_is_a_partial_finalization(self):
+        class DisconnectedProfilePage(self.DiskScreenshotPage):
+            def __init__(self, secret):
+                super().__init__(secret)
+                self.states = FakeStates(alive=False)
+                self.quit_calls = 0
+
+            def quit(self):
+                self.quit_calls += 1
+                super().quit()
+
+        secret = "person@example.com OTP 123456"
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            page = DisconnectedProfilePage(secret)
+            with patch.dict(
+                os.environ,
+                {
+                    "BROWSER_PRESERVE_ON_FAILURE": "0",
+                    "BROWSER_PRESERVE_ON_SUCCESS": "0",
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    self.run_late_flow(
+                        report_dir,
+                        page,
+                        {"trusted": True, "error": False},
+                        {"name": "Test Given Test Family", "birthday": "2000-01-02"},
+                        events,
+                    ),
+                    0,
+                )
+
+            result = next(event for event in events if event.get("event") == "result")
+            self.assertTrue(result["success"])
+            self.assertTrue(result["browserLogin"]["accountHomeConfirmed"])
+            self.assertEqual(page.quit_calls, 0)
+            self.assertEqual(
+                result["postLoginFinalization"],
+                {
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": False,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_connection_lost",
+                },
+            )
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "browser_finalization_partial",
+                    "browserFinalizationCompleted": False,
+                    "browserPreservationRequested": False,
+                    "browserSessionPreserved": False,
+                    "finalizationClass": "browser_connection_lost",
+                },
+                events,
+            )
             self.assertNotIn(secret, json.dumps(events))
 
     def test_successful_flow_retains_fixed_success_screenshots(self):
@@ -3236,6 +3602,22 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             self.assertEqual(
                 screenshots,
                 ["02-ruyipage-after-login.png", "03-account-information.png"],
+            )
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "screenshot_capture",
+                    "checkpoint": "account_home",
+                },
+                events,
+            )
+            self.assertIn(
+                {
+                    "event": "status",
+                    "status": "screenshot_capture",
+                    "checkpoint": "account_information",
+                },
+                events,
             )
 
     def test_early_failure_does_not_delete_fixed_screenshots_from_an_older_run(self):
@@ -3298,12 +3680,20 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 return "safe-screenshot.png"
 
         with patch("apple_account_flow.emit") as emit_event:
-            result = account_flow.take_screenshot(FailingScreenshotPage(), FakePath())
+            result = account_flow.take_screenshot(
+                FailingScreenshotPage(),
+                FakePath(),
+                checkpoint="account_home",
+            )
 
         self.assertIsNone(result)
         self.assertEqual(
             emit_event.call_args.args[0],
-            {"event": "warning", "message": "ruyipage_screenshot_failed"},
+            {
+                "event": "status",
+                "status": "screenshot_failed",
+                "checkpoint": "account_home",
+            },
         )
         self.assertNotIn(self.SECRET_SENTINEL, json.dumps(emit_event.call_args.args[0]))
 
@@ -3512,17 +3902,25 @@ class SafeFailureBoundaryTests(unittest.TestCase):
 
         self.assertEqual(return_code, 1)
         events = [call.args[0] for call in emit_event.call_args_list]
-        self.assertEqual(events[0]["event"], "diagnostic")
-        self.assertEqual(events[0]["kind"], "python_exception")
-        self.assertEqual(events[0]["errorType"], "RuntimeError")
-        self.assertEqual(events[0]["errorClass"], "browser_exception")
-        self.assertIs(events[0]["hasTraceback"], True)
-        self.assertNotIn("message", events[0])
-        self.assertNotIn("traceback", events[0])
-        self.assertNotIn(self.SECRET_SENTINEL, json.dumps(events[0]))
-        self.assertNotIn("123 456", json.dumps(events[0]))
-        self.assertNotIn("user:pw@", json.dumps(events[0]))
-        self.assertNotIn("?token=secret", json.dumps(events[0]))
+        self.assertEqual(
+            events[0],
+            {
+                "event": "status",
+                "status": "browser_failure",
+                "failureStage": "not_started",
+            },
+        )
+        self.assertEqual(events[1]["event"], "diagnostic")
+        self.assertEqual(events[1]["kind"], "python_exception")
+        self.assertEqual(events[1]["errorType"], "RuntimeError")
+        self.assertEqual(events[1]["errorClass"], "browser_exception")
+        self.assertIs(events[1]["hasTraceback"], True)
+        self.assertNotIn("message", events[1])
+        self.assertNotIn("traceback", events[1])
+        self.assertNotIn(self.SECRET_SENTINEL, json.dumps(events[1]))
+        self.assertNotIn("123 456", json.dumps(events[1]))
+        self.assertNotIn("user:pw@", json.dumps(events[1]))
+        self.assertNotIn("?token=secret", json.dumps(events[1]))
         self.assertEqual(
             events[-1],
             {

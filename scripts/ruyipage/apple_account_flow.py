@@ -117,7 +117,7 @@ APPLE_AUTH_HOSTS = frozenset(
     }
 )
 OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
-SCREENSHOT_FAILURE_REASON = "ruyipage_screenshot_failed"
+SCREENSHOT_CHECKPOINTS = frozenset({"account_home", "account_information"})
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
@@ -161,6 +161,7 @@ BROWSER_STARTUP_STAGES = {
 browser_startup_stage = "not_started"
 browser_stage_file: Path | None = None
 diagnostic_secrets: list[str] = []
+browser_failure_emitted = False
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
@@ -184,6 +185,38 @@ TWO_FACTOR_PROGRESS_PHASES = frozenset(
         "transition_retry_requested",
         "transition_confirmed",
         "handoff_failed",
+    }
+)
+BROWSER_OBSERVATION_CHECKPOINTS = frozenset(
+    {
+        "login_state",
+        "twofa_wait",
+        "account_home",
+        "account_information",
+        "profile_ready",
+        "profile_capture_failed",
+    }
+)
+BROWSER_PAGE_KINDS = frozenset(
+    {
+        "sign_in",
+        "password",
+        "two_factor",
+        "account_manage",
+        "account_information",
+        "authentication_error",
+        "unknown",
+    }
+)
+PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
+    {
+        "profile_authentication_error",
+        "profile_session_unconfirmed",
+        "profile_element_unavailable",
+        "profile_page_unready",
+        "profile_data_incomplete",
+        "browser_connection_lost",
+        "profile_capture_failed",
     }
 )
 
@@ -335,6 +368,83 @@ def emit_two_factor_progress(
     emit(event)
 
 
+def classify_browser_page_kind(page: Any, state: dict[str, Any] | None) -> str:
+    """Classify a page with fixed tokens only; never emit URLs or page text."""
+    source = state if isinstance(state, dict) else {}
+    try:
+        current_url = scope_location_url(page)
+        current_path = urlsplit(current_url).path.rstrip("/")
+        information_path = urlsplit(ACCOUNT_INFORMATION_URL).path.rstrip("/")
+    except Exception:
+        current_url = ""
+        current_path = ""
+        information_path = ""
+    if information_path and current_path == information_path:
+        return "account_information"
+    if current_url and is_account_manage_url(current_url):
+        return "account_manage"
+    if source.get("error") is True:
+        return "authentication_error"
+    if source.get("twofa") is True or source.get("twofaVisible") is True:
+        return "two_factor"
+    if source.get("password") is True:
+        return "password"
+    if source.get("email") is True:
+        return "sign_in"
+    return "unknown"
+
+
+def emit_browser_observation(
+    checkpoint: str,
+    page: Any,
+    state: dict[str, Any] | None,
+    *,
+    account_home_confirmed: bool,
+) -> None:
+    """Emit a fixed, non-secret browser checkpoint for audit correlation."""
+    if checkpoint not in BROWSER_OBSERVATION_CHECKPOINTS:
+        raise RuntimeError("browser observation checkpoint is invalid")
+    source = state if isinstance(state, dict) else {}
+    try:
+        session_confirmed = has_confirmed_account_session(source)
+    except Exception:
+        session_confirmed = False
+    code_input_count = source.get("codeInputCount")
+    emit(
+        {
+            "event": "status",
+            "status": "browser_observation",
+            "checkpoint": checkpoint,
+            "pageKind": classify_browser_page_kind(page, source),
+            "connectionAlive": browser_connection_is_alive(page),
+            "sessionConfirmed": session_confirmed,
+            "accountHomeConfirmed": account_home_confirmed is True,
+            "twofaVisible": bool(source.get("twofa") or source.get("twofaVisible")),
+            "inputReady": source.get("inputReady") is True,
+            "codeInputCount": code_input_count if code_input_count in (1, 6) else 0,
+            "authenticationError": source.get("error") is True,
+        }
+    )
+
+
+def classify_profile_capture_failure(error: Exception) -> str:
+    """Use fixed failure classes instead of forwarding page or exception text."""
+    message = str(error).lower()
+    if "personal information page reported an authentication error" in message:
+        return "profile_authentication_error"
+    if "personal information page did not confirm" in message:
+        return "profile_session_unconfirmed"
+    if "browser connection was lost" in message:
+        return "browser_connection_lost"
+    if "page element did not appear" in message:
+        return "profile_element_unavailable"
+    if "name and birthday" in message:
+        return "profile_data_incomplete"
+    if "profile" in message or "personal information" in message:
+        return "profile_page_unready"
+    return "profile_capture_failed"
+
+
 def preserve_browser_on_failure() -> bool:
     """Keep direct-run Firefox open for a human to inspect a failed handoff.
 
@@ -359,6 +469,96 @@ def browser_connection_is_alive(page: Any) -> bool:
         return bool(page.states.is_alive)
     except Exception:
         return False
+
+
+def finalize_post_login_browser(
+    page: Any,
+    *,
+    preserve_requested: bool,
+    profile_capture_success: bool,
+) -> dict[str, Any]:
+    """Settle the post-login browser disposition before emitting the success result.
+
+    A dead ruyiPage connection after account-home confirmation is useful
+    observability, not a reason to rewrite a completed sign-in as a failure.
+    """
+    finalization = {
+        "browserFinalizationCompleted": True,
+        "browserPreservationRequested": preserve_requested is True,
+        "browserSessionPreserved": False,
+        "finalizationClass": "completed",
+    }
+    emit(
+        {
+            "event": "status",
+            "status": "browser_finalization_started",
+            "browserPreservationRequested": preserve_requested is True,
+        }
+    )
+    if preserve_requested:
+        if browser_connection_is_alive(page):
+            finalization["browserSessionPreserved"] = True
+            emit(
+                {
+                    "event": "status",
+                    "status": "browser_session_preserved",
+                    "preserved": True,
+                    "profileCaptureSuccess": profile_capture_success is True,
+                }
+            )
+            emit(
+                {
+                    "event": "status",
+                    "status": "browser_finalization_completed",
+                    **finalization,
+                }
+            )
+            return finalization
+
+        finalization["browserFinalizationCompleted"] = False
+        finalization["finalizationClass"] = "browser_connection_lost"
+        emit(
+            {
+                "event": "status",
+                "status": "browser_finalization_partial",
+                **finalization,
+            }
+        )
+        return finalization
+
+    if not browser_connection_is_alive(page):
+        finalization["browserFinalizationCompleted"] = False
+        finalization["finalizationClass"] = "browser_connection_lost"
+        emit(
+            {
+                "event": "status",
+                "status": "browser_finalization_partial",
+                **finalization,
+            }
+        )
+        return finalization
+
+    try:
+        page.quit()
+    except Exception:
+        finalization["browserFinalizationCompleted"] = False
+        finalization["finalizationClass"] = "browser_quit_failed"
+        emit(
+            {
+                "event": "status",
+                "status": "browser_finalization_partial",
+                **finalization,
+            }
+        )
+    else:
+        emit(
+            {
+                "event": "status",
+                "status": "browser_finalization_completed",
+                **finalization,
+            }
+        )
+    return finalization
 
 
 def classify_input_read(readable: bool, actual: Any, expected: str) -> str:
@@ -393,8 +593,17 @@ def set_browser_startup_stage(stage: str) -> None:
     global browser_startup_stage
     if stage not in BROWSER_STARTUP_STAGES:
         raise RuntimeError("browser startup stage is invalid")
+    previous_stage = browser_startup_stage
     browser_startup_stage = stage
-    emit({"event": "status", "status": "browser_stage", "stage": stage})
+    emit(
+        {
+            "event": "status",
+            "status": "browser_stage",
+            "stage": stage,
+            "previousStage": previous_stage,
+            "transition": "entered",
+        }
+    )
     if browser_stage_file is None:
         return
     temporary = browser_stage_file.with_name(
@@ -423,6 +632,28 @@ def set_browser_startup_stage(stage: str) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def begin_browser_flow_run() -> None:
+    """Reset per-run state so every invocation has an independent audit trail."""
+    global browser_failure_emitted, browser_startup_stage
+    browser_failure_emitted = False
+    browser_startup_stage = "not_started"
+
+
+def emit_browser_failure_once() -> None:
+    """Publish one fixed terminal stage for direct and broker browser runs."""
+    global browser_failure_emitted
+    if browser_failure_emitted or browser_startup_stage not in BROWSER_STARTUP_STAGES:
+        return
+    browser_failure_emitted = True
+    emit(
+        {
+            "event": "status",
+            "status": "browser_failure",
+            "failureStage": browser_startup_stage,
+        }
+    )
 
 
 def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
@@ -3385,7 +3616,13 @@ def validate_personal_info_result(
         raise RuntimeError("personal information page loaded but name and birthday were not parsed")
 
 
-def take_screenshot(page: Any, path: Path) -> str | None:
+def take_screenshot(
+    page: Any,
+    path: Path,
+    *,
+    checkpoint: str,
+) -> str | None:
+    safe_checkpoint = checkpoint if checkpoint in SCREENSHOT_CHECKPOINTS else "unknown"
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if hasattr(path.parent, "chmod"):
@@ -3393,9 +3630,22 @@ def take_screenshot(page: Any, path: Path) -> str | None:
         page.screenshot(str(path), full_page=True)
         if hasattr(path, "chmod"):
             path.chmod(0o600)
+        emit(
+            {
+                "event": "status",
+                "status": "screenshot_capture",
+                "checkpoint": safe_checkpoint,
+            }
+        )
         return str(path)
     except Exception:
-        emit({"event": "warning", "message": SCREENSHOT_FAILURE_REASON})
+        emit(
+            {
+                "event": "status",
+                "status": "screenshot_failed",
+                "checkpoint": safe_checkpoint,
+            }
+        )
         return None
 
 
@@ -4029,25 +4279,34 @@ def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
 
 
 def browser_flow(args: argparse.Namespace) -> int:
+    begin_browser_flow_run()
+    try:
+        return _browser_flow(args)
+    except Exception:
+        # Covers pre-browser failures such as credential, URL, or runtime setup.
+        emit_browser_failure_once()
+        raise
+
+
+def _browser_flow(args: argparse.Namespace) -> int:
     report_dir = Path(args.report_dir)
     configure_browser_stage_file(report_dir)
     set_browser_startup_stage("not_started")
     apple_id, password = load_browser_credentials()
     configure_diagnostic_secrets(apple_id, password)
     broker_mode = browser_broker_mode_enabled()
+    set_browser_startup_stage("credentials_received")
     if broker_mode:
-        set_browser_startup_stage("credentials_received")
         emit({"event": "status", "status": "broker_credentials_received"})
     sign_in_url = validate_apple_url(args.sign_in_url)
+    set_browser_startup_stage("url_validated")
     if broker_mode:
-        set_browser_startup_stage("url_validated")
         emit({"event": "status", "status": "browser_url_validated"})
 
-    if broker_mode:
-        set_browser_startup_stage("runtime_importing")
+    set_browser_startup_stage("runtime_importing")
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
+    set_browser_startup_stage("runtime_imported")
     if broker_mode:
-        set_browser_startup_stage("runtime_imported")
         emit({"event": "status", "status": "browser_runtime_imported"})
     opts = FirefoxOptions()
     if args.firefox:
@@ -4071,8 +4330,10 @@ def browser_flow(args: argparse.Namespace) -> int:
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     account_home_confirmed = False
+    preserve_after_flow = preserve_on_success
+    post_login_browser_finalized = False
+    set_browser_startup_stage("browser_constructing")
     if broker_mode:
-        set_browser_startup_stage("browser_constructing")
         emit({"event": "status", "status": "browser_constructing"})
     page, browser_route = try_attach_existing_browser_for_flow(apple_id, args.profile_dir)
     attached_existing_browser = browser_route == "account_session"
@@ -4082,8 +4343,7 @@ def browser_flow(args: argparse.Namespace) -> int:
             raise RuntimeError("active Firefox profile could not be attached through ruyiPage")
         page = construct_firefox_page(FirefoxPage, opts)
     persist_browser_attach_address(page, args.profile_dir)
-    if broker_mode:
-        set_browser_startup_stage("browser_ready")
+    set_browser_startup_stage("browser_ready")
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
         set_browser_startup_stage("login_navigation")
@@ -4106,6 +4366,12 @@ def browser_flow(args: argparse.Namespace) -> int:
             page,
             initial_state,
             deadline=time.monotonic() + 5.0,
+        )
+        emit_browser_observation(
+            "login_state",
+            page,
+            initial_state,
+            account_home_confirmed=False,
         )
         if initial_state.get("error") and not has_confirmed_account_session(
             initial_state
@@ -4182,6 +4448,12 @@ def browser_flow(args: argparse.Namespace) -> int:
 
             set_browser_startup_stage("twofa_page_wait")
             login_state = wait_for_2fa_or_session(page)
+            emit_browser_observation(
+                "twofa_wait",
+                page,
+                login_state,
+                account_home_confirmed=False,
+            )
             if login_state.get("trusted"):
                 skipped_2fa = True
                 set_browser_startup_stage("signed_in")
@@ -4272,51 +4544,142 @@ def browser_flow(args: argparse.Namespace) -> int:
 
         emit({"event": "status", "status": "account_home_confirmed"})
         account_home_confirmed = True
+        emit_browser_observation(
+            "account_home",
+            page,
+            {"trusted": True},
+            account_home_confirmed=True,
+        )
         screenshots["afterLogin"] = take_screenshot(
-            page, success_screenshot_paths[0]
+            page,
+            success_screenshot_paths[0],
+            checkpoint="account_home",
         )
         if screenshots["afterLogin"] is not None:
             generated_screenshot_paths.append(success_screenshot_paths[0])
 
-        set_browser_startup_stage("account_information")
-        page.get(ACCOUNT_INFORMATION_URL)
-        page.wait.doc_loaded(timeout=20)
-        human_pause(1200, 2400)
-        final_state = detect_login_state(page)
-        final_state = settle_trust_state(
-            page,
-            final_state,
-            deadline=time.monotonic() + 5.0,
-        )
-        if not has_confirmed_account_session(final_state):
-            direct_session_state = confirmed_account_manage_state(page)
-            if direct_session_state is not None:
-                final_state = direct_session_state
-        if final_state.get("error") and not has_confirmed_account_session(final_state):
-            raise RuntimeError("personal information page reported an authentication error")
-        if not has_confirmed_account_session(final_state):
-            raise RuntimeError("personal information page did not confirm an authenticated Apple session")
-        final_state["trusted"] = True
-        set_browser_startup_stage("profile_capture")
-        wait_for_profile_capture_ready(page)
-        emit({"event": "status", "status": "profile_page_ready"})
-        screenshots["personalInformation"] = take_screenshot(
-            page, success_screenshot_paths[1]
-        )
-        if screenshots["personalInformation"] is not None:
-            generated_screenshot_paths.append(success_screenshot_paths[1])
-            emit({"event": "status", "status": "profile_screenshot_saved"})
-        set_browser_startup_stage("profile_birthday")
-        personal_info = collect_personal_info(page)
-        validate_personal_info_result(final_state, personal_info)
-        if preserve_on_success and browser_connection_is_alive(page):
+        personal_info: dict[str, str] = {}
+        profile_state: dict[str, Any] = {"trusted": True}
+        post_login_profile_capture: dict[str, Any] = {
+            "success": False,
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": False,
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+        try:
+            set_browser_startup_stage("account_information")
+            emit({"event": "status", "status": "profile_capture_started"})
+            page.get(ACCOUNT_INFORMATION_URL)
+            page.wait.doc_loaded(timeout=20)
+            human_pause(1200, 2400)
+            profile_state = detect_login_state(page)
+            profile_state = settle_trust_state(
+                page,
+                profile_state,
+                deadline=time.monotonic() + 5.0,
+            )
+            if not has_confirmed_account_session(profile_state):
+                direct_session_state = confirmed_account_manage_state(page)
+                if direct_session_state is not None:
+                    profile_state = direct_session_state
+            emit_browser_observation(
+                "account_information",
+                page,
+                profile_state,
+                account_home_confirmed=True,
+            )
+            if profile_state.get("error") and not has_confirmed_account_session(
+                profile_state
+            ):
+                raise RuntimeError("personal information page reported an authentication error")
+            if not has_confirmed_account_session(profile_state):
+                raise RuntimeError(
+                    "personal information page did not confirm an authenticated Apple session"
+                )
+            profile_state["trusted"] = True
+            set_browser_startup_stage("profile_capture")
+            wait_for_profile_capture_ready(page)
+            emit({"event": "status", "status": "profile_page_ready"})
+            emit_browser_observation(
+                "profile_ready",
+                page,
+                profile_state,
+                account_home_confirmed=True,
+            )
+            screenshots["personalInformation"] = take_screenshot(
+                page,
+                success_screenshot_paths[1],
+                checkpoint="account_information",
+            )
+            if screenshots["personalInformation"] is not None:
+                generated_screenshot_paths.append(success_screenshot_paths[1])
+                emit({"event": "status", "status": "profile_screenshot_saved"})
+            set_browser_startup_stage("profile_birthday")
+            personal_info = collect_personal_info(page)
+            validate_personal_info_result(profile_state, personal_info)
+            post_login_profile_capture = {
+                "success": True,
+                "failureStage": "unknown",
+                "failureClass": "unknown",
+                "browserAlive": browser_connection_is_alive(page),
+                "browserPreserved": False,
+                "browserPreservationRequested": False,
+            }
             emit(
                 {
                     "event": "status",
-                    "status": "browser_session_preserved",
-                    "preserved": True,
+                    "status": "profile_capture_completed",
                 }
             )
+        except Exception as profile_error:
+            failure_stage = browser_startup_stage
+            failure_class = classify_profile_capture_failure(profile_error)
+            browser_alive = browser_connection_is_alive(page)
+            browser_preservation_requested = (
+                preserve_on_success or preserve_on_failure
+            )
+            post_login_profile_capture = {
+                "success": False,
+                "failureStage": failure_stage,
+                "failureClass": failure_class,
+                "browserAlive": browser_alive,
+                "browserPreserved": False,
+                "browserPreservationRequested": browser_preservation_requested,
+            }
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_capture_failed",
+                    "failureStage": failure_stage,
+                    "failureClass": failure_class,
+                    "browserAlive": browser_alive,
+                    "browserPreservationRequested": browser_preservation_requested,
+                }
+            )
+            emit_browser_observation(
+                "profile_capture_failed",
+                page,
+                profile_state,
+                account_home_confirmed=True,
+            )
+
+        preserve_after_flow = preserve_on_success or (
+            post_login_profile_capture["success"] is False and preserve_on_failure
+        )
+        post_login_profile_capture["browserPreservationRequested"] = (
+            preserve_after_flow
+        )
+        post_login_finalization = finalize_post_login_browser(
+            page,
+            preserve_requested=preserve_after_flow,
+            profile_capture_success=post_login_profile_capture["success"],
+        )
+        post_login_browser_finalized = True
+        post_login_profile_capture["browserPreserved"] = post_login_finalization[
+            "browserSessionPreserved"
+        ]
 
         emit(
             {
@@ -4331,20 +4694,17 @@ def browser_flow(args: argparse.Namespace) -> int:
                     "sessionReused": skipped_login or attached_existing_browser,
                     "rememberAccount": remember_checked,
                 },
-                "personalInfo": personal_info,
+                "postLoginProfileCapture": post_login_profile_capture,
+                "postLoginFinalization": post_login_finalization,
+                "personalInfo": personal_info
+                if post_login_profile_capture["success"] is True
+                else {},
                 "screenshots": screenshots,
             }
         )
         return 0
     except Exception:
-        if broker_mode and browser_startup_stage in BROWSER_STARTUP_STAGES:
-            emit(
-                {
-                    "event": "status",
-                    "status": "browser_failure",
-                    "failureStage": browser_startup_stage,
-                }
-            )
+        emit_browser_failure_once()
         raise
     finally:
         had_error = sys.exc_info()[0] is not None
@@ -4360,7 +4720,7 @@ def browser_flow(args: argparse.Namespace) -> int:
                     "preserved": True,
                 }
             )
-        elif not had_error and preserve_on_success and browser_connection_is_alive(page):
+        elif account_home_confirmed and post_login_browser_finalized:
             pass
         else:
             try:
@@ -4407,9 +4767,11 @@ def main(argv: list[str]) -> int:
 
 
 def run_cli(argv: list[str]) -> int:
+    begin_browser_flow_run()
     try:
         return main(argv)
     except Exception as error:
+        emit_browser_failure_once()
         emit(
             {
                 "event": "diagnostic",

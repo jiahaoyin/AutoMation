@@ -150,8 +150,12 @@ function snapshotProtocolContext(context) {
     accountHomeConfirmed: context.accountHomeConfirmed === true,
     browserPreserved: context.browserPreserved === true,
     browserSessionPreserved: context.browserSessionPreserved === true,
+    browserFinalizationCompleted: context.browserFinalizationCompleted === true,
+    browserPreservationRequested: context.browserPreservationRequested === true,
     directBrowserPreservationRequested:
       context.directBrowserPreservationRequested === true,
+    directPostLoginRecoveryEligible:
+      context.directPostLoginRecoveryEligible === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
     backendExitCode:
       Number.isInteger(context.backendExitCode) && context.backendExitCode >= 0
@@ -1177,7 +1181,11 @@ async function runRuyiPageBackend({
     accountHomeConfirmed: false,
     browserPreserved: false,
     browserSessionPreserved: false,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: false,
     directBrowserPreservationRequested: false,
+    directPostLoginRecoveryEligible:
+      !usesBrowserBroker && !usesProcessStateSupervisor && !usesOuterProcessSupervisor,
     browserErrorClass: "unknown",
     backendExitCode: null,
     cleanupFailed: false,
@@ -1212,6 +1220,18 @@ async function runRuyiPageBackend({
         protocolContext.accountHomeConfirmed = true;
       } else if (event.status === "browser_session_preserved") {
         if (event.preserved === true) protocolContext.browserSessionPreserved = true;
+      } else if (
+        event.status === "browser_finalization_started" ||
+        event.status === "browser_finalization_completed" ||
+        event.status === "browser_finalization_partial"
+      ) {
+        protocolContext.browserFinalizationCompleted =
+          event.browserFinalizationCompleted === true;
+        protocolContext.browserPreservationRequested =
+          event.browserPreservationRequested === true;
+        if (event.browserSessionPreserved === true) {
+          protocolContext.browserSessionPreserved = true;
+        }
       }
     } else if (event.event === "need_2fa") {
       if (event.generation === 1 || event.generation === 2) {
@@ -1814,6 +1834,12 @@ async function runRuyiPageBackend({
       if (shouldCleanUpProcessGroup) {
         if (!timedOut) stopper.stopIfProcessGroupAlive();
         await stopper.waitForCleanup();
+        // A verified process-group cleanup terminates the direct browser along
+        // with its Python driver. Do not let an earlier preservation event
+        // survive in the failure context and mislead post-login diagnostics.
+        protocolContext.browserPreserved = false;
+        protocolContext.browserSessionPreserved = false;
+        protocolContext.browserFinalizationCompleted = false;
       } else if (
         protocolContext.browserPreserved ||
         protocolContext.browserSessionPreserved ||
@@ -1889,6 +1915,30 @@ async function runRuyiPageBackend({
       protocolContext
     );
   }
-  if (cleanupError) throw annotateRunnerFailure(cleanupError, protocolContext);
+  if (cleanupError) {
+    const canReturnPostLoginFinalization =
+      finalResult.success === true &&
+      protocolContext.accountHomeConfirmed === true &&
+      protocolContext.browserSessionPreserved &&
+      !usesBrowserBroker &&
+      !usesProcessStateSupervisor &&
+      !usesOuterProcessSupervisor;
+    if (!canReturnPostLoginFinalization) {
+      throw annotateRunnerFailure(cleanupError, protocolContext);
+    }
+    const existingFinalization =
+      finalResult.postLoginFinalization &&
+      typeof finalResult.postLoginFinalization === "object"
+        ? finalResult.postLoginFinalization
+        : {};
+    finalResult = {
+      ...finalResult,
+      postLoginFinalization: {
+        ...existingFinalization,
+        backendCleanupCompleted: false,
+        finalizationClass: "backend_cleanup_failed",
+      },
+    };
+  }
   return finalResult;
 }

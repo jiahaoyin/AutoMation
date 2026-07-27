@@ -70,7 +70,16 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "browser_login_tab_created",
   "browser_profile_attach_required",
   "browser_session_preserved",
+  "browser_finalization_started",
+  "browser_finalization_completed",
+  "browser_finalization_partial",
+  "screenshot_capture",
+  "screenshot_failed",
   "account_home_confirmed",
+  "browser_observation",
+  "profile_capture_started",
+  "profile_capture_completed",
+  "profile_capture_failed",
   "profile_page_ready",
   "profile_screenshot_saved",
   "profile_birthday_collected",
@@ -111,6 +120,55 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   profile_name_collected: "[ruyipage] ✓ 已读取姓名",
   browser_session_preserved: "[ruyipage] ✓ 已保留 Firefox 窗口和账户标签页",
 });
+const RUYIPAGE_STAGE_TRANSITIONS = new Set(["entered"]);
+const RUYIPAGE_OBSERVATION_CHECKPOINTS = new Set([
+  "login_state",
+  "twofa_wait",
+  "account_home",
+  "account_information",
+  "profile_ready",
+  "profile_capture_failed",
+]);
+const RUYIPAGE_SCREENSHOT_CHECKPOINTS = new Set([
+  "account_home",
+  "account_information",
+]);
+const RUYIPAGE_PAGE_KINDS = new Set([
+  "sign_in",
+  "password",
+  "two_factor",
+  "account_manage",
+  "account_information",
+  "authentication_error",
+  "unknown",
+]);
+const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
+  "profile_authentication_error",
+  "profile_session_unconfirmed",
+  "profile_element_unavailable",
+  "profile_page_unready",
+  "profile_data_incomplete",
+  "browser_connection_lost",
+  "profile_capture_failed",
+  "profile_persistence_failed",
+  "profile_result_missing",
+  "runner_post_login_failed",
+  "unknown",
+]);
+const POST_LOGIN_FINALIZATION_CLASSES = new Set([
+  "completed",
+  "browser_connection_lost",
+  "browser_quit_failed",
+  "backend_cleanup_failed",
+  "runner_post_login_failed",
+  "collector_dispose_failed",
+  "unknown",
+]);
+const POST_LOGIN_RUNNER_PARTIAL_CODES = new Set([
+  "backend_exit",
+  "backend_timeout",
+  "backend_cleanup",
+]);
 const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "twofa_digit_input_verification_failed",
   "twofa_sequence_failed",
@@ -262,6 +320,46 @@ function sanitizeBrowserFailureStage(stage) {
   return RUYIPAGE_FAILURE_STAGES.has(stage) ? stage : "unknown";
 }
 
+function sanitizeStageTransition(value) {
+  return RUYIPAGE_STAGE_TRANSITIONS.has(value) ? value : "unknown";
+}
+
+function sanitizeBrowserObservationCheckpoint(value) {
+  return RUYIPAGE_OBSERVATION_CHECKPOINTS.has(value) ? value : "unknown";
+}
+
+function sanitizeScreenshotCheckpoint(value) {
+  return RUYIPAGE_SCREENSHOT_CHECKPOINTS.has(value) ? value : "unknown";
+}
+
+function sanitizeBrowserPageKind(value) {
+  return RUYIPAGE_PAGE_KINDS.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileCaptureFailureClass(value) {
+  return PROFILE_CAPTURE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizePostLoginFinalizationClass(value) {
+  return POST_LOGIN_FINALIZATION_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizeBrowserObservation(event) {
+  return {
+    checkpoint: sanitizeBrowserObservationCheckpoint(event?.checkpoint),
+    pageKind: sanitizeBrowserPageKind(event?.pageKind),
+    connectionAlive: event?.connectionAlive === true,
+    sessionConfirmed: event?.sessionConfirmed === true,
+    accountHomeConfirmed: event?.accountHomeConfirmed === true,
+    twofaVisible: event?.twofaVisible === true,
+    inputReady: event?.inputReady === true,
+    codeInputCount: event?.codeInputCount === 1 || event?.codeInputCount === 6
+      ? event.codeInputCount
+      : 0,
+    authenticationError: event?.authenticationError === true,
+  };
+}
+
 function annotateBrowserRunFailure(error, override = null, failureStage = "unknown") {
   const inheritedCode = error?.ruyiPageFailureCode;
   const inheritedStage = error?.ruyiPageFailureStage;
@@ -381,7 +479,10 @@ function readRunnerFailureContext(error) {
       accountHomeConfirmed: false,
       browserPreserved: false,
       browserSessionPreserved: false,
+      browserFinalizationCompleted: false,
+      browserPreservationRequested: false,
       directBrowserPreservationRequested: false,
+      directPostLoginRecoveryEligible: false,
       browserErrorClass: "unknown",
       backendExitCode: null,
       cleanupFailed: false,
@@ -400,8 +501,12 @@ function readRunnerFailureContext(error) {
     accountHomeConfirmed: context.accountHomeConfirmed === true,
     browserPreserved: context.browserPreserved === true,
     browserSessionPreserved: context.browserSessionPreserved === true,
+    browserFinalizationCompleted: context.browserFinalizationCompleted === true,
+    browserPreservationRequested: context.browserPreservationRequested === true,
     directBrowserPreservationRequested:
       context.directBrowserPreservationRequested === true,
+    directPostLoginRecoveryEligible:
+      context.directPostLoginRecoveryEligible === true,
     browserErrorClass: sanitizeBackendDiagnosticClass(context.browserErrorClass),
     backendExitCode: sanitizeBackendExitCode(context.backendExitCode),
     cleanupFailed: context.cleanupFailed === true,
@@ -530,13 +635,18 @@ function shouldPrintCapturedProfile() {
   return process.stdout.isTTY && process.env.APPLE_AUTOMATION_SUPERVISED_GUI !== "1";
 }
 
-function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile) {
+function normalizeCapturedProfile(personalInfo) {
   const name = normalizeCapturedProfileValue(personalInfo?.name, "profile name", 256);
   const birthday = normalizeCapturedProfileValue(
     personalInfo?.birthday,
     "profile birthday",
     128
   );
+  return { name, birthday };
+}
+
+function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile) {
+  const { name, birthday } = normalizeCapturedProfile(personalInfo);
   flowAudit?.addSecrets?.([name, birthday]);
   saveProfile({ name, birthday });
   if (printProfile === true) {
@@ -579,6 +689,136 @@ function sanitizeBrowserLoginMetadata(browserLogin) {
   };
 }
 
+function sanitizePostLoginProfileCapture(profileCapture) {
+  const isPresent = profileCapture && typeof profileCapture === "object";
+  const source = isPresent ? profileCapture : {};
+  const success = source.success === true;
+  return {
+    success,
+    failureStage: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeBrowserFailureStage(source.failureStage)
+        : "profile_capture",
+    failureClass: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeProfileCaptureFailureClass(source.failureClass)
+        : "profile_result_missing",
+    browserAlive: source.browserAlive === true,
+    browserPreserved: source.browserPreserved === true,
+    browserPreservationRequested: source.browserPreservationRequested === true,
+  };
+}
+
+function sanitizePostLoginFinalization(finalization) {
+  if (!finalization || typeof finalization !== "object") return null;
+  const source = finalization;
+  const backendCleanupCompleted = source.backendCleanupCompleted !== false;
+  const collectorDisposed = source.collectorDisposed !== false;
+  const browserFinalizationCompleted = source.browserFinalizationCompleted === true;
+  const browserPreservationRequested = source.browserPreservationRequested === true;
+  const browserSessionPreserved = source.browserSessionPreserved === true;
+  const finalizationClass = sanitizePostLoginFinalizationClass(source.finalizationClass);
+  const browserPreservationSatisfied =
+    !browserPreservationRequested || browserSessionPreserved;
+  return {
+    success:
+      backendCleanupCompleted &&
+      collectorDisposed &&
+      browserFinalizationCompleted &&
+      browserPreservationSatisfied,
+    backendCleanupCompleted,
+    collectorDisposed,
+    browserFinalizationCompleted,
+    browserPreservationRequested,
+    browserSessionPreserved,
+    finalizationClass,
+  };
+}
+
+function sanitizeBrowserFinalizationStatus(event) {
+  return {
+    browserFinalizationCompleted: event?.browserFinalizationCompleted === true,
+    browserPreservationRequested: event?.browserPreservationRequested === true,
+    browserSessionPreserved: event?.browserSessionPreserved === true,
+    finalizationClass: sanitizePostLoginFinalizationClass(event?.finalizationClass),
+  };
+}
+
+function safeRunnerFailureAuditDetails(failureCode, failureStage, runnerContext) {
+  return {
+    failureCode,
+    failureStage,
+    runnerStage: runnerContext.stage,
+    twoFaPhase: runnerContext.twoFaPhase,
+    twoFaGeneration: runnerContext.generation,
+    codeDeliveryAttempted: runnerContext.codeDeliveryAttempted,
+    codeDeliverySent: runnerContext.codeDeliverySent,
+    codeDeliveryAcknowledged: runnerContext.codeDeliveryAcknowledged,
+    codeDeliveryWriteStarted: runnerContext.codeDeliveryWriteStarted,
+    codeDeliveryWriteCompleted: runnerContext.codeDeliveryWriteCompleted,
+    browserLaunchObserved: runnerContext.browserLaunchObserved,
+    accountHomeConfirmed: runnerContext.accountHomeConfirmed,
+    browserPreserved: runnerContext.browserPreserved,
+    browserSessionPreserved: runnerContext.browserSessionPreserved,
+    browserFinalizationCompleted: runnerContext.browserFinalizationCompleted,
+    browserPreservationRequested: runnerContext.browserPreservationRequested,
+    directBrowserPreservationRequested:
+      runnerContext.directBrowserPreservationRequested,
+    directPostLoginRecoveryEligible:
+      runnerContext.directPostLoginRecoveryEligible,
+    browserErrorClass: runnerContext.browserErrorClass,
+    backendExitCode: runnerContext.backendExitCode,
+    cleanupFailed: runnerContext.cleanupFailed,
+  };
+}
+
+function canReturnPostLoginRunnerPartial(failureCode, runnerContext) {
+  return (
+    runnerContext.accountHomeConfirmed === true &&
+    runnerContext.directPostLoginRecoveryEligible === true &&
+    POST_LOGIN_RUNNER_PARTIAL_CODES.has(failureCode)
+  );
+}
+
+function createPostLoginRunnerPartialResult(failureCode, failureStage, runnerContext) {
+  // A generic failure-preservation event is not proof that the authenticated
+  // account session is still available. Only a session-preservation status
+  // may be reported as a retained post-login browser.
+  const browserPreserved = runnerContext.browserSessionPreserved;
+  const browserPreservationRequested =
+    runnerContext.browserPreservationRequested ||
+    runnerContext.directBrowserPreservationRequested;
+  return {
+    success: true,
+    browserLogin: {
+      success: true,
+      backend: "ruyipage",
+      accountHomeConfirmed: true,
+    },
+    postLoginProfileCapture: {
+      success: false,
+      failureStage,
+      failureClass: "runner_post_login_failed",
+      browserAlive: false,
+      browserPreserved,
+      browserPreservationRequested,
+    },
+    postLoginFinalization: {
+      backendCleanupCompleted:
+        runnerContext.cleanupFailed !== true && failureCode !== "backend_cleanup",
+      collectorDisposed: true,
+      browserFinalizationCompleted: runnerContext.browserFinalizationCompleted,
+      browserPreservationRequested,
+      browserSessionPreserved: runnerContext.browserSessionPreserved,
+      finalizationClass: "runner_post_login_failed",
+    },
+    personalInfo: {},
+    screenshots: {},
+  };
+}
+
 function sanitizeAccountBrowserBackendResult(result) {
   const source = result && typeof result === "object" ? result : {};
   const personalInfo = source.personalInfo && typeof source.personalInfo === "object"
@@ -587,6 +827,12 @@ function sanitizeAccountBrowserBackendResult(result) {
   return {
     success: source.success === true,
     browserLogin: sanitizeBrowserLoginMetadata(source.browserLogin),
+    postLoginProfileCapture: sanitizePostLoginProfileCapture(
+      source.postLoginProfileCapture
+    ),
+    postLoginFinalization: sanitizePostLoginFinalization(
+      source.postLoginFinalization
+    ),
     personalInfo: {
       name: personalInfo.name,
       birthday: personalInfo.birthday,
@@ -634,6 +880,8 @@ function auditRuyiPageEvent(flowAudit, event) {
     }
     if (event.status === "browser_stage") {
       details.stage = sanitizeBrowserFailureStage(event.stage);
+      details.previousStage = sanitizeBrowserFailureStage(event.previousStage);
+      details.transition = sanitizeStageTransition(event.transition);
     }
     if (event.status === "browser_preserved") {
       details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
@@ -641,6 +889,19 @@ function auditRuyiPageEvent(flowAudit, event) {
     }
     if (event.status === "browser_session_preserved") {
       details.preserved = event.preserved === true;
+      details.profileCaptureSuccess = event.profileCaptureSuccess === true;
+    }
+    if (event.status === "browser_finalization_started") {
+      details.browserPreservationRequested = event.browserPreservationRequested === true;
+    }
+    if (
+      event.status === "browser_finalization_completed" ||
+      event.status === "browser_finalization_partial"
+    ) {
+      Object.assign(details, sanitizeBrowserFinalizationStatus(event));
+    }
+    if (event.status === "screenshot_capture" || event.status === "screenshot_failed") {
+      details.checkpoint = sanitizeScreenshotCheckpoint(event.checkpoint);
     }
     if (event.status === "account_home_confirmed") {
       details.accountHomeConfirmed = true;
@@ -652,6 +913,16 @@ function auditRuyiPageEvent(flowAudit, event) {
         details.targetCount = event.targetCount;
       }
       if (typeof event.submitted === "boolean") details.submitted = event.submitted;
+    }
+    if (event.status === "browser_observation") {
+      Object.assign(details, sanitizeBrowserObservation(event));
+    }
+    if (event.status === "profile_capture_failed") {
+      details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
+      details.failureClass = sanitizeProfileCaptureFailureClass(event.failureClass);
+      details.browserAlive = event.browserAlive === true;
+      details.browserPreservationRequested =
+        event.browserPreservationRequested === true;
     }
     if (Number.isInteger(event.attempt)) details.attempt = event.attempt;
     writeFlowAudit(flowAudit, "ruyipage", "status", details);
@@ -692,6 +963,7 @@ function auditRuyiPageEvent(flowAudit, event) {
       failureStage: sanitizeBrowserFailureStage(event.failureStage),
       accountHomeConfirmed:
         event.browserLogin?.accountHomeConfirmed === true,
+      profileCaptureSuccess: event.postLoginProfileCapture?.success === true,
     });
     return;
   }
@@ -830,6 +1102,7 @@ export async function runAccountBrowserPhase(
   });
   let result;
   let runError = null;
+  let collectorDisposed = true;
   let lastFailureStage = "unknown";
   let reportedFailureStage = null;
   try {
@@ -873,6 +1146,58 @@ export async function runAccountBrowserPhase(
           console.log(`[ruyipage] status:${inputStatusLine}`);
         } else if (twoFactorHandoffLine) {
           console.log(`[ruyipage] status:${twoFactorHandoffLine}`);
+        } else if (event.event === "status" && event.status === "browser_stage") {
+          console.log(
+            `[ruyipage] stage:${sanitizeBrowserFailureStage(event.stage)}:from:${sanitizeBrowserFailureStage(
+              event.previousStage
+            )}:transition:${sanitizeStageTransition(event.transition)}`
+          );
+        } else if (event.event === "status" && event.status === "browser_observation") {
+          const observation = sanitizeBrowserObservation(event);
+          console.log(
+            `[ruyipage] observation:${observation.checkpoint}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}`
+          );
+        } else if (
+          event.event === "status" &&
+          (event.status === "screenshot_capture" || event.status === "screenshot_failed")
+        ) {
+          const output = `[ruyipage] status:${event.status}:checkpoint:${sanitizeScreenshotCheckpoint(
+            event.checkpoint
+          )}`;
+          if (event.status === "screenshot_failed") console.warn(output);
+          else console.log(output);
+        } else if (event.event === "status" && event.status === "profile_capture_started") {
+          console.log("[ruyipage] status:profile_capture_started");
+        } else if (event.event === "status" && event.status === "profile_capture_completed") {
+          console.log("[ruyipage] status:profile_capture_completed");
+        } else if (event.event === "status" && event.status === "profile_capture_failed") {
+          console.warn(
+            `[ruyipage] profile_capture_partial:stage:${sanitizeBrowserFailureStage(
+              event.failureStage
+            )}:class:${sanitizeProfileCaptureFailureClass(
+              event.failureClass
+            )}:alive:${event.browserAlive === true ? 1 : 0}:preserve_requested:${event.browserPreservationRequested === true ? 1 : 0}`
+          );
+        } else if (event.event === "status" && event.status === "browser_finalization_started") {
+          console.log(
+            `[ruyipage] status:browser_finalization_started:preserve_requested:${event.browserPreservationRequested === true ? 1 : 0}`
+          );
+        } else if (
+          event.event === "status" &&
+          (event.status === "browser_finalization_completed" ||
+            event.status === "browser_finalization_partial")
+        ) {
+          const finalization = sanitizeBrowserFinalizationStatus(event);
+          const output =
+            `[ruyipage] status:${event.status}:completed:${
+              finalization.browserFinalizationCompleted ? 1 : 0
+            }:preserve_requested:${
+              finalization.browserPreservationRequested ? 1 : 0
+            }:preserved:${finalization.browserSessionPreserved ? 1 : 0}:class:${
+              finalization.finalizationClass
+            }`;
+          if (event.status === "browser_finalization_partial") console.warn(output);
+          else console.log(output);
         } else if (
           event.event === "status" &&
           Object.hasOwn(RUYIPAGE_PROFILE_STATUS_MESSAGES, event.status)
@@ -945,39 +1270,51 @@ export async function runAccountBrowserPhase(
     const failureStage = sanitizeBrowserFailureStage(
       lastFailureStage === "unknown" ? runnerContext.stage : lastFailureStage
     );
-    writeFlowAuditError(flowAudit, "account_browser", "runner_failed", error, {
-      failureCode,
-      failureStage,
-      runnerStage: runnerContext.stage,
-      twoFaPhase: runnerContext.twoFaPhase,
-      twoFaGeneration: runnerContext.generation,
-      codeDeliveryAttempted: runnerContext.codeDeliveryAttempted,
-      codeDeliverySent: runnerContext.codeDeliverySent,
-      codeDeliveryAcknowledged: runnerContext.codeDeliveryAcknowledged,
-      codeDeliveryWriteStarted: runnerContext.codeDeliveryWriteStarted,
-      codeDeliveryWriteCompleted: runnerContext.codeDeliveryWriteCompleted,
-      browserLaunchObserved: runnerContext.browserLaunchObserved,
-      accountHomeConfirmed: runnerContext.accountHomeConfirmed,
-      browserPreserved: runnerContext.browserPreserved,
-      browserSessionPreserved: runnerContext.browserSessionPreserved,
-      directBrowserPreservationRequested:
-        runnerContext.directBrowserPreservationRequested,
-      browserErrorClass: runnerContext.browserErrorClass,
-      backendExitCode: runnerContext.backendExitCode,
-      cleanupFailed: runnerContext.cleanupFailed,
-    });
-    if (runnerContext.accountHomeConfirmed) markBrowserAccountHomeConfirmed(error);
-    throw annotateBrowserRunFailure(error, null, failureStage);
+    if (canReturnPostLoginRunnerPartial(failureCode, runnerContext)) {
+      result = sanitizeAccountBrowserBackendResult(
+        createPostLoginRunnerPartialResult(failureCode, failureStage, runnerContext)
+      );
+      runError = null;
+      writeFlowAudit(flowAudit, "account_browser", "runner_post_login_partial", {
+        ...safeRunnerFailureAuditDetails(failureCode, failureStage, runnerContext),
+        finalizationClass: "runner_post_login_failed",
+      });
+      console.warn(
+        `[ruyipage] runner_post_login_partial:stage:${failureStage}:code:${failureCode}:preserve_requested:${result.postLoginFinalization.browserPreservationRequested ? 1 : 0}:preserved:${result.postLoginFinalization.browserSessionPreserved ? 1 : 0}:browser_finalized:${result.postLoginFinalization.browserFinalizationCompleted ? 1 : 0}`
+      );
+    } else {
+      writeFlowAuditError(
+        flowAudit,
+        "account_browser",
+        "runner_failed",
+        error,
+        safeRunnerFailureAuditDetails(failureCode, failureStage, runnerContext)
+      );
+      if (runnerContext.accountHomeConfirmed) markBrowserAccountHomeConfirmed(error);
+      throw annotateBrowserRunFailure(error, null, failureStage);
+    }
   } finally {
     try {
       await collector.dispose();
       writeFlowAudit(flowAudit, "two_factor", "collector_disposed");
     } catch (error) {
+      collectorDisposed = false;
       writeFlowAuditError(flowAudit, "two_factor", "collector_dispose_failed", error);
-      if (!runError) {
+      const accountHomeConfirmed =
+        result?.browserLogin?.success === true &&
+        result.browserLogin.backend === "ruyipage" &&
+        result.browserLogin.accountHomeConfirmed === true;
+      if (!runError && !accountHomeConfirmed) {
         throw annotateBrowserRunFailure(error, "collector_cleanup", lastFailureStage);
       }
-      console.warn("[2FA] collector cleanup failed");
+      if (accountHomeConfirmed) {
+        writeFlowAudit(flowAudit, "two_factor", "collector_dispose_partial", {
+          accountHomeConfirmed: true,
+        });
+        console.warn("[2FA] collector cleanup partial after account-home confirmation");
+      } else {
+        console.warn("[2FA] collector cleanup failed");
+      }
     }
   }
 
@@ -996,21 +1333,97 @@ export async function runAccountBrowserPhase(
 
   writeFlowAudit(flowAudit, "account_browser", "account_home_confirmed");
 
+  let postLoginProfileCapture = sanitizePostLoginProfileCapture(
+    result.postLoginProfileCapture
+  );
+  let postLoginFinalization = sanitizePostLoginFinalization(
+    result.postLoginFinalization
+  );
+  if (!collectorDisposed) {
+    postLoginFinalization = {
+      ...(postLoginFinalization ?? {
+        backendCleanupCompleted: true,
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: false,
+        browserSessionPreserved: false,
+      }),
+      success: false,
+      collectorDisposed: false,
+      finalizationClass: "collector_dispose_failed",
+    };
+  }
+  if (postLoginFinalization?.success === false) {
+    writeFlowAudit(flowAudit, "account_browser", "post_login_finalization_partial", {
+      ...postLoginFinalization,
+    });
+    console.warn(
+      `[ruyipage] post_login_finalization_partial:backend_cleanup:${postLoginFinalization.backendCleanupCompleted ? 1 : 0}:collector_disposed:${postLoginFinalization.collectorDisposed ? 1 : 0}:browser_finalized:${postLoginFinalization.browserFinalizationCompleted ? 1 : 0}:preserve_requested:${postLoginFinalization.browserPreservationRequested ? 1 : 0}:preserved:${postLoginFinalization.browserSessionPreserved ? 1 : 0}:class:${postLoginFinalization.finalizationClass}`
+    );
+  }
+  const partialProfileResult = () => ({
+    browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
+    antiAutomation: { backend: "ruyipage", delegated: true },
+    postLoginProfileCapture,
+    postLoginFinalization,
+    personalInfo: {
+      collected: false,
+      nameStored: false,
+      birthdayStored: false,
+    },
+    screenshots: sanitizeScreenshotMetadata(result.screenshots),
+  });
+
+  if (!postLoginProfileCapture.success) {
+    writeFlowAudit(flowAudit, "account_browser", "profile_capture_partial", {
+      ...postLoginProfileCapture,
+    });
+    console.warn(
+      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
+    );
+    return partialProfileResult();
+  }
+
+  let capturedProfile;
+  try {
+    capturedProfile = normalizeCapturedProfile(result.personalInfo);
+  } catch (error) {
+    postLoginProfileCapture = {
+      ...postLoginProfileCapture,
+      success: false,
+      failureStage: "profile_capture",
+      failureClass: "profile_result_missing",
+    };
+    writeFlowAuditError(flowAudit, "account_browser", "profile_result_invalid", error, {
+      ...postLoginProfileCapture,
+    });
+    console.warn(
+      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
+    );
+    return partialProfileResult();
+  }
+
   let personalInfo;
   try {
     personalInfo = saveCapturedProfile(
-      result.personalInfo,
+      capturedProfile,
       flowAudit,
       saveProfile,
       shouldPrintProfile()
     );
   } catch (error) {
-    markBrowserAccountHomeConfirmed(error);
-    writeFlowAuditError(flowAudit, "account_browser", "profile_persistence_failed", error, {
+    postLoginProfileCapture = {
+      ...postLoginProfileCapture,
+      success: false,
       failureStage: "profile_capture",
-      failureCode: "profile_persistence",
+      failureClass: "profile_persistence_failed",
+    };
+    writeFlowAuditError(flowAudit, "account_browser", "profile_persistence_failed", error, {
+      ...postLoginProfileCapture,
     });
-    throw annotateBrowserRunFailure(error, "profile_persistence", "profile_capture");
+    console.warn(
+      `[ruyipage] profile_capture_partial:stage:${postLoginProfileCapture.failureStage}:class:${postLoginProfileCapture.failureClass}:alive:${postLoginProfileCapture.browserAlive ? 1 : 0}:preserved:${postLoginProfileCapture.browserPreserved ? 1 : 0}`
+    );
+    return partialProfileResult();
   }
   writeFlowAudit(flowAudit, "account_browser", "profile_persisted", {
     collected: true,
@@ -1021,6 +1434,8 @@ export async function runAccountBrowserPhase(
   return {
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
+    postLoginProfileCapture,
+    postLoginFinalization,
     personalInfo,
     screenshots: sanitizeScreenshotMetadata(result.screenshots),
   };

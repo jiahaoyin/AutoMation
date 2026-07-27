@@ -14,6 +14,8 @@ import {
   createFlowFailureEnvelope,
   createFlowReport,
   mergeMacSettingsSmsRuntimeEnv,
+  recordAccountHomeAcceptanceMarker,
+  summarizeAccountBrowserCompletion,
 } from "./apple-id-full-flow.mjs";
 import {
   loadEnvFile,
@@ -115,6 +117,20 @@ function successfulResult() {
       success: true,
       backend: "ruyipage",
       accountHomeConfirmed: true,
+    },
+    postLoginProfileCapture: {
+      success: true,
+      failureStage: "unknown",
+      failureClass: "unknown",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: false,
+    },
+    postLoginFinalization: {
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: false,
+      browserSessionPreserved: false,
+      finalizationClass: "completed",
     },
     personalInfo: { name: "Test Given Test Family", birthday: "2000-01-02" },
     screenshots: {},
@@ -236,6 +252,23 @@ async function runFlowAuditForwardingTest() {
       event: "status",
       status: "browser_stage",
       stage: "twofa_input",
+      previousStage: "twofa_code_wait",
+      transition: "entered",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "browser_observation",
+      checkpoint: "twofa_wait",
+      pageKind: "two_factor",
+      connectionAlive: true,
+      sessionConfirmed: false,
+      accountHomeConfirmed: false,
+      twofaVisible: true,
+      inputReady: true,
+      codeInputCount: 6,
+      authenticationError: false,
+      secret: SECRET_FIXTURE,
     });
     await options.onEvent?.({
       event: "need_2fa",
@@ -329,8 +362,30 @@ async function runFlowAuditForwardingTest() {
         entry.source === "ruyipage" &&
         entry.event === "status" &&
         entry.details.status === "browser_stage" &&
-        entry.details.stage === "twofa_input"
+        entry.details.stage === "twofa_input" &&
+        entry.details.previousStage === "twofa_code_wait" &&
+        entry.details.transition === "entered"
     )
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "browser_observation"
+    )?.details,
+    {
+      status: "browser_observation",
+      checkpoint: "twofa_wait",
+      pageKind: "two_factor",
+      connectionAlive: true,
+      sessionConfirmed: false,
+      accountHomeConfirmed: false,
+      twofaVisible: true,
+      inputReady: true,
+      codeInputCount: 6,
+      authenticationError: false,
+    }
   );
   assert.ok(
     entries.some(
@@ -493,7 +548,10 @@ async function runTwoFactorHandoffFailureContextTest() {
     accountHomeConfirmed: false,
     browserPreserved: true,
     browserSessionPreserved: false,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: false,
     directBrowserPreservationRequested: false,
+    directPostLoginRecoveryEligible: false,
     browserErrorClass: "twofa_target_missing",
     backendExitCode: 1,
     cleanupFailed: false,
@@ -992,6 +1050,86 @@ function runFlowFailureEnvelopeTest() {
   });
 }
 
+function runAccountBrowserCompletionSummaryTest() {
+  assert.deepEqual(summarizeAccountBrowserCompletion({ skipped: true }), {
+    accountHomeConfirmed: false,
+    profileCaptureState: "skipped",
+    postLoginFinalizationState: "skipped",
+    backendCleanupCompleted: null,
+    collectorDisposed: null,
+    browserFinalizationCompleted: null,
+    browserPreservationRequested: null,
+    browserSessionPreserved: null,
+    finalizationClass: null,
+  });
+  assert.deepEqual(
+    summarizeAccountBrowserCompletion({
+      browserLogin: { accountHomeConfirmed: true },
+      postLoginProfileCapture: { success: true },
+    }),
+    {
+      accountHomeConfirmed: true,
+      profileCaptureState: "succeeded",
+      postLoginFinalizationState: "unknown",
+      backendCleanupCompleted: null,
+      collectorDisposed: null,
+      browserFinalizationCompleted: null,
+      browserPreservationRequested: null,
+      browserSessionPreserved: null,
+      finalizationClass: null,
+    }
+  );
+  assert.deepEqual(
+    summarizeAccountBrowserCompletion({
+      browserLogin: { accountHomeConfirmed: true },
+      postLoginProfileCapture: { success: false },
+      postLoginFinalization: {
+        backendCleanupCompleted: false,
+        collectorDisposed: true,
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: true,
+        browserSessionPreserved: false,
+        finalizationClass: "backend_cleanup_failed",
+      },
+    }),
+    {
+      accountHomeConfirmed: true,
+      profileCaptureState: "partial",
+      postLoginFinalizationState: "partial",
+      backendCleanupCompleted: false,
+      collectorDisposed: true,
+      browserFinalizationCompleted: false,
+      browserPreservationRequested: true,
+      browserSessionPreserved: false,
+      finalizationClass: "backend_cleanup_failed",
+    }
+  );
+  assert.deepEqual(
+    summarizeAccountBrowserCompletion({
+      browserLogin: { accountHomeConfirmed: true },
+      postLoginProfileCapture: { success: true },
+      postLoginFinalization: {
+        backendCleanupCompleted: true,
+        collectorDisposed: true,
+        browserFinalizationCompleted: true,
+        browserPreservationRequested: false,
+        browserSessionPreserved: false,
+      },
+    }),
+    {
+      accountHomeConfirmed: true,
+      profileCaptureState: "succeeded",
+      postLoginFinalizationState: "completed",
+      backendCleanupCompleted: true,
+      collectorDisposed: true,
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: false,
+      browserSessionPreserved: false,
+      finalizationClass: "unknown",
+    }
+  );
+}
+
 async function runMissingAccountHomeConfirmationTest() {
   const harness = createRuntime(async () => ({
     success: true,
@@ -1106,6 +1244,21 @@ async function runBrowserResultMetadataAllowlistTest() {
       appleId: SECRET_FIXTURE,
       profileName: SECRET_FIXTURE,
     },
+    postLoginProfileCapture: {
+      success: true,
+      failureStage: SECRET_FIXTURE,
+      failureClass: SECRET_FIXTURE,
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: true,
+      rawProfile: SECRET_FIXTURE,
+    },
+    postLoginFinalization: {
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
+      rawFinalization: SECRET_FIXTURE,
+    },
     personalInfo: profile,
     screenshots: {
       afterLogin: "/private/run/02-ruyipage-after-login.png",
@@ -1130,11 +1283,29 @@ async function runBrowserResultMetadataAllowlistTest() {
     afterLogin: "02-ruyipage-after-login.png",
     personalInformation: "03-account-information.png",
   });
+  assert.deepEqual(result.postLoginProfileCapture, {
+    success: true,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: true,
+  });
+  assert.deepEqual(result.postLoginFinalization, {
+    success: true,
+    backendCleanupCompleted: true,
+    collectorDisposed: true,
+    browserFinalizationCompleted: true,
+    browserPreservationRequested: true,
+    browserSessionPreserved: true,
+    finalizationClass: "unknown",
+  });
   assert.equal(JSON.stringify(result).includes(SECRET_FIXTURE), false);
 }
 
 async function runPostHomeProfileFailureRetentionTest() {
   const entries = [];
+  const storedProfiles = [];
   const flowAudit = {
     addSecrets() {},
     write(source, event, details = {}) {
@@ -1148,56 +1319,250 @@ async function runPostHomeProfileFailureRetentionTest() {
     await options.onEvent({ event: "status", status: "account_home_confirmed" });
     await options.onEvent({
       event: "status",
-      status: "browser_preserved",
+      status: "profile_capture_failed",
       failureStage: "profile_name",
+      failureClass: "profile_data_incomplete",
+      browserAlive: true,
+      browserPreservationRequested: true,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "browser_session_preserved",
       preserved: true,
     });
-    const error = new Error("ruyipage backend failed");
-    Object.defineProperties(error, {
-      ruyiPageFailureCode: { value: "backend_failed" },
-      ruyiPageFailureStage: { value: "profile_name" },
-      ruyiPageFailureContext: {
-        value: {
-          stage: "profile_name",
-          twoFaPhase: "unknown",
-          generation: 0,
-          codeDeliveryAttempted: false,
-          codeDeliverySent: false,
-          codeDeliveryAcknowledged: false,
-          codeDeliveryWriteStarted: false,
-          codeDeliveryWriteCompleted: false,
-          browserLaunchObserved: true,
-          accountHomeConfirmed: true,
-          browserPreserved: true,
-          browserSessionPreserved: false,
-          directBrowserPreservationRequested: false,
-          browserErrorClass: "profile_capture_failed",
-          backendExitCode: 1,
-          cleanupFailed: false,
-        },
-      },
+    await options.onEvent({
+      event: "status",
+      status: "browser_finalization_completed",
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
     });
-    throw error;
+    return {
+      ...successfulResult(),
+      postLoginProfileCapture: {
+        success: false,
+        failureStage: "profile_name",
+        failureClass: "profile_data_incomplete",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: true,
+      },
+      personalInfo: {
+        name: SECRET_FIXTURE,
+        birthday: SECRET_FIXTURE,
+      },
+      postLoginFinalization: {
+        browserFinalizationCompleted: true,
+        browserPreservationRequested: true,
+        browserSessionPreserved: true,
+      },
+    };
+  }, {
+    saveAppleProfileToEnv(profile) {
+      storedProfiles.push(profile);
+    },
   });
 
-  await captureConsole("log", async () => {
-    await assert.rejects(
-      runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime),
-      (error) => {
-        assert.equal(readBrowserFailureCode(error), "backend_failed");
-        assert.equal(readBrowserFailureStage(error), "profile_name");
-        assert.equal(readBrowserAccountHomeConfirmed(error), true);
-        return true;
-      }
+  let result;
+  const warnings = await captureConsole("warn", async () => {
+    result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.deepEqual(result.personalInfo, {
+    collected: false,
+    nameStored: false,
+    birthdayStored: false,
+  });
+  assert.deepEqual(result.postLoginProfileCapture, {
+    success: false,
+    failureStage: "profile_name",
+    failureClass: "profile_data_incomplete",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: true,
+  });
+  assert.deepEqual(result.postLoginFinalization, {
+    success: true,
+    backendCleanupCompleted: true,
+    collectorDisposed: true,
+    browserFinalizationCompleted: true,
+    browserPreservationRequested: true,
+    browserSessionPreserved: true,
+    finalizationClass: "unknown",
+  });
+  assert.deepEqual(storedProfiles, []);
+  const partial = entries.find(
+    (entry) => entry.source === "account_browser" && entry.event === "profile_capture_partial"
+  );
+  assert.equal(partial?.details.failureStage, "profile_name");
+  assert.equal(partial?.details.failureClass, "profile_data_incomplete");
+  assert.equal(partial?.details.browserPreserved, true);
+  assert.ok(warnings.some((line) => line.includes("profile_capture_partial")));
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+}
+
+async function runProfilePersistenceFailureReturnsPartialTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async () => successfulResult(), {
+    saveAppleProfileToEnv() {
+      throw new Error(`profile persistence ${SECRET_FIXTURE}`);
+    },
+  });
+
+  let result;
+  const warnings = await captureConsole("warn", async () => {
+    result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.deepEqual(result.postLoginProfileCapture, {
+    success: false,
+    failureStage: "profile_capture",
+    failureClass: "profile_persistence_failed",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: false,
+  });
+  assert.deepEqual(result.personalInfo, {
+    collected: false,
+    nameStored: false,
+    birthdayStored: false,
+  });
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "profile_persistence_failed" &&
+        entry.details.failureClass === "profile_persistence_failed"
+    )
+  );
+  assert.ok(warnings.some((line) => line.includes("profile_capture_partial")));
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+}
+
+async function runMissingProfileResultReturnsPartialTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async () => ({
+    ...successfulResult(),
+    personalInfo: {},
+  }));
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.equal(result.postLoginProfileCapture.success, false);
+  assert.equal(result.postLoginProfileCapture.failureStage, "profile_capture");
+  assert.equal(result.postLoginProfileCapture.failureClass, "profile_result_missing");
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "profile_result_invalid" &&
+        entry.details.failureClass === "profile_result_missing"
+    )
+  );
+}
+
+async function runBrowserStageTerminalOutputTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "browser_stage",
+      stage: "account_information",
+      previousStage: "signed_in",
+      transition: "entered",
+    });
+    await options.onEvent({
+      event: "status",
+      status: "browser_observation",
+      checkpoint: "account_information",
+      pageKind: "account_information",
+      connectionAlive: true,
+      sessionConfirmed: true,
+      accountHomeConfirmed: true,
+      twofaVisible: false,
+      inputReady: false,
+      codeInputCount: 0,
+      authenticationError: false,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "screenshot_capture",
+      checkpoint: "account_home",
+      path: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "screenshot_failed",
+      checkpoint: "account_information",
+      error: SECRET_FIXTURE,
+    });
+    return successfulResult();
+  });
+
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", () =>
+      runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
     );
   });
-
-  const runnerFailure = entries.find(
-    (entry) => entry.source === "account_browser" && entry.event === "runner_failed"
+  assert.ok(
+    logs.includes(
+      "[ruyipage] stage:account_information:from:signed_in:transition:entered"
+    )
   );
-  assert.equal(runnerFailure?.details.accountHomeConfirmed, true);
-  assert.equal(runnerFailure?.details.browserPreserved, true);
-  assert.equal(runnerFailure?.details.browserSessionPreserved, false);
+  assert.ok(
+    logs.includes(
+      "[ruyipage] observation:account_information:page:account_information:session:1:home:1:alive:1:twofa:0:input:0:cells:0:auth_error:0"
+    )
+  );
+  assert.ok(logs.includes("[ruyipage] status:screenshot_capture:checkpoint:account_home"));
+  assert.ok(
+    warnings.includes("[ruyipage] status:screenshot_failed:checkpoint:account_information")
+  );
+  assert.deepEqual(
+    entries
+      .filter(
+        (entry) =>
+          entry.source === "ruyipage" &&
+          entry.event === "status" &&
+          entry.details.status.startsWith("screenshot_")
+      )
+      .map((entry) => entry.details),
+    [
+      { status: "screenshot_capture", checkpoint: "account_home" },
+      { status: "screenshot_failed", checkpoint: "account_information" },
+    ]
+  );
+  assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
 }
 
 async function runWarningSanitizationTest() {
@@ -1289,6 +1654,365 @@ async function runCleanupErrorSanitizationTest() {
   });
   assert.deepEqual(warnings, ["[2FA] collector cleanup failed"]);
   assert.equal(warnings.join(" ").includes(SECRET_FIXTURE), false);
+}
+
+async function runPostLoginCollectorCleanupPartialTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async () => successfulResult(), {
+    disposeError: new Error(`collector cleanup ${SECRET_FIXTURE}`),
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+    });
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.deepEqual(result.postLoginFinalization, {
+    success: false,
+    backendCleanupCompleted: true,
+    collectorDisposed: false,
+    browserFinalizationCompleted: true,
+    browserPreservationRequested: false,
+    browserSessionPreserved: false,
+    finalizationClass: "collector_dispose_failed",
+  });
+  assert.deepEqual(harness.calls, ["dispose"]);
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "two_factor" &&
+        entry.event === "collector_dispose_partial" &&
+        entry.details.accountHomeConfirmed === true
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "post_login_finalization_partial" &&
+        entry.details.backendCleanupCompleted === true &&
+        entry.details.collectorDisposed === false
+    )
+  );
+  assert.equal(logs.some((line) => line.includes("status:node-failure")), false);
+  assert.ok(
+    warnings.includes("[2FA] collector cleanup partial after account-home confirmation")
+  );
+  assert.ok(
+    warnings.some((line) => line.includes("post_login_finalization_partial"))
+  );
+  assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+}
+
+async function runMissingPostLoginFinalizationRemainsUnknownTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async () => {
+    const result = successfulResult();
+    delete result.postLoginFinalization;
+    return result;
+  });
+
+  let result;
+  const warnings = await captureConsole("warn", async () => {
+    result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.equal(result.postLoginFinalization, null);
+  assert.deepEqual(summarizeAccountBrowserCompletion(result), {
+    accountHomeConfirmed: true,
+    profileCaptureState: "succeeded",
+    postLoginFinalizationState: "unknown",
+    backendCleanupCompleted: null,
+    collectorDisposed: null,
+    browserFinalizationCompleted: null,
+    browserPreservationRequested: null,
+    browserSessionPreserved: null,
+    finalizationClass: null,
+  });
+  assert.equal(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" && entry.event === "post_login_finalization_partial"
+    ),
+    false
+  );
+  assert.equal(warnings.some((line) => line.includes("post_login_finalization_partial")), false);
+}
+
+async function runBrowserFinalizationPartialRetentionTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "browser_finalization_started",
+      browserPreservationRequested: true,
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "browser_finalization_partial",
+      browserFinalizationCompleted: false,
+      browserPreservationRequested: true,
+      browserSessionPreserved: false,
+      secret: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginFinalization: {
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: true,
+        browserSessionPreserved: false,
+        rawFinalization: SECRET_FIXTURE,
+      },
+    };
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+    });
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.deepEqual(result.postLoginFinalization, {
+    success: false,
+    backendCleanupCompleted: true,
+    collectorDisposed: true,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: true,
+    browserSessionPreserved: false,
+    finalizationClass: "unknown",
+  });
+  assert.ok(
+    logs.includes("[ruyipage] status:browser_finalization_started:preserve_requested:1")
+  );
+  assert.ok(
+    warnings.includes(
+      "[ruyipage] status:browser_finalization_partial:completed:0:preserve_requested:1:preserved:0:class:unknown"
+    )
+  );
+  assert.ok(warnings.some((line) => line.includes("post_login_finalization_partial")));
+  assert.deepEqual(
+    entries
+      .filter(
+        (entry) =>
+          entry.source === "ruyipage" &&
+          entry.event === "status" &&
+          entry.details.status.startsWith("browser_finalization_")
+      )
+      .map((entry) => entry.details),
+    [
+      {
+        status: "browser_finalization_started",
+        browserPreservationRequested: true,
+      },
+      {
+        status: "browser_finalization_partial",
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: true,
+        browserSessionPreserved: false,
+        finalizationClass: "unknown",
+      },
+    ]
+  );
+  assert.equal(JSON.stringify({ result, entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+}
+
+function createPostLoginRunnerError({
+  failureCode = "backend_exit",
+  accountHomeConfirmed = true,
+  browserPreserved = false,
+  browserSessionPreserved = true,
+  directPostLoginRecoveryEligible = true,
+} = {}) {
+  const error = new Error(SECRET_FIXTURE);
+  Object.defineProperties(error, {
+    ruyiPageFailureCode: { value: failureCode },
+    ruyiPageFailureStage: { value: "profile_capture" },
+    ruyiPageFailureContext: {
+      value: {
+        stage: "profile_capture",
+        twoFaPhase: "transition_confirmed",
+        generation: 1,
+        codeDeliveryAttempted: true,
+        codeDeliverySent: true,
+        codeDeliveryAcknowledged: true,
+        codeDeliveryWriteStarted: true,
+        codeDeliveryWriteCompleted: true,
+        browserLaunchObserved: true,
+        accountHomeConfirmed,
+        browserPreserved,
+        browserSessionPreserved,
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: browserSessionPreserved,
+        directBrowserPreservationRequested: false,
+        directPostLoginRecoveryEligible,
+        browserErrorClass: "unknown",
+        backendExitCode: 1,
+        cleanupFailed: false,
+      },
+    },
+  });
+  return error;
+}
+
+async function runPostLoginRunnerPartialTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const runnerError = createPostLoginRunnerError();
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({ event: "status", status: "account_home_confirmed" });
+    await options.onEvent({
+      event: "status",
+      status: "browser_session_preserved",
+      preserved: true,
+      profileCaptureSuccess: false,
+    });
+    throw runnerError;
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+    });
+  });
+
+  assert.deepEqual(result.browserLogin, {
+    success: true,
+    backend: "ruyipage",
+    accountHomeConfirmed: true,
+    skippedLogin: false,
+    skipped2FA: false,
+    sessionReused: false,
+    rememberAccount: null,
+  });
+  assert.deepEqual(result.personalInfo, {
+    collected: false,
+    nameStored: false,
+    birthdayStored: false,
+  });
+  assert.deepEqual(result.postLoginProfileCapture, {
+    success: false,
+    failureStage: "profile_capture",
+    failureClass: "runner_post_login_failed",
+    browserAlive: false,
+    browserPreserved: true,
+    browserPreservationRequested: true,
+  });
+  assert.deepEqual(result.postLoginFinalization, {
+    success: false,
+    backendCleanupCompleted: true,
+    collectorDisposed: true,
+    browserFinalizationCompleted: false,
+    browserPreservationRequested: true,
+    browserSessionPreserved: true,
+    finalizationClass: "runner_post_login_failed",
+  });
+  assert.deepEqual(harness.calls, ["dispose"]);
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "runner_post_login_partial" &&
+        entry.details.failureCode === "backend_exit" &&
+        entry.details.browserSessionPreserved === true
+    )
+  );
+  assert.equal(
+    entries.some((entry) => entry.source === "account_browser" && entry.event === "runner_failed"),
+    false
+  );
+  assert.ok(
+    warnings.includes(
+      "[ruyipage] runner_post_login_partial:stage:profile_capture:code:backend_exit:preserve_requested:1:preserved:1:browser_finalized:0"
+    )
+  );
+  assert.equal(logs.some((line) => line.includes("status:node-failure")), false);
+  assert.equal(JSON.stringify({ result, entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+}
+
+async function runPostLoginRunnerPartialBoundaryTest() {
+  for (const options of [
+    { browserSessionPreserved: false },
+    { browserPreserved: true, browserSessionPreserved: false },
+    { failureCode: "backend_timeout", browserSessionPreserved: false },
+  ]) {
+    const harness = createRuntime(async () => {
+      throw createPostLoginRunnerError(options);
+    });
+    const result = await runAccountBrowserPhase(params, harness.runtime);
+    assert.equal(result.browserLogin.accountHomeConfirmed, true);
+    assert.equal(result.postLoginProfileCapture.failureClass, "runner_post_login_failed");
+    assert.equal(
+      result.postLoginProfileCapture.browserPreserved,
+      options.browserSessionPreserved ?? true,
+      "post-login partial must not treat a generic failure-preservation signal as session evidence"
+    );
+    assert.equal(result.postLoginFinalization.finalizationClass, "runner_post_login_failed");
+    assert.equal(
+      result.postLoginFinalization.browserSessionPreserved,
+      options.browserSessionPreserved ?? true
+    );
+  }
+
+  for (const options of [
+    { accountHomeConfirmed: false },
+    { failureCode: "backend_interrupted" },
+    { directPostLoginRecoveryEligible: false },
+    { failureCode: "backend_protocol" },
+  ]) {
+    const harness = createRuntime(async () => {
+      throw createPostLoginRunnerError(options);
+    });
+    await assert.rejects(
+      runAccountBrowserPhase(params, harness.runtime),
+      (error) => readBrowserFailureCode(error) === (options.failureCode ?? "backend_exit")
+    );
+  }
 }
 
 function runAppleIdMaskingTest() {
@@ -1544,6 +2268,66 @@ function runAcceptanceMarkerTest() {
   }
 }
 
+function runAcceptanceMarkerFailureIsNonfatalTest() {
+  const entries = [];
+  const logs = [];
+  const warnings = [];
+  const flowAudit = {
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const result = recordAccountHomeAcceptanceMarker(true, {
+    writeMarker() {
+      throw new Error(SECRET_FIXTURE);
+    },
+    flowAudit,
+    logger: {
+      log(line) {
+        logs.push(line);
+      },
+      warn(line) {
+        warnings.push(line);
+      },
+    },
+  });
+
+  assert.equal(result, "partial");
+  assert.deepEqual(entries, [
+    {
+      source: "flow",
+      event: "acceptance_marker_partial",
+      details: { accountHomeConfirmed: true },
+    },
+  ]);
+  assert.deepEqual(logs, []);
+  assert.deepEqual(warnings, ["[apple-automation] status:acceptance_marker_partial:home:1"]);
+  assert.equal(
+    recordAccountHomeAcceptanceMarker(false, {
+      writeMarker() {
+        throw new Error("must not run");
+      },
+      flowAudit,
+      logger: {
+        log(line) {
+          logs.push(line);
+        },
+        warn(line) {
+          warnings.push(line);
+        },
+      },
+    }),
+    "skipped"
+  );
+  assert.deepEqual(entries.at(-1), {
+    source: "flow",
+    event: "acceptance_marker_skipped",
+    details: { accountHomeConfirmed: false },
+  });
+  assert.equal(logs.at(-1), "[apple-automation] status:acceptance_marker_skipped:home:0");
+  assert.equal(JSON.stringify({ entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+}
+
 function runTwoFASidecarSettingsScreenshotSourceContractTest() {
   const source = fs.readFileSync(
     new URL("./lib/two-fa-sidecar.js", import.meta.url),
@@ -1563,10 +2347,19 @@ const focusedTests = {
     runSupervisedCredentialConfirmationTest();
     runReportRootOverrideTest();
     runAcceptanceMarkerTest();
+    runAcceptanceMarkerFailureIsNonfatalTest();
   },
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
+  "profile-persistence-partial": runProfilePersistenceFailureReturnsPartialTest,
+  "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
   "post-home-profile-failure": runPostHomeProfileFailureRetentionTest,
+  "browser-stage-terminal": runBrowserStageTerminalOutputTest,
+  "collector-cleanup-partial": runPostLoginCollectorCleanupPartialTest,
+  "finalization-unknown": runMissingPostLoginFinalizationRemainsUnknownTest,
+  "browser-finalization-partial": runBrowserFinalizationPartialRetentionTest,
+  "runner-post-login-partial": runPostLoginRunnerPartialTest,
+  "runner-post-login-boundary": runPostLoginRunnerPartialBoundaryTest,
   "ready-mode": runReadyModeSanitizationTest,
   "sidecar-screenshot": runTwoFASidecarSettingsScreenshotSourceContractTest,
   "collector-timeout": runCollectorTimeoutIsAlways240SecondsTest,
@@ -1583,6 +2376,7 @@ const focusedTests = {
   "failure-stage": runFailureStageRetentionTest,
   "failure-envelope": () => {
     runFlowFailureEnvelopeTest();
+    runAccountBrowserCompletionSummaryTest();
     runFullFlowSourceContractTest();
   },
 };
@@ -1615,14 +2409,23 @@ await runTrustedSessionDisposalTest();
 await runProfilePersistenceAndAuditRedactionTest();
 await runBrowserResultMetadataAllowlistTest();
 await runPostHomeProfileFailureRetentionTest();
+await runProfilePersistenceFailureReturnsPartialTest();
+await runMissingProfileResultReturnsPartialTest();
+await runBrowserStageTerminalOutputTest();
 await runWarningSanitizationTest();
 await runEnvironmentWarningSanitizationTest();
 await runReadyModeSanitizationTest();
 await runCleanupErrorSanitizationTest();
+await runPostLoginCollectorCleanupPartialTest();
+await runMissingPostLoginFinalizationRemainsUnknownTest();
+await runBrowserFinalizationPartialRetentionTest();
+await runPostLoginRunnerPartialTest();
+await runPostLoginRunnerPartialBoundaryTest();
 await runFailureStageRetentionTest();
 runAppleIdMaskingTest();
 runBrowserFailureClassificationTest();
 runFlowFailureEnvelopeTest();
+runAccountBrowserCompletionSummaryTest();
 runEnvDataParsingTest();
 runSmsRuntimeEnvMergeTest();
 runFlowReportPrivacyTest();
@@ -1630,6 +2433,7 @@ runFullFlowSourceContractTest();
 runSupervisedCredentialConfirmationTest();
 runReportRootOverrideTest();
 runAcceptanceMarkerTest();
+runAcceptanceMarkerFailureIsNonfatalTest();
 runTwoFASidecarSettingsScreenshotSourceContractTest();
 
 console.log("account browser flow lifecycle: ok");
