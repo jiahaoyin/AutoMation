@@ -335,10 +335,14 @@ private func axFrame(_ element: AXUIElement) -> CGRect? {
     var sizeValue: CFTypeRef?
     guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
           AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
-          let position = positionValue as? AXValue,
-          let size = sizeValue as? AXValue else {
+          let positionValue,
+          let sizeValue,
+          CFGetTypeID(positionValue) == AXValueGetTypeID(),
+          CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
         return nil
     }
+    let position = positionValue as! AXValue
+    let size = sizeValue as! AXValue
     var point = CGPoint.zero
     var dimensions = CGSize.zero
     guard AXValueGetValue(position, .cgPoint, &point),

@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +18,16 @@ const PIP_TLS_OVERRIDE_ENV_NAMES = new Set([
   "REQUESTS_CA_BUNDLE",
   "SSL_CERT_FILE",
 ]);
+export const RUYIPAGE_COMMAND_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+const MACOS_SYSTEM_ROOT_CA_KEYCHAIN =
+  "/System/Library/Keychains/SystemRootCertificates.keychain";
+const MACOS_ADMIN_SYSTEM_KEYCHAIN = "/Library/Keychains/System.keychain";
+const MACOS_SYSTEM_CA_KEYCHAINS = Object.freeze([
+  MACOS_SYSTEM_ROOT_CA_KEYCHAIN,
+  MACOS_ADMIN_SYSTEM_KEYCHAIN,
+]);
+const PEM_CERTIFICATE_PATTERN =
+  /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
 
 /**
  * Build the pinned ruyiPage installation command.  Python.org's macOS
@@ -59,13 +71,195 @@ export function buildVerifiedPipEnvironment(env = process.env) {
   return verified;
 }
 
+export function isPipTLSCertificateFailure(value) {
+  return /CERTIFICATE_VERIFY_FAILED|SSL\s*certificate|confirming the ssl certificate|unable to get local issuer certificate/i.test(
+    String(value ?? "")
+  );
+}
+
 function run(cmd, args, options = {}) {
   return spawnSync(cmd, args, {
     encoding: "utf-8",
     stdio: "pipe",
     shell: false,
+    maxBuffer: RUYIPAGE_COMMAND_MAX_BUFFER_BYTES,
     ...options,
   });
+}
+
+function cleanupTemporaryFile(
+  filePath,
+  directory,
+  unlinkSync = fs.unlinkSync,
+  rmdirSync = fs.rmdirSync
+) {
+  let completed = true;
+  try {
+    unlinkSync(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") completed = false;
+  }
+  try {
+    rmdirSync(directory);
+  } catch (error) {
+    if (error?.code !== "ENOENT") completed = false;
+  }
+  return completed;
+}
+
+export function isMacOSTrustedSystemCACertificate(value, options = {}) {
+  const parseCertificate =
+    options.parseCertificate ?? ((certificate) => new X509Certificate(certificate));
+  const runCommand = options.runCommand ?? run;
+  const mkdtempSync = options.mkdtempSync ?? fs.mkdtempSync;
+  const writeFileSync = options.writeFileSync ?? fs.writeFileSync;
+  const unlinkSync = options.unlinkSync ?? fs.unlinkSync;
+  const rmdirSync = options.rmdirSync ?? fs.rmdirSync;
+  const tmpDir = options.tmpDir ?? os.tmpdir();
+  let certificate;
+  try {
+    certificate = parseCertificate(String(value ?? ""));
+  } catch {
+    return false;
+  }
+  if (
+    certificate?.ca !== true ||
+    certificate.subject !== certificate.issuer
+  ) {
+    return false;
+  }
+  const directory = mkdtempSync(
+    path.join(tmpDir, "apple-automation-ca-verify-")
+  );
+  const certificatePath = path.join(directory, "candidate-ca.pem");
+  try {
+    writeFileSync(certificatePath, `${String(value).trim()}\n`, {
+      encoding: "ascii",
+      flag: "wx",
+      mode: 0o600,
+    });
+    const result = runCommand(
+      "/usr/bin/security",
+      [
+        "verify-cert",
+        "-c",
+        certificatePath,
+        "-p",
+        "basic",
+        "-l",
+        "-L",
+      ],
+      { stdio: "pipe" }
+    );
+    return result.status === 0;
+  } finally {
+    cleanupTemporaryFile(
+      certificatePath,
+      directory,
+      unlinkSync,
+      rmdirSync
+    );
+  }
+}
+
+/**
+ * Export trusted macOS roots into a private temporary CA bundle. Apple's
+ * SystemRootCertificates keychain is authoritative. Additional certificates
+ * from the administrator-controlled System keychain must be self-signed CAs
+ * and pass macOS local trust evaluation before they can become pip anchors.
+ */
+export function createMacOSSystemCABundle(options = {}) {
+  const keychains = options.keychains ?? MACOS_SYSTEM_CA_KEYCHAINS;
+  const existsSync = options.existsSync ?? fs.existsSync;
+  const runCommand = options.runCommand ?? run;
+  const mkdtempSync = options.mkdtempSync ?? fs.mkdtempSync;
+  const writeFileSync = options.writeFileSync ?? fs.writeFileSync;
+  const unlinkSync = options.unlinkSync ?? fs.unlinkSync;
+  const rmdirSync = options.rmdirSync ?? fs.rmdirSync;
+  const tmpDir = options.tmpDir ?? os.tmpdir();
+  const isTrustedSystemCA =
+    options.isTrustedSystemCA ??
+    ((certificate) =>
+      isMacOSTrustedSystemCACertificate(certificate, {
+        runCommand,
+        mkdtempSync,
+        writeFileSync,
+        unlinkSync,
+        rmdirSync,
+        tmpDir,
+      }));
+  const certificates = new Set();
+  const exportFailures = [];
+
+  for (const keychain of keychains) {
+    if (!existsSync(keychain)) continue;
+    const result = runCommand(
+      "/usr/bin/security",
+      ["find-certificate", "-a", "-p", keychain],
+      { stdio: "pipe" }
+    );
+    if (result.status !== 0) {
+      exportFailures.push(
+        commandFailure(
+          "/usr/bin/security",
+          ["find-certificate", "-a", "-p", keychain],
+          result
+        )
+      );
+      continue;
+    }
+    for (const certificate of String(result.stdout ?? "").match(PEM_CERTIFICATE_PATTERN) ?? []) {
+      const normalized = certificate.trim();
+      if (
+        keychain !== MACOS_SYSTEM_ROOT_CA_KEYCHAIN &&
+        !isTrustedSystemCA(normalized)
+      ) {
+        continue;
+      }
+      certificates.add(normalized);
+    }
+  }
+
+  if (certificates.size === 0) {
+    if (exportFailures.length > 0) {
+      throw new Error(
+        `[ruyipage-install:macos_ca_export] Unable to export certificates from the macOS System keychains: ${exportFailures
+          .map((error) => error.message)
+          .join("; ")}`
+      );
+    }
+    throw new Error("macOS system keychains did not provide any CA certificates");
+  }
+
+  const directory = mkdtempSync(path.join(tmpDir, "apple-automation-ca-"));
+  const bundlePath = path.join(directory, "macos-system-ca.pem");
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return true;
+    const completed = cleanupTemporaryFile(
+      bundlePath,
+      directory,
+      unlinkSync,
+      rmdirSync
+    );
+    cleaned = completed;
+    return completed;
+  };
+  try {
+    writeFileSync(bundlePath, `${[...certificates].join("\n")}\n`, {
+      encoding: "ascii",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+
+  return {
+    path: bundlePath,
+    cleanup,
+  };
 }
 
 function defaultCommandWorks(cmd) {
@@ -185,6 +379,46 @@ function commandFailure(command, args, result) {
   return new Error(`${command} ${args.join(" ")} failed: ${detail}`);
 }
 
+function ruyiPagePipInstallFailure(command, args, result, systemCABundleUsed) {
+  const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
+  if (isPipTLSCertificateFailure(detail)) {
+    const trustSource = systemCABundleUsed
+      ? "the exported macOS System keychains"
+      : "Python's default trust configuration";
+    return new Error(
+      `[ruyipage-install:tls_certificate] PyPI HTTPS certificate verification failed with ${trustSource}. ` +
+        "Install the active network or enterprise proxy root certificate in the macOS System keychain, then rerun ./install.sh.\n" +
+        detail
+    );
+  }
+  return commandFailure(command, args, result);
+}
+
+function forwardCommandOutput(result, quiet) {
+  if (quiet) return;
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+}
+
+function cleanupMacOSSystemCABundle(bundle, quiet) {
+  if (!bundle) return;
+  try {
+    if (bundle.cleanup() === false && !quiet) {
+      process.stderr.write(
+        "[ruyipage-install:ca_cleanup] Temporary macOS CA bundle cleanup was incomplete.\n"
+      );
+    }
+  } catch (error) {
+    if (!quiet) {
+      process.stderr.write(
+        `[ruyipage-install:ca_cleanup] Temporary macOS CA bundle cleanup failed: ${
+          error?.message ?? error
+        }\n`
+      );
+    }
+  }
+}
+
 function pipTruststoreSupported(python, runCommand, env) {
   const result = runCommand(python, ["-m", "pip", "--version"], {
     stdio: "pipe",
@@ -205,7 +439,8 @@ function pipTruststoreSupported(python, runCommand, env) {
  *   resolveBasePython?: (env: NodeJS.ProcessEnv|Record<string,string|undefined>) => string|null,
  *   runCommand?: typeof run,
  *   mkdirSync?: typeof fs.mkdirSync,
- *   pipEnvironment?: NodeJS.ProcessEnv|Record<string,string|undefined>
+ *   pipEnvironment?: NodeJS.ProcessEnv|Record<string,string|undefined>,
+ *   createMacCABundle?: typeof createMacOSSystemCABundle
  * }} [options]
  */
 export function installRuyiPage(options = {}) {
@@ -215,6 +450,8 @@ export function installRuyiPage(options = {}) {
   const commandWorks = options.commandWorks ?? defaultCommandWorks;
   const runCommand = options.runCommand ?? run;
   const mkdirSync = options.mkdirSync ?? fs.mkdirSync;
+  const createMacCABundle =
+    options.createMacCABundle ?? createMacOSSystemCABundle;
   const resolveBasePython = options.resolveBasePython ?? ((candidateEnv) =>
     resolveBasePythonCommand(candidateEnv, { commandWorks })
   );
@@ -243,14 +480,41 @@ export function installRuyiPage(options = {}) {
   }
 
   const managedVenv = !requested;
-  const pipEnv = buildVerifiedPipEnvironment(options.pipEnvironment ?? process.env);
-  const truststoreSupported =
-    platform === "darwin" && managedVenv && pipTruststoreSupported(python, runCommand, pipEnv);
-  const args = buildRuyiPagePipInstallArgs({ platform, managedVenv, truststoreSupported });
-  const result = runCommand(python, args, {
-    stdio: options.quiet ? "pipe" : "inherit",
-    env: pipEnv,
-  });
-  if (result.status !== 0) throw commandFailure(python, args, result);
-  return { python };
+  let pipEnv = buildVerifiedPipEnvironment(options.pipEnvironment ?? process.env);
+  let macCABundle = null;
+  try {
+    if (platform === "darwin" && managedVenv) {
+      macCABundle = createMacCABundle();
+      pipEnv = {
+        ...pipEnv,
+        PIP_CERT: macCABundle.path,
+        SSL_CERT_FILE: macCABundle.path,
+      };
+    }
+    const truststoreSupported =
+      platform === "darwin" &&
+      managedVenv &&
+      pipTruststoreSupported(python, runCommand, pipEnv);
+    const args = buildRuyiPagePipInstallArgs({
+      platform,
+      managedVenv,
+      truststoreSupported,
+    });
+    const result = runCommand(python, args, {
+      stdio: "pipe",
+      env: pipEnv,
+    });
+    forwardCommandOutput(result, options.quiet === true);
+    if (result.status !== 0) {
+      throw ruyiPagePipInstallFailure(
+        python,
+        args,
+        result,
+        macCABundle !== null
+      );
+    }
+    return { python };
+  } finally {
+    cleanupMacOSSystemCABundle(macCABundle, options.quiet === true);
+  }
 }

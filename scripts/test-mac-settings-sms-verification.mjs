@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   completeSupervisedMacSettingsSmsVerification,
@@ -334,10 +338,37 @@ assert.doesNotMatch(source, /smsrecord|smsapi|lixsms|xsd20vip/i);
 assert.match(source, /manual-verification-prompt/);
 assert.doesNotMatch(source, /manual-2fa-prompt/);
 
-const swiftSource = fs.readFileSync(
-  new URL("./swift/mac-settings-sms-verification.swift", import.meta.url),
-  "utf8"
+const swiftSourceUrl = new URL(
+  "./swift/mac-settings-sms-verification.swift",
+  import.meta.url
 );
+const swiftSourcePath = fileURLToPath(swiftSourceUrl);
+const swiftSource = fs.readFileSync(swiftSourceUrl, "utf8");
+if (process.platform === "darwin") {
+  const typecheck = spawnSync(
+    "/usr/bin/xcrun",
+    [
+      "swiftc",
+      "-module-cache-path",
+      path.join(os.tmpdir(), "apple-automation-swift-module-cache"),
+      "-typecheck",
+      swiftSourcePath,
+      "-framework",
+      "ApplicationServices",
+      "-framework",
+      "AppKit",
+    ],
+    { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }
+  );
+  assert.equal(
+    typecheck.status,
+    0,
+    typecheck.stderr || typecheck.stdout || typecheck.error?.message
+  );
+}
+assert.match(swiftSource, /CFGetTypeID\(positionValue\) == AXValueGetTypeID\(\)/);
+assert.match(swiftSource, /CFGetTypeID\(sizeValue\) == AXValueGetTypeID\(\)/);
+assert.doesNotMatch(swiftSource, /as\?\s+AXValue/);
 assert.match(swiftSource, /case "sms-state"/);
 assert.match(swiftSource, /case "sms-select"/);
 assert.match(swiftSource, /case "sms-continue"/);

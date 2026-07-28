@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   completeMacSettingsPostSmsFinalization,
@@ -226,10 +230,43 @@ assert.deepEqual(
   { status: "manual_required" }
 );
 
-const helperSource = fs.readFileSync(
-  new URL("./swift/mac-settings-post-sms-finalization.swift", import.meta.url),
-  "utf8"
+const helperSourceUrl = new URL(
+  "./swift/mac-settings-post-sms-finalization.swift",
+  import.meta.url
 );
+const helperSourcePath = fileURLToPath(helperSourceUrl);
+const helperSource = fs.readFileSync(helperSourceUrl, "utf8");
+if (process.platform === "darwin") {
+  const typecheck = spawnSync(
+    "/usr/bin/xcrun",
+    [
+      "swiftc",
+      "-module-cache-path",
+      path.join(os.tmpdir(), "apple-automation-swift-module-cache"),
+      "-typecheck",
+      helperSourcePath,
+      "-framework",
+      "ApplicationServices",
+      "-framework",
+      "AppKit",
+      "-framework",
+      "Vision",
+      "-framework",
+      "CoreGraphics",
+      "-framework",
+      "ScreenCaptureKit",
+    ],
+    { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 }
+  );
+  assert.equal(
+    typecheck.status,
+    0,
+    typecheck.stderr || typecheck.stdout || typecheck.error?.message
+  );
+}
+assert.match(helperSource, /CFGetTypeID\(positionValue\) == AXValueGetTypeID\(\)/);
+assert.match(helperSource, /CFGetTypeID\(sizeValue\) == AXValueGetTypeID\(\)/);
+assert.doesNotMatch(helperSource, /as\?\s+AXValue/);
 assert.match(helperSource, /VNRecognizeTextRequest/);
 assert.match(helperSource, /VNDetectRectanglesRequest/);
 assert.match(helperSource, /request\.maximumAspectRatio = 1\.0/);
