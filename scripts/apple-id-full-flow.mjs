@@ -12,6 +12,8 @@
  *   node scripts/apple-id-full-flow.mjs --skip-browser # 仅 Mac 设置阶段
  */
 
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,7 +33,7 @@ import {
   writeReport,
 } from "./lib/report.js";
 import { ensureEnvironment } from "./lib/env-setup.js";
-import { createFlowAudit } from "./lib/flow-audit.js";
+import { createFlowAudit, normalizeFlowRunId } from "./lib/flow-audit.js";
 
 const skipMac = process.argv.includes("--skip-mac");
 const skipBrowser = process.argv.includes("--skip-browser");
@@ -53,6 +55,19 @@ const POST_LOGIN_FINALIZATION_PARTIAL_CLASSES = new Set([
   "runner_post_login_failed",
   "collector_dispose_failed",
 ]);
+const FLOW_PHASES = new Set([
+  "flow",
+  "environment_setup",
+  "credential_resolution",
+  "mac_settings",
+  "account_browser",
+  "report_write",
+  "acceptance_marker",
+]);
+const FLOW_PHASE_STATES = new Set(["entered", "completed", "failed", "skipped", "partial"]);
+const LAUNCHER_AUDIT_FILE = "launcher-audit.jsonl";
+const LAUNCHER_AUDIT_DIR_RE = /^\.launcher-audit\.[A-Za-z0-9]+$/;
+const MAX_LAUNCHER_AUDIT_BYTES = 256 * 1024;
 
 function failureToken(value) {
   return typeof value === "string" && FAILURE_TOKEN_RE.test(value) ? value : "unknown";
@@ -66,6 +81,74 @@ function finalizationClassRequiresPartial(value) {
   return POST_LOGIN_FINALIZATION_PARTIAL_CLASSES.has(value);
 }
 
+export function resolveFlowRunId(value = process.env.APPLE_AUTOMATION_RUN_ID) {
+  const normalized = normalizeFlowRunId(value);
+  return normalized === "standalone" ? `run-${randomUUID()}` : normalized;
+}
+
+export function archiveLauncherAudit(
+  reportDir,
+  runId,
+  sourceValue = process.env.APPLE_AUTOMATION_LAUNCHER_AUDIT_PATH
+) {
+  const sourceText = typeof sourceValue === "string" ? sourceValue.trim() : "";
+  if (!sourceText) return { state: "unavailable", file: null };
+
+  const resolvedReportDir = path.resolve(reportDir);
+  const reportRoot = path.dirname(resolvedReportDir);
+  const sourcePath = path.resolve(sourceText);
+  const sourceDir = path.dirname(sourcePath);
+  const targetPath = path.join(resolvedReportDir, LAUNCHER_AUDIT_FILE);
+  if (
+    path.basename(sourcePath) !== LAUNCHER_AUDIT_FILE ||
+    path.dirname(sourceDir) !== reportRoot ||
+    !LAUNCHER_AUDIT_DIR_RE.test(path.basename(sourceDir))
+  ) {
+    return { state: "invalid", file: null };
+  }
+
+  try {
+    const stat = fs.lstatSync(sourcePath);
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      stat.size <= 0 ||
+      stat.size > MAX_LAUNCHER_AUDIT_BYTES
+    ) {
+      return { state: "invalid", file: null };
+    }
+    const firstLine = fs.readFileSync(sourcePath, "utf8").split(/\r?\n/, 1)[0];
+    const firstEntry = JSON.parse(firstLine);
+    if (
+      firstEntry?.version !== 1 ||
+      firstEntry?.runId !== normalizeFlowRunId(runId) ||
+      firstEntry?.sequence !== 1 ||
+      firstEntry?.stage !== "launcher_entered"
+    ) {
+      return { state: "invalid", file: null };
+    }
+    fs.linkSync(sourcePath, targetPath);
+    fs.chmodSync(targetPath, 0o600);
+    return { state: "linked", file: LAUNCHER_AUDIT_FILE };
+  } catch {
+    return { state: "failed", file: null };
+  }
+}
+
+function recordFlowPhase(flowAudit, phase, state, details = {}) {
+  if (!FLOW_PHASES.has(phase) || !FLOW_PHASE_STATES.has(state)) return;
+  flowAudit?.write?.("flow", "phase", { phase, state, ...details });
+}
+
+function recordFlowPhaseError(flowAudit, phase, error, details = {}) {
+  if (!FLOW_PHASES.has(phase)) return;
+  flowAudit?.writeError?.("flow", "phase_failed", error, {
+    phase,
+    state: "failed",
+    ...details,
+  });
+}
+
 export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = new Date()) {
   return {
     failureStage: failureToken(failureStage),
@@ -75,8 +158,10 @@ export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = 
   };
 }
 
-export function createFlowReport(runAt = new Date()) {
+export function createFlowReport(runAt = new Date(), options = {}) {
   return {
+    version: 1,
+    runId: normalizeFlowRunId(options.runId),
     runAt: runAt.toISOString(),
     phases: {},
   };
@@ -215,6 +300,7 @@ export function mergeMacSettingsSmsRuntimeEnv(initialEnv = {}, persistedEnv = {}
 
 export async function main() {
   let smsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
+  const runId = resolveFlowRunId();
   const mirrorDiagnostics = shouldMirrorTerminalDiagnostics();
   if (mirrorDiagnostics) {
     console.log("[apple-automation] stage:flow_main_started");
@@ -224,14 +310,27 @@ export async function main() {
   console.log("═══════════════════════════════════════════\n");
 
   const reportDir = createReportDir("apple-id-flow");
+  const launcherAudit = archiveLauncherAudit(reportDir, runId);
   const flowAudit = createFlowAudit(reportDir, {
+    runId,
     onWriteFailure() {
       console.warn("[报告] 统一诊断日志写入失败");
     },
   });
   addSmsRuntimeSecrets(flowAudit, smsRuntimeEnv);
+  flowAudit.write("flow", "launcher_audit_archive", {
+    state: launcherAudit.state,
+    linked: launcherAudit.state === "linked",
+  });
+  if (
+    process.env.APPLE_AUTOMATION_LAUNCHER_AUDIT_PATH &&
+    launcherAudit.state !== "linked"
+  ) {
+    console.warn("[!] 启动日志未能归档到本次报告目录，原始日志仍保留");
+  }
   console.log(`[报告] 统一诊断日志: ${flowAudit.path}`);
-  const report = createFlowReport();
+  const report = createFlowReport(new Date(), { runId });
+  report.launcherAudit = launcherAudit;
   let reportFile = null;
   let creds = null;
   let failureStage = "unknown";
@@ -243,10 +342,15 @@ export async function main() {
       skipBrowser,
       skipSetup,
     });
+    recordFlowPhase(flowAudit, "flow", "entered", {
+      launcherAuditLinked: launcherAudit.state === "linked",
+      launcherAuditState: launcherAudit.state,
+    });
 
     if (!skipSetup) {
       failureStage = "environment_setup";
       failureCode = "environment_setup_failed";
+      recordFlowPhase(flowAudit, "environment_setup", "entered");
       try {
         await ensureEnvironment({
           quiet: false,
@@ -255,29 +359,42 @@ export async function main() {
           skipAutomation: skipMac,
         });
       } catch (error) {
+        recordFlowPhaseError(flowAudit, "environment_setup", error, {
+          failureStage,
+          failureCode,
+        });
         flowAudit.write("flow", "environment_setup_failed", {
           failureStage,
           failureCode,
         });
         throw error;
       }
+      recordFlowPhase(flowAudit, "environment_setup", "completed");
       console.log("");
+    } else {
+      recordFlowPhase(flowAudit, "environment_setup", "skipped");
     }
 
     failureStage = "credential_resolution";
     failureCode = "credential_resolution_failed";
+    recordFlowPhase(flowAudit, "credential_resolution", "entered");
     try {
       creds = await confirmOrPromptAppleCredentials();
       const persistedSmsRuntimeEnv = captureMacSettingsSmsRuntimeEnv();
       smsRuntimeEnv = mergeMacSettingsSmsRuntimeEnv(smsRuntimeEnv, persistedSmsRuntimeEnv);
       addSmsRuntimeSecrets(flowAudit, smsRuntimeEnv);
     } catch (error) {
+      recordFlowPhaseError(flowAudit, "credential_resolution", error, {
+        failureStage,
+        failureCode,
+      });
       flowAudit.write("flow", "credential_resolution_failed", {
         failureStage,
         failureCode,
       });
       throw error;
     }
+    recordFlowPhase(flowAudit, "credential_resolution", "completed");
     flowAudit.addSecrets([creds.appleId, creds.password]);
     if (mirrorDiagnostics) {
       console.log("[apple-automation] stage:credentials_ready");
@@ -285,11 +402,14 @@ export async function main() {
     if (!skipMac) {
       failureStage = "mac_settings";
       failureCode = "mac_settings_failed";
+      recordFlowPhase(flowAudit, "mac_settings", "entered");
       try {
         flowAudit.write("mac_settings", "started");
         report.phases.macSettings = await runMacSettingsLoginPhase(creds, { smsEnv: smsRuntimeEnv });
         flowAudit.write("mac_settings", "completed", { success: true });
+        recordFlowPhase(flowAudit, "mac_settings", "completed");
       } catch (e) {
+        recordFlowPhaseError(flowAudit, "mac_settings", e, { failureStage, failureCode });
         flowAudit.write("mac_settings", "failed", { failureStage, failureCode });
         report.phases.macSettings = {
           success: false,
@@ -303,17 +423,20 @@ export async function main() {
       console.log("[Mac 设置] --skip-mac：跳过系统设置登录阶段\n");
       report.phases.macSettings = { skipped: true };
       flowAudit.write("mac_settings", "skipped");
+      recordFlowPhase(flowAudit, "mac_settings", "skipped");
     }
 
     if (!skipBrowser) {
       failureStage = "unknown";
       failureCode = "account_browser_failed";
+      recordFlowPhase(flowAudit, "account_browser", "entered");
       try {
         flowAudit.write("account_browser", "started");
         report.phases.accountBrowser = await runAccountBrowserPhase({
           creds,
           reportDir,
           flowAudit,
+          runId,
         });
         const browserCompletion = summarizeAccountBrowserCompletion(
           report.phases.accountBrowser
@@ -322,6 +445,11 @@ export async function main() {
         flowAudit.write("account_browser", "completed", {
           success: true,
           ...browserCompletion,
+        });
+        recordFlowPhase(flowAudit, "account_browser", "completed", {
+          accountHomeConfirmed: browserCompletion.accountHomeConfirmed,
+          profileCaptureState: browserCompletion.profileCaptureState,
+          postLoginFinalizationState: browserCompletion.postLoginFinalizationState,
         });
         if (mirrorDiagnostics) {
           console.log(
@@ -359,6 +487,10 @@ export async function main() {
       } catch (e) {
         failureStage = readBrowserFailureStage(e);
         failureCode = readBrowserFailureCode(e);
+        recordFlowPhaseError(flowAudit, "account_browser", e, {
+          failureStage,
+          failureCode,
+        });
         flowAudit.write("account_browser", "failed", {
           failureStage,
           failureCode,
@@ -385,6 +517,7 @@ export async function main() {
       console.log("[Firefox] --skip-browser：跳过浏览器阶段\n");
       report.phases.accountBrowser = { skipped: true };
       flowAudit.write("account_browser", "skipped");
+      recordFlowPhase(flowAudit, "account_browser", "skipped");
       if (mirrorDiagnostics) {
         console.log("[apple-automation] status:account_browser_skipped");
       }
@@ -392,17 +525,30 @@ export async function main() {
 
     failureStage = "report_write";
     failureCode = "report_write_failed";
-    reportFile = writeReport(reportDir, report);
+    recordFlowPhase(flowAudit, "report_write", "entered");
+    try {
+      reportFile = writeReport(reportDir, report);
+    } catch (error) {
+      recordFlowPhaseError(flowAudit, "report_write", error, { failureStage, failureCode });
+      throw error;
+    }
     flowAudit.write("flow", "report_written", { file: "report.json" });
+    recordFlowPhase(flowAudit, "report_write", "completed");
+    recordFlowPhase(flowAudit, "acceptance_marker", "entered");
     const acceptanceMarkerState = recordAccountHomeAcceptanceMarker(
       report.phases.accountBrowser?.browserLogin?.accountHomeConfirmed === true,
       { flowAudit, mirrorDiagnostics }
     );
+    recordFlowPhase(flowAudit, "acceptance_marker", acceptanceMarkerState);
     const browserCompletion = summarizeAccountBrowserCompletion(report.phases.accountBrowser);
     flowAudit.write("flow", "completed", {
       success: true,
       ...browserCompletion,
       acceptanceMarkerState,
+    });
+    recordFlowPhase(flowAudit, "flow", "completed", {
+      profileCaptureState: browserCompletion.profileCaptureState,
+      postLoginFinalizationState: browserCompletion.postLoginFinalizationState,
     });
     if (mirrorDiagnostics) {
       console.log(
@@ -412,11 +558,19 @@ export async function main() {
   } catch (e) {
     report.error = "Apple ID flow failed";
     report.failure = createFlowFailureEnvelope(failureStage, failureCode);
+    recordFlowPhaseError(flowAudit, "flow", e, {
+      failureStage: report.failure.failureStage,
+      failureCode: report.failure.failureCode,
+    });
     reportFile = writeReport(reportDir, report);
     flowAudit.write("flow", "failed", {
       failureStage: report.failure.failureStage,
       failureCode: report.failure.failureCode,
       reportFile: "report.json",
+    });
+    recordFlowPhase(flowAudit, "flow", "failed", {
+      failureStage: report.failure.failureStage,
+      failureCode: report.failure.failureCode,
     });
     if (mirrorDiagnostics) {
       console.error(`[apple-automation] failure_stage:${report.failure.failureStage}`);
@@ -430,6 +584,13 @@ export async function main() {
     );
     console.error(`[报告] ${reportFile}`);
     console.error(`[日志] ${flowAudit.path}`);
+    if (launcherAudit.file) {
+      console.error(`[启动日志] ${path.join(reportDir, launcherAudit.file)}`);
+    }
+    const twoFactorAuditPath = path.join(reportDir, "2fa-audit.jsonl");
+    if (fs.existsSync(twoFactorAuditPath)) {
+      console.error(`[2FA 日志] ${twoFactorAuditPath}`);
+    }
     throw e;
   } finally {
     flowAudit.close();
@@ -439,6 +600,13 @@ export async function main() {
   console.log(" 完成");
   console.log(` 报告: ${reportFile}`);
   console.log(` 日志: ${flowAudit.path}`);
+  if (launcherAudit.file) {
+    console.log(` 启动日志: ${path.join(reportDir, launcherAudit.file)}`);
+  }
+  const twoFactorAuditPath = path.join(reportDir, "2fa-audit.jsonl");
+  if (fs.existsSync(twoFactorAuditPath)) {
+    console.log(` 2FA 日志: ${twoFactorAuditPath}`);
+  }
   console.log(` 截图: ${reportDir}/screenshots/`);
   console.log("═══════════════════════════════════════════\n");
 }

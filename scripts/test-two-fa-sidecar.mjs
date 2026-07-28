@@ -394,6 +394,7 @@ function createHarness(options = {}) {
   try {
     const collectorOptions = {
       reportDir,
+      runId: options.runId,
       timeoutMs: options.timeoutMs ?? 30_000,
       popupPostAllowGraceMs: options.popupPostAllowGraceMs,
       settingsFallback: options.settingsFallback,
@@ -481,8 +482,13 @@ async function readOnlyCwdDoesNotAffectHarnessReportsTest() {
       return originalAppendFileSync(targetPath, ...args);
     };
 
-    harnesses.push(createHarness({ settingsFallback: false, manualFallback: false }));
-    harnesses.push(createHarness({ settingsFallback: false, manualFallback: false }));
+    const auditRunId = "launcher-run-123";
+    harnesses.push(
+      createHarness({ settingsFallback: false, manualFallback: false, runId: auditRunId })
+    );
+    harnesses.push(
+      createHarness({ settingsFallback: false, manualFallback: false, runId: auditRunId })
+    );
     reportDirs = harnesses.map(({ reportDir }) => reportDir);
     await Promise.all(harnesses.map(({ collector }) => collector.prepare()));
 
@@ -499,6 +505,17 @@ async function readOnlyCwdDoesNotAffectHarnessReportsTest() {
       true,
       "each harness must successfully write its audit outside cwd"
     );
+    for (const reportDir of reportDirs) {
+      const entries = fs
+        .readFileSync(path.join(reportDir, "2fa-audit.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(entries.length > 0, true);
+      assert.equal(entries.every((entry) => entry.version === 1), true);
+      assert.equal(entries.every((entry) => entry.runId === auditRunId), true);
+      assert.deepEqual(entries.map((entry) => entry.sequence), entries.map((_, index) => index + 1));
+    }
   } finally {
     try {
       for (const { collector } of harnesses) await collector.dispose();

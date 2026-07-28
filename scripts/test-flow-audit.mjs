@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   createFlowAudit,
+  normalizeFlowRunId,
   redactFlowAuditText,
   serializeFlowAuditError,
 } from "./lib/flow-audit.js";
@@ -52,6 +53,7 @@ function runAuditRedactionTest() {
   try {
     const audit = createFlowAudit(tempDir, {
       secrets: [PASSWORD, EMAIL, LOWERCASE_SECRET],
+      runId: "launcher-run-123",
     });
     const circular = { label: "normal" };
     circular.self = circular;
@@ -111,6 +113,7 @@ function runAuditRedactionTest() {
       .map((line) => JSON.parse(line));
     assert.equal(lines.length, 2);
     assert.deepEqual(lines.map((line) => line.sequence), [1, 2]);
+    assert.deepEqual(lines.map((line) => line.runId), ["launcher-run-123", "launcher-run-123"]);
     assert.equal(lines[0].details.safeToken, "flow_started");
     assert.equal(lines[0].details.unsafeText, "unknown");
     assert.equal("diagnosticMessage" in lines[0].details, false);
@@ -185,8 +188,35 @@ function runSplitOtpAndRelativeQueryRedactionTest() {
   assert.equal(redacted.includes("code:123456"), false);
 }
 
+function runIdNormalizationTest() {
+  assert.equal(normalizeFlowRunId("Launcher-Run-123"), "launcher-run-123");
+  assert.equal(normalizeFlowRunId("invalid run id"), "standalone");
+  assert.equal(normalizeFlowRunId("x".repeat(97)), "standalone");
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-flow-audit-run-id-"));
+  const auditPath = path.join(tempDir, "flow-audit.jsonl");
+  try {
+    const audit = createFlowAudit(tempDir, { runId: "invalid run id" });
+    audit.write("flow", "started");
+    assert.equal(audit.close(), true);
+    const [entry] = fs
+      .readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      { version: entry.version, runId: entry.runId, sequence: entry.sequence },
+      { version: 1, runId: "standalone", sequence: 1 }
+    );
+  } finally {
+    if (fs.existsSync(auditPath)) fs.unlinkSync(auditPath);
+    fs.rmdirSync(tempDir);
+  }
+}
+
 runAuditRedactionTest();
 runRedactBeforeTruncateTest();
 runSplitOtpAndRelativeQueryRedactionTest();
+runIdNormalizationTest();
 
 console.log("flow audit: ok");

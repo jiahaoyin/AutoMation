@@ -86,6 +86,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "profile_screenshot_saved",
   "profile_birthday_collected",
   "profile_name_collected",
+  "profile_name_modal_query_failed",
   "profile_navigation_started",
   "profile_navigation_sidebar_link_resolved",
   "profile_navigation_sidebar_click_sent",
@@ -119,6 +120,21 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
   "twofa_code_delivery_started",
   "twofa_code_delivery_sent",
   "twofa_code_delivery_acknowledged",
+]);
+const RUYIPAGE_RUNNER_LIFECYCLE_STATUSES = new Set([
+  "backend_spawned",
+  "backend_result_received",
+  "backend_exit_observed",
+  "backend_close_observed",
+  "completion_close",
+  "completion_timeout",
+  "completion_termination",
+  "completion_preserved",
+  "cleanup_group_requested",
+  "cleanup_backend_requested",
+  "cleanup_not_required",
+  "cleanup_completed",
+  "cleanup_failed",
 ]);
 const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   browser_session_attached: "[✓] 已接管现有 Apple 账户标签页",
@@ -190,6 +206,7 @@ const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
   "profile_card_ambiguous",
   "profile_card_identity_collision",
   "profile_data_incomplete",
+  "profile_name_modal_query_failed",
   "browser_connection_lost",
   "profile_capture_failed",
   "profile_persistence_failed",
@@ -291,6 +308,9 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "profile_capture",
   "profile_birthday",
   "profile_name",
+  "post_login_finalization",
+  "result_emitting",
+  "result_emitted",
 ]);
 const BROWSER_RUN_FAILURE_CODES = new Set([
   "account_home_unconfirmed",
@@ -552,6 +572,22 @@ function sanitizeRunnerStatusCode(value) {
   return RUYIPAGE_RUNNER_STATUS_CODES.has(value) ? value : "unknown";
 }
 
+function sanitizeRunnerLifecycle(event) {
+  return {
+    status: RUYIPAGE_RUNNER_LIFECYCLE_STATUSES.has(event?.status)
+      ? event.status
+      : "unknown",
+    backendExitCode: sanitizeBackendExitCode(event?.backendExitCode),
+    resultSuccess: event?.resultSuccess === true,
+    usesBrowserBroker: event?.usesBrowserBroker === true,
+    strictProcessCleanup: event?.strictProcessCleanup === true,
+    processGroupCleanup: event?.processGroupCleanup === true,
+    directBackendCleanup: event?.directBackendCleanup === true,
+    timedOut: event?.timedOut === true,
+    interrupted: event?.interrupted === true,
+  };
+}
+
 function sanitizeTwoFactorGeneration(value) {
   return value === 1 || value === 2 ? value : 0;
 }
@@ -713,6 +749,19 @@ function twoFactorHandoffStatusLine(event) {
   return `twofa:${sanitizeTwoFactorProgressPhase(event.phase)}:generation:${sanitizeTwoFactorGeneration(
     event.generation
   )}`;
+}
+
+function runnerLifecycleStatusLine(event) {
+  if (event?.event !== "runner_lifecycle") return null;
+  const lifecycle = sanitizeRunnerLifecycle(event);
+  if (lifecycle.status === "unknown") return null;
+  return `runner:${lifecycle.status}:exit:${
+    lifecycle.backendExitCode ?? "unknown"
+  }:group_cleanup:${lifecycle.processGroupCleanup ? 1 : 0}:backend_cleanup:${
+    lifecycle.directBackendCleanup ? 1 : 0
+  }:timeout:${lifecycle.timedOut ? 1 : 0}:interrupted:${
+    lifecycle.interrupted ? 1 : 0
+  }`;
 }
 
 function writeFlowAudit(flowAudit, source, event, details = {}) {
@@ -978,6 +1027,10 @@ function auditRuyiPageEvent(flowAudit, event) {
     });
     return;
   }
+  if (event.event === "runner_lifecycle") {
+    writeFlowAudit(flowAudit, "ruyipage_runner", "lifecycle", sanitizeRunnerLifecycle(event));
+    return;
+  }
   if (event.event === "status") {
     const passwordBidiInputProgress = passwordBidiInputProgressToken(event);
     const isInputProgress = event.status === "input_progress";
@@ -1171,7 +1224,7 @@ function reportTwoFactorStatus(event) {
  * @param {object} [runtime]
  */
 export async function runAccountBrowserPhase(
-  { creds, reportDir, flowAudit = null },
+  { creds, reportDir, flowAudit = null, runId = "standalone" },
   runtime = {}
 ) {
   const getEnvironmentSummary =
@@ -1214,6 +1267,7 @@ export async function runAccountBrowserPhase(
   const collector = createCollector({
     timeoutMs: TWO_FACTOR_TIMEOUT_MS,
     reportDir,
+    runId,
     // Keep the popup-first policy explicit. The collector resolves optional
     // fallback switches from the environment so documented opt-outs work.
     settingsOnly: false,
@@ -1272,6 +1326,7 @@ export async function runAccountBrowserPhase(
           passwordBidiInputProgress
         );
         const twoFactorHandoffLine = twoFactorHandoffStatusLine(event);
+        const runnerLifecycleLine = runnerLifecycleStatusLine(event);
         if (
           eventFailureStage !== "unknown" &&
           ((event.event === "status" &&
@@ -1304,6 +1359,8 @@ export async function runAccountBrowserPhase(
           if (Object.hasOwn(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES, phase)) {
             console.log(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES[phase]);
           }
+        } else if (runnerLifecycleLine) {
+          if (showTerminalDebug) console.log(`[ruyipage] status:${runnerLifecycleLine}`);
         } else if (event.event === "status" && event.status === "browser_stage") {
           const stage = sanitizeBrowserFailureStage(event.stage);
           if (showTerminalDebug) {

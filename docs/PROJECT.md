@@ -219,3 +219,9 @@ Settings 两次串行回退与取消/迟到清理，以及 Settings 结束后、
 另以 `./run.sh` 验证 Mac 设置登录阶段的 Automation 权限。检查终端、
 `report.json`、`2fa-audit.jsonl` 和报告目录，确认无 OTP、raw AX/OCR/stderr、
 完整 Apple ID、认证全页截图或 OCR 图片残留。
+
+每次 `./run.sh` 会生成一个非敏感 `runId`，并贯通 `report.json`、
+`flow-audit.jsonl`、`2fa-audit.jsonl` 和 `launcher-audit.jsonl`。launcher
+日志在 Node 主流程创建报告目录后以 hard link 归档，保证后续
+`apple_flow_completed` 或 `failure` 仍写入同一份报告内日志。各 JSONL
+独立使用从 1 开始的 `sequence`，用于判断单个日志是否缺行。

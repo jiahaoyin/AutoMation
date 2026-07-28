@@ -12,6 +12,7 @@ import {
   shouldMirrorTerminalDiagnostics,
 } from "./lib/account-browser-flow.js";
 import {
+  archiveLauncherAudit,
   createFlowFailureEnvelope,
   createFlowReport,
   mergeMacSettingsSmsRuntimeEnv,
@@ -297,6 +298,11 @@ async function runFlowAuditForwardingTest() {
       secret: SECRET_FIXTURE,
     });
     await options.onEvent?.({
+      event: "status",
+      status: "profile_name_modal_query_failed",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
       event: "need_2fa",
       generation: 1,
       state: {
@@ -312,6 +318,20 @@ async function runFlowAuditForwardingTest() {
       event: "runner_status",
       status: "twofa_code_delivery_sent",
       generation: 1,
+    });
+    await options.onEvent?.({
+      event: "runner_lifecycle",
+      status: "cleanup_completed",
+      backendExitCode: 0,
+      resultSuccess: true,
+      usesBrowserBroker: false,
+      strictProcessCleanup: true,
+      processGroupCleanup: false,
+      directBackendCleanup: true,
+      timedOut: false,
+      interrupted: false,
+      secret: SECRET_FIXTURE,
+      reportDir: SECRET_FIXTURE,
     });
     await options.onEvent?.({
       event: "status",
@@ -333,9 +353,13 @@ async function runFlowAuditForwardingTest() {
     return successfulResult();
   });
 
-  await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  await runAccountBrowserPhase(
+    { ...params, flowAudit, runId: "launcher-run-123" },
+    harness.runtime
+  );
 
   assert.deepEqual(secrets, ["123456", "Test Given Test Family", "2000-01-02"]);
+  assert.equal(harness.collectorOptions?.runId, "launcher-run-123");
   assert.ok(
     entries.some(
       (entry) =>
@@ -346,6 +370,22 @@ async function runFlowAuditForwardingTest() {
         entry.details.step === "owner_fallback_started" &&
         entry.details.route === "owner"
     )
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) => entry.source === "ruyipage_runner" && entry.event === "lifecycle"
+    )?.details,
+    {
+      status: "cleanup_completed",
+      backendExitCode: 0,
+      resultSuccess: true,
+      usesBrowserBroker: false,
+      strictProcessCleanup: true,
+      processGroupCleanup: false,
+      directBackendCleanup: true,
+      timedOut: false,
+      interrupted: false,
+    }
   );
   assert.deepEqual(
     entries.find(
@@ -380,6 +420,15 @@ async function runFlowAuditForwardingTest() {
       snapshotOutcome: "ready",
       stableObservations: 2,
     }
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_name_modal_query_failed"
+    )?.details,
+    { status: "profile_name_modal_query_failed" }
   );
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
   assert.equal(JSON.stringify(entries).includes("Test Given Test Family"), false);
@@ -1876,6 +1925,19 @@ async function runBrowserStageTerminalOutputTest() {
       checkpoint: "account_information",
       error: SECRET_FIXTURE,
     });
+    await options.onEvent({
+      event: "runner_lifecycle",
+      status: "cleanup_completed",
+      backendExitCode: 0,
+      resultSuccess: true,
+      usesBrowserBroker: false,
+      strictProcessCleanup: true,
+      processGroupCleanup: false,
+      directBackendCleanup: true,
+      timedOut: false,
+      interrupted: false,
+      path: SECRET_FIXTURE,
+    });
     return successfulResult();
   };
   const harness = createRuntime(runBackend);
@@ -1924,6 +1986,11 @@ async function runBrowserStageTerminalOutputTest() {
       "[ruyipage] status:screenshot_failed:checkpoint:account_information"
     )
   );
+  assert.ok(
+    debugLogs.includes(
+      "[ruyipage] status:runner:cleanup_completed:exit:0:group_cleanup:0:backend_cleanup:1:timeout:0:interrupted:0"
+    )
+  );
   assert.deepEqual(debugWarnings, [
     "[!] 个人信息页面截图保存失败，详情已写入日志",
   ]);
@@ -1940,6 +2007,22 @@ async function runBrowserStageTerminalOutputTest() {
       { status: "screenshot_capture", checkpoint: "account_information" },
       { status: "screenshot_failed", checkpoint: "account_information" },
     ]
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) => entry.source === "ruyipage_runner" && entry.event === "lifecycle"
+    )?.details,
+    {
+      status: "cleanup_completed",
+      backendExitCode: 0,
+      resultSuccess: true,
+      usesBrowserBroker: false,
+      strictProcessCleanup: true,
+      processGroupCleanup: false,
+      directBackendCleanup: true,
+      timedOut: false,
+      interrupted: false,
+    }
   );
   assert.equal(
     JSON.stringify({ entries, logs, warnings, debugLogs, debugWarnings }).includes(
@@ -2617,16 +2700,93 @@ function runFlowReportPrivacyTest() {
   const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-flow-report-"));
   const reportFile = path.join(reportDir, "report.json");
   try {
-    const report = createFlowReport(new Date("2030-01-02T03:04:05.678Z"));
+    const report = createFlowReport(new Date("2030-01-02T03:04:05.678Z"), {
+      runId: "launcher-run-123",
+    });
     writeReport(reportDir, report);
     const saved = fs.readFileSync(reportFile, "utf8");
     assert.deepEqual(JSON.parse(saved), report);
     assert.equal(Object.hasOwn(report, "appleId"), false);
     assert.equal(saved.includes(params.creds.appleId), false);
     assert.equal(saved.includes(maskAppleId(params.creds.appleId)), false);
+    assert.deepEqual(
+      { version: report.version, runId: report.runId },
+      { version: 1, runId: "launcher-run-123" }
+    );
+    assert.equal(createFlowReport(new Date(), { runId: "invalid run id" }).runId, "standalone");
   } finally {
     if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
     fs.rmdirSync(reportDir);
+  }
+}
+
+function runLauncherAuditArchiveTest() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "apple-launcher-audit-"));
+  const reportDir = path.join(root, "apple-id-flow-test");
+  const mismatchReportDir = path.join(root, "apple-id-flow-mismatch");
+  const launcherDir = path.join(root, ".launcher-audit.Ab12Cd");
+  const launcherPath = path.join(launcherDir, "launcher-audit.jsonl");
+  const archivedPath = path.join(reportDir, "launcher-audit.jsonl");
+  const runId = "launcher-run-123";
+  fs.mkdirSync(reportDir);
+  fs.mkdirSync(mismatchReportDir);
+  fs.mkdirSync(launcherDir);
+  fs.writeFileSync(
+    launcherPath,
+    `${JSON.stringify({
+      version: 1,
+      runId,
+      sequence: 1,
+      timestamp: "2030-01-02T03:04:05Z",
+      stage: "launcher_entered",
+      exitCode: 0,
+    })}\n`,
+    "utf8"
+  );
+
+  try {
+    assert.deepEqual(archiveLauncherAudit(reportDir, runId, launcherPath), {
+      state: "linked",
+      file: "launcher-audit.jsonl",
+    });
+    fs.appendFileSync(
+      launcherPath,
+      `${JSON.stringify({
+        version: 1,
+        runId,
+        sequence: 2,
+        timestamp: "2030-01-02T03:04:06Z",
+        stage: "apple_flow_completed",
+        exitCode: 0,
+      })}\n`,
+      "utf8"
+    );
+    const archivedEntries = fs
+      .readFileSync(archivedPath, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      archivedEntries.map((entry) => entry.stage),
+      ["launcher_entered", "apple_flow_completed"],
+      "the archived hard link must retain launcher stages appended after the Node flow exits"
+    );
+    assert.deepEqual(
+      archiveLauncherAudit(mismatchReportDir, "different-run", launcherPath),
+      { state: "invalid", file: null }
+    );
+    assert.deepEqual(archiveLauncherAudit(mismatchReportDir, runId, ""), {
+      state: "unavailable",
+      file: null,
+    });
+    assert.equal(fs.existsSync(path.join(mismatchReportDir, "launcher-audit.jsonl")), false);
+  } finally {
+    if (fs.existsSync(archivedPath)) fs.unlinkSync(archivedPath);
+    if (fs.existsSync(launcherPath)) fs.unlinkSync(launcherPath);
+    fs.rmdirSync(launcherDir);
+    fs.rmdirSync(mismatchReportDir);
+    fs.rmdirSync(reportDir);
+    fs.rmdirSync(root);
   }
 }
 
@@ -3055,6 +3215,7 @@ const focusedTests = {
     runAccountBrowserCompletionSummaryTest();
     runFullFlowSourceContractTest();
   },
+  "launcher-audit-archive": runLauncherAuditArchiveTest,
 };
 
 const focusedTest = process.env.ACCOUNT_BROWSER_FLOW_FOCUSED_TEST;
@@ -3109,6 +3270,7 @@ runAccountBrowserCompletionSummaryTest();
 runEnvDataParsingTest();
 runSmsRuntimeEnvMergeTest();
 runFlowReportPrivacyTest();
+runLauncherAuditArchiveTest();
 runFullFlowSourceContractTest();
 runAccountManageSecurityCardDetectorTest();
 runSupervisedCredentialConfirmationTest();

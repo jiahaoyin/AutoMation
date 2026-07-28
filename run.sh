@@ -56,13 +56,19 @@ if ! { : > "$launcher_audit_path" && /bin/chmod 600 "$launcher_audit_path"; } 2>
   launcher_pre_audit_failure
 fi
 export APPLE_AUTOMATION_LAUNCHER_AUDIT_PATH="$launcher_audit_path"
+launcher_run_id="$(/usr/bin/uuidgen 2>/dev/null | /usr/bin/tr '[:upper:]' '[:lower:]' || true)"
+if [[ ! "$launcher_run_id" =~ ^[a-z0-9][a-z0-9-]{0,95}$ ]]; then
+  launcher_run_id="run-$$-$(/bin/date -u '+%s' 2>/dev/null || printf '0')"
+fi
+export APPLE_AUTOMATION_RUN_ID="$launcher_run_id"
+launcher_audit_sequence=0
 if launcher_terminal_debug_enabled; then
   printf '%s\n' "$launcher_audit_path"
 fi
 
 launcher_stage_token_valid() {
   case "$1" in
-    launcher_entered|launcher_bootstrap_started|launcher_bootstrap_ready|launcher_env_setup_started|launcher_env_setup_skipped|launcher_env_setup_ready|launcher_preflight_started|launcher_preflight_skipped|launcher_preflight_ready|flow_main_started|credentials_ready|apple_flow_exec|settings_smoke_exec|settings_smoke_completed|failure) return 0 ;;
+    launcher_entered|launcher_bootstrap_started|launcher_bootstrap_ready|launcher_env_setup_started|launcher_env_setup_skipped|launcher_env_setup_ready|launcher_preflight_started|launcher_preflight_skipped|launcher_preflight_ready|flow_main_started|credentials_ready|apple_flow_exec|apple_flow_completed|settings_smoke_exec|settings_smoke_completed|failure) return 0 ;;
   esac
   return 1
 }
@@ -81,10 +87,11 @@ launcher_audit_record() {
   fi
   timestamp="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" || return 1
   [[ "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  launcher_audit_sequence=$((launcher_audit_sequence + 1))
   if [[ "$stage" == "failure" ]]; then
-    printf '{"timestamp":"%s","stage":"%s","exitCode":%d,"failedStage":"%s"}\n' "$timestamp" "$stage" "$exit_code" "$failed_stage" >> "$launcher_audit_path" 2>/dev/null
+    printf '{"version":1,"runId":"%s","sequence":%d,"timestamp":"%s","stage":"%s","exitCode":%d,"failedStage":"%s"}\n' "$launcher_run_id" "$launcher_audit_sequence" "$timestamp" "$stage" "$exit_code" "$failed_stage" >> "$launcher_audit_path" 2>/dev/null
   else
-    printf '{"timestamp":"%s","stage":"%s","exitCode":%d}\n' "$timestamp" "$stage" "$exit_code" >> "$launcher_audit_path" 2>/dev/null
+    printf '{"version":1,"runId":"%s","sequence":%d,"timestamp":"%s","stage":"%s","exitCode":%d}\n' "$launcher_run_id" "$launcher_audit_sequence" "$timestamp" "$stage" "$exit_code" >> "$launcher_audit_path" 2>/dev/null
   fi
 }
 
@@ -176,3 +183,4 @@ fi
 
 launcher_stage apple_flow_exec
 node scripts/apple-id-full-flow.mjs --skip-setup "$@"
+launcher_stage apple_flow_completed

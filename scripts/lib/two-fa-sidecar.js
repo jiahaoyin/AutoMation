@@ -508,6 +508,8 @@ export function createMac2FACollector(options = {}) {
   const onDiagnostic =
     typeof options.onDiagnostic === "function" ? options.onDiagnostic : null;
   const onStatus = typeof options.onStatus === "function" ? options.onStatus : null;
+  const auditRunId = options.runId;
+  let auditSequence = 0;
 
   const elapsedSincePrepare = () => Math.max(0, runtime.now() - preparedAt);
   const throwIfDisposedDuringPreparation = () => {
@@ -527,7 +529,12 @@ export function createMac2FACollector(options = {}) {
 
     const sanitized = sanitizeAuditEntry(entry);
     try {
-      append2FAAudit(reportDir, sanitized);
+      const nextAuditSequence = auditSequence + 1;
+      append2FAAudit(reportDir, sanitized, {
+        runId: auditRunId,
+        sequence: nextAuditSequence,
+      });
+      auditSequence = nextAuditSequence;
       onAudit?.(sanitized);
       return true;
     } catch {

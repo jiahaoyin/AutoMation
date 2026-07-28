@@ -8,6 +8,7 @@ const MAX_OBJECT_DEPTH = 6;
 const SAFE_TOKEN_RE = /^[a-z0-9_.-]+$/;
 const SAFE_KEY_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,96}$/;
 const SAFE_ERROR_CODE_RE = /^[a-z0-9_.-]+$/;
+const SAFE_RUN_ID_RE = /^[a-z0-9][a-z0-9-]{0,95}$/;
 const SAFE_REDACTED_TEXT_FIELDS = new Set();
 const SAFE_ERROR_TYPES = new Set([
   "error",
@@ -339,10 +340,16 @@ function requireToken(value, label) {
   return token;
 }
 
+export function normalizeFlowRunId(value) {
+  const token = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return SAFE_RUN_ID_RE.test(token) ? token : "standalone";
+}
+
 export function createFlowAudit(reportDir, options = {}) {
   const auditPath = path.join(path.resolve(reportDir), "flow-audit.jsonl");
   const now = options.now ?? Date.now;
   const startedAt = now();
+  const runId = normalizeFlowRunId(options.runId);
   const secrets = new Set((options.secrets ?? []).map(String).filter(Boolean));
   const onWriteFailure =
     typeof options.onWriteFailure === "function" ? options.onWriteFailure : null;
@@ -387,6 +394,7 @@ export function createFlowAudit(reportDir, options = {}) {
       const timestamp = now();
       const entry = {
         version: 1,
+        runId,
         sequence: ++sequence,
         timestamp: new Date(timestamp).toISOString(),
         elapsedMs: Math.max(0, timestamp - startedAt),

@@ -60,6 +60,9 @@ const RUYIPAGE_BACKEND_STAGES = new Set([
   "profile_capture",
   "profile_birthday",
   "profile_name",
+  "post_login_finalization",
+  "result_emitting",
+  "result_emitted",
 ]);
 const RUYIPAGE_TWO_FACTOR_PROGRESS_PHASES = new Set([
   "code_received",
@@ -78,6 +81,21 @@ const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
   "twofa_code_delivery_started",
   "twofa_code_delivery_sent",
   "twofa_code_delivery_acknowledged",
+]);
+const RUYIPAGE_RUNNER_LIFECYCLE_STATUSES = new Set([
+  "backend_spawned",
+  "backend_result_received",
+  "backend_exit_observed",
+  "backend_close_observed",
+  "completion_close",
+  "completion_timeout",
+  "completion_termination",
+  "completion_preserved",
+  "cleanup_group_requested",
+  "cleanup_backend_requested",
+  "cleanup_not_required",
+  "cleanup_completed",
+  "cleanup_failed",
 ]);
 const RUYIPAGE_RUNNER_FAILURE_CODES = new Set([
   "backend_cleanup",
@@ -1270,6 +1288,10 @@ async function runRuyiPageBackend({
   let processIdentity = null;
   /** @type {Promise<void>} */
   let processing = Promise.resolve();
+  const pendingRunnerLifecycleObservations = [];
+  const recordRunnerLifecycleObservation = (status, details = {}) => {
+    pendingRunnerLifecycleObservations.push({ status, details });
+  };
   const stopper = createChildStopper(child, {
     ...childStopperOptions,
     graceMs: killGraceMs,
@@ -1366,6 +1388,9 @@ async function runRuyiPageBackend({
       exitCode = code;
       protocolContext.backendExitCode = Number.isInteger(code) ? code : null;
       directBrowserBackendStopper.cancelForce();
+      recordRunnerLifecycleObservation("backend_exit_observed", {
+        backendExitCode: protocolContext.backendExitCode,
+      });
       resolve({ error: null, exitCode: code });
     });
   });
@@ -1376,6 +1401,9 @@ async function runRuyiPageBackend({
       protocolContext.backendExitCode = Number.isInteger(code) ? code : null;
       stopper.cancelForce();
       directBrowserBackendStopper.cancelForce();
+      recordRunnerLifecycleObservation("backend_close_observed", {
+        backendExitCode: protocolContext.backendExitCode,
+      });
       resolve({ error: childError, exitCode: code });
     });
   });
@@ -1585,6 +1613,7 @@ async function runRuyiPageBackend({
       "ready",
       "status",
       "runner_status",
+      "runner_lifecycle",
       "diagnostic",
       "prepare_2fa",
       "need_2fa",
@@ -1592,6 +1621,10 @@ async function runRuyiPageBackend({
       "result",
     ]);
     const eventName = safeEventNames.has(event?.event) ? event.event : "unknown";
+    const handlerDeadlineMs =
+      event?.event === "runner_lifecycle"
+        ? Math.min(eventHandlerTimeoutMs, 250)
+        : eventHandlerTimeoutMs;
     let handlerTimer;
     const handlerOutcome = callExternal(
       () => onEvent(event),
@@ -1601,24 +1634,22 @@ async function runRuyiPageBackend({
       handlerTimer = setTimeout(() => {
         reject(
           new Error(
-            `ruyipage onEvent handler timed out for ${eventName} after ${eventHandlerTimeoutMs}ms`
+            `ruyipage onEvent handler timed out for ${eventName} after ${handlerDeadlineMs}ms`
           )
         );
-      }, eventHandlerTimeoutMs);
+      }, handlerDeadlineMs);
     });
-    const candidates = [
-      handlerOutcome,
-      handlerTimeout,
-      backendTimeoutOutcome.then(() => {
-        throw terminalError();
-      }),
-    ];
     const terminalFailureEvent =
       event?.event === "diagnostic" ||
+      event?.event === "runner_lifecycle" ||
       (event?.event === "status" && event.status === "browser_failure") ||
       event?.event === "result";
+    const candidates = [handlerOutcome, handlerTimeout];
     if (!terminalFailureEvent) {
       candidates.push(
+        backendTimeoutOutcome.then(() => {
+          throw terminalError();
+        }),
         childOutcome.then((outcome) => {
           throw terminalError(outcome);
         })
@@ -1687,6 +1718,43 @@ async function runRuyiPageBackend({
 
   child.stderr.resume();
 
+  const recordProcessingFailure = (error) => {
+    processingError ??= annotateRunnerFailure(error, protocolContext);
+    if (!childEnded && !requestDirectBrowserPreservation()) stopper.stop();
+  };
+  const reportRunnerLifecycle = async (status, details = {}) => {
+    if (!RUYIPAGE_RUNNER_LIFECYCLE_STATUSES.has(status)) return;
+    await callOnEvent({
+      event: "runner_lifecycle",
+      status,
+      backendExitCode: protocolContext.backendExitCode,
+      resultSuccess: finalResult?.success === true,
+      usesBrowserBroker,
+      strictProcessCleanup: usesProcessStateSupervisor || usesOuterProcessSupervisor,
+      processGroupCleanup: false,
+      directBackendCleanup: false,
+      timedOut,
+      interrupted: Boolean(terminationSignal),
+      ...details,
+    });
+  };
+  let runnerLifecycleDeliveryAvailable = true;
+  const safelyReportRunnerLifecycle = async (status, details = {}) => {
+    if (!runnerLifecycleDeliveryAvailable) return;
+    try {
+      await reportRunnerLifecycle(status, details);
+    } catch {
+      // Lifecycle delivery is bounded and diagnostic-only. A broken observer
+      // must not change browser cleanup or the authenticated result.
+      runnerLifecycleDeliveryAvailable = false;
+    }
+  };
+  const flushRunnerLifecycleObservations = async () => {
+    while (pendingRunnerLifecycleObservations.length > 0) {
+      const observation = pendingRunnerLifecycleObservations.shift();
+      await safelyReportRunnerLifecycle(observation.status, observation.details);
+    }
+  };
   const processEvent = async (event) => {
     const directCodeDeliveryAcknowledged = updateProtocolContext(event);
     await callOnEvent(event);
@@ -1754,12 +1822,13 @@ async function runRuyiPageBackend({
         throw new Error("ruyipage backend result schema is invalid");
       }
       finalResult = sanitized;
+      await safelyReportRunnerLifecycle("backend_result_received", {
+        resultSuccess: sanitized.success === true,
+      });
     }
   };
-  const recordProcessingFailure = (error) => {
-    processingError ??= annotateRunnerFailure(error, protocolContext);
-    if (!childEnded && !requestDirectBrowserPreservation()) stopper.stop();
-  };
+  processing = processing
+    .then(() => safelyReportRunnerLifecycle("backend_spawned"));
   const enqueueLine = (line) => {
     if (!line.trim()) return;
     let event;
@@ -1787,6 +1856,8 @@ async function runRuyiPageBackend({
 
   let outcome;
   let cleanupError = null;
+  let processGroupCleanup = false;
+  let directBackendCleanup = false;
   try {
     const completion = await Promise.race([
       childCloseOutcome.then((value) => ({ type: "close", value })),
@@ -1804,6 +1875,8 @@ async function runRuyiPageBackend({
       stdoutBuffer = "";
       await processing;
     }
+    await flushRunnerLifecycleObservations();
+    await safelyReportRunnerLifecycle(`completion_${completion.type}`);
   } finally {
     clearTimeout(timer);
     for (const [signal, handler] of signalHandlers) {
@@ -1820,7 +1893,7 @@ async function runRuyiPageBackend({
       ) {
         protocolContext.directBrowserPreservationRequested = true;
       }
-      const shouldCleanUpProcessGroup = shouldCleanUpRuyiPageProcessGroup({
+      processGroupCleanup = shouldCleanUpRuyiPageProcessGroup({
         timedOut,
         terminationSignal,
         usesBrowserBroker,
@@ -1831,7 +1904,22 @@ async function runRuyiPageBackend({
         directBrowserPreservationRequested:
           protocolContext.directBrowserPreservationRequested,
       });
-      if (shouldCleanUpProcessGroup) {
+      directBackendCleanup =
+        !processGroupCleanup &&
+        (protocolContext.browserPreserved ||
+          protocolContext.browserSessionPreserved ||
+          protocolContext.directBrowserPreservationRequested);
+      const cleanupStatus = processGroupCleanup
+        ? "cleanup_group_requested"
+        : directBackendCleanup
+          ? "cleanup_backend_requested"
+          : "cleanup_not_required";
+      await safelyReportRunnerLifecycle(cleanupStatus, {
+        processGroupCleanup,
+        directBackendCleanup,
+      });
+      await processing;
+      if (processGroupCleanup) {
         if (!timedOut) stopper.stopIfProcessGroupAlive();
         await stopper.waitForCleanup();
         // A verified process-group cleanup terminates the direct browser along
@@ -1840,18 +1928,24 @@ async function runRuyiPageBackend({
         protocolContext.browserPreserved = false;
         protocolContext.browserSessionPreserved = false;
         protocolContext.browserFinalizationCompleted = false;
-      } else if (
-        protocolContext.browserPreserved ||
-        protocolContext.browserSessionPreserved ||
-        protocolContext.directBrowserPreservationRequested
-      ) {
+      } else if (directBackendCleanup) {
         directBrowserBackendStopper.stop();
         await directBrowserBackendStopper.waitForCleanup();
       }
       cleanupConfirmed = true;
+      await flushRunnerLifecycleObservations();
+      await safelyReportRunnerLifecycle("cleanup_completed", {
+        processGroupCleanup,
+        directBackendCleanup,
+      });
     } catch (error) {
       protocolContext.cleanupFailed = true;
       cleanupError = error;
+      await flushRunnerLifecycleObservations();
+      await safelyReportRunnerLifecycle("cleanup_failed", {
+        processGroupCleanup,
+        directBackendCleanup,
+      });
     } finally {
       try {
         if (processStatePath && processIdentity) {
@@ -1870,6 +1964,7 @@ async function runRuyiPageBackend({
           );
         }
       } finally {
+        await processing;
         removeRuyiPageLaunchGate(launchGatePath);
         removeRuyiPageLaunchGate(launchCancelPath);
         child.stdout.destroy();

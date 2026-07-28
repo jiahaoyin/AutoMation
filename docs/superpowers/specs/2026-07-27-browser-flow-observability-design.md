@@ -145,3 +145,23 @@ Regression coverage proves that a profile failure after account-home confirmatio
 5. treats browser disconnect/close failures after account-home confirmation as
    finalization partials instead of failed login; and
 6. does not leak sensitive fixtures.
+
+## Run Correlation And Runner Lifecycle
+
+Every launcher invocation creates one fixed-format `runId`. The same identifier is
+stored in `report.json` and every `flow-audit.jsonl` and `2fa-audit.jsonl` record.
+Each JSONL keeps its own monotonic `sequence`, so missing records can be detected
+without merging independent writers.
+
+After the report directory exists, the validated launcher audit is hard-linked as
+`launcher-audit.jsonl`. This is not an early snapshot: launcher stages appended after
+the Node process returns, including `apple_flow_completed` or `failure`, remain visible
+inside the report directory. A mismatched run identifier, unexpected path, symlink,
+oversized file, or invalid first record is rejected without reading arbitrary files.
+
+The ruyiPage runner records spawn, sanitized result receipt, process exit/close,
+completion reason, cleanup decision, and cleanup completion. Lifecycle delivery is
+ordered and bounded; a stalled diagnostic observer is disabled after its first bounded
+failure and cannot strand browser cleanup or change an authenticated result. Default
+terminal output remains concise, while the full fixed lifecycle remains in the flow
+audit when its local sink is healthy.

@@ -849,6 +849,62 @@ async function withBrowserBrokerEnvironment(operation) {
   }
 }
 
+function assertRunnerLifecycleContract(events, usesBrowserBroker) {
+  const lifecycle = events.filter((event) => event.event === "runner_lifecycle");
+  const statuses = lifecycle.map((event) => event.status);
+  const indexOf = (predicate) => lifecycle.findIndex(predicate);
+  const spawnedIndex = indexOf((event) => event.status === "backend_spawned");
+  const resultIndex = indexOf((event) => event.status === "backend_result_received");
+  const terminalIndex = indexOf(
+    (event) => event.status === "backend_exit_observed" || event.status === "backend_close_observed"
+  );
+  const completionIndex = indexOf((event) => event.status?.startsWith("completion_"));
+  const cleanupRequestedIndex = indexOf(
+    (event) =>
+      event.status === "cleanup_group_requested" ||
+      event.status === "cleanup_backend_requested" ||
+      event.status === "cleanup_not_required"
+  );
+  const cleanupCompletedIndex = indexOf((event) => event.status === "cleanup_completed");
+
+  assert.ok(spawnedIndex >= 0, `missing lifecycle backend_spawned: ${statuses.join(",")}`);
+  assert.ok(resultIndex > spawnedIndex, `result must follow spawn: ${statuses.join(",")}`);
+  assert.ok(terminalIndex >= 0, `missing terminal lifecycle event: ${statuses.join(",")}`);
+  assert.ok(completionIndex > resultIndex, `completion must follow result: ${statuses.join(",")}`);
+  assert.ok(
+    cleanupRequestedIndex > completionIndex,
+    `cleanup decision must follow completion: ${statuses.join(",")}`
+  );
+  assert.ok(
+    cleanupCompletedIndex > cleanupRequestedIndex,
+    `cleanup completion must follow its decision: ${statuses.join(",")}`
+  );
+  assert.equal(lifecycle[spawnedIndex].usesBrowserBroker, usesBrowserBroker);
+
+  const allowedKeys = new Set([
+    "event",
+    "status",
+    "backendExitCode",
+    "resultSuccess",
+    "usesBrowserBroker",
+    "strictProcessCleanup",
+    "processGroupCleanup",
+    "directBackendCleanup",
+    "timedOut",
+    "interrupted",
+  ]);
+  for (const event of lifecycle) {
+    assert.equal(
+      Object.keys(event).every((key) => allowedKeys.has(key)),
+      true,
+      `runner lifecycle leaked an unapproved field: ${Object.keys(event).join(",")}`
+    );
+  }
+  const lifecycleText = JSON.stringify(lifecycle);
+  assert.equal(lifecycleText.includes(SECRET_CHILD_OUTPUT), false);
+  assert.equal(lifecycleText.includes("data/reports/protocol-test"), false);
+}
+
 async function runNodeRunnerBrowserBrokerSelfTest() {
   const commands = [];
   const events = [];
@@ -932,7 +988,7 @@ async function runNodeRunnerBrowserBrokerSelfTest() {
     "broker verification code mismatch"
   );
   assert.deepEqual(
-    events.map((event) => event.event),
+    events.filter((event) => event.event !== "runner_lifecycle").map((event) => event.event),
     [
       "ready",
       "prepare_2fa",
@@ -951,6 +1007,7 @@ async function runNodeRunnerBrowserBrokerSelfTest() {
       "twofa_code_delivery_acknowledged",
     ]
   );
+  assertRunnerLifecycleContract(events, true);
   assert.equal(result.success, true);
   assert.equal(result.receivedGeneration, 1);
   const publicOutput = JSON.stringify({ events, result });
@@ -2354,7 +2411,7 @@ async function runNodeRunnerSelfTest() {
     creds: FIXTURE_CREDS,
     reportDir: "data/reports/protocol-test",
     onEvent(event) {
-      events.push(event.event);
+      events.push(event);
     },
     async prepare2FA() {
       prepared = true;
@@ -2366,20 +2423,62 @@ async function runNodeRunnerSelfTest() {
     },
   });
 
-  assert.deepEqual(events, [
-    "ready",
-    "prepare_2fa",
-    "need_2fa",
-    "runner_status",
-    "runner_status",
-    "status",
-    "runner_status",
-    "result",
-  ]);
+  assert.deepEqual(
+    events.filter((event) => event.event !== "runner_lifecycle").map((event) => event.event),
+    [
+      "ready",
+      "prepare_2fa",
+      "need_2fa",
+      "runner_status",
+      "runner_status",
+      "status",
+      "runner_status",
+      "result",
+    ]
+  );
+  assertRunnerLifecycleContract(events, false);
   assert.equal(result.success, true);
   assert.equal(result.twoFaCodeLength, 6);
   assert.equal(result.receivedGeneration, 1);
   assert.equal(result.credentialsInArgv, false);
+}
+
+async function runNodeRunnerLifecycleObserverDoesNotInterruptSelfTest() {
+  const runner = createRuyiPageBackendRunner({
+    python: process.execPath,
+    script: fileURLToPath(import.meta.url),
+    cwd: root,
+    args: ["--node-runner-self-test-child"],
+    timeoutMs: 2_000,
+    eventHandlerTimeoutMs: 80,
+  });
+  const lifecycleEvents = [];
+  const protocolEvents = [];
+  const startedAt = Date.now();
+  const result = await withRejectGuard(
+    runner.run({
+      creds: FIXTURE_CREDS,
+      reportDir: "data/reports/protocol-test",
+      onEvent(event) {
+        if (event.event === "runner_lifecycle") {
+          lifecycleEvents.push(event.status);
+          return new Promise(() => {});
+        }
+        protocolEvents.push(event.event);
+      },
+      async prepare2FA() {},
+      async get2FACode() {
+        return SECRET_FIXTURES.verificationCode;
+      },
+    }),
+    1_000,
+    "runner hung behind a lifecycle-only observer"
+  );
+
+  assert.equal(result.success, true);
+  assert.ok(Date.now() - startedAt < 1_000, "lifecycle observer must not delay completion");
+  assert.ok(lifecycleEvents.includes("backend_spawned"));
+  assert.deepEqual(protocolEvents.at(-1), "result");
 }
 
 async function runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest() {
@@ -2666,6 +2765,7 @@ async function runNodeRunnerTerminalFailureEventsAfterExitSelfTest() {
       creds: FIXTURE_CREDS,
       reportDir: "data/reports/protocol-test",
       onEvent(event) {
+        if (event.event === "runner_lifecycle") return;
         events.push({
           event: event.event,
           status: event.status ?? null,
@@ -3392,6 +3492,7 @@ const focusedTests = {
   "generation-state-reset": runNodeRunnerSecondGenerationStateResetTest,
   "close-boundary": runNodeRunnerCloseBoundarySelfTest,
   "strict-result": runNodeRunnerStrictResultContractSelfTest,
+  "lifecycle-observer": runNodeRunnerLifecycleObserverDoesNotInterruptSelfTest,
   "utf8-chunks": runNodeRunnerSplitUtf8ChunkSelfTest,
   "supervisor-parent-exit": runSupervisorParentExitBeforeGateSelfTest,
   "supervisor-runtime-policy": runSupervisorRuntimePolicySelfTest,
@@ -3450,6 +3551,7 @@ await runNodeRunnerOnEventFailureSelfTest();
 runBackendTimeoutConfigTest();
 await runProtocolSelfTest();
 await runNodeRunnerSelfTest();
+await runNodeRunnerLifecycleObserverDoesNotInterruptSelfTest();
 await runNodeRunnerTwoFactorInputUnconfirmedProtocolSelfTest();
 await runNodeRunnerDelayedResultOnEventSelfTest();
 await runNodeRunnerTerminalFailureEventsAfterExitSelfTest();

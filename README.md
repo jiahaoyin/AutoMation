@@ -227,6 +227,9 @@ AX/OCR/stderr、完整 Apple ID 或认证页面正文；认证失败不得保存
 - `data/` 含 Firefox Profile 与报告，注意保管
 - 敏感认证失败只保留固定失败原因和脱敏安全审计，不保存认证页全页截图
 - 姓名和生日只保存在私有 `.env` 并在直接交互终端显示；`report.json` 和 audit 仅记录落盘布尔状态
+- 每次 `./run.sh` 的 `report.json`、`flow-audit.jsonl`、`2fa-audit.jsonl`
+  和 `launcher-audit.jsonl` 使用同一 `runId`；启动日志通过 hard link 归档到本次报告目录，
+  因此 Node 流程返回后的 launcher 完成/失败阶段也不会遗漏
 
 ## 版本
 

@@ -384,6 +384,7 @@ const launcherAuditStages = [
   "flow_main_started",
   "credentials_ready",
   "apple_flow_exec",
+  "apple_flow_completed",
   "failure",
 ];
 assert.match(
@@ -401,14 +402,17 @@ assert.match(generatedRunSh, /umask 077/);
 assert.match(generatedRunSh, /\/bin\/chmod 600 "\$launcher_audit_path"/);
 assert.match(
   generatedRunSh,
-  /\{"timestamp":"%s","stage":"%s","exitCode":%d\}/,
-  "normal launcher audit records must contain fixed timestamp, stage, and exitCode fields"
+  /\{"version":1,"runId":"%s","sequence":%d,"timestamp":"%s","stage":"%s","exitCode":%d\}/,
+  "normal launcher audit records must carry the versioned run correlation and fixed stage fields"
 );
 assert.match(
   generatedRunSh,
-  /\{"timestamp":"%s","stage":"%s","exitCode":%d,"failedStage":"%s"\}/,
-  "launcher failure records must preserve the last fixed stage alongside the exit code"
+  /\{"version":1,"runId":"%s","sequence":%d,"timestamp":"%s","stage":"%s","exitCode":%d,"failedStage":"%s"\}/,
+  "launcher failure records must preserve run correlation and the last fixed stage"
 );
+assert.match(generatedRunSh, /export APPLE_AUTOMATION_RUN_ID="\$launcher_run_id"/);
+assert.match(generatedRunSh, /launcher_audit_sequence=0/);
+assert.match(generatedRunSh, /launcher_audit_sequence=\$\(\(launcher_audit_sequence \+ 1\)\)/);
 assert.match(
   generatedRunSh,
   /launcher_normalize_flag\(\) \{[\s\S]*launcher_trim_value[\s\S]*\/usr\/bin\/tr '\[:upper:\]' '\[:lower:\]'/,
