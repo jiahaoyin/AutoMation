@@ -180,9 +180,9 @@ on targetWindowMatchesLoginState(targetW, wantedState)
 	set usernameCount to my countElementsWithIdentifier(targetW, "USERNAME_TEXT_FIELD", "field", 12)
 	set passwordCount to my countElementsWithIdentifier(targetW, "PASSWORD_TEXT_FIELD", "field", 12)
 	set buttonCount to my countElementsWithIdentifier(targetW, "LOGIN_BUTTON", "button", 12)
-	if usernameCount is not 1 or buttonCount is not 1 then return false
-	if wantedState is "email" then return passwordCount is 0
-	if wantedState is "password" then return passwordCount is 1
+	if buttonCount is not 1 then return false
+	if wantedState is "email" then return usernameCount is 1 and passwordCount is 0
+	if wantedState is "password" then return usernameCount is less than or equal to 1 and passwordCount is 1
 	return false
 end targetWindowMatchesLoginState
 
@@ -303,6 +303,19 @@ on currentFrontmostLoginWindow(wantedState, maxAttempts, pauseSeconds)
 	end repeat
 	return missing value
 end currentFrontmostLoginWindow
+
+-- The WebView can be between email and password states when fallback begins.
+-- Probe both states on every bounded poll instead of checking password only once.
+on currentFrontmostLoginTarget(maxAttempts, pauseSeconds)
+	repeat maxAttempts times
+		set passwordW to my currentFrontmostLoginWindow("password", 1, 0)
+		if passwordW is not missing value then return {"password", passwordW}
+		set emailW to my currentFrontmostLoginWindow("email", 1, 0)
+		if emailW is not missing value then return {"email", emailW}
+		delay pauseSeconds
+	end repeat
+	return {"", missing value}
+end currentFrontmostLoginTarget
 end using terms from
 
 on run argv
@@ -343,37 +356,42 @@ on run argv
 			delay 0.6
 			my logStep(3, "System Settings frontmost, windows=" & (count of windows))
 
-			set targetW to my currentFrontmostLoginWindow("email", 15, 0.25)
+			set loginTarget to my currentFrontmostLoginTarget(18, 0.25)
+			set loginState to item 1 of loginTarget
+			set targetW to item 2 of loginTarget
 			if targetW is missing value then
-				error "未找到前台 Apple 登录邮箱页（USERNAME_TEXT_FIELD + LOGIN_BUTTON）"
+				error "未找到前台 Apple 登录邮箱页或密码页"
 			end if
-			my logStep(4, "frontmost email login window resolved")
+			if loginState is "email" then
+				my logStep(4, "frontmost email login window resolved")
 
-			-- 首屏的 Apple Account 输入框由 AXIdentifier 唯一标识，不能按文本框序号猜测。
-			set emailResult to my waitForIdentifierPath(targetW, "USERNAME_TEXT_FIELD", "field", 12, 0.25)
-			set emailFound to item 1 of emailResult
-			set emailPath to item 2 of emailResult
-			if not emailFound then
-				error "未找到登录邮箱输入框（USERNAME_TEXT_FIELD）"
-			end if
-			my logStep(5, "found USERNAME_TEXT_FIELD")
+				-- 首屏的 Apple Account 输入框由 AXIdentifier 唯一标识，不能按文本框序号猜测。
+				set emailResult to my waitForIdentifierPath(targetW, "USERNAME_TEXT_FIELD", "field", 12, 0.25)
+				set emailFound to item 1 of emailResult
+				if not emailFound then
+					error "未找到登录邮箱输入框（USERNAME_TEXT_FIELD）"
+				end if
+				my logStep(5, "found USERNAME_TEXT_FIELD")
 
-			set emailFilled to my fillIdentifierField("email", "USERNAME_TEXT_FIELD", appleId, "email", 3, 0.15)
-			if not emailFilled then
-				error "邮箱未成功填入登录框"
-			end if
-			my logStep(7, "email verified ok")
+				set emailFilled to my fillIdentifierField("email", "USERNAME_TEXT_FIELD", appleId, "email", 3, 0.15)
+				if not emailFilled then
+					error "邮箱未成功填入登录框"
+				end if
+				my logStep(7, "email verified ok")
 
-			delay 0.4
-			set clickedCont to my clickLoginButton("email", 10, 0.2)
-			if clickedCont then
-				my logStep(8, "clicked Continue")
+				delay 0.4
+				set clickedCont to my clickLoginButton("email", 10, 0.2)
+				if clickedCont then
+					my logStep(8, "clicked Continue")
+				else
+					error "未找到或未启用登录继续按钮（LOGIN_BUTTON）"
+				end if
+
+				-- Continue 后窗口会重绘；每轮从当前窗口重新解析 PASSWORD_TEXT_FIELD 的路径。
+				set targetW to my currentFrontmostLoginWindow("password", 18, 0.35)
 			else
-				error "未找到或未启用登录继续按钮（LOGIN_BUTTON）"
+				my logStep(4, "frontmost password login window already active")
 			end if
-
-			-- Continue 后窗口会重绘；每轮从当前窗口重新解析 PASSWORD_TEXT_FIELD 的路径。
-			set targetW to my currentFrontmostLoginWindow("password", 18, 0.35)
 			if targetW is missing value then
 				error "未在限定时间内找到密码输入框（PASSWORD_TEXT_FIELD）"
 			end if

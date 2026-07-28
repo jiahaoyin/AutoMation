@@ -149,6 +149,77 @@ function recordFlowPhaseError(flowAudit, phase, error, details = {}) {
   });
 }
 
+function sanitizeMacSettingsStatus(status = {}) {
+  const routes = new Set(["swift_ax", "applescript"]);
+  const phases = new Set([
+    "preflight",
+    "dump",
+    "email",
+    "continue",
+    "password",
+    "state",
+    "fallback_recovery",
+  ]);
+  const outcomes = new Set(["started", "succeeded", "failed", "fallback"]);
+  const reasons = new Set([
+    "ok",
+    "target_unavailable_before_write",
+    "target_focus_unavailable",
+    "target_changed_before_write",
+    "ax_value_unconfirmed",
+    "keyboard_fallback_unsafe",
+    "keyboard_target_changed",
+    "keyboard_unconfirmed",
+    "login_state_unknown",
+    "login_window_not_found",
+    "exact_username_field_not_found",
+    "exact_password_field_not_found",
+    "enabled_login_button_not_found",
+    "enabled_login_button_not_found_after_password",
+    "missing_email_value",
+    "missing_password_value",
+    "settings_process_not_found",
+    "helper_invalid_output",
+    "helper_exit",
+    "helper_unavailable",
+    "compile_failed",
+    "preflight_unavailable",
+    "fallback_recovery_failed",
+    "applescript_failed",
+    "applescript_invalid_output",
+    "unknown",
+  ]);
+  const states = new Set(["email", "password", "unknown"]);
+  const inputRoutes = new Set(["ax_value", "keyboard", "existing_value", "unknown"]);
+  return {
+    route: routes.has(status?.route) ? status.route : "unknown",
+    phase: phases.has(status?.phase) ? status.phase : "unknown",
+    outcome: outcomes.has(status?.outcome) ? status.outcome : "failed",
+    reason: reasons.has(status?.reason) ? status.reason : "unknown",
+    loginState: states.has(status?.loginState) ? status.loginState : "unknown",
+    inputRoute: inputRoutes.has(status?.inputRoute) ? status.inputRoute : "unknown",
+    textFieldCount:
+      Number.isInteger(status?.textFieldCount) &&
+      status.textFieldCount >= 0 &&
+      status.textFieldCount <= 32
+        ? status.textFieldCount
+        : null,
+  };
+}
+
+export function resolveMacSettingsFailureStatus(error, lastStatus) {
+  const directStatus =
+    error?.macSettingsStatus && typeof error.macSettingsStatus === "object"
+      ? error.macSettingsStatus
+      : null;
+  const inheritedStatus =
+    !directStatus && lastStatus?.outcome === "failed" ? lastStatus : null;
+  return sanitizeMacSettingsStatus({
+    ...(directStatus ?? inheritedStatus ?? {}),
+    outcome: "failed",
+  });
+}
+
 export function createFlowFailureEnvelope(failureStage, failureCode, failedAt = new Date()) {
   return {
     failureStage: failureToken(failureStage),
@@ -403,19 +474,40 @@ export async function main() {
       failureStage = "mac_settings";
       failureCode = "mac_settings_failed";
       recordFlowPhase(flowAudit, "mac_settings", "entered");
+      let lastMacSettingsStatus = null;
+      const onMacSettingsStatus = (status) => {
+        const safeStatus = sanitizeMacSettingsStatus(status);
+        lastMacSettingsStatus = safeStatus;
+        flowAudit.write("mac_settings", "login_status", safeStatus);
+        if (mirrorDiagnostics) {
+          console.log(
+            `[mac-settings] status:route:${safeStatus.route}:phase:${safeStatus.phase}:outcome:${safeStatus.outcome}:reason:${safeStatus.reason}:state:${safeStatus.loginState}:input:${safeStatus.inputRoute}:fields:${safeStatus.textFieldCount ?? 0}`
+          );
+        }
+      };
       try {
         flowAudit.write("mac_settings", "started");
-        report.phases.macSettings = await runMacSettingsLoginPhase(creds, { smsEnv: smsRuntimeEnv });
+        report.phases.macSettings = await runMacSettingsLoginPhase(creds, {
+          smsEnv: smsRuntimeEnv,
+          onStatus: onMacSettingsStatus,
+        });
         flowAudit.write("mac_settings", "completed", { success: true });
         recordFlowPhase(flowAudit, "mac_settings", "completed");
       } catch (e) {
+        const failureStatus = resolveMacSettingsFailureStatus(e, lastMacSettingsStatus);
+        flowAudit.write("mac_settings", "login_failure", failureStatus);
         recordFlowPhaseError(flowAudit, "mac_settings", e, { failureStage, failureCode });
-        flowAudit.write("mac_settings", "failed", { failureStage, failureCode });
+        flowAudit.write("mac_settings", "failed", {
+          failureStage,
+          failureCode,
+          ...failureStatus,
+        });
         report.phases.macSettings = {
           success: false,
           error: "Mac Settings phase failed",
           failureStage,
           failureCode,
+          diagnostics: failureStatus,
         };
         throw e;
       }

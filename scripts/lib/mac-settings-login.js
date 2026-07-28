@@ -41,6 +41,115 @@ const SMS_RUNTIME_SECRET_ENV_KEYS = [
   "APPLE_AUTOMATION_SMS_API_URL",
   "APPLE_AUTOMATION_MANUAL_SMS_CODE",
 ];
+const MAC_LOGIN_STATUS_ROUTES = new Set(["swift_ax", "applescript"]);
+const MAC_LOGIN_STATUS_PHASES = new Set([
+  "preflight",
+  "dump",
+  "email",
+  "continue",
+  "password",
+  "state",
+  "fallback_recovery",
+]);
+const MAC_LOGIN_STATUS_OUTCOMES = new Set(["started", "succeeded", "failed", "fallback"]);
+const MAC_LOGIN_STATUS_REASONS = new Set([
+  "ok",
+  "target_unavailable_before_write",
+  "target_focus_unavailable",
+  "target_changed_before_write",
+  "ax_value_unconfirmed",
+  "keyboard_fallback_unsafe",
+  "keyboard_target_changed",
+  "keyboard_unconfirmed",
+  "login_state_unknown",
+  "login_window_not_found",
+  "exact_username_field_not_found",
+  "exact_password_field_not_found",
+  "enabled_login_button_not_found",
+  "enabled_login_button_not_found_after_password",
+  "missing_email_value",
+  "missing_password_value",
+  "settings_process_not_found",
+  "helper_invalid_output",
+  "helper_exit",
+  "helper_unavailable",
+  "compile_failed",
+  "preflight_unavailable",
+  "fallback_recovery_failed",
+  "applescript_failed",
+  "applescript_invalid_output",
+]);
+const MAC_LOGIN_STATES = new Set(["email", "password", "unknown"]);
+const MAC_LOGIN_INPUT_ROUTES = new Set(["ax_value", "keyboard", "existing_value", "unknown"]);
+const MAC_LOGIN_PREWRITE_FAILURE_REASONS = new Set([
+  "target_unavailable_before_write",
+  "target_focus_unavailable",
+  "target_changed_before_write",
+  "login_state_unknown",
+  "login_window_not_found",
+  "exact_username_field_not_found",
+  "exact_password_field_not_found",
+  "settings_process_not_found",
+]);
+const MAX_MAC_LOGIN_TEXT_FIELDS = 32;
+
+function macLoginToken(value, allowed, fallback = "unknown") {
+  return allowed.has(value) ? value : fallback;
+}
+
+function normalizeMacLoginReason(value, fallback = "unknown") {
+  if (typeof value !== "string") return fallback;
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return MAC_LOGIN_STATUS_REASONS.has(normalized) ? normalized : fallback;
+}
+
+function sanitizeMacLoginStatus(status = {}) {
+  return {
+    route: macLoginToken(status.route, MAC_LOGIN_STATUS_ROUTES),
+    phase: macLoginToken(status.phase, MAC_LOGIN_STATUS_PHASES),
+    outcome: macLoginToken(status.outcome, MAC_LOGIN_STATUS_OUTCOMES, "failed"),
+    reason: normalizeMacLoginReason(status.reason),
+    loginState: macLoginToken(status.loginState, MAC_LOGIN_STATES),
+    inputRoute: macLoginToken(status.inputRoute, MAC_LOGIN_INPUT_ROUTES),
+    textFieldCount:
+      Number.isInteger(status.textFieldCount) &&
+      status.textFieldCount >= 0 &&
+      status.textFieldCount <= MAX_MAC_LOGIN_TEXT_FIELDS
+        ? status.textFieldCount
+        : null,
+  };
+}
+
+function emitMacLoginStatus(onStatus, status) {
+  const safeStatus = sanitizeMacLoginStatus(status);
+  if (typeof onStatus === "function") {
+    try {
+      onStatus(safeStatus);
+    } catch {
+      /* Audit delivery cannot alter credential submission. */
+    }
+  }
+  return safeStatus;
+}
+
+function createMacLoginError(status) {
+  const error = new Error("MAC_SETTINGS_LOGIN_FAILED");
+  error.code = "MAC_SETTINGS_LOGIN_FAILED";
+  error.macSettingsStatus = sanitizeMacLoginStatus(status);
+  return error;
+}
+
+export function appleScriptPhaseFromStep(step) {
+  if (!Number.isInteger(step) || step < 1) return "state";
+  if (step <= 3) return "state";
+  if (step <= 6) return "email";
+  if (step <= 8) return "continue";
+  return "password";
+}
 
 export function sanitizedMacSettingsChildEnv(env = process.env) {
   const childEnv = { ...env };
@@ -72,7 +181,10 @@ export async function preflightMacSettingsAutomation() {
 }
 
 /** 预检：登录窗口是否可见（解析 dump 脚本输出） */
-async function preflightLoginWindowVisible() {
+async function preflightLoginWindowVisible(options = {}) {
+  const route = options.route ?? "swift_ax";
+  const phase = options.phase ?? "preflight";
+  emitMacLoginStatus(options.onStatus, { route, phase, outcome: "started", reason: "ok" });
   try {
     const { stdout } = await execFileAsync("osascript", [DUMP_SCPT], {
       timeout: 25_000,
@@ -81,36 +193,89 @@ async function preflightLoginWindowVisible() {
     const text = stdout.trim();
     if (/login window found/.test(text) && /deep=[1-9]/.test(text)) {
       console.log("[Mac 设置] ✓ 预检：登录窗口已就绪");
+      emitMacLoginStatus(options.onStatus, { route, phase, outcome: "succeeded", reason: "ok" });
       return true;
     }
     console.warn("[Mac 设置] 预检：登录窗口或输入框未就绪");
+    emitMacLoginStatus(options.onStatus, {
+      route,
+      phase,
+      outcome: "failed",
+      reason: "preflight_unavailable",
+    });
     return false;
   } catch {
     console.warn("[Mac 设置] 预检 AX probe 失败");
+    emitMacLoginStatus(options.onStatus, {
+      route,
+      phase,
+      outcome: "failed",
+      reason: "preflight_unavailable",
+    });
     return false;
   }
 }
 
 /** AppleScript 回退（索引式 BFS，不缓存元素引用） */
-async function fillViaAppleScript(creds) {
+async function fillViaAppleScript(creds, options = {}) {
   console.log("[Mac 设置] AppleScript 回退填表…");
-  const { stdout, stderr } = await execFileAsync("osascript", [LOGIN_SCPT], {
-    timeout: 180_000,
-    env: {
-      ...sanitizedMacSettingsChildEnv(),
-      APPLE_SCRIPT_APPLE_ID: creds.appleId,
-      APPLE_SCRIPT_PASSWORD: creds.password,
-      APPLE_SCRIPT_PANE_OPENED: "1",
-    },
+  emitMacLoginStatus(options.onStatus, {
+    route: "applescript",
+    phase: "state",
+    outcome: "started",
+    reason: "ok",
   });
+  let stdout = "";
+  let stderr = "";
+  let executionFailed = false;
+  let lastStep = 0;
+  try {
+    ({ stdout, stderr } = await execFileAsync("osascript", [LOGIN_SCPT], {
+      timeout: 180_000,
+      env: {
+        ...sanitizedMacSettingsChildEnv(),
+        APPLE_SCRIPT_APPLE_ID: creds.appleId,
+        APPLE_SCRIPT_PASSWORD: creds.password,
+        APPLE_SCRIPT_PANE_OPENED: "1",
+      },
+    }));
+  } catch (error) {
+    executionFailed = true;
+    stdout = typeof error?.stdout === "string" ? error.stdout : "";
+    stderr = typeof error?.stderr === "string" ? error.stderr : "";
+  }
 
   if (stderr?.trim()) {
     for (const line of stderr.trim().split("\n")) {
       const match = /^\[step\s+(\d+)\]/.exec(line.trim());
-      if (match) console.log("[Mac 设置] AppleScript step " + match[1] + " complete");
+      if (match) {
+        lastStep = Math.max(lastStep, Number.parseInt(match[1], 10) || 0);
+        console.log("[Mac 设置] AppleScript step " + match[1] + " complete");
+      }
     }
   }
-  return stdout?.trim() || "ok";
+  const ok = !executionFailed && stdout?.trim() === "ok";
+  const status = emitMacLoginStatus(options.onStatus, {
+    route: "applescript",
+    phase: ok ? "password" : appleScriptPhaseFromStep(lastStep),
+    outcome: ok ? "succeeded" : "failed",
+    reason: ok ? "ok" : executionFailed ? "applescript_failed" : "applescript_invalid_output",
+  });
+  if (!ok) throw createMacLoginError(status);
+  return status;
+}
+
+export function mayUseAppleScriptFallback(status) {
+  if (status?.route !== "swift_ax" || status?.inputRoute !== "unknown") {
+    return false;
+  }
+  if (status?.phase === "dump" || status?.phase === "state") {
+    return true;
+  }
+  if (status?.phase !== "email" && status?.phase !== "password") {
+    return false;
+  }
+  return MAC_LOGIN_PREWRITE_FAILURE_REASONS.has(status?.reason);
 }
 
 export async function isMacSettingsSignedIn() {
@@ -139,11 +304,19 @@ export function isMacSettingsSmsRuntimeEnabled(env = process.env) {
  * 打开系统设置 Apple ID 并填入账号密码（手机验证码人工完成）
  * @param {{ appleId: string, password: string }} creds
  */
-export async function fillMacSettingsAppleLogin(creds) {
+export async function fillMacSettingsAppleLogin(creds, options = {}) {
   console.log("\n[Mac 设置] 打开 Apple ID 并填入账号密码…");
 
   await preflightMacSettingsAutomation();
-  compileAxFillHelper({ quiet: true });
+  const built = compileAxFillHelper({ quiet: true });
+  if (!built.ok) {
+    emitMacLoginStatus(options.onStatus, {
+      route: "swift_ax",
+      phase: "preflight",
+      outcome: "failed",
+      reason: "compile_failed",
+    });
+  }
 
   await withAccessibilityRetry(
     async () => {
@@ -166,24 +339,39 @@ export async function fillMacSettingsAppleLogin(creds) {
         }
       }
 
-      await preflightLoginWindowVisible();
+      await preflightLoginWindowVisible({ onStatus: options.onStatus });
 
       // 主路径：Swift AX API
       if (isAxFillAvailable()) {
         try {
-          await fillViaSwiftAx(creds);
+          await fillViaSwiftAx(creds, { onStatus: options.onStatus });
           return;
         } catch (swiftErr) {
+          const swiftStatus = sanitizeMacLoginStatus(swiftErr?.macSettingsStatus);
+          if (!mayUseAppleScriptFallback(swiftStatus)) {
+            throw createMacLoginError(swiftStatus);
+          }
+          emitMacLoginStatus(options.onStatus, {
+            ...swiftStatus,
+            outcome: "fallback",
+          });
           console.warn("[Mac 设置] Swift AX 主路径失败，回退 AppleScript…");
+          await fillViaAppleScript(creds, { onStatus: options.onStatus });
+          return;
         }
       } else {
         console.warn("[Mac 设置] Swift AX helper 不可用，使用 AppleScript 回退");
+        emitMacLoginStatus(options.onStatus, {
+          route: "swift_ax",
+          phase: "preflight",
+          outcome: "fallback",
+          reason: "helper_unavailable",
+        });
       }
 
-      const result = await fillViaAppleScript(creds);
-      if (result !== "ok") {
-        throw new Error(`AppleScript 填表异常: ${result}`);
-      }
+      // The fallback resolves the same exact identifiers and can begin from a
+      // fresh email page or an already advanced password page.
+      await fillViaAppleScript(creds, { onStatus: options.onStatus });
     },
     { label: "Mac 系统设置填表", maxAttempts: 2 }
   );
@@ -255,7 +443,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
 
 /**
  * @param {{ appleId: string, password: string }} creds
- * @param {{ smsEnv?: Record<string, string | undefined> }} [options]
+ * @param {{ smsEnv?: Record<string, string | undefined>, onStatus?: (status: object) => void }} [options]
  */
 export async function runMacSettingsLoginPhase(creds, options = {}) {
   const version = ensureMacOS15({
@@ -286,7 +474,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
   }
   if (smsConfig) clearMacSettingsSmsRuntimeSecrets();
 
-  await fillMacSettingsAppleLogin(creds);
+  await fillMacSettingsAppleLogin(creds, { onStatus: options.onStatus });
   if (smsConfig) {
     if (!isMacSettingsSmsHelperAvailable()) {
       console.warn(
