@@ -76,3 +76,22 @@ Regression coverage must prove:
 6. default terminal output omits raw stage/input/observation lines, debug mode
    restores only the redacted diagnostic lines; and
 7. the existing login, 2FA, session preservation, and privacy suites remain green.
+
+## 2026-07-28 Follow-up
+
+The first production modal query reached the correct Apple name dialog but called
+an undefined JavaScript `normalize()` helper. The resolver intentionally swallowed
+DOM-query exceptions while waiting for hydration, so this defect surfaced only as
+`profile_page_unready` and prevented `.env` persistence.
+
+The repaired contract keeps the existing birthday-first and screenshot ordering,
+but now:
+
+- executes the exact embedded modal script against English and Chinese DOM fixtures;
+- classifies given, family, and middle-name fields without positional guessing;
+- combines the confirmed given/family values in their real modal DOM order, preserving
+  family-first locales;
+- records one fixed `profile_name_modal_query_failed` audit status if the DOM query
+  throws, without forwarding DOM text or exception content; and
+- records `result_emitting` before the terminal event and persists `result_emitted`
+  only after the event was written successfully.

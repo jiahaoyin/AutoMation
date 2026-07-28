@@ -177,11 +177,15 @@ BROWSER_STARTUP_STAGES = {
     "profile_capture",
     "profile_birthday",
     "profile_name",
+    "post_login_finalization",
+    "result_emitting",
+    "result_emitted",
 }
 browser_startup_stage = "not_started"
 browser_stage_file: Path | None = None
 diagnostic_secrets: list[str] = []
 browser_failure_emitted = False
+profile_name_modal_query_failure_emitted = False
 BROWSER_BROKER_MODE_ENV = "APPLE_AUTOMATION_BROWSER_BROKER_MODE"
 BROWSER_BROKER_CREDENTIALS_ERROR = "invalid browser broker credentials"
 BROWSER_STAGE_FILE_ENV = "APPLE_AUTOMATION_BROWSER_STAGE_FILE"
@@ -239,6 +243,7 @@ PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
         "profile_card_identity_collision",
         "profile_reauthentication_exhausted",
         "profile_data_incomplete",
+        "profile_name_modal_query_failed",
         "browser_connection_lost",
         "profile_capture_failed",
     }
@@ -496,6 +501,8 @@ def classify_profile_capture_failure(error: Exception) -> str:
         return "profile_card_identity_collision"
     if "card is ambiguous" in message:
         return "profile_card_ambiguous"
+    if "personal information name modal query failed" in message:
+        return "profile_name_modal_query_failed"
     if "name and birthday" in message:
         return "profile_data_incomplete"
     if "profile" in message or "personal information" in message:
@@ -647,21 +654,22 @@ def configure_browser_stage_file(report_dir: Path) -> None:
     browser_stage_file = candidate
 
 
-def set_browser_startup_stage(stage: str) -> None:
+def set_browser_startup_stage(stage: str, *, emit_transition: bool = True) -> None:
     global browser_startup_stage
     if stage not in BROWSER_STARTUP_STAGES:
         raise RuntimeError("browser startup stage is invalid")
     previous_stage = browser_startup_stage
     browser_startup_stage = stage
-    emit(
-        {
-            "event": "status",
-            "status": "browser_stage",
-            "stage": stage,
-            "previousStage": previous_stage,
-            "transition": "entered",
-        }
-    )
+    if emit_transition:
+        emit(
+            {
+                "event": "status",
+                "status": "browser_stage",
+                "stage": stage,
+                "previousStage": previous_stage,
+                "transition": "entered",
+            }
+        )
     if browser_stage_file is None:
         return
     temporary = browser_stage_file.with_name(
@@ -692,10 +700,20 @@ def set_browser_startup_stage(stage: str) -> None:
             pass
 
 
+def emit_browser_result(result: dict[str, Any]) -> None:
+    set_browser_startup_stage("result_emitting")
+    emit(result)
+    # The result event itself is the protocol evidence. Persist the completed
+    # stage without emitting a second event after the terminal result.
+    set_browser_startup_stage("result_emitted", emit_transition=False)
+
+
 def begin_browser_flow_run() -> None:
     """Reset per-run state so every invocation has an independent audit trail."""
     global browser_failure_emitted, browser_startup_stage
+    global profile_name_modal_query_failure_emitted
     browser_failure_emitted = False
+    profile_name_modal_query_failure_emitted = False
     browser_startup_stage = "not_started"
 
 
@@ -710,6 +728,19 @@ def emit_browser_failure_once() -> None:
             "event": "status",
             "status": "browser_failure",
             "failureStage": browser_startup_stage,
+        }
+    )
+
+
+def emit_profile_name_modal_query_failure_once() -> None:
+    global profile_name_modal_query_failure_emitted
+    if profile_name_modal_query_failure_emitted:
+        return
+    profile_name_modal_query_failure_emitted = True
+    emit(
+        {
+            "event": "status",
+            "status": "profile_name_modal_query_failed",
         }
     )
 
@@ -4187,62 +4218,101 @@ def wait_for_profile_card(
     raise RuntimeError(f"personal information {kind} card was not found")
 
 
-def profile_name_modal_summary(modal: Any) -> dict[str, Any]:
-    raw = modal.run_js(
-        r"""
-        function () {
-          // ruyipage-profile-name-modal
-          const visible = (element) => {
-            if (!element) return false;
-            const rect = element.getBoundingClientRect();
-            const style = window.getComputedStyle(element);
-            return rect.width > 2 && rect.height > 2 &&
-              style.display !== 'none' && style.visibility !== 'hidden' &&
-              element.getAttribute('aria-hidden') !== 'true';
-          };
-          const labelText = (field) => {
-            const labels = Array.from(field.labels || []).map((label) => label.innerText || label.textContent || '');
-            const closest = field.closest('label')?.innerText || '';
-            return [
-              field.getAttribute('autocomplete'), field.getAttribute('name'), field.getAttribute('id'),
-              field.getAttribute('aria-label'), field.getAttribute('placeholder'), closest, ...labels
-            ].filter(Boolean).join(' ');
-          };
-          const fields = Array.from(this.querySelectorAll('input')).filter((field) =>
-            visible(field) && !field.disabled && !field.readOnly &&
-            ['text', 'search'].includes(String(field.type || 'text').toLowerCase())
-          );
-          const classify = (field) => {
-            const meta = normalize(labelText(field));
-            if (/middle-name|middlename|additional-name|additionalname|\u4e2d\u95f4\u540d|\u4e2d\u9593\u540d/.test(meta)) return 'middle';
-            if (/family-name|familyname|surname|last-name|lastname|姓氏|姓/.test(meta)) return 'family';
-            if (/given-name|givenname|first-name|firstname|名字|名/.test(meta)) return 'given';
-            return null;
-          };
-          let given = null;
-          let family = null;
-          for (const field of fields) {
-            const value = String(field.value || '').trim();
-            if (!value) continue;
-            const kind = classify(field);
-            if (kind === 'given' && given === null) given = value;
-            if (kind === 'family' && family === null) family = value;
-          }
-          return JSON.stringify({
-            visible: visible(this),
-            fieldCount: fields.length,
-            given,
-            family
-          });
-        }
-        """
+PROFILE_NAME_MODAL_SUMMARY_SCRIPT = r"""
+function () {
+  // ruyipage-profile-name-modal
+  const visible = (element) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width > 2 && rect.height > 2 &&
+      style.display !== 'none' && style.visibility !== 'hidden' &&
+      element.getAttribute('aria-hidden') !== 'true';
+  };
+  const normalize = (value) => String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/-+/g, '-');
+  const fieldSignals = (field) => {
+    const labels = Array.from(field.labels || []).map(
+      (label) => label.innerText || label.textContent || ''
+    );
+    const closest = field.closest('label')?.innerText || '';
+    return [
+      field.getAttribute('autocomplete'), field.getAttribute('name'),
+      field.getAttribute('id'), field.getAttribute('aria-label'),
+      field.getAttribute('placeholder'), closest, ...labels
+    ].filter(Boolean).map(normalize);
+  };
+  const hasAsciiToken = (signals, aliases) => signals.some((signal) =>
+    aliases.some((alias) =>
+      signal === alias || signal.startsWith(`${alias}-`) ||
+      signal.endsWith(`-${alias}`) || signal.includes(`-${alias}-`)
     )
+  );
+  const fields = Array.from(this.querySelectorAll('input')).filter((field) =>
+    visible(field) && !field.disabled && !field.readOnly &&
+    ['text', 'search'].includes(String(field.type || 'text').toLowerCase())
+  );
+  const classify = (field) => {
+    const signals = fieldSignals(field);
+    if (
+      hasAsciiToken(signals, ['middle-name', 'middlename', 'additional-name', 'additionalname']) ||
+      signals.some((signal) => signal.includes('\u4e2d\u95f4\u540d') || signal.includes('\u4e2d\u9593\u540d'))
+    ) return 'middle';
+    if (
+      hasAsciiToken(signals, ['family-name', 'familyname', 'surname', 'last-name', 'lastname']) ||
+      signals.some((signal) => signal.includes('\u59d3\u6c0f') || signal === '\u59d3')
+    ) return 'family';
+    if (
+      hasAsciiToken(signals, ['given-name', 'givenname', 'first-name', 'firstname']) ||
+      signals.some((signal) => signal.includes('\u540d\u5b57') || signal === '\u540d')
+    ) return 'given';
+    return null;
+  };
+  let given = null;
+  let family = null;
+  const orderedParts = [];
+  for (const field of fields) {
+    const value = String(field.value || '').trim();
+    if (!value) continue;
+    const kind = classify(field);
+    if (kind === 'given' && given === null) {
+      given = value;
+      orderedParts.push(value);
+    }
+    if (kind === 'family' && family === null) {
+      family = value;
+      orderedParts.push(value);
+    }
+  }
+  return JSON.stringify({
+    visible: visible(this),
+    fieldCount: fields.length,
+    given,
+    family,
+    orderedParts
+  });
+}
+"""
+
+
+def profile_name_modal_summary(modal: Any) -> dict[str, Any]:
+    raw = modal.run_js(PROFILE_NAME_MODAL_SUMMARY_SCRIPT)
     result = parse_profile_query_result(raw, "name modal")
+    given = result.get("given")
+    family = result.get("family")
+    ordered_parts = result.get("orderedParts")
+    if not isinstance(ordered_parts, list):
+        ordered_parts = [part for part in (given, family) if part is not None]
     return {
         "visible": result.get("visible") is True,
         "fieldCount": int(result.get("fieldCount") or 0),
-        "given": result.get("given"),
-        "family": result.get("family"),
+        "given": given,
+        "family": family,
+        "orderedParts": ordered_parts,
     }
 
 
@@ -4263,6 +4333,7 @@ def resolve_profile_name_modal(page: Any) -> tuple[Any, Any, dict[str, Any]] | N
                     summary = profile_name_modal_summary(modal)
                     identity = element_stability_signature(scope, modal)
                 except Exception:
+                    emit_profile_name_modal_query_failure_once()
                     continue
                 previous_selector = seen.get(identity)
                 if previous_selector is not None and previous_selector != selector:
@@ -4300,6 +4371,10 @@ def wait_for_profile_name_modal(
                 element_stability_signature(_scope, modal),
                 normalize_profile_value(summary.get("given"), "name"),
                 normalize_profile_value(summary.get("family"), "name"),
+                tuple(
+                    normalize_profile_value(part, "name")
+                    for part in summary.get("orderedParts", [])
+                ),
             )
             stable_observations = (
                 stable_observations + 1 if signature == previous_signature else 1
@@ -4311,6 +4386,8 @@ def wait_for_profile_name_modal(
             previous_signature = None
             stable_observations = 0
         pause(180, 420)
+    if profile_name_modal_query_failure_emitted:
+        raise RuntimeError("personal information name modal query failed")
     raise RuntimeError("personal information name modal was not found")
 
 
@@ -4554,7 +4631,16 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
     _modal_scope, _modal, modal_summary = wait_for_profile_name_modal(page)
     given = normalize_profile_value(modal_summary.get("given"), "name")
     family = normalize_profile_value(modal_summary.get("family"), "name")
-    name = normalize_profile_value(f"{given} {family}", "name")
+    ordered_parts = [
+        normalize_profile_value(part, "name")
+        for part in modal_summary.get("orderedParts", [])
+    ]
+    if len(ordered_parts) != 2 or ordered_parts not in (
+        [given, family],
+        [family, given],
+    ):
+        raise RuntimeError("personal information name field order was not confirmed")
+    name = normalize_profile_value(" ".join(ordered_parts), "name")
     emit({"event": "status", "status": "profile_name_collected"})
     return {"name": name, "birthday": birthday}
 
@@ -5782,6 +5868,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
         post_login_profile_capture["browserPreservationRequested"] = (
             preserve_after_flow
         )
+        set_browser_startup_stage("post_login_finalization")
         post_login_finalization = finalize_post_login_browser(
             page,
             preserve_requested=preserve_after_flow,
@@ -5792,7 +5879,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             "browserSessionPreserved"
         ]
 
-        emit(
+        emit_browser_result(
             {
                 "event": "result",
                 "success": True,

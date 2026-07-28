@@ -2,6 +2,7 @@ import json
 import io
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -921,7 +922,7 @@ class FakeElement:
             )
             return json.dumps(summary)
         if "ruyipage-profile-name-modal" in script:
-            return json.dumps(
+            summary = dict(
                 self.attrs.get(
                     "profileModal",
                     {
@@ -932,6 +933,15 @@ class FakeElement:
                     },
                 )
             )
+            summary.setdefault(
+                "orderedParts",
+                [
+                    part
+                    for part in (summary.get("given"), summary.get("family"))
+                    if part is not None
+                ],
+            )
+            return json.dumps(summary)
         if "ruyipage-profile-navigation-link-summary" in script:
             return json.dumps(
                 self.attrs.get(
@@ -3568,7 +3578,51 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 "name_modal_opened",
             ],
         )
-        self.assertEqual(page.urls[-1], account_flow.ACCOUNT_INFORMATION_URL)
+
+    def test_result_stage_is_completed_only_after_the_result_is_emitted(self):
+        result = {"event": "result", "success": True}
+        emitted = []
+
+        def fail_result(event):
+            emitted.append(event)
+            if event.get("event") == "result":
+                raise BrokenPipeError("test result write failed")
+
+        with patch.object(
+            account_flow, "browser_startup_stage", "post_login_finalization"
+        ), patch.object(account_flow, "browser_stage_file", None), patch(
+            "apple_account_flow.emit", side_effect=fail_result
+        ):
+            with self.assertRaises(BrokenPipeError):
+                account_flow.emit_browser_result(result)
+            self.assertEqual(account_flow.browser_startup_stage, "result_emitting")
+            self.assertEqual(
+                emitted,
+                [
+                    {
+                        "event": "status",
+                        "status": "browser_stage",
+                        "stage": "result_emitting",
+                        "previousStage": "post_login_finalization",
+                        "transition": "entered",
+                    },
+                    result,
+                ],
+            )
+
+        emitted.clear()
+        with patch.object(
+            account_flow, "browser_startup_stage", "post_login_finalization"
+        ), patch.object(account_flow, "browser_stage_file", None), patch(
+            "apple_account_flow.emit", side_effect=emitted.append
+        ):
+            account_flow.emit_browser_result(result)
+            self.assertEqual(account_flow.browser_startup_stage, "result_emitted")
+            self.assertEqual(
+                [event.get("stage") for event in emitted if event.get("event") == "status"],
+                ["result_emitting"],
+            )
+            self.assertIs(emitted[-1], result)
 
     def test_personal_info_parse_failure_is_a_profile_partial_result(self):
         secret = "person@example.com OTP 123456"
@@ -10658,6 +10712,196 @@ class PersonalInformationTests(unittest.TestCase):
 
         self.assertEqual(summary["given"], "Given")
         self.assertEqual(summary["family"], "Family")
+
+    def test_name_modal_script_executes_for_english_and_chinese_fields(self):
+        harness = r"""
+const fs = require('node:fs');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+global.window = {
+  getComputedStyle() {
+    return { display: 'block', visibility: 'visible' };
+  }
+};
+const makeField = (item) => ({
+  labels: (item.labels || []).map((text) => ({ innerText: text, textContent: text })),
+  disabled: false,
+  readOnly: false,
+  type: item.type || 'text',
+  value: item.value || '',
+  getBoundingClientRect() {
+    return { width: 160, height: 32 };
+  },
+  getAttribute(name) {
+    return Object.hasOwn(item.attributes || {}, name) ? item.attributes[name] : null;
+  },
+  closest(selector) {
+    return selector === 'label' && item.closestLabel
+      ? { innerText: item.closestLabel }
+      : null;
+  }
+});
+const fields = payload.fields.map(makeField);
+const modal = {
+  querySelectorAll(selector) {
+    return selector === 'input' ? fields : [];
+  },
+  getBoundingClientRect() {
+    return { width: 480, height: 320 };
+  },
+  getAttribute() {
+    return null;
+  }
+};
+const query = eval(`(${payload.script})`);
+process.stdout.write(query.call(modal));
+"""
+        fixtures = (
+            (
+                [
+                    {
+                        "value": "Ada",
+                        "attributes": {"placeholder": "First Name"},
+                    },
+                    {
+                        "value": "Ignored",
+                        "attributes": {"autocomplete": "additional-name"},
+                    },
+                    {
+                        "value": "Lovelace",
+                        "attributes": {"aria-label": "Last Name"},
+                    },
+                ],
+                {
+                    "given": "Ada",
+                    "family": "Lovelace",
+                    "orderedParts": ["Ada", "Lovelace"],
+                },
+            ),
+            (
+                [
+                    {
+                        "value": "王",
+                        "labels": ["姓氏"],
+                    },
+                    {
+                        "value": "忽略",
+                        "attributes": {"aria-label": "中间名"},
+                    },
+                    {
+                        "value": "小明",
+                        "closestLabel": "名",
+                    },
+                ],
+                {
+                    "given": "小明",
+                    "family": "王",
+                    "orderedParts": ["王", "小明"],
+                },
+            ),
+        )
+
+        for fields, expected in fixtures:
+            with self.subTest(expected=expected):
+                completed = subprocess.run(
+                    ["node", "-e", harness],
+                    input=json.dumps(
+                        {
+                            "script": account_flow.PROFILE_NAME_MODAL_SUMMARY_SCRIPT,
+                            "fields": fields,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                summary = json.loads(completed.stdout)
+                self.assertEqual(summary["fieldCount"], 3)
+                self.assertEqual(
+                    {
+                        "given": summary["given"],
+                        "family": summary["family"],
+                        "orderedParts": summary["orderedParts"],
+                    },
+                    expected,
+                )
+
+    def test_name_modal_query_failure_is_reported_once_without_error_text(self):
+        modal = FakeElement()
+
+        def fail_query(_script):
+            raise RuntimeError("secret DOM text must not leave the backend")
+
+        modal.run_js = fail_query
+        page = FakePage(
+            {"css:[id^='modal-content-']": [modal]},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+
+        with patch.object(
+            account_flow, "profile_name_modal_query_failure_emitted", False
+        ), patch("apple_account_flow.emit", side_effect=events.append):
+            self.assertIsNone(account_flow.resolve_profile_name_modal(page))
+            self.assertIsNone(account_flow.resolve_profile_name_modal(page))
+
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "profile_name_modal_query_failed",
+                }
+            ],
+        )
+        self.assertNotIn("secret DOM text", json.dumps(events))
+
+    def test_name_modal_query_failure_has_a_fixed_profile_failure_class(self):
+        modal = FakeElement()
+
+        def fail_query(_script):
+            raise RuntimeError("secret DOM text must not leave the backend")
+
+        modal.run_js = fail_query
+        page = FakePage(
+            {"css:[id^='modal-content-']": [modal]},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+        monotonic_values = iter((0.0, 0.0, 0.5))
+
+        with patch.object(
+            account_flow, "profile_name_modal_query_failure_emitted", False
+        ), patch("apple_account_flow.emit", side_effect=events.append), patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "personal information name modal query failed"
+            ) as raised:
+                account_flow.wait_for_profile_name_modal(
+                    page,
+                    timeout_s=0.25,
+                    pause=lambda *_: None,
+                )
+
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(raised.exception),
+            "profile_name_modal_query_failed",
+        )
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "profile_name_modal_query_failed",
+                }
+            ],
+        )
+        self.assertNotIn("secret DOM text", json.dumps(events))
 
     def test_collects_birthday_before_opening_the_name_modal(self):
         calls: list[str] = []
