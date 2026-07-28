@@ -45,7 +45,7 @@ const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
   popup_scanning:
     "[2FA] 网页已确认需要验证码，正在持续扫描受限 Apple 原生窗口。",
   popup_close_pending:
-    "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
+    "[2FA] 原生验证码窗仍可见，正在继续提交到网页。",
   timeout:
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
 });
@@ -79,6 +79,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "account_home_confirmed",
   "browser_observation",
   "profile_capture_started",
+  "profile_capture_readiness",
   "profile_capture_completed",
   "profile_capture_failed",
   "profile_page_ready",
@@ -186,6 +187,8 @@ const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
   "profile_session_unconfirmed",
   "profile_element_unavailable",
   "profile_page_unready",
+  "profile_card_ambiguous",
+  "profile_card_identity_collision",
   "profile_data_incomplete",
   "browser_connection_lost",
   "profile_capture_failed",
@@ -193,6 +196,16 @@ const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
   "profile_result_missing",
   "runner_post_login_failed",
   "unknown",
+]);
+const PROFILE_CAPTURE_READINESS_OUTCOMES = new Set([
+  "ready",
+  "route_unready",
+  "state_unavailable",
+  "authentication_blocked",
+  "card_missing",
+  "card_ambiguous",
+  "card_identity_collision",
+  "card_query_failed",
 ]);
 const POST_LOGIN_FINALIZATION_CLASSES = new Set([
   "completed",
@@ -392,6 +405,24 @@ function sanitizeBrowserPageKind(value) {
 
 function sanitizeProfileCaptureFailureClass(value) {
   return PROFILE_CAPTURE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileCaptureReadiness(event) {
+  const count = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 3 ? value : 0;
+  return {
+    routeConfirmed: event?.routeConfirmed === true,
+    stateReadable: event?.stateReadable === true,
+    authenticationBlocked: event?.authenticationBlocked === true,
+    nameCardCount: count(event?.nameCardCount),
+    birthdayCardCount: count(event?.birthdayCardCount),
+    birthdayValueReady: event?.birthdayValueReady === true,
+    sameCardIdentity: event?.sameCardIdentity === true,
+    snapshotOutcome: PROFILE_CAPTURE_READINESS_OUTCOMES.has(event?.snapshotOutcome)
+      ? event.snapshotOutcome
+      : "card_query_failed",
+    stableObservations: count(event?.stableObservations),
+  };
 }
 
 function sanitizePostLoginFinalizationClass(value) {
@@ -1005,6 +1036,9 @@ function auditRuyiPageEvent(flowAudit, event) {
     if (event.status === "browser_observation") {
       Object.assign(details, sanitizeBrowserObservation(event));
     }
+    if (event.status === "profile_capture_readiness") {
+      Object.assign(details, sanitizeProfileCaptureReadiness(event));
+    }
     if (event.status === "profile_capture_failed") {
       details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
       details.failureClass = sanitizeProfileCaptureFailureClass(event.failureClass);
@@ -1283,6 +1317,16 @@ export async function runAccountBrowserPhase(
             reportTerminalProgress(
               `browser-stage:${stage}`,
               RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES[stage]
+            );
+          }
+        } else if (
+          event.event === "status" &&
+          event.status === "profile_capture_readiness"
+        ) {
+          if (showTerminalDebug) {
+            const readiness = sanitizeProfileCaptureReadiness(event);
+            console.log(
+              `[ruyipage] profile:route:${readiness.routeConfirmed ? 1 : 0}:state:${readiness.stateReadable ? 1 : 0}:auth_blocked:${readiness.authenticationBlocked ? 1 : 0}:name_cards:${readiness.nameCardCount}:birthday_cards:${readiness.birthdayCardCount}:birthday_ready:${readiness.birthdayValueReady ? 1 : 0}:same_card:${readiness.sameCardIdentity ? 1 : 0}:outcome:${readiness.snapshotOutcome}:stable:${readiness.stableObservations}`
             );
           }
         } else if (event.event === "status" && event.status === "browser_observation") {

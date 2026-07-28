@@ -212,6 +212,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "popup_winner_close_fallback",
     "popup_winner_close_fallback_failed",
     "popup_winner_close_pending",
+    "popup_winner_close_result",
     "popup_code_buffered",
     "popup_code_read",
     "popup_ocr_scan",
@@ -242,6 +243,7 @@ const AUDIT_LABELS_BY_KEY = Object.freeze({
     "idle",
     "has_allow_dialog",
     "has_code_dialog",
+    "accessibility_unavailable",
     "probe_error",
     "dismissed_stale",
     "dismissed_done",
@@ -849,6 +851,15 @@ export function createMac2FACollector(options = {}) {
     });
   };
 
+  const reportPopupCloseResult = (action, popupClosed) => {
+    audit({
+      phase: "popup_winner_close_result",
+      action,
+      popupClosed,
+      elapsedSincePrepareMs: elapsedSincePrepare(),
+    });
+  };
+
   const startPopupCloseCleanup = (candidate, generation) => {
     const primaryController = new AbortController();
     const fallbackController = new AbortController();
@@ -912,6 +923,26 @@ export function createMac2FACollector(options = {}) {
       }
     };
 
+    const confirmPopupCloseState = async () => {
+      let state;
+      try {
+        if (!closeMayContinue(fallbackController)) return false;
+        state = await runtime.probe2FAState(2, {
+          signal: fallbackController.signal,
+        });
+      } catch {
+        state = { action: "probe_error" };
+      }
+      if (!closeMayContinue(fallbackController)) return false;
+      const action = String(state?.action ?? "probe_error");
+      const popupClosed = action === "idle";
+      reportPopupCloseResult(action, popupClosed);
+      if (!popupClosed && action === "has_code_dialog") {
+        reportPopupClosePending(candidate);
+      }
+      return popupClosed;
+    };
+
     const primaryClose = closePrimary();
     const closeGrace = scheduleDelay(config.popupDeliveryGraceMs);
     const cleanup = (async () => {
@@ -926,19 +957,23 @@ export function createMac2FACollector(options = {}) {
       if (closeResult.kind === "cancelled" || !closeMayContinue(fallbackController)) {
         return;
       }
-      if (closeResult.kind === "close" && closeResult.popupClosed) return;
+      if (closeResult.kind === "close" && closeResult.popupClosed) {
+        reportPopupCloseResult("dismissed_done", true);
+        return;
+      }
 
       if (closeResult.kind === "grace") {
         // Do not let a hung primary close touch a later popup. The fallback has
         // its own controller so it can still run after this bounded grace.
         primaryController.abort();
-        reportPopupClosePending(candidate);
       }
 
       const fallbackClosed = await closeFallback();
-      if (!fallbackClosed && closeMayContinue(fallbackController)) {
-        reportPopupClosePending(candidate);
+      if (fallbackClosed) {
+        reportPopupCloseResult("dismissed_stale", true);
+        return;
       }
+      await confirmPopupCloseState();
     })();
 
     void cleanup

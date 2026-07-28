@@ -898,7 +898,7 @@ class FakeElement:
         if not str(script).lstrip().startswith("function"):
             raise RuntimeError("FirefoxElement.run_js requires a function declaration")
         if "ruyipage-profile-card-summary" in script:
-            return json.dumps(
+            summary = dict(
                 self.attrs.get(
                     "profileCard",
                     {
@@ -909,6 +909,17 @@ class FakeElement:
                     },
                 )
             )
+            summary.setdefault(
+                "domIdentity",
+                self.attrs.get("profileDomIdentity")
+                or f"test:{self.attrs.get('id') or id(self)}",
+            )
+            summary.setdefault(
+                "semanticActionTarget",
+                str(self.attrs.get("tagName") or "").upper() == "BUTTON"
+                or str(self.attrs.get("role") or "").lower() == "button",
+            )
+            return json.dumps(summary)
         if "ruyipage-profile-name-modal" in script:
             return json.dumps(
                 self.attrs.get(
@@ -10019,6 +10030,313 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertTrue(state["hardAuthenticationError"])
         self.assertTrue(state["rootHardAuthenticationError"])
 
+    def test_shadow_root_profile_cards_have_distinct_dom_identities(self):
+        name_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/shadow/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        birthday_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/shadow/button:2",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                },
+            }
+        )
+        shadow_root = FakePage(buttons=[name_card, birthday_card])
+        page = FakePage(
+            shadow_roots=[shadow_root],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+        safe_state = {
+            "trusted": True,
+            "password": False,
+            "email": False,
+            "trustPrompt": False,
+            "codeInputCount": 0,
+            "otpRejected": False,
+            "blocked": False,
+            "hardAuthenticationError": False,
+            "rootHardAuthenticationError": False,
+            "childAuthUiPresent": False,
+        }
+
+        self.assertEqual(
+            account_flow.element_stability_signature(page, name_card),
+            account_flow.element_stability_signature(page, birthday_card),
+        )
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=safe_state,
+        ), patch("apple_account_flow.emit", side_effect=events.append):
+            state = account_flow.wait_for_profile_capture_ready(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(state["trusted"])
+        self.assertIn(("all", False), page.shadow_roots_calls)
+        readiness = [
+            event
+            for event in events
+            if event.get("status") == "profile_capture_readiness"
+        ]
+        self.assertEqual(readiness[-1]["snapshotOutcome"], "ready")
+        self.assertEqual(readiness[-1]["nameCardCount"], 1)
+        self.assertEqual(readiness[-1]["birthdayCardCount"], 1)
+        self.assertFalse(readiness[-1]["sameCardIdentity"])
+
+    def test_profile_card_candidates_collapse_a_matching_parent_card(self):
+        parent_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/main:1/div:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        name_button = FakeElement(
+            attrs={
+                "tagName": "BUTTON",
+                "profileDomIdentity": "html:1/body:1/main:1/div:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        page = FakePage(
+            elements_by_selector={
+                "css:.card": [parent_card],
+                "css:button.button.button-bare": [name_button],
+            },
+            buttons=[name_button],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        candidates = account_flow.profile_card_candidates(page, "name")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIs(candidates[0][1], name_button)
+        self.assertIs(account_flow.resolve_profile_card(page, "name")[1], name_button)
+
+    def test_profile_card_candidates_prefer_an_outer_semantic_button(self):
+        name_button = FakeElement(
+            attrs={
+                "tagName": "BUTTON",
+                "profileDomIdentity": "html:1/body:1/main:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        inner_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/main:1/button:1/div:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        page = FakePage(
+            elements_by_selector={
+                "css:.card": [inner_card],
+                "css:button.button.button-bare": [name_button],
+            },
+            buttons=[name_button],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        candidates = account_flow.profile_card_candidates(page, "name")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIs(candidates[0][1], name_button)
+        self.assertIs(account_flow.resolve_profile_card(page, "name")[1], name_button)
+
+    def test_birthday_card_keeps_the_container_with_the_ready_value(self):
+        birthday_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/main:1/div:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                },
+            }
+        )
+        edit_button = FakeElement(
+            attrs={
+                "tagName": "BUTTON",
+                "profileDomIdentity": "html:1/body:1/main:1/div:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        page = FakePage(
+            elements_by_selector={
+                "css:.card": [birthday_card],
+                "css:button.button.button-bare": [edit_button],
+            },
+            buttons=[edit_button],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        candidates = account_flow.profile_card_candidates(page, "birthday")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIs(candidates[0][1], birthday_card)
+        self.assertEqual(
+            account_flow.resolve_profile_card(page, "birthday")[2][
+                "birthdayValue"
+            ],
+            "2000-01-02",
+        )
+
+    def test_profile_capture_ignores_child_frame_cards_and_modals(self):
+        frame_name_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        frame_birthday_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/button:2",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                },
+            }
+        )
+        frame_modal = FakeElement(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        child_frame = FakePage(
+            elements_by_selector={"css:[id^='modal-content-']": [frame_modal]},
+            buttons=[frame_name_card, frame_birthday_card],
+            state={"href": "https://account.apple.com/auth/child"},
+        )
+        page = FakePage(
+            frames=[child_frame],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        self.assertEqual(account_flow.profile_card_candidates(page, "name"), [])
+        self.assertEqual(account_flow.profile_card_candidates(page, "birthday"), [])
+        self.assertIsNone(account_flow.resolve_profile_name_modal(page))
+
+    def test_all_profile_card_ambiguity_errors_keep_the_specific_failure_class(self):
+        for message in (
+            "personal information name card is ambiguous",
+            "personal information birthday card is ambiguous",
+            "personal information profile card is ambiguous",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    account_flow.classify_profile_capture_failure(
+                        RuntimeError(message)
+                    ),
+                    "profile_card_ambiguous",
+                )
+
+    def test_shadow_root_profile_name_modal_is_collected_after_birthday(self):
+        calls: list[str] = []
+        birthday_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/shadow/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                },
+            }
+        )
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: (
+                calls.append("name_click"),
+                setattr(modal.states, "is_displayed", True),
+            ),
+            attrs={
+                "profileDomIdentity": "html:1/body:1/shadow/button:2",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            },
+        )
+        shadow_root = FakePage(
+            elements_by_selector={"css:[id^='modal-content-']": [modal]},
+            buttons=[birthday_card, name_card],
+        )
+        page = FakePage(
+            shadow_roots=[shadow_root],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        with patch("apple_account_flow.human_pause", lambda *_: None):
+            result = account_flow.collect_personal_info(page)
+
+        self.assertEqual(result, {"name": "Given Family", "birthday": "2000-01-02"})
+        self.assertEqual(calls, ["name_click"])
+        self.assertIn(("human_click", name_card), page.actions.calls)
+
     def test_profile_confirmation_fails_closed_for_live_authentication_state(self):
         blockers = (
             {"password": True},
@@ -10140,18 +10458,21 @@ class PersonalInformationTests(unittest.TestCase):
                 "name": False,
                 "birthday": True,
                 "birthdayValue": "",
+                "domIdentity": "test:hydrated-birthday-card",
             },
             {
                 "visible": True,
                 "name": False,
                 "birthday": True,
                 "birthdayValue": "2000-01-02",
+                "domIdentity": "test:hydrated-birthday-card",
             },
             {
                 "visible": True,
                 "name": False,
                 "birthday": True,
                 "birthdayValue": "2000-01-02",
+                "domIdentity": "test:hydrated-birthday-card",
             },
         ]
 

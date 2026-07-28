@@ -1211,7 +1211,7 @@ test("popup and OCR helpers expose only fixed diagnostics", () => {
 });
 
 test("popup reads are reported as candidates until the sidecar buffers a winner", () => {
-  assert.match(popupSource, /已读取候选验证码，等待关闭验证码窗/);
+  assert.match(popupSource, /已读取候选验证码，正在后台确认验证码窗状态/);
   assert.doesNotMatch(popupSource, /console\.log\("\[2FA\] 已读取验证码"\)/);
   assert.match(sidecarSource, /phase: "popup_code_buffered"/);
   assert.match(sidecarSource, /status\("winner"/);

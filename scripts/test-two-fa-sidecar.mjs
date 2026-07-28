@@ -122,6 +122,7 @@ function createNativeHarness(
     popupCloseWait = null,
     popupPrimaryCloseSucceeds = true,
     popupFallbackCloseFailures = 0,
+    popupAutoCloseOnFallbackFailure = false,
     allowStrategy = null,
     allowSource = "FollowUpUI",
     popupSource = "test-popup",
@@ -234,6 +235,7 @@ function createNativeHarness(
       if (phase === "dismiss_stale" && popup) {
         if (fallbackCloseFailuresRemaining > 0) {
           fallbackCloseFailuresRemaining -= 1;
+          if (popupAutoCloseOnFallbackFailure) popup = null;
           return { action: "none", code: null };
         }
         const code = popup.code;
@@ -2164,6 +2166,46 @@ async function popupCodeIsPublishedWhenDialogCleanupFailsTest() {
   await collector.dispose();
 }
 
+async function popupAutoCloseIsConfirmedBeforePendingStatusTest() {
+  const { clock, native, collector, audits, statuses } = createHarness({
+    popupPrimaryCloseSucceeds: false,
+    popupFallbackCloseFailures: 1,
+    popupAutoCloseOnFallbackFailure: true,
+    popupDeliveryGraceMs: 0,
+    settingsFallback: false,
+    manualFallback: false,
+  });
+  await collector.prepare();
+  const codePromise = collector.getCode();
+  native.setPopup("898989");
+
+  await clock.advance(20);
+  await clock.flush();
+
+  assert.equal(await codePromise, "898989");
+  assert.equal(
+    audits.some((entry) => entry.phase === "popup_winner_close_pending"),
+    false,
+    "an automatically closed dialog must not be reported as still visible"
+  );
+  assert.equal(
+    statuses.some((entry) => entry.status === "popup_close_pending"),
+    false,
+    "the terminal status must wait for a confirmed visible dialog"
+  );
+  assert.equal(
+    audits.some(
+      (entry) =>
+        entry.phase === "popup_winner_close_result" &&
+        entry.action === "idle" &&
+        entry.popupClosed === true
+    ),
+    true,
+    "the audit must record a probe-confirmed automatic close"
+  );
+  await collector.dispose();
+}
+
 async function popupCodeWinsAfterAllDialogCleanupPathsFailTest() {
   const { clock, native, collector, audits } = createHarness({
     popupPrimaryCloseSucceeds: false,
@@ -3952,6 +3994,7 @@ const focusedTests = {
   "late-need": lateNeedStartsSettingsImmediatelyTest,
   "popup-primary-env-floor": environmentCannotShortenPopupPrimaryWindowTest,
   "popup-close-pending": popupCodeWinsAfterAllDialogCleanupPathsFailTest,
+  "popup-close-auto-confirm": popupAutoCloseIsConfirmedBeforePendingStatusTest,
   "popup-close-grace": popupDeliveryGraceNeverExceedsConfiguredMaximumTest,
   "generation-cleanup": generationTwoRunsCleanupWhileGenerationOneCleanupIsPendingTest,
   "prepare-dispose": disposeWaitsForInProgressPreparationTest,
@@ -4044,6 +4087,7 @@ await environmentCannotShortenPopupPrimaryWindowTest();
   await popupDeliveryGraceNeverExceedsConfiguredMaximumTest();
   await popupCodeFallsBackToGenericDialogCleanupTest();
   await popupCodeIsPublishedWhenDialogCleanupFailsTest();
+  await popupAutoCloseIsConfirmedBeforePendingStatusTest();
   await popupCodeWinsAfterAllDialogCleanupPathsFailTest();
   await settingsGracePeriodTest();
   await settingsOnlyStartsImmediatelyWithoutPopupHelpersTest();

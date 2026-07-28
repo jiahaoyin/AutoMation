@@ -283,6 +283,20 @@ async function runFlowAuditForwardingTest() {
       secret: SECRET_FIXTURE,
     });
     await options.onEvent?.({
+      event: "status",
+      status: "profile_capture_readiness",
+      routeConfirmed: true,
+      stateReadable: true,
+      authenticationBlocked: false,
+      nameCardCount: 1,
+      birthdayCardCount: 1,
+      birthdayValueReady: true,
+      sameCardIdentity: false,
+      snapshotOutcome: "ready",
+      stableObservations: 2,
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
       event: "need_2fa",
       generation: 1,
       state: {
@@ -345,6 +359,26 @@ async function runFlowAuditForwardingTest() {
         codeInputCount: 0,
         elapsedMs: 1234,
       },
+    }
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_capture_readiness"
+    )?.details,
+    {
+      status: "profile_capture_readiness",
+      routeConfirmed: true,
+      stateReadable: true,
+      authenticationBlocked: false,
+      nameCardCount: 1,
+      birthdayCardCount: 1,
+      birthdayValueReady: true,
+      sameCardIdentity: false,
+      snapshotOutcome: "ready",
+      stableObservations: 2,
     }
   );
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
@@ -883,7 +917,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
     "[2FA] OCR 需要权限：系统设置 → 隐私与安全性 → 屏幕与系统音频录制；系统设置取码仍在工作。",
     "[2FA] 原生验证码弹窗未获辅助功能授权；将先尝试已授权的屏幕录制 OCR，无有效码才按顺序回退。",
     "[2FA] 网页已确认需要验证码，正在持续扫描受限 Apple 原生窗口。",
-    "[2FA] 已读取验证码；系统弹窗尚未自动关闭，正在继续提交到网页。",
+    "[2FA] 原生验证码窗仍可见，正在继续提交到网页。",
     "[2FA] 240 秒内未取得可用验证码。请确认 Mac 已登录同一 Apple ID、允许弹窗已处理，并检查系统设置取码与相关权限。",
   ]);
   assert.deepEqual(

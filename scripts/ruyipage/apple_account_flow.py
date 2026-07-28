@@ -46,8 +46,10 @@ PROFILE_CARD_SELECTORS = (
     "css:button.button.button-bare",
     "css:button[class*='button-bare']",
     "css:.card",
+    "css:button",
+    "css:[role='button']",
 )
-PROFILE_NAME_CARD_SELECTORS = PROFILE_CARD_SELECTORS[:2]
+PROFILE_NAME_CARD_SELECTORS = PROFILE_CARD_SELECTORS
 PROFILE_NAME_MODAL_SELECTORS = (
     "css:[id^='modal-content-']",
     "css:[role='dialog']",
@@ -233,10 +235,24 @@ PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
         "profile_session_unconfirmed",
         "profile_element_unavailable",
         "profile_page_unready",
+        "profile_card_ambiguous",
+        "profile_card_identity_collision",
         "profile_reauthentication_exhausted",
         "profile_data_incomplete",
         "browser_connection_lost",
         "profile_capture_failed",
+    }
+)
+PROFILE_CAPTURE_READINESS_OUTCOMES = frozenset(
+    {
+        "ready",
+        "route_unready",
+        "state_unavailable",
+        "authentication_blocked",
+        "card_missing",
+        "card_ambiguous",
+        "card_identity_collision",
+        "card_query_failed",
     }
 )
 
@@ -476,6 +492,10 @@ def classify_profile_capture_failure(error: Exception) -> str:
         return "browser_connection_lost"
     if "page element did not appear" in message:
         return "profile_element_unavailable"
+    if "profile card identity collision" in message:
+        return "profile_card_identity_collision"
+    if "card is ambiguous" in message:
+        return "profile_card_ambiguous"
     if "name and birthday" in message:
         return "profile_data_incomplete"
     if "profile" in message or "personal information" in message:
@@ -3920,6 +3940,34 @@ def profile_card_summary(card: Any) -> dict[str, Any]:
           };
           const normalize = (value) => String(value || '')
             .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const domIdentity = (element) => {
+            const parts = [];
+            let current = element;
+            for (let depth = 0; current && depth < 32; depth += 1) {
+              if (current.nodeType === 1) {
+                const tag = String(current.tagName || '').toLocaleLowerCase();
+                if (!tag) return '';
+                let ordinal = 1;
+                for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+                  if (sibling.tagName === current.tagName) ordinal += 1;
+                }
+                parts.push(`${tag}:${ordinal}`);
+              }
+              const parent = current.parentElement;
+              if (parent) {
+                current = parent;
+                continue;
+              }
+              const root = current.getRootNode?.();
+              if (root?.host && root.host !== current) {
+                parts.push('shadow');
+                current = root.host;
+                continue;
+              }
+              break;
+            }
+            return parts.reverse().join('/');
+          };
           const lines = String(this.innerText || this.textContent || '')
             .split(/\n+/).map((line) => line.trim()).filter(Boolean);
           const labels = {
@@ -3954,7 +4002,11 @@ def profile_card_summary(card: Any) -> dict[str, Any]:
             visible: visible(this),
             name: labelIndex('name') >= 0,
             birthday: birthdayIndex >= 0,
-            birthdayValue
+            birthdayValue,
+            domIdentity: domIdentity(this),
+            semanticActionTarget:
+              String(this.tagName || '').toLocaleLowerCase() === 'button' ||
+              normalize(this.getAttribute?.('role')) === 'button'
           });
         }
         """
@@ -3965,7 +4017,23 @@ def profile_card_summary(card: Any) -> dict[str, Any]:
         "name": result.get("name") is True,
         "birthday": result.get("birthday") is True,
         "birthdayValue": result.get("birthdayValue"),
+        "domIdentity": result.get("domIdentity"),
+        "semanticActionTarget": result.get("semanticActionTarget") is True,
     }
+
+
+def profile_card_dom_identity(summary: dict[str, Any]) -> str | None:
+    value = summary.get("domIdentity")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not re.fullmatch(r"[a-z0-9:/.-]{1,512}", normalized):
+        return None
+    return normalized
+
+
+def profile_card_identity_is_ancestor(ancestor: str, descendant: str) -> bool:
+    return descendant.startswith(f"{ancestor}/")
 
 
 def normalize_profile_value(value: Any, field: str) -> str:
@@ -3992,30 +4060,67 @@ def profile_card_candidates(page: Any, kind: str) -> list[tuple[Any, Any, dict[s
         raise RuntimeError("personal information card kind is invalid")
     selectors = PROFILE_NAME_CARD_SELECTORS if kind == "name" else PROFILE_CARD_SELECTORS
     candidates: list[tuple[Any, Any, dict[str, Any]]] = []
-    seen: dict[tuple[Any, ...], str] = {}
-    for selector in selectors:
-        for card in safe_elements(page, selector):
-            if not element_is_interactable(card):
-                continue
-            try:
-                summary = profile_card_summary(card)
-            except Exception:
-                continue
-            identity = (
-                element_stability_signature(page, card),
-                summary["name"],
-                summary["birthday"],
-                normalize_profile_value(summary.get("birthdayValue"), "birthday")
-                if profile_value_is_ready(summary.get("birthdayValue"), "birthday")
-                else "",
+    seen: set[tuple[str, str]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in selectors:
+            for card in safe_elements(root, selector):
+                if not element_is_interactable(card):
+                    continue
+                try:
+                    summary = profile_card_summary(card)
+                    dom_identity = profile_card_dom_identity(summary)
+                    context_id = scope_browsing_context_id(scope)
+                except Exception:
+                    continue
+                if dom_identity is None:
+                    continue
+                identity = context_id, dom_identity
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if summary["visible"] and summary[kind] is True:
+                    candidates.append((scope, card, summary))
+    if kind == "birthday":
+        ready_candidates = [
+            candidate
+            for candidate in candidates
+            if profile_value_is_ready(
+                candidate[2].get("birthdayValue"),
+                "birthday",
             )
-            previous_selector = seen.get(identity)
-            if previous_selector is not None and previous_selector != selector:
-                continue
-            seen.setdefault(identity, selector)
-            if summary["visible"] and summary[kind] is True:
-                candidates.append((page, card, summary))
-    return candidates
+        ]
+        if ready_candidates:
+            candidates = ready_candidates
+    semantic_action_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2].get("semanticActionTarget") is True
+    ]
+    if semantic_action_candidates:
+        candidates = semantic_action_candidates
+    identities = [
+        (
+            scope_browsing_context_id(scope),
+            profile_card_dom_identity(summary),
+        )
+        for scope, _card, summary in candidates
+    ]
+    leaf_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    for index, candidate in enumerate(candidates):
+        context_id, identity = identities[index]
+        has_matching_descendant = any(
+            context_id == other_context_id
+            and identity is not None
+            and other_identity is not None
+            and profile_card_identity_is_ancestor(identity, other_identity)
+            for other_index, (other_context_id, other_identity) in enumerate(identities)
+            if other_index != index
+        )
+        if not has_matching_descendant:
+            leaf_candidates.append(candidate)
+    return leaf_candidates
 
 
 def resolve_profile_card(page: Any, kind: str) -> tuple[Any, Any, dict[str, Any]] | None:
@@ -4063,7 +4168,8 @@ def wait_for_profile_card(
         if resolved is not None:
             _scope, card, summary = resolved
             signature = (
-                element_stability_signature(_scope, card),
+                scope_browsing_context_id(_scope),
+                profile_card_dom_identity(summary),
                 normalize_profile_value(summary.get("birthdayValue"), "birthday")
                 if kind == "birthday"
                 else "name-card",
@@ -4147,25 +4253,28 @@ def resolve_profile_name_modal(page: Any) -> tuple[Any, Any, dict[str, Any]] | N
         visible_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
         candidates: list[tuple[Any, Any, dict[str, Any]]] = []
         seen: dict[tuple[str, tuple[str, ...]], str] = {}
-        for modal in safe_elements(page, selector):
-            if not element_is_interactable(modal):
+        for scope, root in current_element_search_roots(page):
+            if scope is not page:
                 continue
-            try:
-                summary = profile_name_modal_summary(modal)
-            except Exception:
-                continue
-            identity = element_stability_signature(page, modal)
-            previous_selector = seen.get(identity)
-            if previous_selector is not None and previous_selector != selector:
-                continue
-            seen.setdefault(identity, selector)
-            if not (summary["visible"] and summary["fieldCount"] >= 2):
-                continue
-            visible_candidates.append((page, modal, summary))
-            if profile_value_is_ready(summary.get("given"), "name") and profile_value_is_ready(
-                summary.get("family"), "name"
-            ):
-                candidates.append((page, modal, summary))
+            for modal in safe_elements(root, selector):
+                if not element_is_interactable(modal):
+                    continue
+                try:
+                    summary = profile_name_modal_summary(modal)
+                    identity = element_stability_signature(scope, modal)
+                except Exception:
+                    continue
+                previous_selector = seen.get(identity)
+                if previous_selector is not None and previous_selector != selector:
+                    continue
+                seen.setdefault(identity, selector)
+                if not (summary["visible"] and summary["fieldCount"] >= 2):
+                    continue
+                visible_candidates.append((scope, modal, summary))
+                if profile_value_is_ready(
+                    summary.get("given"), "name"
+                ) and profile_value_is_ready(summary.get("family"), "name"):
+                    candidates.append((scope, modal, summary))
         if visible_candidates:
             if len(visible_candidates) != 1:
                 raise RuntimeError("personal information name modal is ambiguous")
@@ -4263,13 +4372,14 @@ def profile_capture_card_snapshot(
         return None
     birthday_scope, birthday_card, birthday_summary = birthday
     name_scope, name_card, _name_summary = name
-    birthday_signature = element_stability_signature(
-        birthday_scope,
-        birthday_card,
-    )
-    name_signature = element_stability_signature(name_scope, name_card)
+    birthday_identity = profile_card_dom_identity(birthday_summary)
+    name_identity = profile_card_dom_identity(_name_summary)
+    if birthday_identity is None or name_identity is None:
+        raise RuntimeError("personal information profile card identity is unavailable")
+    birthday_signature = scope_browsing_context_id(birthday_scope), birthday_identity
+    name_signature = scope_browsing_context_id(name_scope), name_identity
     if birthday_signature == name_signature:
-        raise RuntimeError("personal information profile cards are ambiguous")
+        raise RuntimeError("personal information profile card identity collision")
     signature = (
         birthday_signature,
         normalize_profile_value(
@@ -4279,6 +4389,68 @@ def profile_capture_card_snapshot(
         name_signature,
     )
     return signature, birthday, name
+
+
+def profile_capture_snapshot_outcome(error: Exception) -> str:
+    message = str(error).lower()
+    if "identity collision" in message:
+        return "card_identity_collision"
+    if "card is ambiguous" in message or "birthday card is ambiguous" in message:
+        return "card_ambiguous"
+    return "card_query_failed"
+
+
+def profile_capture_readiness_observation(
+    page: Any,
+    *,
+    state_readable: bool,
+    authentication_blocked: bool,
+    snapshot_outcome: str,
+    stable_observations: int,
+) -> dict[str, Any]:
+    """Emit only fixed structural facts, never card text or profile values."""
+    route_confirmed = is_personal_information_scope(page, page)
+    name_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    birthday_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    outcome = (
+        snapshot_outcome
+        if snapshot_outcome in PROFILE_CAPTURE_READINESS_OUTCOMES
+        else "card_query_failed"
+    )
+    if route_confirmed:
+        try:
+            name_candidates = profile_card_candidates(page, "name")
+            birthday_candidates = profile_card_candidates(page, "birthday")
+        except Exception:
+            outcome = "card_query_failed"
+    name_identity = (
+        profile_card_dom_identity(name_candidates[0][2])
+        if len(name_candidates) == 1
+        else None
+    )
+    birthday_identity = (
+        profile_card_dom_identity(birthday_candidates[0][2])
+        if len(birthday_candidates) == 1
+        else None
+    )
+    return {
+        "routeConfirmed": route_confirmed,
+        "stateReadable": state_readable,
+        "authenticationBlocked": authentication_blocked,
+        "nameCardCount": min(3, len(name_candidates)),
+        "birthdayCardCount": min(3, len(birthday_candidates)),
+        "birthdayValueReady": any(
+            profile_value_is_ready(summary.get("birthdayValue"), "birthday")
+            for _scope, _card, summary in birthday_candidates
+        ),
+        "sameCardIdentity": bool(
+            name_identity is not None
+            and birthday_identity is not None
+            and name_identity == birthday_identity
+        ),
+        "snapshotOutcome": outcome,
+        "stableObservations": min(3, max(0, stable_observations)),
+    }
 
 
 def wait_for_profile_capture_ready(
@@ -4292,22 +4464,39 @@ def wait_for_profile_capture_ready(
     previous_signature: tuple[Any, ...] | None = None
     stable_observations = 0
     authentication_blocked = False
+    previous_observation: tuple[Any, ...] | None = None
+    last_snapshot_outcome = "route_unready"
     while time.monotonic() < deadline:
         state: dict[str, Any] | None = None
         try:
             state = detect_login_state(page)
         except Exception:
             pass
-        if state is None or profile_state_has_hard_authentication_blocker(state):
+        snapshot = None
+        if state is None:
+            authentication_blocked = False
+            last_snapshot_outcome = "state_unavailable"
+            previous_signature = None
+            stable_observations = 0
+        elif profile_state_has_hard_authentication_blocker(state):
             authentication_blocked = (
-                state is not None
-                and profile_state_has_hard_authentication_blocker(state)
+                profile_state_has_hard_authentication_blocker(state)
             )
+            last_snapshot_outcome = "authentication_blocked"
             previous_signature = None
             stable_observations = 0
         else:
             authentication_blocked = False
-            snapshot = profile_capture_card_snapshot(page)
+            if not is_personal_information_scope(page, page):
+                last_snapshot_outcome = "route_unready"
+            else:
+                try:
+                    snapshot = profile_capture_card_snapshot(page)
+                    last_snapshot_outcome = (
+                        "ready" if snapshot is not None else "card_missing"
+                    )
+                except Exception as error:
+                    last_snapshot_outcome = profile_capture_snapshot_outcome(error)
             if snapshot is not None:
                 signature, _birthday, _name = snapshot
                 stable_observations = (
@@ -4316,16 +4505,37 @@ def wait_for_profile_capture_ready(
                     else 1
                 )
                 previous_signature = signature
-                if stable_observations >= PROFILE_VALUE_STABLE_OBSERVATIONS:
-                    return confirmed_personal_information_state(state)
             else:
                 previous_signature = None
                 stable_observations = 0
+        observation = profile_capture_readiness_observation(
+            page,
+            state_readable=state is not None,
+            authentication_blocked=authentication_blocked,
+            snapshot_outcome=last_snapshot_outcome,
+            stable_observations=stable_observations,
+        )
+        observation_key = tuple(observation.items())
+        if observation_key != previous_observation:
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_capture_readiness",
+                    **observation,
+                }
+            )
+            previous_observation = observation_key
+        if snapshot is not None and stable_observations >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+            return confirmed_personal_information_state(state)
         pause(180, 420)
     if authentication_blocked:
         raise RuntimeError(
             "personal information page reported an authentication error"
         )
+    if last_snapshot_outcome == "card_identity_collision":
+        raise RuntimeError("personal information profile card identity collision")
+    if last_snapshot_outcome == "card_ambiguous":
+        raise RuntimeError("personal information profile card is ambiguous")
     raise RuntimeError("personal information page was not ready")
 
 
