@@ -10929,8 +10929,9 @@ process.stdout.write(query.call(modal));
                 "profileModal": {
                     "visible": True,
                     "fieldCount": 3,
-                    "given": "Given",
-                    "family": "Family",
+                    "given": "Quang Vinh",
+                    "family": "Le",
+                    "orderedParts": ["Le", "Quang Vinh"],
                 }
             },
         )
@@ -10967,7 +10968,7 @@ process.stdout.write(query.call(modal));
 
         self.assertEqual(
             result,
-            {"name": "Given Family", "birthday": "2000年1月2日"},
+            {"name": "Quang Vinh Le", "birthday": "2000年1月2日"},
         )
         self.assertLess(calls.index("birthday"), calls.index("name_click"))
         self.assertEqual(name_card.clicks, 0)

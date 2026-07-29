@@ -4640,7 +4640,7 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
         [family, given],
     ):
         raise RuntimeError("personal information name field order was not confirmed")
-    name = normalize_profile_value(" ".join(ordered_parts), "name")
+    name = normalize_profile_value(" ".join([given, family]), "name")
     emit({"event": "status", "status": "profile_name_collected"})
     return {"name": name, "birthday": birthday}
 
