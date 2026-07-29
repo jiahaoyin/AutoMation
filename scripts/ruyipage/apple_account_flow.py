@@ -72,6 +72,10 @@ PASSWORD_SELECTORS = (
     "css:input[autocomplete='current-password']",
     "css:input[type='password']",
 )
+PASSWORD_TARGET_STABLE_OBSERVATIONS = 3
+PASSWORD_TARGET_SETTLE_MIN_MS = 650
+PASSWORD_TARGET_SETTLE_MAX_MS = 950
+PASSWORD_TARGET_REFRESH_TIMEOUT_S = 12
 REMEMBER_SELECTORS = (
     (
         "css:#remember-me",
@@ -326,7 +330,10 @@ def sanitize_diagnostic_text(value: Any) -> str:
     return text[: 64 * 1024] + ("\n[TRUNCATED]" if len(text) > 64 * 1024 else "")
 
 
-def classify_browser_exception(error: Exception) -> str:
+def classify_browser_exception(
+    error: Exception,
+    failure_stage: str | None = None,
+) -> str:
     """Convert backend exceptions to fixed diagnostics without forwarding page text."""
     message = str(error).lower()
     if "2fa digit input verification failed" in message:
@@ -341,6 +348,13 @@ def classify_browser_exception(error: Exception) -> str:
         return "twofa_input_target_count"
     if "interactable otp target did not appear" in message:
         return "twofa_target_missing"
+    if "live password input target did not stabilize" in message:
+        return "password_target_unstable"
+    if (
+        "input target focus was not confirmed" in message
+        and failure_stage in {"password_wait", "password_input", "password_submit"}
+    ):
+        return "password_focus_unconfirmed"
     if "input target focus was not confirmed" in message:
         return "twofa_focus_unconfirmed"
     if "2fa submit" in message:
@@ -960,6 +974,109 @@ def wait_for_element(
         stable_count = 0
         pause(300, 650)
     raise RuntimeError(f"page element did not appear: {', '.join(selectors)}")
+
+
+def password_target_readiness(element: Any) -> dict[str, Any] | None:
+    """Read non-secret readiness evidence for one painted password node."""
+    if not element_is_interactable(element):
+        return None
+    try:
+        raw = element.run_js(
+            """
+            function() {
+              /* ruyipage-password-target-readiness */
+              const registryKey = Symbol.for(
+                'apple-automation-password-target-registry'
+              );
+              let registry = window[registryKey];
+              if (!registry) {
+                registry = { nextId: 0, identities: new WeakMap() };
+                Object.defineProperty(window, registryKey, {
+                  value: registry,
+                  configurable: true
+                });
+              }
+              let nodeIdentity = registry.identities.get(this);
+              if (!nodeIdentity) {
+                registry.nextId += 1;
+                nodeIdentity = `password-${registry.nextId}`;
+                registry.identities.set(this, nodeIdentity);
+              }
+              const rect = this.getBoundingClientRect();
+              const style = window.getComputedStyle(this);
+              return JSON.stringify({
+                nodeIdentity,
+                connected: this.isConnected === true,
+                visible: rect.width > 2 && rect.height > 2 &&
+                  this.getClientRects().length > 0 &&
+                  style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  style.opacity !== '0',
+                editable: this.disabled !== true &&
+                  this.readOnly !== true &&
+                  this.getAttribute('aria-disabled') !== 'true',
+                inputType: String(this.type || '').toLowerCase()
+              });
+            }
+            """
+        )
+        state = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+    if not (
+        isinstance(state, dict)
+        and isinstance(state.get("nodeIdentity"), str)
+        and bool(state.get("nodeIdentity"))
+        and state.get("connected") is True
+        and state.get("visible") is True
+        and state.get("editable") is True
+        and state.get("inputType") == "password"
+    ):
+        return None
+    return state
+
+
+def password_target_is_live(element: Any) -> bool:
+    """Require the painted, editable password node instead of a hydration placeholder."""
+    return password_target_readiness(element) is not None
+
+
+def wait_for_password_target(
+    page: Any,
+    timeout_s: int = 45,
+    pause: Callable[[int, int], None] | None = None,
+) -> tuple[Any, Any]:
+    """Resolve the latest live password wrapper after a bounded paint-stability dwell."""
+    if pause is None:
+        pause = human_pause
+    deadline = time.monotonic() + max(0, timeout_s)
+    while time.monotonic() < deadline:
+        remaining = max(1, int(deadline - time.monotonic() + 0.999))
+        scope, field = wait_for_element(
+            page,
+            PASSWORD_SELECTORS,
+            timeout_s=remaining,
+            stable_observations=PASSWORD_TARGET_STABLE_OBSERVATIONS,
+            pause=pause,
+        )
+        readiness = password_target_readiness(field)
+        if readiness is None:
+            pause(260, 520)
+            continue
+        context_id = scope_browsing_context_id(scope)
+        pause(PASSWORD_TARGET_SETTLE_MIN_MS, PASSWORD_TARGET_SETTLE_MAX_MS)
+        current = find_first_scoped_element(page, PASSWORD_SELECTORS)
+        if current is None:
+            continue
+        current_scope, current_field = current
+        current_readiness = password_target_readiness(current_field)
+        if (
+            current_readiness is not None
+            and scope_browsing_context_id(current_scope) == context_id
+            and current_readiness["nodeIdentity"] == readiness["nodeIdentity"]
+        ):
+            return current_scope, current_field
+    raise RuntimeError("live password input target did not stabilize")
 
 
 def wait_for_document_settle(
@@ -1729,8 +1846,11 @@ def input_and_verify(
     keys: Any,
     pause: Callable[[int, int], None] = human_pause,
     root_page: Any | None = None,
+    target_holder: dict[str, Any] | None = None,
 ) -> Any:
     root_page = root_page or scope
+    if label == "password" and target_holder is not None:
+        target_holder.update({"scope": scope, "field": field})
     password_keyboard_retry_required = False
     if label == "password":
         try:
@@ -1749,6 +1869,30 @@ def input_and_verify(
                 "password input unreadable after trusted input",
             ):
                 raise
+            emit_input_progress("password", "target_refresh_started", "owner")
+            try:
+                scope, field = wait_for_password_target(
+                    root_page,
+                    timeout_s=PASSWORD_TARGET_REFRESH_TIMEOUT_S,
+                    pause=pause,
+                )
+            except Exception as refresh_error:
+                raise RuntimeError("password input verification failed") from refresh_error
+            emit_input_progress("password", "target_refresh_resolved", "owner")
+            if target_holder is not None:
+                target_holder.update({"scope": scope, "field": field})
+            readable, actual = read_element_input_value(field)
+            refresh_state = classify_input_read(readable, actual, value)
+            emit_input_progress(
+                "password",
+                f"target_refresh_value_{refresh_state}",
+                "owner",
+            )
+            if readable and str(actual) == value:
+                emit_input_progress("password", "verified", "owner")
+                return scope
+            if not readable or str(actual) != "":
+                raise RuntimeError("password input verification failed")
             password_keyboard_retry_required = True
             emit_input_progress("password", "owner_bidi_keyboard_retry", "owner")
 
@@ -1809,7 +1953,11 @@ def input_and_verify(
             return action_scope
         saw_readable_nonempty_mismatch = readable and str(actual) != ""
 
-        if scope is not root_page and action_scope is root_page:
+        if (
+            scope is not root_page
+            and action_scope is root_page
+            and not (label == "password" and password_keyboard_retry_required)
+        ):
             emit_input_progress(label, "owner_fallback_started", "owner")
             action_scope = focus_keyboard_target_in_owner_context(
                 scope,
@@ -1944,11 +2092,15 @@ def submit_element_with_enter(
 
             # The 2FA prepare acknowledgement can outlive an Apple iframe
             # refresh. Rediscover and revalidate before sending any key.
-            candidate_scope, candidate_element = wait_for_element(
+            candidate_scope, candidate_element = wait_for_password_target(
                 root_page,
-                PASSWORD_SELECTORS,
                 timeout_s=15,
+                pause=pause,
             )
+            refreshed_target: dict[str, Any] = {
+                "scope": candidate_scope,
+                "field": candidate_element,
+            }
             input_and_verify(
                 candidate_scope,
                 candidate_element,
@@ -1957,7 +2109,10 @@ def submit_element_with_enter(
                 keys,
                 pause=pause,
                 root_page=root_page,
+                target_holder=refreshed_target,
             )
+            candidate_scope = refreshed_target["scope"]
+            candidate_element = refreshed_target["field"]
             emit_input_progress("password", "submit_target_refreshed", "owner")
             continue
 
@@ -5770,13 +5925,15 @@ def complete_account_authentication(
                 wait_for_document_settle(page)
 
             set_browser_startup_stage("password_wait")
-            password_scope, password_field = wait_for_element(
+            password_scope, password_field = wait_for_password_target(
                 page,
-                PASSWORD_SELECTORS,
                 timeout_s=45,
-                stable_observations=2,
             )
             set_browser_startup_stage("password_input")
+            password_target: dict[str, Any] = {
+                "scope": password_scope,
+                "field": password_field,
+            }
             input_and_verify(
                 password_scope,
                 password_field,
@@ -5784,7 +5941,10 @@ def complete_account_authentication(
                 "password",
                 Keys,
                 root_page=page,
+                target_holder=password_target,
             )
+            password_scope = password_target["scope"]
+            password_field = password_target["field"]
             set_browser_startup_stage("remember_account")
             remember_checked = ensure_remember_checked(page)
             set_browser_startup_stage("twofa_prepare")
@@ -6565,7 +6725,10 @@ def run_cli(argv: list[str]) -> int:
                 "kind": "python_exception",
                 "failureStage": browser_startup_stage,
                 "errorType": type(error).__name__,
-                "errorClass": classify_browser_exception(error),
+                "errorClass": classify_browser_exception(
+                    error,
+                    browser_startup_stage,
+                ),
                 "hasTraceback": True,
             }
         )

@@ -291,6 +291,8 @@ const BACKEND_DIAGNOSTIC_CLASSES = new Set([
   "account_session_unconfirmed_after_2fa",
   "twofa_login_failed",
   "password_input_verification_failed",
+  "password_focus_unconfirmed",
+  "password_target_unstable",
   "account_home_unconfirmed",
   "profile_capture_failed",
   "browser_exception",
@@ -743,6 +745,9 @@ function classifyBackendDiagnosticMessage(value) {
   }
   if (normalized.includes("password input verification failed")) {
     return "password_input_verification_failed";
+  }
+  if (normalized.includes("live password input target did not stabilize")) {
+    return "password_target_unstable";
   }
   if (normalized.includes("login stopped before 2fa")) {
     return "login_stopped_before_2fa";

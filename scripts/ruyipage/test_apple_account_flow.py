@@ -115,6 +115,26 @@ class BrowserStageRecorderTests(unittest.TestCase):
             ],
         )
 
+class BrowserExceptionClassificationTests(unittest.TestCase):
+    def test_classifies_focus_failure_by_the_fixed_browser_stage(self):
+        error = RuntimeError("ruyiPage input target focus was not confirmed")
+
+        self.assertEqual(
+            account_flow.classify_browser_exception(error, "password_input"),
+            "password_focus_unconfirmed",
+        )
+        self.assertEqual(
+            account_flow.classify_browser_exception(error, "twofa_input"),
+            "twofa_focus_unconfirmed",
+        )
+        self.assertEqual(
+            account_flow.classify_browser_exception(
+                RuntimeError("live password input target did not stabilize"),
+                "password_wait",
+            ),
+            "password_target_unstable",
+        )
+
 
 class BrowserObservationTests(unittest.TestCase):
     def test_emits_only_fixed_non_secret_browser_observation(self):
@@ -725,6 +745,87 @@ class PageTransitionWaitTests(unittest.TestCase):
         self.assertIs(field, fresh)
         self.assertEqual(page.password_queries, 2)
 
+    def test_password_target_wait_rejects_a_prepaint_placeholder(self):
+        placeholder = FakeElement(
+            attrs={
+                "type": "password",
+                "passwordTargetReadiness": {
+                    "connected": False,
+                    "visible": False,
+                    "editable": True,
+                    "inputType": "password",
+                },
+            }
+        )
+
+        live = FakeElement(attrs={"type": "password"})
+        selector = account_flow.PASSWORD_SELECTORS[0]
+
+        class PasswordPage(FakePage):
+            def __init__(self):
+                super().__init__()
+                self.password_targets = [placeholder] * 3 + [live] * 4
+                self.password_queries = 0
+                placeholder.scope = self
+                live.scope = self
+
+            def eles(self, candidate, timeout=None):
+                self.eles_calls.append((candidate, timeout))
+                if candidate == selector:
+                    self.password_queries += 1
+                    return [
+                        self.password_targets.pop(0)
+                        if self.password_targets
+                        else live
+                    ]
+                return []
+
+        page = PasswordPage()
+        scope, field = account_flow.wait_for_password_target(
+            page,
+            timeout_s=1,
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(scope, page)
+        self.assertIs(field, live)
+        self.assertEqual(page.password_queries, 7)
+
+    def test_password_target_wait_restarts_when_hydration_replaces_the_node(self):
+        first = FakeElement(attrs={"type": "password"})
+        fresh = FakeElement(attrs={"type": "password"})
+        selector = account_flow.PASSWORD_SELECTORS[0]
+
+        class RehydratingPasswordPage(FakePage):
+            def __init__(self):
+                super().__init__()
+                self.password_targets = [first] * 3 + [fresh] * 4
+                self.password_queries = 0
+                first.scope = self
+                fresh.scope = self
+
+            def eles(self, candidate, timeout=None):
+                self.eles_calls.append((candidate, timeout))
+                if candidate == selector:
+                    self.password_queries += 1
+                    return [
+                        self.password_targets.pop(0)
+                        if self.password_targets
+                        else fresh
+                    ]
+                return []
+
+        page = RehydratingPasswordPage()
+        scope, field = account_flow.wait_for_password_target(
+            page,
+            timeout_s=1,
+            pause=lambda *_: None,
+        )
+
+        self.assertIs(scope, page)
+        self.assertIs(field, fresh)
+        self.assertEqual(page.password_queries, 8)
+
 
 class TwoFactorPreparationTests(unittest.TestCase):
     def test_accepts_only_two_factor_prepared_ack(self):
@@ -867,6 +968,9 @@ class FakeElement:
         self.rendered_text = rendered_text
         self.scroll = FakeScroll(on_scroll)
         self.prompt_semantics = prompt_semantics
+        self.password_target_identity = (
+            self.attrs.get("passwordTargetIdentity") or f"test-password:{id(self)}"
+        )
         self.equality_key = (
             ("shared", shared_id) if shared_id is not None else ("instance", object())
         )
@@ -963,6 +1067,20 @@ class FakeElement:
                     },
                 )
             )
+        if "ruyipage-password-target-readiness" in script:
+            readiness = dict(
+                self.attrs.get(
+                    "passwordTargetReadiness",
+                    {
+                        "connected": True,
+                        "visible": self.states.is_displayed,
+                        "editable": self.states.is_enabled,
+                        "inputType": str(self.attrs.get("type") or "").lower(),
+                    },
+                )
+            )
+            readiness.setdefault("nodeIdentity", self.password_target_identity)
+            return json.dumps(readiness)
         if "ruyipage-otp-length-check" in script:
             expected = re.search(r"value\.length === (\d+)", script)
             return bool(expected and len(str(self.value)) == int(expected.group(1)))
@@ -1594,6 +1712,125 @@ class InputTests(unittest.TestCase):
             [call.args[0]["step"] for call in emit_event.call_args_list],
         )
 
+    def test_password_refreshes_a_replaced_target_before_keyboard_recovery(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        stale = EmptyBidiPassword(attrs={"type": "password"})
+        fresh = FakeElement(attrs={"type": "password"})
+        page = FakePage(
+            {"css:input[type='password']": [fresh]},
+            actions=FakeActions(),
+        )
+        target_holder = {}
+
+        action_scope = input_and_verify(
+            page,
+            stale,
+            "secret",
+            "password",
+            FakeKeys,
+            pause=lambda *_: None,
+            root_page=page,
+            target_holder=target_holder,
+        )
+
+        self.assertIs(action_scope, page)
+        self.assertEqual(stale.inputs, [("secret", True)])
+        self.assertEqual(stale.value, "")
+        self.assertEqual(fresh.value, "secret")
+        self.assertIs(target_holder["scope"], page)
+        self.assertIs(target_holder["field"], fresh)
+        self.assertIn(("type", "secret", ANY), page.actions.calls)
+
+    def test_password_keyboard_recovery_does_not_repeat_in_the_owner_frame(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        auth_url = "https://idmsa.apple.com/appleauth/auth/authorize/signin"
+        iframe = FakeElement(
+            attrs={"src": auth_url},
+            location={"x": 120, "y": 220},
+            size={"width": 700, "height": 420},
+        )
+        stale = EmptyBidiPassword(attrs={"type": "password"})
+        fresh = FakeElement(
+            attrs={"type": "password"},
+            location={"x": 80, "y": 96},
+            size={"width": 460, "height": 56},
+        )
+        root = FakePage(
+            {"css:iframe": [iframe]},
+            state={"href": "https://account.apple.com/sign-in"},
+            actions=FakeActions(apply_typed_text=False, coordinate_target=fresh),
+        )
+        frame = FakePage(
+            {"css:input[type='password']": [fresh]},
+            state={"href": auth_url},
+            parent=root,
+        )
+        root.frames = [frame]
+
+        with patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(frame, fresh),
+        ), self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                frame,
+                stale,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=root,
+            )
+
+        self.assertEqual(stale.inputs, [("secret", True)])
+        self.assertEqual(
+            [call[1] for call in root.actions.calls if call[0] == "type"],
+            ["secret"],
+        )
+        self.assertEqual(
+            [call for call in frame.actions.calls if call[0] == "type"],
+            [],
+        )
+
+    def test_password_refresh_stops_on_a_nonempty_mismatched_target(self):
+        class EmptyBidiPassword(FakeElement):
+            def input(self, value, clear=True):
+                self.inputs.append((value, clear))
+                return self
+
+        stale = EmptyBidiPassword(attrs={"type": "password"})
+        fresh = FakeElement(attrs={"type": "password"})
+        fresh.value = "other"
+        page = FakePage(
+            {"css:input[type='password']": [fresh]},
+            actions=FakeActions(),
+        )
+        target_holder = {}
+
+        with self.assertRaisesRegex(RuntimeError, "password input verification failed"):
+            input_and_verify(
+                page,
+                stale,
+                "secret",
+                "password",
+                FakeKeys,
+                pause=lambda *_: None,
+                root_page=page,
+                target_holder=target_holder,
+            )
+
+        self.assertEqual(stale.inputs, [("secret", True)])
+        self.assertEqual(fresh.value, "other")
+        self.assertIs(target_holder["field"], fresh)
+        self.assertNotIn(("type", "secret", ANY), page.actions.calls)
+
     def test_password_empty_after_keyboard_retry_fails_before_2fa(self):
         class EmptyBidiPassword(FakeElement):
             def input(self, value, clear=True):
@@ -1760,6 +1997,7 @@ class InputTests(unittest.TestCase):
         iframe = FakeElement(attrs={"src": auth_url})
         stale = FakeElement(attrs={"type": "password"}, focused=False)
         fresh = FakeElement(attrs={"type": "password"})
+        refreshed = FakeElement(attrs={"type": "password"})
         root = FakePage(
             {"css:iframe": [iframe]},
             state={"href": "https://account.apple.com/sign-in"},
@@ -1771,11 +2009,17 @@ class InputTests(unittest.TestCase):
             parent=root,
         )
 
+        def retype(_scope, _field, _value, _label, _keys, **kwargs):
+            kwargs["target_holder"].update({"scope": frame, "field": refreshed})
+            return frame
+
         with patch(
-            "apple_account_flow.wait_for_element", return_value=(frame, fresh)
+            "apple_account_flow.wait_for_password_target", return_value=(frame, fresh)
         ) as rediscover, patch(
-            "apple_account_flow.input_and_verify", return_value=frame
-        ) as retype, patch("apple_account_flow.emit") as emit_event:
+            "apple_account_flow.input_and_verify", side_effect=retype
+        ) as retype_input, patch(
+            "apple_account_flow.submit_with_enter"
+        ) as submit_with_enter, patch("apple_account_flow.emit") as emit_event:
             submit_element_with_enter(
                 root,
                 frame,
@@ -1786,9 +2030,9 @@ class InputTests(unittest.TestCase):
             )
 
         rediscover.assert_called_once_with(
-            root, account_flow.PASSWORD_SELECTORS, timeout_s=15
+            root, timeout_s=15, pause=unittest.mock.ANY
         )
-        retype.assert_called_once_with(
+        retype_input.assert_called_once_with(
             frame,
             fresh,
             "secret",
@@ -1796,9 +2040,9 @@ class InputTests(unittest.TestCase):
             FakeKeys,
             pause=unittest.mock.ANY,
             root_page=root,
+            target_holder=unittest.mock.ANY,
         )
-        enter_index = root.actions.calls.index(("press", "ENTER"))
-        self.assertEqual(root.actions.calls[enter_index + 1], ("perform",))
+        self.assertIs(submit_with_enter.call_args.args[1], refreshed)
         self.assertEqual(
             [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
             ["submit_target_refreshed"],
@@ -1999,7 +2243,7 @@ class InputTests(unittest.TestCase):
         self.assertIn("keyboard_unverified_continue", steps)
         self.assertNotIn("element_fallback_started", steps)
 
-    def test_password_retries_keyboard_after_unreadable_trusted_input(self):
+    def test_password_refresh_accepts_a_fresh_matching_value_after_unreadable_input(self):
         password = FakeElement(attrs={"type": "password"})
         page = FakePage({"css:input[type='password']": [password]})
 
@@ -2019,9 +2263,9 @@ class InputTests(unittest.TestCase):
         self.assertIs(action_scope, page)
         self.assertEqual(password.value, "secret")
         self.assertEqual(password.inputs, [("secret", True)])
-        self.assertIn(("type", "secret", ANY), page.actions.calls)
+        self.assertNotIn(("type", "secret", ANY), page.actions.calls)
         self.assertIn(
-            "owner_bidi_keyboard_retry",
+            "target_refresh_value_matched",
             [event["step"] for event in (call.args[0] for call in emit_event.call_args_list)],
         )
 
@@ -2456,7 +2700,10 @@ class BrowserFlowTests(unittest.TestCase):
             return_value={"trusted": False},
         ), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(root, email), (root, password)],
+            return_value=(root, email),
+        ), patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(root, password),
         ), patch(
             "apple_account_flow.input_and_verify",
             side_effect=input_or_fail,
@@ -2592,7 +2839,7 @@ class BrowserFlowTests(unittest.TestCase):
         root.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
         root.quit = lambda: None
         email = FakeElement()
-        password = FakeElement()
+        password = FakeElement(attrs={"type": "password"})
         otp = FakeElement()
         target = [(root, otp)]
         calls = []
@@ -2638,7 +2885,10 @@ class BrowserFlowTests(unittest.TestCase):
             side_effect=[{"trusted": False}, {"trusted": True}],
         ), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(root, email), (root, password)],
+            return_value=(root, email),
+        ), patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(root, password),
         ), patch(
             "apple_account_flow.input_and_verify",
             return_value=root,
@@ -2932,7 +3182,10 @@ class BrowserFlowTests(unittest.TestCase):
             side_effect=[{"trusted": False}, {"trusted": True}],
         ), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(root, email), (root, password)],
+            return_value=(root, email),
+        ), patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(root, password),
         ), patch("apple_account_flow.input_and_verify"), patch(
             "apple_account_flow.submit_element_with_enter"
         ), patch("apple_account_flow.ensure_remember_checked", return_value=True), patch(
@@ -3017,7 +3270,10 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.detect_login_state", return_value={"trusted": False}
         ), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(root, FakeElement()), (root, FakeElement())],
+            return_value=(root, FakeElement()),
+        ), patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(root, FakeElement(attrs={"type": "password"})),
         ), patch("apple_account_flow.input_and_verify"), patch(
             "apple_account_flow.submit_element_with_enter"
         ), patch("apple_account_flow.ensure_remember_checked", return_value=True), patch(
@@ -3078,9 +3334,9 @@ class BrowserFlowTests(unittest.TestCase):
             "apple_account_flow.settle_trust_state",
             side_effect=lambda _page, state, **_kwargs: state,
         ), patch(
-            "apple_account_flow.wait_for_element",
+            "apple_account_flow.wait_for_password_target",
             return_value=(root, password),
-        ) as wait_for_element, patch(
+        ) as wait_for_password_target, patch(
             "apple_account_flow.input_and_verify",
         ) as input_and_verify, patch(
             "apple_account_flow.ensure_remember_checked",
@@ -3107,11 +3363,9 @@ class BrowserFlowTests(unittest.TestCase):
         ), patch("apple_account_flow.emit"):
             self.assertEqual(browser_flow(args), 0)
 
-        wait_for_element.assert_called_once_with(
+        wait_for_password_target.assert_called_once_with(
             root,
-            account_flow.PASSWORD_SELECTORS,
             timeout_s=45,
-            stable_observations=2,
         )
         self.assertEqual(input_and_verify.call_args.args[3], "password")
         prepare_two_factor.assert_called_once_with()
@@ -3248,7 +3502,10 @@ class BrowserFlowTests(unittest.TestCase):
             return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
         ), patch("apple_account_flow.detect_login_state", return_value={"trusted": False}), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(root, FakeElement()), (root, FakeElement())],
+            return_value=(root, FakeElement()),
+        ), patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(root, FakeElement(attrs={"type": "password"})),
         ), patch("apple_account_flow.input_and_verify"), patch(
             "apple_account_flow.submit_element_with_enter"
         ), patch("apple_account_flow.ensure_remember_checked", return_value=True), patch(
@@ -10604,6 +10861,7 @@ class PersonalInformationTests(unittest.TestCase):
         )
         email = FakeElement()
         password = FakeElement(attrs={"type": "password"})
+        refreshed_password = FakeElement(attrs={"type": "password"})
         initial_state = {
             "href": page.state["href"],
             "email": True,
@@ -10617,6 +10875,14 @@ class PersonalInformationTests(unittest.TestCase):
             "otpRejected": False,
         }
         authentication_context = {"twofaPrepared": False, "nextGeneration": 1}
+
+        def input_value(scope, _field, _value, label, _keys, **kwargs):
+            if label == "password":
+                kwargs["target_holder"].update(
+                    {"scope": scope, "field": refreshed_password}
+                )
+            return scope
+
         with patch(
             "apple_account_flow.detect_login_state",
             return_value=initial_state,
@@ -10628,12 +10894,16 @@ class PersonalInformationTests(unittest.TestCase):
             return_value=False,
         ), patch(
             "apple_account_flow.wait_for_element",
-            side_effect=[(page, email), (page, password)],
+            return_value=(page, email),
         ), patch(
-            "apple_account_flow.input_and_verify"
-        ) as input_value, patch(
+            "apple_account_flow.wait_for_password_target",
+            return_value=(page, password),
+        ), patch(
+            "apple_account_flow.input_and_verify",
+            side_effect=input_value,
+        ) as input_verify, patch(
             "apple_account_flow.submit_element_with_enter"
-        ), patch(
+        ) as submit_password, patch(
             "apple_account_flow.ensure_remember_checked",
             return_value=True,
         ), patch(
@@ -10658,9 +10928,10 @@ class PersonalInformationTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            [call.args[3] for call in input_value.call_args_list],
+            [call.args[3] for call in input_verify.call_args_list],
             ["email", "password"],
         )
+        self.assertIs(submit_password.call_args.args[2], refreshed_password)
         prepare.assert_called_once_with()
         self.assertTrue(authentication_context["twofaPrepared"])
         self.assertTrue(result["confirmedState"]["trusted"])

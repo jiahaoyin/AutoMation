@@ -360,7 +360,15 @@ async function runFlowAuditForwardingTest() {
       kind: "python_exception",
       failureStage: "password_input",
       errorType: "RuntimeError",
-      errorClass: "twofa_target_missing",
+      errorClass: "password_focus_unconfirmed",
+      hasTraceback: true,
+    });
+    await options.onEvent?.({
+      event: "diagnostic",
+      kind: "python_exception",
+      failureStage: "password_wait",
+      errorType: "RuntimeError",
+      errorClass: "password_target_unstable",
       hasTraceback: true,
     });
     await options.prepare2FA();
@@ -384,6 +392,24 @@ async function runFlowAuditForwardingTest() {
         entry.details.field === "password" &&
         entry.details.step === "owner_fallback_started" &&
         entry.details.route === "owner"
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "diagnostic" &&
+        entry.details.failureStage === "password_wait" &&
+        entry.details.errorType === "backend_diagnostic" &&
+        entry.details.diagnosticErrorType === "runtimeerror" &&
+        entry.details.diagnosticErrorClass === "password_target_unstable" &&
+        entry.details.diagnosticMessageClass === "unknown" &&
+        entry.details.hasDiagnosticMessage === false &&
+        entry.details.hasTraceback === true &&
+        !("message" in entry.details) &&
+        !("traceback" in entry.details) &&
+        !("diagnosticMessage" in entry.details) &&
+        !("diagnosticTraceback" in entry.details)
     )
   );
   assert.deepEqual(
@@ -456,7 +482,7 @@ async function runFlowAuditForwardingTest() {
         entry.details.failureStage === "password_input" &&
         entry.details.errorType === "backend_diagnostic" &&
         entry.details.diagnosticErrorType === "runtimeerror" &&
-        entry.details.diagnosticErrorClass === "twofa_target_missing" &&
+        entry.details.diagnosticErrorClass === "password_focus_unconfirmed" &&
         entry.details.diagnosticMessageClass === "unknown" &&
         entry.details.hasDiagnosticMessage === false &&
         entry.details.hasTraceback === true &&
