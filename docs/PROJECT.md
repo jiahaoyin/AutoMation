@@ -88,7 +88,9 @@ TTY 且手输未被明确禁用，才隐藏读取手输验证码。手输默认�
 - `BROWSER_PRESERVE_ON_FAILURE=1`：直接运行 `./run.sh` 时失败后默认保留 Firefox，便于核对当前 Apple 页面；设置为 `0` 才关闭。受监督 broker 会话仍严格清理。
 - `BROWSER_PRESERVE_ON_SUCCESS=1`：直接运行成功后默认保留 Firefox 窗口和已登录标签页；设为 `0` 才在 Python 结束时关闭。
 - `BROWSER_ATTACH_EXISTING=1`：下次直接运行时优先用 ruyiPage 接管现有 `account.apple.com` 标签页，并检测已登录状态；`BROWSER_ATTACH_ADDRESS` 可显式指定调试地址。
-- 登录成功后精确访问 `https://account.apple.com/account/manage/section/information`，在姓名/生日两张卡连续稳定后保存唯一截图 `screenshots/02-account-information.png`。流程先读取生日，再点击姓名卡并从结构化弹窗字段读取名与姓；值仅写入 `.env` 的小写 `name`、`birthday`，交互终端用于核对，audit 和 `report.json` 仅保留是否采集成功。
+- 初始标签页先完成 `https://developer.apple.com/account` 的登录和会员判定；仅 `active` 会保存会员详情截图。结果先写入 `.env` 的 `developer_membership`。随后才为 Account 模块新建标签页。
+- `DEVELOPER_MEMBERSHIP_GATE=0`：测试默认值，所有固定会员状态都继续 Account；设为 `1` 时仅 `active` 新建 Account 标签页，其他状态会记录会员结果、保留 Developer 页面并将 Account 标为已跳过。
+- Account 运行后精确访问 `https://account.apple.com/account/manage/section/information`，在姓名/生日两张卡连续稳定后保存唯一截图 `screenshots/02-account-information.png`。流程先读取生日，再点击姓名卡并从结构化弹窗字段读取名与姓；值仅写入 `.env` 的小写 `name`、`birthday`，交互终端用于核对，audit 和 `report.json` 仅保留是否采集成功。
 - OTP 不会输出到终端、audit、报告、截图或错误文本；使用固定状态与交接阶段排查取码和填码问题。
 - 普通终端只显示 `[→]`、`[✓]`、`[!]`、`[×]` 进度；每条脱敏 backend 事件仍完整写入 `flow-audit.jsonl`。排查时以 shell/export 运行时开关设置 `APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac`，在终端额外镜像脱敏机器协议；该开关不从 `.env` 读取，受监督验收会自动启用协议。
 

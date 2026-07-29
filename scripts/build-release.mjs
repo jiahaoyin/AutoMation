@@ -290,6 +290,7 @@ cd apple-id-automation-${VERSION}
 | \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
 | \`BROWSER_PRESERVE_ON_FAILURE\` | 可选，直接运行默认 \`1\`；失败后保留 Firefox 供人工检查当前页面，设为 \`0\` 才关闭；受监督 broker 会话仍严格清理 |
 | \`BROWSER_PRESERVE_ON_SUCCESS\` | 可选，默认 \`1\`；成功后保留已登录 Firefox 窗口、标签页和持久 Profile |
+| \`DEVELOPER_MEMBERSHIP_GATE\` | 可选，默认 \`0\` 测试模式始终继续 Account；设为 \`1\` 时仅已加入 Developer Program 的账号继续 |
 | \`APPLE_AUTOMATION_TERMINAL_DEBUG\` | shell/export 运行时开关，设为 \`1\` 时终端镜像脱敏机器协议；不从 \`.env\` 读取，完整日志始终写入 \`flow-audit.jsonl\` |
 | \`name\` / \`birthday\` | 个人信息页成功采集后自动写入；不要手动放入日志或报告 |
 
@@ -353,6 +354,7 @@ APPLE_PASSWORD=your_password
 # BROWSER_PRESERVE_ON_SUCCESS=1
 # BROWSER_ATTACH_EXISTING=1
 # BROWSER_ATTACH_ADDRESS=127.0.0.1:9222
+# DEVELOPER_MEMBERSHIP_GATE=0
 # 终端诊断仅接受 shell/export 运行时开关，不从 .env 读取：
 # APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 # name=                              # 已登录个人信息页采集后写入

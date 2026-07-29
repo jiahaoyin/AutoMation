@@ -128,6 +128,7 @@ BROWSER_PRESERVE_ON_FAILURE=1  # 失败时保留 Firefox 现场；超时或外�
 BROWSER_PRESERVE_ON_SUCCESS=1  # 成功后保留已登录窗口和标签页
 BROWSER_ATTACH_EXISTING=1      # 下次运行优先接管现有 account.apple.com 标签页
 BROWSER_ATTACH_ADDRESS=127.0.0.1:9222  # 可选：显式 ruyiPage 接管地址
+DEVELOPER_MEMBERSHIP_GATE=0    # 测试默认继续 Account；设为 1 时仅已加入会员继续
 # 终端诊断仅接受 shell/export 运行时开关，不从 .env 读取：
 # APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 BROWSER_2FA_SETTINGS_AFTER_MS=30000
@@ -136,7 +137,13 @@ BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
 ```
 
-登录成功后，ruyiPage 会精确访问
+浏览器先使用初始标签页完成 Apple Developer 登录和会员状态判定；仅 `active` 会打开会员资格详情并
+保存会员详情截图。随后才新建 Account 标签页进行个人资料采集。`DEVELOPER_MEMBERSHIP_GATE=0` 是测试默认值，会员状态为
+`active`、`not_enrolled` 或 `unknown` 都会继续执行 Account。设为 `1` 时，只有 `active` 会新建
+Account 标签页；其他结果会写入 `developer_membership`、保留 Developer 页面和已生成的会员详情截图，
+并以已跳过的 Account 模块正常结束。
+
+Account 登录成功后，ruyiPage 会精确访问
 `https://account.apple.com/account/manage/section/information`。姓名与生日卡连续稳定后，
 保存唯一截图 `screenshots/02-account-information.png`，先读取生日，再打开姓名弹窗；
 采集值写入 `.env` 的 `name`、`birthday`，交互终端会直接显示两项供核对。Firefox 窗口、

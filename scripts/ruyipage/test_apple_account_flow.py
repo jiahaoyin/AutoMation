@@ -2587,6 +2587,41 @@ class InputTests(unittest.TestCase):
 
 
 class BrowserFlowTests(unittest.TestCase):
+    def setUp(self):
+        def completed_developer_membership(page, *_args, **kwargs):
+            page_holder = kwargs.get("page_holder")
+            if isinstance(page_holder, dict):
+                page_holder["page"] = page
+            return (
+                {
+                    "success": True,
+                    "authenticated": True,
+                    "membershipStatus": "active",
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                page,
+                None,
+            )
+
+        self._developer_membership_patch = patch(
+            "apple_account_flow.collect_developer_account_membership",
+            side_effect=completed_developer_membership,
+        )
+        self._account_tab_patch = patch(
+            "apple_account_flow.open_account_module_tab",
+            side_effect=lambda page, _url: page,
+        )
+        self._developer_membership_mock = self._developer_membership_patch.start()
+        self._account_tab_mock = self._account_tab_patch.start()
+
+    def tearDown(self):
+        self._account_tab_patch.stop()
+        self._developer_membership_patch.stop()
+
     def test_direct_mode_emits_complete_early_browser_stage_sequence(self):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
@@ -2639,13 +2674,13 @@ class BrowserFlowTests(unittest.TestCase):
             [
                 "not_started",
                 "credentials_received",
-                "url_validated",
                 "runtime_importing",
                 "runtime_imported",
                 "browser_constructing",
+                "browser_ready",
             ],
         )
-        self.assertIn("browser_ready", stages)
+        self.assertGreater(stages.index("url_validated"), stages.index("browser_ready"))
         self.assertFalse(
             any(
                 event.get("status") in {
@@ -3624,6 +3659,10 @@ class BrowserFlowTests(unittest.TestCase):
         def click_without_pause(page, **_kwargs):
             return click_trust_browser(page, pause=lambda *_: None)
 
+        def open_account_tab(page, url):
+            page.get(url)
+            return page
+
         args = parse_args(["--report-dir", "test-report"])
         with patch.dict(
             os.environ,
@@ -3634,6 +3673,8 @@ class BrowserFlowTests(unittest.TestCase):
             return_value=(FakeFirefoxOptions, lambda _opts: root, FakeKeys),
         ), patch(
             "apple_account_flow.click_trust_browser", side_effect=click_without_pause
+        ), patch(
+            "apple_account_flow.open_account_module_tab", side_effect=open_account_tab
         ), patch("apple_account_flow.take_screenshot", return_value=None), patch(
             "apple_account_flow.wait_for_profile_capture_ready", return_value=None
         ), patch(
@@ -3647,7 +3688,371 @@ class BrowserFlowTests(unittest.TestCase):
         self.assertIn(("human_click", trust), root.actions.calls)
 
 
+class DeveloperFirstSequencingTests(unittest.TestCase):
+    @staticmethod
+    def _page(url="about:blank"):
+        page = FakePage(state={"href": url})
+        page.states = FakeStates(alive=True)
+        page.wait = type("FakeWait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        page.quit = lambda: None
+        page.get_calls = []
+
+        def get(target):
+            page.get_calls.append(target)
+            page.state["href"] = target
+
+        page.get = get
+        return page
+
+    @staticmethod
+    def _developer_result(status="active"):
+        return {
+            "success": True,
+            "authenticated": True,
+            "membershipStatus": status,
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": True,
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+
+    @staticmethod
+    def _account_authentication_result():
+        return {
+            "confirmedState": {"trusted": True, "error": False},
+            "skippedLogin": True,
+            "skipped2FA": True,
+            "rememberAccount": None,
+        }
+
+    def _run_with_pages(
+        self,
+        developer_page,
+        account_page,
+        *,
+        developer_result=None,
+        developer_error=None,
+        gate="0",
+    ):
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        events = []
+        developer_contexts = []
+        account_contexts = []
+        developer_page.new_tab = lambda url: (
+            setattr(developer_page, "opened_account_url", url) or account_page
+        )
+
+        def collect_developer(page, *_args, **kwargs):
+            developer_contexts.append(_args[3])
+            holder = kwargs.get("page_holder")
+            if isinstance(holder, dict):
+                holder["page"] = page
+            self.assertFalse(kwargs["open_in_new_tab"])
+            if developer_error is not None:
+                raise developer_error
+            return developer_result or self._developer_result(), page, None
+
+        def complete_account(page, *_args, **kwargs):
+            account_contexts.append(kwargs["authentication_context"])
+            self.assertIs(page, account_page)
+            return self._account_authentication_result()
+
+        args = parse_args(["--report-dir", "test-report"])
+        with patch.dict(
+            os.environ,
+            {
+                "APPLE_ID": "person@example.com",
+                "APPLE_PASSWORD": "secret",
+                "DEVELOPER_MEMBERSHIP_GATE": gate,
+                "BROWSER_PRESERVE_ON_FAILURE": "0",
+                "BROWSER_PRESERVE_ON_SUCCESS": "0",
+            },
+            clear=False,
+        ), patch(
+            "apple_account_flow.import_ruyipage",
+            return_value=(FakeFirefoxOptions, lambda _opts: developer_page, FakeKeys),
+        ), patch(
+            "apple_account_flow.try_attach_existing_browser_for_flow",
+            return_value=(None, "new_tab"),
+        ), patch(
+            "apple_account_flow.collect_developer_account_membership",
+            side_effect=collect_developer,
+        ), patch(
+            "apple_account_flow.complete_account_authentication",
+            side_effect=complete_account,
+        ), patch(
+            "apple_account_flow.reach_personal_information_page", return_value=None
+        ), patch(
+            "apple_account_flow.detect_login_state", return_value={"trusted": True, "error": False}
+        ), patch(
+            "apple_account_flow.settle_trust_state", side_effect=lambda _page, state, **_kwargs: state
+        ), patch(
+            "apple_account_flow.wait_for_profile_capture_ready", return_value=None
+        ), patch(
+            "apple_account_flow.take_screenshot", return_value=None
+        ), patch(
+            "apple_account_flow.collect_personal_info",
+            return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
+        ), patch(
+            "apple_account_flow.finalize_post_login_browser",
+            return_value={
+                "browserFinalizationCompleted": True,
+                "browserPreservationRequested": False,
+                "browserSessionPreserved": False,
+                "finalizationClass": "completed",
+            },
+        ), patch("apple_account_flow.human_pause", return_value=None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            self.assertEqual(browser_flow(args), 0)
+
+        return events, developer_contexts, account_contexts
+
+    def test_developer_uses_initial_tab_then_account_uses_one_new_tab_and_shared_context(self):
+        developer_page = self._page()
+        account_page = self._page()
+
+        events, developer_contexts, account_contexts = self._run_with_pages(
+            developer_page,
+            account_page,
+            gate="1",
+        )
+
+        self.assertEqual(developer_page.opened_account_url, "https://appleid.apple.com/sign-in")
+        self.assertEqual(len(developer_contexts), 1)
+        self.assertEqual(len(account_contexts), 1)
+        self.assertIs(developer_contexts[0], account_contexts[0])
+        self.assertTrue(
+            any(event.get("status") == "account_module_tab_created" for event in events)
+        )
+
+    def test_gate_disabled_continues_to_account_for_non_member(self):
+        developer_page = self._page()
+        account_page = self._page()
+
+        _events, _developer_contexts, account_contexts = self._run_with_pages(
+            developer_page,
+            account_page,
+            developer_result=self._developer_result("not_enrolled"),
+            gate="0",
+        )
+
+        self.assertEqual(len(account_contexts), 1)
+        self.assertEqual(developer_page.opened_account_url, "https://appleid.apple.com/sign-in")
+
+    def test_gate_disabled_continues_to_account_for_unknown_and_developer_failure(self):
+        cases = (
+            (self._developer_result("unknown"), None),
+            (None, RuntimeError("developer membership unavailable")),
+        )
+        for developer_result, developer_error in cases:
+            with self.subTest(
+                membership=(developer_result or {}).get("membershipStatus", "failure")
+            ):
+                developer_page = self._page()
+                account_page = self._page()
+                events, _developer_contexts, account_contexts = self._run_with_pages(
+                    developer_page,
+                    account_page,
+                    developer_result=developer_result,
+                    developer_error=developer_error,
+                    gate="0",
+                )
+
+                self.assertEqual(len(account_contexts), 1)
+                self.assertEqual(
+                    developer_page.opened_account_url,
+                    "https://appleid.apple.com/sign-in",
+                )
+                result = next(event for event in events if event.get("event") == "result")
+                self.assertEqual(
+                    result["accountModule"],
+                    {
+                        "attempted": True,
+                        "skipped": False,
+                        "skipReason": "unknown",
+                        "membershipGateEnabled": False,
+                        "membershipGatePassed": True,
+                    },
+                )
+
+    def test_gate_enabled_blocks_non_active_and_developer_failure_before_new_tab(self):
+        cases = (
+            (self._developer_result("not_enrolled"), None),
+            (self._developer_result("unknown"), None),
+            (None, RuntimeError("developer membership unavailable")),
+        )
+        for developer_result, developer_error in cases:
+            with self.subTest(
+                membership=(developer_result or {}).get("membershipStatus", "failure")
+            ):
+                developer_page = self._page()
+                account_page = self._page()
+                events, _developer_contexts, account_contexts = self._run_with_pages(
+                    developer_page,
+                    account_page,
+                    developer_result=developer_result,
+                    developer_error=developer_error,
+                    gate="1",
+                )
+
+                self.assertEqual(account_contexts, [])
+                self.assertFalse(hasattr(developer_page, "opened_account_url"))
+                result = next(event for event in events if event.get("event") == "result")
+                self.assertTrue(result["success"])
+                self.assertFalse(result["browserLogin"]["accountHomeConfirmed"])
+                self.assertEqual(
+                    result["accountModule"],
+                    {
+                        "attempted": False,
+                        "skipped": True,
+                        "skipReason": "developer_membership_gate",
+                        "membershipGateEnabled": True,
+                        "membershipGatePassed": False,
+                    },
+                )
+                gate_event = next(
+                    event
+                    for event in events
+                    if event.get("status") == "developer_membership_gate_blocked"
+                )
+                self.assertEqual(
+                    gate_event["developerResultSucceeded"],
+                    developer_result is not None,
+                )
+
+    def test_current_tab_developer_collection_navigates_before_authentication(self):
+        page = self._page("https://account.apple.com/account/manage")
+        contexts = []
+        context = {"twofaPrepared": False, "nextGeneration": 1}
+
+        def complete_developer(page_arg, *_args, **kwargs):
+            self.assertIs(page_arg, page)
+            contexts.append(kwargs["authentication_context"])
+            self.assertFalse(kwargs["account_home_confirmed"])
+            return {
+                "confirmedState": {"developerAccountShell": True},
+                "skippedLogin": False,
+                "skipped2FA": False,
+                "rememberAccount": None,
+            }
+
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            side_effect=complete_developer,
+        ), patch("apple_account_flow.human_pause", return_value=None), patch(
+            "apple_account_flow.emit"
+        ):
+            result, returned_page, _screenshot = account_flow.collect_developer_account_membership(
+                page,
+                "person@example.com",
+                "secret",
+                FakeKeys,
+                context,
+                Path("test-developer.png"),
+                open_in_new_tab=False,
+            )
+
+        self.assertIs(returned_page, page)
+        self.assertTrue(result["success"])
+        self.assertEqual(page.get_calls, [account_flow.DEVELOPER_ACCOUNT_URL])
+        self.assertEqual(contexts, [context])
+
+    def test_account_tab_failure_keeps_developer_membership_screenshot(self):
+        class FakeFirefoxOptions:
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        developer_page = self._page()
+        developer_page.new_tab = lambda _url: (_ for _ in ()).throw(RuntimeError("new tab failed"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            screenshot_path = report_dir / "screenshots" / "03-developer-membership.png"
+            screenshot_path.parent.mkdir(parents=True)
+            screenshot_path.write_text("developer membership", encoding="utf-8")
+            args = parse_args(["--report-dir", str(report_dir)])
+
+            def collect_developer(page, *_args, **kwargs):
+                holder = kwargs.get("page_holder")
+                if isinstance(holder, dict):
+                    holder["page"] = page
+                return self._developer_result(), page, str(screenshot_path)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "APPLE_ID": "person@example.com",
+                    "APPLE_PASSWORD": "secret",
+                    "BROWSER_PRESERVE_ON_FAILURE": "0",
+                    "BROWSER_PRESERVE_ON_SUCCESS": "0",
+                },
+                clear=False,
+            ), patch(
+                "apple_account_flow.import_ruyipage",
+                return_value=(FakeFirefoxOptions, lambda _opts: developer_page, FakeKeys),
+            ), patch(
+                "apple_account_flow.try_attach_existing_browser_for_flow",
+                return_value=(None, "new_tab"),
+            ), patch(
+                "apple_account_flow.collect_developer_account_membership",
+                side_effect=collect_developer,
+            ), patch("apple_account_flow.human_pause", return_value=None), patch(
+                "apple_account_flow.emit"
+            ):
+                with self.assertRaisesRegex(RuntimeError, "new account module tab could not be created"):
+                    browser_flow(args)
+
+            self.assertTrue(screenshot_path.exists())
+
+    def test_membership_gate_requires_the_exact_value_one(self):
+        for value, expected in (("1", True), ("0", False), ("true", False), (" yes ", False), ("", False)):
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ, {account_flow.DEVELOPER_MEMBERSHIP_GATE_ENV: value}, clear=False
+                ):
+                    self.assertIs(account_flow.developer_membership_gate_enabled(), expected)
+
+
 class SafeFailureBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        def completed_developer_membership(page, *_args, **kwargs):
+            page_holder = kwargs.get("page_holder")
+            if isinstance(page_holder, dict):
+                page_holder["page"] = page
+            return (
+                {
+                    "success": True,
+                    "authenticated": True,
+                    "membershipStatus": "active",
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                page,
+                None,
+            )
+
+        self._developer_membership_patch = patch(
+            "apple_account_flow.collect_developer_account_membership",
+            side_effect=completed_developer_membership,
+        )
+        self._account_tab_patch = patch(
+            "apple_account_flow.open_account_module_tab",
+            side_effect=lambda page, _url: page,
+        )
+        self._developer_membership_mock = self._developer_membership_patch.start()
+        self._account_tab_mock = self._account_tab_patch.start()
+
+    def tearDown(self):
+        self._account_tab_patch.stop()
+        self._developer_membership_patch.stop()
+
     SECRET_SENTINEL = "?token=SECRET"
 
     class DiskScreenshotPage:
@@ -4013,7 +4418,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     "browserPreservationRequested": True,
                 },
             )
-            self.assertFalse(
+            self.assertTrue(
                 result["postLoginDeveloperAccount"]["browserPreserved"]
             )
             self.assertLess(
@@ -4262,6 +4667,8 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 return lambda *_args, **_kwargs: None
 
         class FailingPage:
+            states = FakeStates(alive=True)
+
             def get(self, _url):
                 raise RuntimeError("navigation failed")
 
@@ -4286,7 +4693,16 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             ), patch(
                 "apple_account_flow.import_ruyipage",
                 return_value=(FakeFirefoxOptions, lambda _opts: FailingPage(), FakeKeys),
+            ), patch(
+                "apple_account_flow.try_attach_existing_browser_for_flow",
+                return_value=(None, "new_tab"),
             ), patch("apple_account_flow.emit"):
+                self._account_tab_mock.side_effect = (
+                    lambda page, *_args, **_kwargs: (
+                        account_flow.set_browser_startup_stage("account_navigation"),
+                        page.get("https://appleid.apple.com/sign-in"),
+                    )[-1]
+                )
                 with self.assertRaisesRegex(RuntimeError, "navigation failed"):
                     browser_flow(args)
 
@@ -4404,7 +4820,16 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         ), patch(
             "apple_account_flow.import_ruyipage",
             return_value=(lambda: options, lambda _opts: page, FakeKeys),
+        ), patch(
+            "apple_account_flow.try_attach_existing_browser_for_flow",
+            return_value=(None, "new_tab"),
         ), patch("apple_account_flow.emit") as emit_event:
+            self._account_tab_mock.side_effect = (
+                lambda page, *_args, **_kwargs: (
+                    account_flow.set_browser_startup_stage("account_navigation"),
+                    page.get("https://appleid.apple.com/sign-in"),
+                )[-1]
+            )
             with self.assertRaisesRegex(RuntimeError, "navigation failed"):
                 browser_flow(args)
 
@@ -4414,7 +4839,7 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 {
                     "event": "status",
                     "status": "browser_preserved",
-                    "failureStage": "login_navigation",
+                    "failureStage": "account_navigation",
                     "preserved": True,
                 },
             [call.args[0] for call in emit_event.call_args_list],
@@ -4448,7 +4873,16 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         ), patch(
             "apple_account_flow.import_ruyipage",
             return_value=(FakeFirefoxOptions, lambda _opts: page, FakeKeys),
+        ), patch(
+            "apple_account_flow.try_attach_existing_browser_for_flow",
+            return_value=(None, "new_tab"),
         ), patch("apple_account_flow.emit") as emit_event:
+            self._account_tab_mock.side_effect = (
+                lambda page, *_args, **_kwargs: (
+                    account_flow.set_browser_startup_stage("account_navigation"),
+                    page.get("https://appleid.apple.com/sign-in"),
+                )[-1]
+            )
             with self.assertRaisesRegex(RuntimeError, "navigation failed"):
                 browser_flow(args)
 
@@ -4466,6 +4900,8 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 return lambda *_args, **_kwargs: None
 
         class FailingAuthenticationPage:
+            states = FakeStates(alive=True)
+
             def get(self, _url):
                 raise RuntimeError("authentication navigation failed")
 
@@ -4489,20 +4925,29 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 lambda _opts: FailingAuthenticationPage(),
                 FakeKeys,
             ),
+        ), patch(
+            "apple_account_flow.try_attach_existing_browser_for_flow",
+            return_value=(None, "new_tab"),
         ), patch("apple_account_flow.take_screenshot") as take_screenshot, patch(
             "apple_account_flow.emit",
             side_effect=lambda event: order.append(("event", event)),
         ) as emit_event:
+            self._account_tab_mock.side_effect = (
+                lambda page, *_args, **_kwargs: (
+                    account_flow.set_browser_startup_stage("account_navigation"),
+                    page.get("https://appleid.apple.com/sign-in"),
+                )[-1]
+            )
             with self.assertRaisesRegex(RuntimeError, "authentication navigation failed"):
                 browser_flow(args)
 
         take_screenshot.assert_not_called()
         self.assertIn(
             {
-                "event": "status",
-                "status": "browser_failure",
-                "failureStage": "login_navigation",
-            },
+                    "event": "status",
+                    "status": "browser_failure",
+                    "failureStage": "account_navigation",
+                },
             [call.args[0] for call in emit_event.call_args_list],
         )
         failure_event_index = next(
@@ -9871,7 +10316,7 @@ class DeveloperAccountTests(unittest.TestCase):
             "person@example.com",
             "secret",
             FakeKeys,
-            account_home_confirmed=True,
+            account_home_confirmed=False,
             authentication_context=context,
             session_probe=account_flow.confirmed_developer_account_state,
         )

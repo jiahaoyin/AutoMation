@@ -292,7 +292,18 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
     source.postLoginFinalization && typeof source.postLoginFinalization === "object"
       ? source.postLoginFinalization
       : null;
-  const skipped = source.skipped === true;
+  const accountModule =
+    source.accountModule && typeof source.accountModule === "object"
+      ? source.accountModule
+      : {};
+  const developerMembershipGateBlocked =
+    accountModule.attempted !== true &&
+    accountModule.skipped === true &&
+    accountModule.skipReason === "developer_membership_gate" &&
+    accountModule.membershipGateEnabled === true &&
+    accountModule.membershipGatePassed !== true;
+  const browserSkipped = source.skipped === true;
+  const profileCaptureSkipped = browserSkipped || developerMembershipGateBlocked;
   const accountHomeConfirmed = browserLogin.accountHomeConfirmed === true;
   const finalizationClass = finalization
     ? finalizationClassToken(finalization.finalizationClass)
@@ -321,14 +332,15 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
     browserPreservationRequested !== true || browserSessionPreserved === true;
   return {
     accountHomeConfirmed,
-    profileCaptureState: skipped
+    accountModuleSkipped: developerMembershipGateBlocked,
+    profileCaptureState: profileCaptureSkipped
       ? "skipped"
       : profileCapture?.success === true
         ? "succeeded"
         : accountHomeConfirmed
           ? "partial"
           : "unknown",
-    postLoginFinalizationState: skipped
+    postLoginFinalizationState: browserSkipped
       ? "skipped"
       : !finalization
         ? "unknown"

@@ -63,6 +63,7 @@ const RUYIPAGE_BACKEND_STAGES = new Set([
   "developer_account",
   "developer_login",
   "developer_membership",
+  "account_navigation",
   "post_login_finalization",
   "result_emitting",
   "result_emitted",

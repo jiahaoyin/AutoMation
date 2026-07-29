@@ -30,6 +30,10 @@ const DEVELOPER_MEMBERSHIP_STATUSES = new Set([
   "not_enrolled",
   "unknown",
 ]);
+const ACCOUNT_MODULE_SKIP_REASONS = new Set([
+  "developer_membership_gate",
+  "unknown",
+]);
 const DEVELOPER_ACCOUNT_FAILURE_CLASSES = new Set([
   "developer_authentication_error",
   "developer_connection_lost",
@@ -124,6 +128,9 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "developer_membership_checked",
   "developer_account_completed",
   "developer_account_failed",
+  "developer_membership_gate_blocked",
+  "account_module_started",
+  "account_module_tab_created",
   "input_progress",
   "remember_progress",
   "twofa_progress",
@@ -181,6 +188,7 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
     "[→] Apple Developer 页面需要登录，正在继续认证",
   developer_account_authenticated: "[✓] 已确认 Apple Developer 账户登录成功",
   developer_account_completed: "[✓] Apple Developer 会员状态检查完成",
+  account_module_started: "[→] 正在打开 Apple 账户页面",
   browser_session_preserved: "[✓] 已保留 Firefox 窗口和账户标签页",
 });
 const RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES = Object.freeze({
@@ -230,6 +238,7 @@ const RUYIPAGE_PAGE_KINDS = new Set([
   "unknown",
 ]);
 const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
+  "developer_membership_gate",
   "profile_authentication_error",
   "profile_reauthentication_exhausted",
   "profile_session_unconfirmed",
@@ -345,6 +354,7 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "developer_account",
   "developer_login",
   "developer_membership",
+  "account_navigation",
   "post_login_finalization",
   "result_emitting",
   "result_emitted",
@@ -978,6 +988,46 @@ function sanitizePostLoginDeveloperAccount(developerAccount) {
   };
 }
 
+function sanitizeAccountModule(accountModule) {
+  const source = accountModule && typeof accountModule === "object" ? accountModule : {};
+  return {
+    attempted: source.attempted === true,
+    skipped: source.skipped === true,
+    skipReason: ACCOUNT_MODULE_SKIP_REASONS.has(source.skipReason)
+      ? source.skipReason
+      : "unknown",
+    membershipGateEnabled: source.membershipGateEnabled === true,
+    membershipGatePassed: source.membershipGatePassed === true,
+  };
+}
+
+function isIntentionalDeveloperMembershipGateStop(result) {
+  const source = result && typeof result === "object" ? result : {};
+  const accountModule = sanitizeAccountModule(source.accountModule);
+  const profileCapture = sanitizePostLoginProfileCapture(
+    source.postLoginProfileCapture
+  );
+  return (
+    source.success === true &&
+    accountModule.attempted === false &&
+    accountModule.skipped === true &&
+    accountModule.skipReason === "developer_membership_gate" &&
+    accountModule.membershipGateEnabled === true &&
+    accountModule.membershipGatePassed === false &&
+    profileCapture.success === false &&
+    profileCapture.failureClass === "developer_membership_gate"
+  );
+}
+
+function hasConfirmedAccountHome(result) {
+  const browserLogin = sanitizeBrowserLoginMetadata(result?.browserLogin);
+  return (
+    browserLogin.success === true &&
+    browserLogin.backend === "ruyipage" &&
+    browserLogin.accountHomeConfirmed === true
+  );
+}
+
 function sanitizePostLoginFinalization(finalization) {
   if (!finalization || typeof finalization !== "object") return null;
   const source = finalization;
@@ -1110,6 +1160,7 @@ function sanitizeAccountBrowserBackendResult(result) {
     postLoginFinalization: sanitizePostLoginFinalization(
       source.postLoginFinalization
     ),
+    accountModule: sanitizeAccountModule(source.accountModule),
     personalInfo: {
       name: personalInfo.name,
       birthday: personalInfo.birthday,
@@ -1223,6 +1274,13 @@ function auditRuyiPageEvent(flowAudit, event) {
         event.membershipStatus
       );
     }
+    if (event.status === "developer_membership_gate_blocked") {
+      details.membershipStatus = sanitizeDeveloperMembershipStatus(
+        event.membershipStatus
+      );
+      details.gateEnabled = event.gateEnabled === true;
+      details.developerResultSucceeded = event.developerResultSucceeded === true;
+    }
     if (
       event.status.startsWith("profile_navigation_") ||
       event.status.startsWith("profile_reauthentication_")
@@ -1270,6 +1328,7 @@ function auditRuyiPageEvent(flowAudit, event) {
     return;
   }
   if (event.event === "result") {
+    const accountModule = sanitizeAccountModule(event.accountModule);
     writeFlowAudit(flowAudit, "ruyipage", "result", {
       success: event.success === true,
       failureStage: sanitizeBrowserFailureStage(event.failureStage),
@@ -1281,6 +1340,11 @@ function auditRuyiPageEvent(flowAudit, event) {
       developerMembershipStatus: sanitizeDeveloperMembershipStatus(
         event.postLoginDeveloperAccount?.membershipStatus
       ),
+      accountModuleAttempted: accountModule.attempted,
+      accountModuleSkipped: accountModule.skipped,
+      accountModuleSkipReason: accountModule.skipReason,
+      membershipGateEnabled: accountModule.membershipGateEnabled,
+      membershipGatePassed: accountModule.membershipGatePassed,
     });
     return;
   }
@@ -1431,6 +1495,54 @@ export async function runAccountBrowserPhase(
   let reportedFailureStage = null;
   let reportedProfilePartial = false;
   let reportedFinalizationPartial = false;
+  let reportedDeveloperMembershipGateStop = false;
+  let developerMembershipPersistenceAttempted = false;
+  let developerAccount = {
+    checked: false,
+    membershipStatus: "unknown",
+    membershipStored: false,
+  };
+  const persistDeveloperMembership = (membershipStatus, checked) => {
+    if (developerMembershipPersistenceAttempted) return developerAccount;
+
+    developerMembershipPersistenceAttempted = true;
+    const normalizedMembershipStatus = sanitizeDeveloperMembershipStatus(membershipStatus);
+    developerAccount = {
+      checked: checked === true,
+      membershipStatus: normalizedMembershipStatus,
+      membershipStored: false,
+    };
+    try {
+      developerAccount = {
+        ...saveDeveloperMembership(
+          normalizedMembershipStatus,
+          flowAudit,
+          saveMembership,
+          shouldPrintProfile()
+        ),
+        checked: checked === true,
+      };
+    } catch (error) {
+      writeFlowAuditError(
+        flowAudit,
+        "developer_account",
+        "membership_persistence_failed",
+        error,
+        { membershipStatus: normalizedMembershipStatus }
+      );
+    }
+    return developerAccount;
+  };
+  const reportDeveloperMembershipGateStop = (membershipStatus) => {
+    if (reportedDeveloperMembershipGateStop) return;
+
+    reportedDeveloperMembershipGateStop = true;
+    if (sanitizeDeveloperMembershipStatus(membershipStatus) === "not_enrolled") {
+      console.log("[✓] Developer 未满足资格，Account 已跳过");
+    } else {
+      console.warn("[!] Developer 会员状态未确认，Account 已跳过");
+    }
+  };
   const reportedTerminalProgress = new Set();
   const reportTerminalProgress = (key, message) => {
     if (reportedTerminalProgress.has(key)) return;
@@ -1469,6 +1581,11 @@ export async function runAccountBrowserPhase(
           lastFailureStage = eventFailureStage;
         }
         auditRuyiPageEvent(flowAudit, event);
+        if (event.event === "status" && event.status === "developer_membership_checked") {
+          persistDeveloperMembership(event.membershipStatus, true);
+        } else if (event.event === "status" && event.status === "developer_account_failed") {
+          persistDeveloperMembership("unknown", false);
+        }
         if (event.event === "ready") {
           console.log("[✓] Firefox 浏览器已就绪");
           if (showTerminalDebug) {
@@ -1581,6 +1698,11 @@ export async function runAccountBrowserPhase(
           }
         } else if (
           event.event === "status" &&
+          event.status === "developer_membership_gate_blocked"
+        ) {
+          reportDeveloperMembershipGateStop(event.membershipStatus);
+        } else if (
+          event.event === "status" &&
           Object.hasOwn(RUYIPAGE_PROFILE_STATUS_MESSAGES, event.status)
         ) {
           console.log(RUYIPAGE_PROFILE_STATUS_MESSAGES[event.status]);
@@ -1687,16 +1809,15 @@ export async function runAccountBrowserPhase(
     } catch (error) {
       collectorDisposed = false;
       writeFlowAuditError(flowAudit, "two_factor", "collector_dispose_failed", error);
-      const accountHomeConfirmed =
-        result?.browserLogin?.success === true &&
-        result.browserLogin.backend === "ruyipage" &&
-        result.browserLogin.accountHomeConfirmed === true;
-      if (!runError && !accountHomeConfirmed) {
+      const accountHomeConfirmed = hasConfirmedAccountHome(result);
+      const intentionalGateStop = isIntentionalDeveloperMembershipGateStop(result);
+      if (!runError && !accountHomeConfirmed && !intentionalGateStop) {
         throw annotateBrowserRunFailure(error, "collector_cleanup", lastFailureStage);
       }
-      if (accountHomeConfirmed) {
+      if (accountHomeConfirmed || intentionalGateStop) {
         writeFlowAudit(flowAudit, "two_factor", "collector_dispose_partial", {
-          accountHomeConfirmed: true,
+          accountHomeConfirmed,
+          intentionalGateStop,
         });
         if (!reportedFinalizationPartial) {
           reportedFinalizationPartial = true;
@@ -1708,11 +1829,31 @@ export async function runAccountBrowserPhase(
     }
   }
 
-  if (
-    result?.browserLogin?.success !== true ||
-    result.browserLogin.backend !== "ruyipage" ||
-    result.browserLogin.accountHomeConfirmed !== true
-  ) {
+  const postLoginDeveloperAccount = sanitizePostLoginDeveloperAccount(
+    result.postLoginDeveloperAccount
+  );
+  const accountModule = sanitizeAccountModule(result.accountModule);
+  const developerResultReported =
+    postLoginDeveloperAccount.success ||
+    postLoginDeveloperAccount.failureClass !== "developer_result_missing";
+  if (developerResultReported) {
+    if (!postLoginDeveloperAccount.success) {
+      writeFlowAudit(flowAudit, "developer_account", "partial", {
+        failureStage: postLoginDeveloperAccount.failureStage,
+        failureClass: postLoginDeveloperAccount.failureClass,
+        authenticated: postLoginDeveloperAccount.authenticated,
+        membershipStatus: postLoginDeveloperAccount.membershipStatus,
+      });
+    }
+    persistDeveloperMembership(
+      postLoginDeveloperAccount.membershipStatus,
+      postLoginDeveloperAccount.success
+    );
+  }
+
+  const accountHomeConfirmed = hasConfirmedAccountHome(result);
+  const intentionalGateStop = isIntentionalDeveloperMembershipGateStop(result);
+  if (!accountHomeConfirmed && !intentionalGateStop) {
     writeFlowAudit(flowAudit, "account_browser", "account_home_unconfirmed");
     throw annotateBrowserRunFailure(
       new Error("ruyipage backend did not confirm the authenticated Apple account home"),
@@ -1721,7 +1862,9 @@ export async function runAccountBrowserPhase(
     );
   }
 
-  writeFlowAudit(flowAudit, "account_browser", "account_home_confirmed");
+  if (accountHomeConfirmed) {
+    writeFlowAudit(flowAudit, "account_browser", "account_home_confirmed");
+  }
 
   let postLoginProfileCapture = sanitizePostLoginProfileCapture(
     result.postLoginProfileCapture
@@ -1756,22 +1899,27 @@ export async function runAccountBrowserPhase(
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
-    postLoginDeveloperAccount: sanitizePostLoginDeveloperAccount(
-      result.postLoginDeveloperAccount
-    ),
+    postLoginDeveloperAccount,
     postLoginFinalization,
+    accountModule,
     personalInfo: {
       collected: false,
       nameStored: false,
       birthdayStored: false,
     },
-    developerAccount: {
-      checked: false,
-      membershipStatus: "unknown",
-      membershipStored: false,
-    },
+    developerAccount,
     screenshots: sanitizeScreenshotMetadata(result.screenshots),
   });
+
+  if (intentionalGateStop) {
+    writeFlowAudit(flowAudit, "account_browser", "developer_membership_gate_blocked", {
+      membershipStatus: postLoginDeveloperAccount.membershipStatus,
+      membershipGateEnabled: true,
+      membershipGatePassed: false,
+    });
+    reportDeveloperMembershipGateStop(postLoginDeveloperAccount.membershipStatus);
+    return partialProfileResult();
+  }
 
   if (!postLoginProfileCapture.success) {
     writeFlowAudit(flowAudit, "account_browser", "profile_capture_partial", {
@@ -1829,50 +1977,13 @@ export async function runAccountBrowserPhase(
     birthdayStored: true,
   });
 
-  const postLoginDeveloperAccount = sanitizePostLoginDeveloperAccount(
-    result.postLoginDeveloperAccount
-  );
-  let developerAccount = {
-    checked: false,
-    membershipStatus: postLoginDeveloperAccount.membershipStatus,
-    membershipStored: false,
-  };
-  if (postLoginDeveloperAccount.success) {
-    try {
-      developerAccount = saveDeveloperMembership(
-        postLoginDeveloperAccount.membershipStatus,
-        flowAudit,
-        saveMembership,
-        shouldPrintProfile()
-      );
-    } catch (error) {
-      writeFlowAuditError(
-        flowAudit,
-        "developer_account",
-        "membership_persistence_failed",
-        error,
-        { membershipStatus: postLoginDeveloperAccount.membershipStatus }
-      );
-      console.warn("[!] Apple Developer 会员状态写入 .env 失败，详情已写入日志");
-    }
-  } else {
-    writeFlowAudit(flowAudit, "developer_account", "partial", {
-      failureStage: postLoginDeveloperAccount.failureStage,
-      failureClass: postLoginDeveloperAccount.failureClass,
-      authenticated: postLoginDeveloperAccount.authenticated,
-      membershipStatus: postLoginDeveloperAccount.membershipStatus,
-    });
-    console.warn(
-      `[!] Apple Developer 会员状态检查未完成（原因：${postLoginDeveloperAccount.failureClass}），详情已写入日志`
-    );
-  }
-
   return {
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
     postLoginDeveloperAccount,
     postLoginFinalization,
+    accountModule,
     personalInfo,
     developerAccount,
     screenshots: sanitizeScreenshotMetadata(result.screenshots),

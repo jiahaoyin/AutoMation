@@ -1216,6 +1216,7 @@ function runFlowFailureEnvelopeTest() {
 function runAccountBrowserCompletionSummaryTest() {
   assert.deepEqual(summarizeAccountBrowserCompletion({ skipped: true }), {
     accountHomeConfirmed: false,
+    accountModuleSkipped: false,
     profileCaptureState: "skipped",
     postLoginFinalizationState: "skipped",
     backendCleanupCompleted: null,
@@ -1232,6 +1233,7 @@ function runAccountBrowserCompletionSummaryTest() {
     }),
     {
       accountHomeConfirmed: true,
+      accountModuleSkipped: false,
       profileCaptureState: "succeeded",
       postLoginFinalizationState: "unknown",
       backendCleanupCompleted: null,
@@ -1257,6 +1259,7 @@ function runAccountBrowserCompletionSummaryTest() {
     }),
     {
       accountHomeConfirmed: true,
+      accountModuleSkipped: false,
       profileCaptureState: "partial",
       postLoginFinalizationState: "partial",
       backendCleanupCompleted: false,
@@ -1281,6 +1284,7 @@ function runAccountBrowserCompletionSummaryTest() {
     }),
     {
       accountHomeConfirmed: true,
+      accountModuleSkipped: false,
       profileCaptureState: "succeeded",
       postLoginFinalizationState: "completed",
       backendCleanupCompleted: true,
@@ -1430,6 +1434,7 @@ async function runDeveloperMembershipPersistenceTest() {
     },
   ];
   const sanitizedResults = [];
+  const persistenceOrder = [];
 
   for (const fixture of cases) {
     const harness = createRuntime(async () => ({
@@ -1451,8 +1456,13 @@ async function runDeveloperMembershipPersistenceTest() {
       },
     }), {
       saveDeveloperMembershipToEnv(value) {
+        persistenceOrder.push("developer_membership");
         storedMemberships.push(value);
         return "/tmp/test-developer-membership.env";
+      },
+      saveAppleProfileToEnv() {
+        persistenceOrder.push("profile");
+        return "/tmp/test-profile.env";
       },
       shouldPrintCapturedProfile: true,
     });
@@ -1493,6 +1503,14 @@ async function runDeveloperMembershipPersistenceTest() {
     "not_enrolled",
     "unknown",
   ]);
+  assert.deepEqual(persistenceOrder, [
+    "developer_membership",
+    "profile",
+    "developer_membership",
+    "profile",
+    "developer_membership",
+    "profile",
+  ]);
   assert.equal(
     JSON.stringify({ sanitizedResults, auditEntries }).includes(SECRET_FIXTURE),
     false
@@ -1512,6 +1530,194 @@ async function runDeveloperMembershipPersistenceTest() {
     if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
     fs.rmdirSync(reportDir);
   }
+}
+
+function createDeveloperMembershipAudit() {
+  const entries = [];
+  return {
+    entries,
+    flowAudit: {
+      addSecrets() {},
+      write(source, event, details = {}) {
+        entries.push({ source, event, details });
+      },
+      writeError(source, event, _error, details = {}) {
+        entries.push({ source, event, details });
+      },
+    },
+  };
+}
+
+function membershipPersistenceEntries(entries) {
+  return entries.filter(
+    (entry) =>
+      entry.source === "developer_account" && entry.event === "membership_persisted"
+  );
+}
+
+async function runDeveloperMembershipEventSurvivesAccountTabFailureTest() {
+  const storedMemberships = [];
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_membership_checked",
+        membershipStatus: "active",
+      });
+      throw new Error("new account module tab could not be created");
+    },
+    {
+      saveDeveloperMembershipToEnv(value) {
+        storedMemberships.push(value);
+        return "/tmp/test-developer-membership.env";
+      },
+    }
+  );
+
+  await assert.rejects(runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime));
+  assert.deepEqual(storedMemberships, ["active"]);
+  assert.deepEqual(membershipPersistenceEntries(entries), [
+    {
+      source: "developer_account",
+      event: "membership_persisted",
+      details: { membershipStatus: "active" },
+    },
+  ]);
+  assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
+}
+
+async function runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest() {
+  const storedMemberships = [];
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_membership_checked",
+        membershipStatus: "active",
+      });
+      return {
+        ...successfulResult(),
+        postLoginDeveloperAccount: {
+          ...successfulResult().postLoginDeveloperAccount,
+          membershipStatus: "active",
+        },
+      };
+    },
+    {
+      saveDeveloperMembershipToEnv(value) {
+        storedMemberships.push(value);
+        return "/tmp/test-developer-membership.env";
+      },
+    }
+  );
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  assert.deepEqual(storedMemberships, ["active"]);
+  assert.deepEqual(result.developerAccount, {
+    checked: true,
+    membershipStatus: "active",
+    membershipStored: true,
+  });
+  assert.equal(membershipPersistenceEntries(entries).length, 1);
+  assert.equal(JSON.stringify({ result, entries }).includes(SECRET_FIXTURE), false);
+}
+
+async function runDeveloperAccountFailureEventPersistsUnknownTest() {
+  const storedMemberships = [];
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_account_failed",
+        failureStage: "developer_login",
+        failureClass: "developer_login_unconfirmed",
+        authenticated: false,
+        membershipStatus: "active",
+      });
+      return {
+        ...successfulResult(),
+        postLoginDeveloperAccount: {
+          success: false,
+          authenticated: false,
+          membershipStatus: "unknown",
+          failureStage: "developer_login",
+          failureClass: "developer_login_unconfirmed",
+          browserAlive: true,
+          browserPreserved: true,
+          browserPreservationRequested: true,
+        },
+      };
+    },
+    {
+      saveDeveloperMembershipToEnv(value) {
+        storedMemberships.push(value);
+        return "/tmp/test-developer-membership.env";
+      },
+    }
+  );
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  assert.deepEqual(storedMemberships, ["unknown"]);
+  assert.deepEqual(result.developerAccount, {
+    checked: false,
+    membershipStatus: "unknown",
+    membershipStored: true,
+  });
+  assert.deepEqual(membershipPersistenceEntries(entries), [
+    {
+      source: "developer_account",
+      event: "membership_persisted",
+      details: { membershipStatus: "unknown" },
+    },
+  ]);
+  assert.equal(JSON.stringify({ result, entries }).includes(SECRET_FIXTURE), false);
+}
+
+async function runDeveloperMembershipEventPersistenceFailureIsNonfatalTest() {
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  let saveAttempts = 0;
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_membership_checked",
+        membershipStatus: "active",
+      });
+      return {
+        ...successfulResult(),
+        postLoginDeveloperAccount: {
+          ...successfulResult().postLoginDeveloperAccount,
+          membershipStatus: "active",
+        },
+      };
+    },
+    {
+      saveDeveloperMembershipToEnv() {
+        saveAttempts += 1;
+        throw new Error("synthetic membership persistence failure");
+      },
+    }
+  );
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  assert.equal(saveAttempts, 1);
+  assert.deepEqual(result.developerAccount, {
+    checked: true,
+    membershipStatus: "active",
+    membershipStored: false,
+  });
+  assert.equal(
+    entries.filter(
+      (entry) =>
+        entry.source === "developer_account" &&
+        entry.event === "membership_persistence_failed"
+    ).length,
+    1
+  );
+  assert.equal(JSON.stringify({ result, entries }).includes(SECRET_FIXTURE), false);
 }
 
 async function runDeveloperTwoFactorUnavailablePartialTest() {
@@ -1546,15 +1752,12 @@ async function runDeveloperTwoFactorUnavailablePartialTest() {
     },
   };
 
-  let result;
-  const warnings = await captureConsole("warn", async () => {
-    result = await runAccountBrowserPhase(
-      { ...params, flowAudit },
-      harness.runtime
-    );
-  });
+  const result = await runAccountBrowserPhase(
+    { ...params, flowAudit },
+    harness.runtime
+  );
 
-  assert.deepEqual(storedMemberships, []);
+  assert.deepEqual(storedMemberships, ["unknown"]);
   assert.deepEqual(result.postLoginDeveloperAccount, {
     success: false,
     authenticated: false,
@@ -1568,13 +1771,8 @@ async function runDeveloperTwoFactorUnavailablePartialTest() {
   assert.deepEqual(result.developerAccount, {
     checked: false,
     membershipStatus: "unknown",
-    membershipStored: false,
+    membershipStored: true,
   });
-  assert.ok(
-    warnings.includes(
-      "[!] Apple Developer 会员状态检查未完成（原因：developer_twofa_unavailable），详情已写入日志"
-    )
-  );
   assert.ok(
     auditEntries.some(
       (entry) =>
@@ -1587,6 +1785,211 @@ async function runDeveloperTwoFactorUnavailablePartialTest() {
     JSON.stringify({ result, auditEntries }).includes(SECRET_FIXTURE),
     false
   );
+}
+
+async function runDeveloperMembershipGateStopTest() {
+  const storedMemberships = [];
+  const auditEntries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+  const cases = [
+    {
+      membershipStatus: "not_enrolled",
+      developerAccount: {
+        success: true,
+        authenticated: true,
+        failureStage: "unknown",
+        failureClass: "unknown",
+      },
+      finalizationState: "completed",
+    },
+    {
+      membershipStatus: "unknown",
+      developerAccount: {
+        success: true,
+        authenticated: true,
+        failureStage: "unknown",
+        failureClass: "unknown",
+      },
+      finalizationState: "completed",
+    },
+    {
+      membershipStatus: "unknown",
+      developerAccount: {
+        success: false,
+        authenticated: false,
+        failureStage: "developer_login",
+        failureClass: "developer_twofa_unavailable",
+      },
+      finalization: {
+        browserFinalizationCompleted: false,
+        browserPreservationRequested: true,
+        browserSessionPreserved: true,
+        finalizationClass: "browser_connection_lost",
+      },
+      finalizationState: "partial",
+    },
+  ];
+
+  for (const fixture of cases) {
+    const finalization = fixture.finalization ?? {
+      browserFinalizationCompleted: true,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
+      finalizationClass: "completed",
+    };
+    const harness = createRuntime(async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_membership_gate_blocked",
+        membershipStatus: fixture.membershipStatus,
+        gateEnabled: true,
+        developerResultSucceeded: fixture.developerAccount.success,
+      });
+      return {
+        success: true,
+        browserLogin: {
+          success: false,
+          backend: "ruyipage",
+          accountHomeConfirmed: false,
+          rawUrl: SECRET_FIXTURE,
+        },
+        postLoginProfileCapture: {
+          success: false,
+          failureStage: "developer_membership",
+          failureClass: "developer_membership_gate",
+          browserAlive: true,
+          browserPreserved: true,
+          browserPreservationRequested: true,
+          rawProfileState: SECRET_FIXTURE,
+        },
+        postLoginDeveloperAccount: {
+          ...fixture.developerAccount,
+          membershipStatus: fixture.membershipStatus,
+          browserAlive: true,
+          browserPreserved: true,
+          browserPreservationRequested: true,
+          rawMembershipDetails: SECRET_FIXTURE,
+        },
+        postLoginFinalization: {
+          ...finalization,
+          rawFinalization: SECRET_FIXTURE,
+        },
+        accountModule: {
+          attempted: false,
+          skipped: true,
+          skipReason: "developer_membership_gate",
+          membershipGateEnabled: true,
+          membershipGatePassed: false,
+          rawGateReason: SECRET_FIXTURE,
+        },
+        personalInfo: { name: SECRET_FIXTURE, birthday: SECRET_FIXTURE },
+        screenshots: { extra: SECRET_FIXTURE },
+      };
+    }, {
+      saveDeveloperMembershipToEnv(value) {
+        storedMemberships.push(value);
+        return "/tmp/test-developer-membership.env";
+      },
+    });
+
+    let result;
+    let warnings;
+    const logs = await captureConsole("log", async () => {
+      warnings = await captureConsole("warn", async () => {
+        result = await runAccountBrowserPhase(
+          { ...params, flowAudit },
+          harness.runtime
+        );
+      });
+    });
+
+    assert.deepEqual(result.accountModule, {
+      attempted: false,
+      skipped: true,
+      skipReason: "developer_membership_gate",
+      membershipGateEnabled: true,
+      membershipGatePassed: false,
+    });
+    assert.deepEqual(result.developerAccount, {
+      checked: fixture.developerAccount.success,
+      membershipStatus: fixture.membershipStatus,
+      membershipStored: true,
+    });
+    assert.deepEqual(result.personalInfo, {
+      collected: false,
+      nameStored: false,
+      birthdayStored: false,
+    });
+    assert.deepEqual(summarizeAccountBrowserCompletion(result), {
+      accountHomeConfirmed: false,
+      accountModuleSkipped: true,
+      profileCaptureState: "skipped",
+      postLoginFinalizationState: fixture.finalizationState,
+      backendCleanupCompleted: true,
+      collectorDisposed: true,
+      browserFinalizationCompleted: finalization.browserFinalizationCompleted,
+      browserPreservationRequested: true,
+      browserSessionPreserved: true,
+      finalizationClass: finalization.finalizationClass,
+    });
+    if (fixture.membershipStatus === "not_enrolled") {
+      assert.ok(logs.includes("[✓] Developer 未满足资格，Account 已跳过"));
+      assert.deepEqual(warnings, []);
+    } else {
+      assert.ok(warnings.includes("[!] Developer 会员状态未确认，Account 已跳过"));
+    }
+    assert.equal(
+      logs.filter((line) => line === "[✓] Developer 未满足资格，Account 已跳过")
+        .length +
+        warnings.filter((line) => line === "[!] Developer 会员状态未确认，Account 已跳过")
+          .length,
+      1
+    );
+  }
+
+  assert.deepEqual(storedMemberships, [
+    "not_enrolled",
+    "unknown",
+    "unknown",
+  ]);
+  const gateEvents = auditEntries.filter(
+    (entry) =>
+      entry.source === "account_browser" &&
+      entry.event === "developer_membership_gate_blocked"
+  );
+  assert.equal(gateEvents.length, cases.length);
+  assert.deepEqual(
+    gateEvents.map((event) => event.details),
+    cases.map((fixture) => ({
+      membershipStatus: fixture.membershipStatus,
+      membershipGateEnabled: true,
+      membershipGatePassed: false,
+    }))
+  );
+  const runnerGateEvents = auditEntries.filter(
+    (entry) =>
+      entry.source === "ruyipage" &&
+      entry.event === "status" &&
+      entry.details.status === "developer_membership_gate_blocked"
+  );
+  assert.deepEqual(
+    runnerGateEvents.map((event) => event.details),
+    cases.map((fixture) => ({
+      status: "developer_membership_gate_blocked",
+      membershipStatus: fixture.membershipStatus,
+      gateEnabled: true,
+      developerResultSucceeded: fixture.developerAccount.success,
+    }))
+  );
+  assert.equal(JSON.stringify({ auditEntries }).includes(SECRET_FIXTURE), false);
 }
 
 async function runBrowserResultMetadataAllowlistTest() {
@@ -1618,6 +2021,14 @@ async function runBrowserResultMetadataAllowlistTest() {
       browserPreservationRequested: true,
       browserSessionPreserved: true,
       rawFinalization: SECRET_FIXTURE,
+    },
+    accountModule: {
+      attempted: true,
+      skipped: false,
+      skipReason: "unknown",
+      membershipGateEnabled: false,
+      membershipGatePassed: true,
+      rawGateMetadata: SECRET_FIXTURE,
     },
     personalInfo: profile,
     screenshots: {
@@ -1658,6 +2069,13 @@ async function runBrowserResultMetadataAllowlistTest() {
     browserPreservationRequested: true,
     browserSessionPreserved: true,
     finalizationClass: "unknown",
+  });
+  assert.deepEqual(result.accountModule, {
+    attempted: true,
+    skipped: false,
+    skipReason: "unknown",
+    membershipGateEnabled: false,
+    membershipGatePassed: true,
   });
   assert.equal(JSON.stringify(result).includes(SECRET_FIXTURE), false);
 }
@@ -2465,6 +2883,7 @@ async function runMissingPostLoginFinalizationRemainsUnknownTest() {
   assert.equal(result.postLoginFinalization, null);
   assert.deepEqual(summarizeAccountBrowserCompletion(result), {
     accountHomeConfirmed: true,
+    accountModuleSkipped: false,
     profileCaptureState: "succeeded",
     postLoginFinalizationState: "unknown",
     backendCleanupCompleted: null,
@@ -3437,8 +3856,14 @@ const focusedTests = {
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
   "developer-membership": async () => {
     await runDeveloperMembershipPersistenceTest();
+    await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
+    await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+    await runDeveloperAccountFailureEventPersistsUnknownTest();
+    await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();
     await runDeveloperTwoFactorUnavailablePartialTest();
+    await runDeveloperMembershipGateStopTest();
   },
+  "developer-membership-gate": runDeveloperMembershipGateStopTest,
   "profile-persistence-partial": runProfilePersistenceFailureReturnsPartialTest,
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
@@ -3503,7 +3928,12 @@ await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
 await runProfilePersistenceAndAuditRedactionTest();
 await runDeveloperMembershipPersistenceTest();
+await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
+await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+await runDeveloperAccountFailureEventPersistsUnknownTest();
+await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();
 await runDeveloperTwoFactorUnavailablePartialTest();
+await runDeveloperMembershipGateStopTest();
 await runBrowserResultMetadataAllowlistTest();
 await runPostHomeProfileFailureRetentionTest();
 await runProfilePersistenceFailureReturnsPartialTest();

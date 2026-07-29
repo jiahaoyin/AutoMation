@@ -188,6 +188,7 @@ BROWSER_STARTUP_STAGES = {
     "developer_account",
     "developer_login",
     "developer_membership",
+    "account_navigation",
     "post_login_finalization",
     "result_emitting",
     "result_emitted",
@@ -204,6 +205,7 @@ BROWSER_PRESERVE_ON_FAILURE_ENV = "BROWSER_PRESERVE_ON_FAILURE"
 BROWSER_PRESERVE_ON_SUCCESS_ENV = "BROWSER_PRESERVE_ON_SUCCESS"
 BROWSER_ATTACH_EXISTING_ENV = "BROWSER_ATTACH_EXISTING"
 BROWSER_ATTACH_ADDRESS_ENV = "BROWSER_ATTACH_ADDRESS"
+DEVELOPER_MEMBERSHIP_GATE_ENV = "DEVELOPER_MEMBERSHIP_GATE"
 BROKER_APPLE_ID_MAX_LENGTH = 320
 BROKER_PASSWORD_MAX_LENGTH = 1024
 BROKER_CREDENTIAL_FRAME_MAX_CHARS = 16384
@@ -246,6 +248,7 @@ BROWSER_PAGE_KINDS = frozenset(
 )
 PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
     {
+        "developer_membership_gate",
         "profile_authentication_error",
         "profile_session_unconfirmed",
         "profile_element_unavailable",
@@ -547,6 +550,25 @@ def preserve_browser_on_success() -> bool:
     configured = os.environ.get(BROWSER_PRESERVE_ON_SUCCESS_ENV, "1").strip().lower()
     enabled = configured not in {"0", "false", "no", "off"}
     return enabled and not browser_broker_mode_enabled()
+
+
+def developer_membership_gate_enabled() -> bool:
+    """Require an active Developer membership before the Account module when set."""
+    return os.environ.get(DEVELOPER_MEMBERSHIP_GATE_ENV, "0").strip() == "1"
+
+
+def developer_membership_allows_account(
+    developer_account: dict[str, Any],
+    *,
+    gate_enabled: bool,
+) -> bool:
+    """The disabled test gate always continues; the enabled gate accepts active only."""
+    if not gate_enabled:
+        return True
+    return (
+        developer_account.get("success") is True
+        and developer_account.get("membershipStatus") == "active"
+    )
 
 
 def browser_connection_is_alive(page: Any) -> bool:
@@ -6213,19 +6235,30 @@ def collect_developer_account_membership(
     authentication_context: dict[str, Any],
     screenshot_path: Path,
     page_holder: dict[str, Any] | None = None,
+    *,
+    open_in_new_tab: bool = True,
 ) -> tuple[dict[str, Any], Any, str | None]:
-    """Open a distinct Developer tab and resolve its fixed membership state."""
+    """Resolve the fixed Developer membership state in a new or current tab."""
     set_browser_startup_stage("developer_account")
     emit({"event": "status", "status": "developer_account_started"})
-    try:
-        developer_page = page.new_tab(DEVELOPER_ACCOUNT_URL)
-    except Exception as error:
-        raise RuntimeError("new developer account tab could not be created") from error
+    if open_in_new_tab:
+        try:
+            developer_page = page.new_tab(DEVELOPER_ACCOUNT_URL)
+        except Exception as error:
+            raise RuntimeError("new developer account tab could not be created") from error
+    else:
+        developer_page = page
     if page_holder is not None:
         page_holder["page"] = developer_page
     if developer_page is None or not browser_connection_is_alive(developer_page):
-        raise RuntimeError("new developer account tab could not be created")
-    emit({"event": "status", "status": "developer_account_tab_created"})
+        raise RuntimeError("developer account page could not be opened")
+    if open_in_new_tab:
+        emit({"event": "status", "status": "developer_account_tab_created"})
+    else:
+        try:
+            developer_page.get(DEVELOPER_ACCOUNT_URL)
+        except Exception as error:
+            raise RuntimeError("opening developer account failed") from error
     try:
         developer_page.wait.doc_loaded(timeout=20)
     except Exception:
@@ -6247,7 +6280,7 @@ def collect_developer_account_membership(
         apple_id,
         password,
         Keys,
-        account_home_confirmed=True,
+        account_home_confirmed=False,
         authentication_context=authentication_context,
         session_probe=confirmed_developer_account_state,
     )
@@ -6296,6 +6329,29 @@ def collect_developer_account_membership(
     )
 
 
+def open_account_module_tab(developer_page: Any, sign_in_url: str) -> Any:
+    """Create the Account module tab only after the Developer decision."""
+    set_browser_startup_stage("account_navigation")
+    emit({"event": "status", "status": "account_module_started"})
+    try:
+        account_page = developer_page.new_tab(sign_in_url)
+    except Exception as error:
+        raise RuntimeError("new account module tab could not be created") from error
+    if account_page is None or not browser_connection_is_alive(account_page):
+        raise RuntimeError("new account module tab could not be created")
+    emit({"event": "status", "status": "account_module_tab_created"})
+    try:
+        account_page.wait.doc_loaded(timeout=20)
+    except Exception:
+        if not browser_connection_is_alive(account_page):
+            raise RuntimeError(
+                "account browser connection was lost while opening account module"
+            )
+    human_pause(900, 1800)
+    set_browser_startup_stage("login_page_loaded")
+    return account_page
+
+
 def browser_flow(args: argparse.Namespace) -> int:
     begin_browser_flow_run()
     try:
@@ -6335,10 +6391,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
     set_browser_startup_stage("credentials_received")
     if broker_mode:
         emit({"event": "status", "status": "broker_credentials_received"})
-    sign_in_url = validate_apple_url(args.sign_in_url)
-    set_browser_startup_stage("url_validated")
-    if broker_mode:
-        emit({"event": "status", "status": "browser_url_validated"})
+    sign_in_url = args.sign_in_url
 
     set_browser_startup_stage("runtime_importing")
     FirefoxOptions, FirefoxPage, Keys = import_ruyipage()
@@ -6381,25 +6434,164 @@ def _browser_flow(args: argparse.Namespace) -> int:
     set_browser_startup_stage("browser_ready")
     try:
         emit({"event": "ready", "mode": "ruyipage-only"})
-        set_browser_startup_stage("login_navigation")
-        if attached_existing_browser:
-            emit({"event": "status", "status": "browser_session_attached"})
-            page.wait.doc_loaded(timeout=20)
-            human_pause(300, 700)
-        else:
-            if browser_route == "empty_tab":
-                emit({"event": "status", "status": "browser_blank_tab_attached"})
-            elif browser_route == "new_tab":
-                emit({"event": "status", "status": "browser_login_tab_created"})
-            page.get(sign_in_url)
-            page.wait.doc_loaded(timeout=20)
-            human_pause(900, 1800)
-        set_browser_startup_stage("login_page_loaded")
-
         authentication_context: dict[str, Any] = {
             "twofaPrepared": False,
             "nextGeneration": 1,
         }
+        post_login_developer_account: dict[str, Any] = {
+            "success": False,
+            "authenticated": False,
+            "membershipStatus": "unknown",
+            "failureStage": "developer_account",
+            "failureClass": "developer_result_missing",
+            "browserAlive": browser_connection_is_alive(page),
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+        developer_page = page
+        developer_page_holder: dict[str, Any] = {}
+        try:
+            (
+                post_login_developer_account,
+                developer_page,
+                screenshots["developerMembership"],
+            ) = collect_developer_account_membership(
+                page,
+                apple_id,
+                password,
+                Keys,
+                authentication_context,
+                developer_screenshot_path,
+                page_holder=developer_page_holder,
+                open_in_new_tab=False,
+            )
+            if screenshots["developerMembership"] is not None:
+                generated_screenshot_paths.append(developer_screenshot_path)
+        except Exception as developer_error:
+            developer_page = developer_page_holder.get("page", page)
+            failure_stage = browser_startup_stage
+            failure_class = classify_developer_account_failure(developer_error)
+            browser_alive = browser_connection_is_alive(developer_page)
+            post_login_developer_account = {
+                "success": False,
+                "authenticated": failure_stage == "developer_membership",
+                "membershipStatus": "unknown",
+                "failureStage": failure_stage,
+                "failureClass": failure_class,
+                "browserAlive": browser_alive,
+                "browserPreserved": False,
+                "browserPreservationRequested": (
+                    preserve_on_success or preserve_on_failure
+                ),
+            }
+            emit(
+                {
+                    "event": "status",
+                    "status": "developer_account_failed",
+                    "failureStage": failure_stage,
+                    "failureClass": failure_class,
+                    "authenticated": failure_stage == "developer_membership",
+                    "membershipStatus": "unknown",
+                }
+            )
+
+        membership_gate_enabled = developer_membership_gate_enabled()
+        membership_gate_passed = developer_membership_allows_account(
+            post_login_developer_account,
+            gate_enabled=membership_gate_enabled,
+        )
+        account_module = {
+            "attempted": membership_gate_passed,
+            "skipped": not membership_gate_passed,
+            "skipReason": (
+                "unknown" if membership_gate_passed else "developer_membership_gate"
+            ),
+            "membershipGateEnabled": membership_gate_enabled,
+            "membershipGatePassed": membership_gate_passed,
+        }
+        if not membership_gate_passed:
+            emit(
+                {
+                    "event": "status",
+                    "status": "developer_membership_gate_blocked",
+                    "membershipStatus": post_login_developer_account["membershipStatus"],
+                    "gateEnabled": True,
+                    "developerResultSucceeded": post_login_developer_account["success"]
+                    is True,
+                }
+            )
+            post_login_profile_capture: dict[str, Any] = {
+                "success": False,
+                "failureStage": "developer_membership",
+                "failureClass": "developer_membership_gate",
+                "browserAlive": browser_connection_is_alive(developer_page),
+                "browserPreserved": False,
+                "browserPreservationRequested": preserve_on_success,
+            }
+            preserve_after_flow = preserve_on_success or (
+                post_login_developer_account["success"] is False and preserve_on_failure
+            )
+            post_login_profile_capture["browserPreservationRequested"] = (
+                preserve_after_flow
+            )
+            post_login_developer_account["browserPreservationRequested"] = (
+                preserve_after_flow
+            )
+            post_login_developer_account["browserAlive"] = browser_connection_is_alive(
+                developer_page
+            )
+            set_browser_startup_stage("post_login_finalization")
+            post_login_finalization = finalize_post_login_browser(
+                developer_page,
+                preserve_requested=preserve_after_flow,
+                profile_capture_success=False,
+            )
+            post_login_browser_finalized = True
+            post_login_profile_capture["browserPreserved"] = post_login_finalization[
+                "browserSessionPreserved"
+            ]
+            post_login_developer_account["browserPreserved"] = (
+                post_login_finalization["browserSessionPreserved"]
+            )
+            emit_browser_result(
+                {
+                    "event": "result",
+                    "success": True,
+                    "browserLogin": {
+                        "success": False,
+                        "backend": "ruyipage",
+                        "accountHomeConfirmed": False,
+                        "skippedLogin": False,
+                        "skipped2FA": False,
+                        "sessionReused": False,
+                        "rememberAccount": None,
+                    },
+                    "postLoginProfileCapture": post_login_profile_capture,
+                    "postLoginDeveloperAccount": post_login_developer_account,
+                    "postLoginFinalization": post_login_finalization,
+                    "accountModule": account_module,
+                    "personalInfo": {},
+                    "screenshots": screenshots,
+                }
+            )
+            return 0
+
+        sign_in_url = validate_apple_url(sign_in_url)
+        set_browser_startup_stage("url_validated")
+        if broker_mode:
+            emit({"event": "status", "status": "browser_url_validated"})
+        account_tab_source = (
+            developer_page
+            if browser_connection_is_alive(developer_page)
+            else page
+        )
+        page = open_account_module_tab(account_tab_source, sign_in_url)
+        if attached_existing_browser:
+            emit({"event": "status", "status": "browser_session_attached"})
+        elif browser_route == "empty_tab":
+            emit({"event": "status", "status": "browser_blank_tab_attached"})
+        elif browser_route == "new_tab":
+            emit({"event": "status", "status": "browser_login_tab_created"})
         authentication = complete_account_authentication(
             page,
             apple_id,
@@ -6534,67 +6726,6 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 account_home_confirmed=True,
             )
 
-        post_login_developer_account: dict[str, Any] = {
-            "success": False,
-            "authenticated": False,
-            "membershipStatus": "unknown",
-            "failureStage": "developer_account",
-            "failureClass": "developer_result_missing",
-            "browserAlive": browser_connection_is_alive(page),
-            "browserPreserved": False,
-            "browserPreservationRequested": False,
-        }
-        developer_page: Any | None = None
-        developer_page_holder: dict[str, Any] = {}
-        developer_module_attempted = post_login_profile_capture["success"] is True
-        if developer_module_attempted:
-            try:
-                (
-                    post_login_developer_account,
-                    developer_page,
-                    screenshots["developerMembership"],
-                ) = collect_developer_account_membership(
-                    page,
-                    apple_id,
-                    password,
-                    Keys,
-                    authentication_context,
-                    developer_screenshot_path,
-                    page_holder=developer_page_holder,
-                )
-                if screenshots["developerMembership"] is not None:
-                    generated_screenshot_paths.append(developer_screenshot_path)
-            except Exception as developer_error:
-                developer_page = developer_page_holder.get("page")
-                failure_stage = browser_startup_stage
-                failure_class = classify_developer_account_failure(developer_error)
-                browser_alive = (
-                    developer_page is not None
-                    and browser_connection_is_alive(developer_page)
-                )
-                post_login_developer_account = {
-                    "success": False,
-                    "authenticated": failure_stage == "developer_membership",
-                    "membershipStatus": "unknown",
-                    "failureStage": failure_stage,
-                    "failureClass": failure_class,
-                    "browserAlive": browser_alive,
-                    "browserPreserved": False,
-                    "browserPreservationRequested": (
-                        preserve_on_success or preserve_on_failure
-                    ),
-                }
-                emit(
-                    {
-                        "event": "status",
-                        "status": "developer_account_failed",
-                        "failureStage": failure_stage,
-                        "failureClass": failure_class,
-                        "authenticated": failure_stage == "developer_membership",
-                        "membershipStatus": "unknown",
-                    }
-                )
-
         preserve_after_flow = preserve_on_success or (
             post_login_profile_capture["success"] is False and preserve_on_failure
         ) or (
@@ -6603,17 +6734,15 @@ def _browser_flow(args: argparse.Namespace) -> int:
         post_login_profile_capture["browserPreservationRequested"] = (
             preserve_after_flow
         )
-        if developer_module_attempted:
-            post_login_developer_account["browserAlive"] = (
-                developer_page is not None
-                and browser_connection_is_alive(developer_page)
-            )
+        post_login_developer_account["browserAlive"] = browser_connection_is_alive(
+            developer_page
+        )
         set_browser_startup_stage("post_login_finalization")
         post_login_finalization = finalize_post_login_browser(
             page,
             preserve_requested=preserve_after_flow,
             profile_capture_success=post_login_profile_capture["success"],
-            required_pages=(developer_page,) if developer_module_attempted else (),
+            required_pages=(developer_page,),
         )
         post_login_browser_finalized = True
         post_login_profile_capture["browserPreserved"] = post_login_finalization[
@@ -6622,10 +6751,9 @@ def _browser_flow(args: argparse.Namespace) -> int:
         post_login_developer_account["browserPreservationRequested"] = (
             preserve_after_flow
         )
-        post_login_developer_account["browserPreserved"] = bool(
-            developer_module_attempted
-            and post_login_finalization["browserSessionPreserved"]
-        )
+        post_login_developer_account["browserPreserved"] = post_login_finalization[
+            "browserSessionPreserved"
+        ]
 
         emit_browser_result(
             {
@@ -6643,6 +6771,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 "postLoginProfileCapture": post_login_profile_capture,
                 "postLoginDeveloperAccount": post_login_developer_account,
                 "postLoginFinalization": post_login_finalization,
+                "accountModule": account_module,
                 "personalInfo": personal_info
                 if post_login_profile_capture["success"] is True
                 else {},
@@ -6657,8 +6786,8 @@ def _browser_flow(args: argparse.Namespace) -> int:
         had_error = sys.exc_info()[0] is not None
         if had_error and preserve_on_failure and browser_connection_is_alive(page):
             if not account_home_confirmed:
-                for screenshot_path in generated_screenshot_paths:
-                    screenshot_path.unlink(missing_ok=True)
+                if success_screenshot_path in generated_screenshot_paths:
+                    success_screenshot_path.unlink(missing_ok=True)
             emit(
                 {
                     "event": "status",
@@ -6667,21 +6796,21 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     "preserved": True,
                 }
             )
-        elif account_home_confirmed and post_login_browser_finalized:
+        elif post_login_browser_finalized:
             pass
         else:
             try:
                 page.quit()
             except Exception:
-                for screenshot_path in generated_screenshot_paths:
-                    screenshot_path.unlink(missing_ok=True)
+                if success_screenshot_path in generated_screenshot_paths:
+                    success_screenshot_path.unlink(missing_ok=True)
                 if not had_error:
                     raise
                 emit({"event": "warning", "message": QUIT_FAILURE_REASON})
             else:
                 if had_error:
-                    for screenshot_path in generated_screenshot_paths:
-                        screenshot_path.unlink(missing_ok=True)
+                    if success_screenshot_path in generated_screenshot_paths:
+                        success_screenshot_path.unlink(missing_ok=True)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
