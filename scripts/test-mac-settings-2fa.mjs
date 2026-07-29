@@ -1993,7 +1993,7 @@ function runAccessibilityPromptSourceContractTest() {
   const originalPath = source.slice(ownerAttempts);
   assert.match(originalPath, /openAppleAccountSettings\(deadline: deadline\)/);
   assert.match(originalPath, /prepareVerificationCodeAlert\(/);
-  assert.match(originalPath, /scanCodeFromAlertOnly\(/);
+  assert.match(originalPath, /scanCodeFromVerifiedAlert\(/);
 }
 
 function runStrictVerificationCodeSourceContractTest() {
@@ -2241,7 +2241,7 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(
     request,
-    /waitForVerificationCodeAlert\([\s\S]{0,320}deadline:\s*deadline/
+    /waitForVerificationCodeAlert\(\s*appElement:\s*appElement,\s*expectedPid:\s*expectedPid,[\s\S]{0,520}deadline:\s*deadline/
   );
   const loopStart = request.indexOf("while Date() < deadline");
   assert.ok(loopStart >= 0, "verification-code request must remain bounded by the global deadline");
@@ -2260,7 +2260,7 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(
     request,
-    /timeoutMs:\s*actionAttempts <= 3[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
+    /timeoutMs:\s*\(actionAttempts <= 3 \|\| visualGetCodeSucceeded\)[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
     "post-click confirmation must be short while delayed alerts remain eligible until the global deadline"
   );
 
@@ -2290,7 +2290,7 @@ function runStrictVerificationCodeSourceContractTest() {
   );
   assert.match(
     prepare,
-    /requestVerificationCodeAlert\([\s\S]{0,220}deadline:\s*deadline/
+    /requestVerificationCodeAlert\(\s*appElement:\s*appElement,\s*expectedPid:\s*expectedPid,[\s\S]{0,360}deadline:\s*deadline/
   );
   assert.match(prepare, /\.timedOut/);
 
@@ -2517,7 +2517,7 @@ function runVerificationCodeHardeningSourceContractTest() {
   );
   assert.match(
     request,
-    /timeoutMs:\s*actionAttempts <= 3[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
+    /timeoutMs:\s*\(actionAttempts <= 3 \|\| visualGetCodeSucceeded\)[\s\S]{0,180}cappedAt:\s*2_000[\s\S]{0,180}cappedAt:\s*250/,
     "button actions must receive a short confirmation window while delayed alerts remain eligible until the global deadline"
   );
   assert.match(request, /\n    return false\n\}/);
@@ -2682,13 +2682,13 @@ function runTraditionalChineseStateContractTest() {
   );
 
   const getCodeRequest = source.lastIndexOf("requestVerificationCodeAlert(");
-  const scan = source.indexOf("scanCodeFromAlertOnly(", getCodeRequest);
+  const scan = source.indexOf("scanCodeFromVerifiedAlert(", getCodeRequest);
   const requestCall = source.slice(getCodeRequest, scan);
   assert.ok(
     getCodeRequest >= 0 &&
       scan > getCodeRequest &&
       /buttonNames:\s*getCodeBtn/.test(requestCall),
-    "zh-Hant navigation must still transition through request, alert scan, and code return"
+    "zh-Hant navigation must still transition through request, verified alert scan, and code return"
   );
 }
 
@@ -3031,8 +3031,8 @@ function assertSettingsVisualFallbackContract(settingsSource, visualSource, node
   );
   assert.equal(
     (settingsSource.match(/requestVisualGetCodeButton\(/g) ?? []).length,
-    2,
-    "the visual helper may only be declared and invoked from the Two-Factor press loop"
+    3,
+    "the visual helper may only be declared and invoked from bounded Two-Factor recovery paths"
   );
 
   assert.match(bindWindow, /trustedSettingsNavigationOwnerElement\(/);
@@ -3263,6 +3263,147 @@ function runSettingsVisualFallbackMutationResistanceTest() {
   );
 }
 
+function runMaskedSettingsOcrFallbackContractTest() {
+  const settingsSource = readSettingsSwiftSource();
+  const visualSource = readVisualHelperSwiftSource();
+  const functionBody = (name) => swiftFunctionBodyFromSource(settingsSource, name);
+  const settingsAlertFinder = swiftFunctionBodyFromSource(
+    visualSource,
+    "findSettingsMaskedCodeDialogs"
+  );
+  const assertOrdered = (body, fragments, message) => {
+    let previous = -1;
+    for (const fragment of fragments) {
+      const current = body.indexOf(fragment);
+      assert.ok(
+        current > previous,
+        `${message}: missing or out-of-order ${fragment}`
+      );
+      previous = current;
+    }
+  };
+  const verifiedScan = functionBody("scanCodeFromVerifiedAlert");
+  const maskedOcr = functionBody("requestMaskedVerificationCodeWithOcr");
+  const request = functionBody("requestVerificationCodeAlert");
+
+  assertOrdered(
+    verifiedScan,
+    [
+      "locateVerificationCodeAlert(",
+      "findSixDigitCodeInAlert(",
+      "alert.usesMaskedCloseButton",
+      "requestMaskedVerificationCodeWithOcr(",
+    ],
+    "Vision may run only after a trusted alert has no AX code and matches the masked-alert shape"
+  );
+  assert.match(verifiedScan, /helperPath:\s*String\?/);
+  assert.match(verifiedScan, /deadline:\s*Date/);
+
+  assert.match(maskedOcr, /initialAlert\.usesMaskedCloseButton/);
+  assert.match(maskedOcr, /preparedVisualGetCodeHelperURL\(helperPath\)/);
+  assert.match(maskedOcr, /"--settings-alert-only"/);
+  assert.match(maskedOcr, /"--cancel-file"/);
+  assert.match(maskedOcr, /visualGetCodeCancellationRequested\(\)/);
+  assert.match(maskedOcr, /terminateVisualGetCodeChild\(/);
+  assert.match(maskedOcr, /while Date\(\) < childDeadline/);
+  assert.match(maskedOcr, /let helperTimeoutSec = max\(1, min\(2, remainingMs \/ 1_000\)\)/);
+  assert.match(maskedOcr, /"--timeout", String\(helperTimeoutSec\)/);
+  assert.match(
+    maskedOcr,
+    /let childDeadline = min\(\s*deadline,\s*Date\(\)\.addingTimeInterval\(TimeInterval\(helperTimeoutSec\) \+ 0\.3\)\s*\)/,
+    "the parent must not terminate the helper before the bounded timeout it advertises"
+  );
+  assert.match(maskedOcr, /data\.count <= 4_096/);
+  assert.match(maskedOcr, /output\.ok/);
+  assert.match(maskedOcr, /output\.source == "vision"/);
+  assert.match(maskedOcr, /output\.message == "ok"/);
+  assert.match(maskedOcr, /\^\[0-9\]\{6\}\$/);
+  assert.match(maskedOcr, /currentAlert\.usesMaskedCloseButton/);
+  assert.doesNotMatch(maskedOcr, /logStep\(|FileHandle\.standard(?:Output|Error)/);
+
+  assert.match(request, /var visualGetCodeAttempted\s*=\s*false/);
+  assert.match(request, /var visualGetCodeSucceeded\s*=\s*false/);
+  assert.match(
+    request,
+    /else if !visualGetCodeAttempted,[\s\S]{0,220}visualTargetForGetCodeControl\(control\)[\s\S]{0,300}requestVisualGetCodeButton\([\s\S]{0,280}navigationWindowID:\s*visualTarget\.windowID/,
+    "a discovered AX Get Verification Code control must have one OCR label-click fallback after AX actions fail"
+  );
+  assert.match(
+    request,
+    /actionAttempts <= 3 \|\| visualGetCodeSucceeded/,
+    "the visual label click must receive the same bounded alert-confirmation window as an AX action"
+  );
+
+  const mainFlow = settingsSource.slice(
+    settingsSource.lastIndexOf("for uiOwnerAttempt in 1...2 {")
+  );
+  assert.match(
+    mainFlow,
+    /scanCodeFromVerifiedAlert\([\s\S]{0,220}helperPath:\s*visualGetCodeHelperPath[\s\S]{0,100}deadline:\s*deadline/,
+    "the Settings acquisition loop must use the verified masked-alert OCR fallback"
+  );
+  assert.match(visualSource, /if settingsAlertOnly \{\s*dialogs = findSettingsMaskedCodeDialogs\(\)/);
+  assert.match(visualSource, /findMaskedAlertCloseButton\(window\)/);
+  assert.match(visualSource, /hasSettingsMaskedAlertImage\(window\)/);
+  assert.match(visualSource, /let isVerifiedSettingsAlert:\s*Bool/);
+  assert.match(
+    settingsAlertFinder,
+    /isVerifiedSettingsAlert:\s*true/,
+    "only the AX-verified System Settings alert may bypass generic shared-host prompt text"
+  );
+  assert.match(
+    visualSource,
+    /requiresAppleAccountEvidence &&\s*!isVerifiedSettingsAlert &&\s*!hasSharedHostVisionEvidence\(fullLines\)/,
+    "shared-host OCR must retain its normal prompt-text gate unless the exact masked Settings alert was verified"
+  );
+  assert.match(
+    visualSource,
+    /tryOcrOnImage\([\s\S]{0,120}isVerifiedSettingsAlert:\s*target\.isVerifiedSettingsAlert/,
+    "the OCR call must carry the verified Settings-alert provenance"
+  );
+
+  const missingMaskGuard = settingsSource.replace(
+    "initialAlert.usesMaskedCloseButton",
+    "true"
+  );
+  assert.notEqual(missingMaskGuard, settingsSource, "masked-alert guard mutation fixture must apply");
+  assert.throws(
+    () => runMaskedSettingsOcrFallbackContractWithSources(missingMaskGuard, visualSource),
+    assert.AssertionError
+  );
+
+  const missingVerifiedAlertGate = visualSource.replace(
+    "!isVerifiedSettingsAlert &&\n        !hasSharedHostVisionEvidence(fullLines)",
+    "!hasSharedHostVisionEvidence(fullLines)"
+  );
+  assert.notEqual(
+    missingVerifiedAlertGate,
+    visualSource,
+    "verified-alert OCR gate mutation fixture must apply"
+  );
+  assert.throws(
+    () => runMaskedSettingsOcrFallbackContractWithSources(settingsSource, missingVerifiedAlertGate),
+    assert.AssertionError
+  );
+}
+
+function runMaskedSettingsOcrFallbackContractWithSources(settingsSource, visualSource) {
+  const functionBody = (name) => swiftFunctionBodyFromSource(settingsSource, name);
+  const maskedOcr = functionBody("requestMaskedVerificationCodeWithOcr");
+  assert.match(maskedOcr, /initialAlert\.usesMaskedCloseButton/);
+  assert.match(maskedOcr, /"--settings-alert-only"/);
+  assert.match(maskedOcr, /output\.source == "vision"/);
+  assert.match(maskedOcr, /output\.message == "ok"/);
+  assert.match(maskedOcr, /currentAlert\.usesMaskedCloseButton/);
+  assert.match(visualSource, /findSettingsMaskedCodeDialogs\(\)/);
+  const tryOcr = swiftFunctionBodyFromSource(visualSource, "tryOcrOnImage");
+  assert.match(tryOcr, /isVerifiedSettingsAlert:\s*Bool/);
+  assert.match(
+    tryOcr,
+    /requiresAppleAccountEvidence &&\s*!isVerifiedSettingsAlert &&\s*!hasSharedHostVisionEvidence\(fullLines\)/
+  );
+}
+
 function runManualSettingsPrivacyContractTest() {
   const source = fs.readFileSync(
     new URL("./test-2fa-settings-code.mjs", import.meta.url),
@@ -3318,6 +3459,7 @@ runSparseAxNavigationRecoveryStateTest();
 runEvidenceDrivenSettingsNavigationContractTest();
 runSettingsVisualFallbackContractTest();
 runSettingsVisualFallbackMutationResistanceTest();
+runMaskedSettingsOcrFallbackContractTest();
 runManualSettingsPrivacyContractTest();
 
 console.log("mac settings 2fa lifecycle: ok");

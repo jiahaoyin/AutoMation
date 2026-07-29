@@ -2428,7 +2428,10 @@ test("OCR scans only trusted Apple authentication processes", () => {
   );
   const imageReader = sourceFunctionBody(popupOcrSwiftSource, "func tryOcrOnImage");
   assert.match(sharedHostVision, /looksLikeCodeDialog\(evidence\).*hasExplicitAppleAccountEvidence\(evidence\)/s);
-  assert.match(imageReader, /requiresAppleAccountEvidence && !hasSharedHostVisionEvidence\(fullLines\)/);
+  assert.match(
+    imageReader,
+    /requiresAppleAccountEvidence &&\s*!isVerifiedSettingsAlert &&\s*!hasSharedHostVisionEvidence\(fullLines\)/
+  );
   assert.match(imageReader, /if fullLines\.isEmpty \{[\s\S]*ocrLines\(from: cg, level: \.fast\)/);
 });
 

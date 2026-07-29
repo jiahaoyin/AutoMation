@@ -296,6 +296,10 @@ func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
 struct DialogTarget {
     let windowID: CGWindowID?
     let requiresAppleAccountEvidence: Bool
+    // This flag is set only after AX has already matched the System Settings
+    // masked verification alert shape. That alert does not expose its normal
+    // prompt text, so Vision must not require the generic shared-host text.
+    let isVerifiedSettingsAlert: Bool
 }
 
 enum OcrCandidateSource: Equatable {
@@ -415,7 +419,11 @@ func findCodeDialogs() -> [DialogTarget] {
                 near: frame
             ) ?? windowIDFor(win)
             guard let windowID else { continue }
-            out.append(DialogTarget(windowID: windowID, requiresAppleAccountEvidence: false))
+            out.append(DialogTarget(
+                windowID: windowID,
+                requiresAppleAccountEvidence: false,
+                isVerifiedSettingsAlert: false
+            ))
         }
     }
     return out
@@ -519,7 +527,11 @@ func findSettingsMaskedCodeDialogs() -> [DialogTarget] {
             guard let windowID,
                   windowIDs.insert(windowID).inserted else { continue }
             targets.append(
-                DialogTarget(windowID: windowID, requiresAppleAccountEvidence: true)
+                DialogTarget(
+                    windowID: windowID,
+                    requiresAppleAccountEvidence: true,
+                    isVerifiedSettingsAlert: true
+                )
             )
         }
     }
@@ -841,7 +853,8 @@ func findScreenOnlyCodeDialogs() -> [DialogTarget] {
         guard windowID != 0, windowIDs.insert(windowID).inserted else { continue }
         out.append(DialogTarget(
             windowID: windowID,
-            requiresAppleAccountEvidence: requiresAppleAccountEvidence
+            requiresAppleAccountEvidence: requiresAppleAccountEvidence,
+            isVerifiedSettingsAlert: false
         ))
     }
     return out
@@ -928,12 +941,18 @@ func hasSharedHostVisionEvidence(_ lines: [String]) -> Bool {
     return looksLikeCodeDialog(evidence) && hasExplicitAppleAccountEvidence(evidence)
 }
 
-func tryOcrOnImage(_ cg: CGImage, requiresAppleAccountEvidence: Bool) -> OcrCandidate? {
+func tryOcrOnImage(
+    _ cg: CGImage,
+    requiresAppleAccountEvidence: Bool,
+    isVerifiedSettingsAlert: Bool
+) -> OcrCandidate? {
     var fullLines = ocrLines(from: cg, level: .accurate)
     if fullLines.isEmpty {
         fullLines = ocrLines(from: cg, level: .fast)
     }
-    if requiresAppleAccountEvidence && !hasSharedHostVisionEvidence(fullLines) {
+    if requiresAppleAccountEvidence &&
+        !isVerifiedSettingsAlert &&
+        !hasSharedHostVisionEvidence(fullLines) {
         return nil
     }
     let fullWindowCode = requiresAppleAccountEvidence
@@ -1100,7 +1119,8 @@ while Date() < deadline {
         }
         guard let candidate = tryOcrOnImage(
             cg,
-            requiresAppleAccountEvidence: target.requiresAppleAccountEvidence
+            requiresAppleAccountEvidence: target.requiresAppleAccountEvidence,
+            isVerifiedSettingsAlert: target.isVerifiedSettingsAlert
         ) else {
             centerCandidateTracker.reset(windowID: wid)
             continue

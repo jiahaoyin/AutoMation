@@ -678,6 +678,36 @@ func scanCodeFromAlertOnly(appElement: AXUIElement, expectedPid: pid_t) -> Strin
     )
 }
 
+// macOS 15 can render the current Settings verification alert without its
+// title or code in AX. Only the AppleIDSettings image and its exact close
+// button remain visible. Keep OCR behind that already-verified alert shape;
+// the helper captures only the trusted Settings alert and returns a code in
+// process memory for the normal stability/cleanup path below.
+func scanCodeFromVerifiedAlert(
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    helperPath: String?,
+    deadline: Date
+) -> String? {
+    guard let alert = locateVerificationCodeAlert(
+        appElement: appElement,
+        expectedPid: expectedPid
+    ) else { return nil }
+    if let code = findSixDigitCodeInAlert(
+        alert.root,
+        expectedPid: alert.ownerPid
+    ) {
+        return code
+    }
+    guard alert.usesMaskedCloseButton else { return nil }
+    return requestMaskedVerificationCodeWithOcr(
+        helperPath: helperPath,
+        appElement: appElement,
+        expectedPid: expectedPid,
+        deadline: deadline
+    )
+}
+
 func hasVerificationCodeAlert(appElement: AXUIElement, expectedPid: pid_t) -> Bool {
     locateVerificationCodeAlert(appElement: appElement, expectedPid: expectedPid) != nil
 }
@@ -1215,6 +1245,33 @@ func visualTargetForFocusedWindow(_ pid: pid_t) -> TrustedSettingsVisualTarget? 
     return TrustedSettingsVisualTarget(ownerPid: pid, windowID: windowID)
 }
 
+// A visible, exact AX Get Verification Code button gives us a stronger visual
+// target than a generic focused window. Use its CGWindowID when the control is
+// owned by System Settings; ExtensionKit controls continue through the bound
+// host path because their AX PID does not own the rendered CGWindow.
+func visualTargetForGetCodeControl(
+    _ control: TrustedSettingsControl
+) -> TrustedSettingsVisualTarget? {
+    guard elementBelongsToProcess(control.element, pid: control.ownerPid),
+          settingsActionScopeAllowsElement(
+              control.element,
+              appElement: control.appElement,
+              expectedPid: control.ownerPid
+          ),
+          let owner = NSRunningApplication(processIdentifier: control.ownerPid) else {
+        return nil
+    }
+    if isTrustedSystemSettings(owner),
+       let windowID = settingsWindowIDFor(control.element) {
+        return TrustedSettingsVisualTarget(ownerPid: control.ownerPid, windowID: windowID)
+    }
+    return bindTrustedSettingsNavigationVisualTarget(
+        appElement: control.appElement,
+        expectedPid: control.ownerPid,
+        navigationOwnerPid: control.ownerPid
+    )
+}
+
 func bindTrustedSettingsNavigationVisualTarget(
     appElement: AXUIElement,
     expectedPid: pid_t,
@@ -1422,6 +1479,95 @@ func requestVisualGetCodeButton(
         return false
     }
     return true
+}
+
+// The prepared Vision helper is also the narrow fallback for a verified
+// Settings alert whose AX tree masks the code. Its stdout is read only by this
+// process, never logged, and the returned value still needs the caller's
+// two-observation stability check before it can leave the helper.
+func requestMaskedVerificationCodeWithOcr(
+    helperPath: String?,
+    appElement: AXUIElement,
+    expectedPid: pid_t,
+    deadline: Date
+) -> String? {
+    guard let initialAlert = locateVerificationCodeAlert(
+        appElement: appElement,
+        expectedPid: expectedPid
+    ), initialAlert.usesMaskedCloseButton,
+          let helperURL = preparedVisualGetCodeHelperURL(helperPath) else {
+        return nil
+    }
+    let remainingMs = remainingMilliseconds(until: deadline, cappedAt: 2_500)
+    guard remainingMs >= 1_000,
+          !visualGetCodeCancellationRequested(),
+          isTrustedSystemSettingsProcess(expectedPid) else {
+        return nil
+    }
+    // The helper accepts whole seconds. Keep its advertised timeout within the
+    // same two-second OCR budget that the parent waits for, so it is never
+    // terminated before the timeout it received.
+    let helperTimeoutSec = max(1, min(2, remainingMs / 1_000))
+    let process = Process()
+    let stdout = Pipe()
+    let completed = DispatchSemaphore(value: 0)
+    process.executableURL = helperURL
+    var arguments = [
+        "--settings-alert-only",
+        "--timeout", String(helperTimeoutSec),
+    ]
+    if let cancelFilePath {
+        arguments.append(contentsOf: ["--cancel-file", cancelFilePath])
+    }
+    process.arguments = arguments
+    process.standardOutput = stdout
+    process.standardError = FileHandle.nullDevice
+    process.terminationHandler = { _ in completed.signal() }
+    do {
+        try process.run()
+    } catch {
+        return nil
+    }
+    let childDeadline = min(
+        deadline,
+        Date().addingTimeInterval(TimeInterval(helperTimeoutSec) + 0.3)
+    )
+    var completedNormally = false
+    while Date() < childDeadline {
+        if visualGetCodeCancellationRequested() {
+            terminateVisualGetCodeChild(process, completed: completed)
+            stopIfCancelled(appElement: appElement, expectedPid: expectedPid)
+            return nil
+        }
+        let waitMs = min(100, max(1, Int(childDeadline.timeIntervalSinceNow * 1_000)))
+        if completed.wait(timeout: .now() + .milliseconds(waitMs)) == .success {
+            completedNormally = true
+            break
+        }
+    }
+    guard completedNormally else {
+        terminateVisualGetCodeChild(process, completed: completed)
+        return nil
+    }
+    guard !visualGetCodeCancellationRequested(), process.terminationStatus == 0 else {
+        return nil
+    }
+    let data = stdout.fileHandleForReading.readDataToEndOfFile()
+    guard data.count <= 4_096,
+          let output = try? JSONDecoder().decode(VisualGetCodeHelperOutput.self, from: data),
+          output.ok,
+          output.source == "vision",
+          output.message == "ok",
+          let code = output.code,
+          code.range(of: #"^[0-9]{6}$"#, options: .regularExpression) != nil,
+          let currentAlert = locateVerificationCodeAlert(
+              appElement: appElement,
+              expectedPid: expectedPid
+          ), currentAlert.usesMaskedCloseButton,
+          isTrustedSystemSettingsProcess(expectedPid) else {
+        return nil
+    }
+    return code
 }
 
 enum WindowlessOwnerStatus: String {
@@ -2663,6 +2809,7 @@ func requestVerificationCodeAlert(
     twoFactorNames: [String],
     buttonNames: [String],
     confirmedTwoFactorOwnerPid: inout pid_t?,
+    visualGetCodeHelperPath: String?,
     deadline: Date
 ) -> Bool {
     guard actionMayProceed(
@@ -2692,6 +2839,8 @@ func requestVerificationCodeAlert(
 
     var actionAttempts = 0
     var currentRequestActionSucceeded = false
+    var visualGetCodeAttempted = false
+    var visualGetCodeSucceeded = false
     while Date() < deadline {
         guard actionMayProceed(
             deadline: deadline,
@@ -2771,6 +2920,19 @@ func requestVerificationCodeAlert(
                 allowControlName: true,
                 deadline: deadline
             )
+        } else if !visualGetCodeAttempted,
+                  let helperPath = visualGetCodeHelperPath,
+                  let visualTarget = visualTargetForGetCodeControl(control) {
+            visualGetCodeAttempted = true
+            visualGetCodeSucceeded = requestVisualGetCodeButton(
+                helperPath: helperPath,
+                appElement: control.appElement,
+                expectedPid: control.ownerPid,
+                navigationOwnerPid: visualTarget.ownerPid,
+                navigationWindowID: visualTarget.windowID,
+                deadline: deadline
+            )
+            actionSucceeded = visualGetCodeSucceeded
         }
         actionAttempts += 1
 
@@ -2779,7 +2941,7 @@ func requestVerificationCodeAlert(
             if waitForVerificationCodeAlert(
                 appElement: appElement,
                 expectedPid: expectedPid,
-                timeoutMs: actionAttempts <= 3
+                timeoutMs: (actionAttempts <= 3 || visualGetCodeSucceeded)
                     ? remainingMilliseconds(until: deadline, cappedAt: 2_000)
                     : remainingMilliseconds(until: deadline, cappedAt: 250),
                 deadline: deadline
@@ -2937,6 +3099,7 @@ func prepareVerificationCodeAlert(
         twoFactorNames: twoFactor,
         buttonNames: getCodeBtn,
         confirmedTwoFactorOwnerPid: &confirmedTwoFactorOwnerPid,
+        visualGetCodeHelperPath: visualGetCodeHelperPath,
         deadline: deadline
     )
     guard actionMayProceed(
@@ -3107,9 +3270,11 @@ for uiOwnerAttempt in 1...2 {
             ownerLost = true
             break
         }
-        let detectedCode = scanCodeFromAlertOnly(
+        let detectedCode = scanCodeFromVerifiedAlert(
             appElement: appElement,
-            expectedPid: settingsPid
+            expectedPid: settingsPid,
+            helperPath: visualGetCodeHelperPath,
+            deadline: deadline
         )
         guard Date() < deadline else { break }
         if let detectedCode {
