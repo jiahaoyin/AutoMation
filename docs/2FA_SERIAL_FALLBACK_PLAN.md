@@ -1,5 +1,7 @@
 # Browser 2FA Serial Fallback Plan
 
+> Current runtime: the Developer-first and Account modules share one authentication/2FA context; this plan applies to both stages.
+
 ## Objective
 
 Make browser two-factor authentication deterministic and serial:
@@ -21,9 +23,9 @@ Make browser two-factor authentication deterministic and serial:
   retry delay. It never runs alongside popup-primary or terminal entry.
 - A second webpage code request returns to popup-primary while retaining the
   shared 240-second deadline and the global Settings attempt budget.
-- Terminal/audit/report output is redacted by default. An explicitly enabled
-  local terminal-only debug display may show the code, but must never write it
-  to audit JSONL, reports, screenshots, or error text.
+- Terminal/audit/report output is redacted by default. The explicitly enabled
+  terminal debug display mirrors only fixed non-secret protocol states; it never
+  shows the code or writes it to audit JSONL, reports, screenshots, or error text.
 
 ## Verification
 

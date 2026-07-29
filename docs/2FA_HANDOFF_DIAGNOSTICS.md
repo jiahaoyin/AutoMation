@@ -1,7 +1,8 @@
 # 2FA Handoff Diagnostics
 
-When the collector has a valid code, that only proves code acquisition. The
-following fixed, non-secret checkpoints prove each successive browser handoff:
+Developer-first and Account modules share one authentication/2FA context. When the
+collector has a valid code, that only proves code acquisition; the following fixed,
+non-secret checkpoints prove each successive browser handoff:
 
 ```text
 twofa_code_delivery_started

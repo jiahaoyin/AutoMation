@@ -1,342 +1,217 @@
-# Mac Codex Continuation Handoff
+# Mac 验证交接
 
-> Purpose: give a new Codex session on the Mac enough context to continue the
-> Apple-AutoMation project without rediscovering its architecture, safety
-> boundaries, or current 2FA state. This document contains no credentials,
-> Apple ID, password, OTP, raw AX/OCR output, or page content.
+> 用于 Mac 只读验证、人工 GUI 测试和脱敏证据回传。当前运行方案以 docs/RUNTIME_RUNBOOK.md 为准。
 
-## 1. Read This First
+## 1. 先读什么
 
-This repository automates an Apple Account browser sign-in on macOS. Browser
-launch, navigation, page inspection, input, click, screenshot, and shutdown
-must use **ruyiPage only**. Do not add or fall back to Playwright, Puppeteer,
-Selenium, AppleScript browser control, or a Node browser driver.
+进入仓库后按顺序阅读：
 
-The user currently wants to test the Mac flow manually and then provide
-sanitized evidence for targeted repair. Mac Codex must **never** directly
-start a real Apple Account flow, browser, System Settings, supervised GUI
-flow, or automatic Mac test. If supervised GUI verification is restored later,
-only the Windows orchestrator may start it through a synchronized exclusive
-run with `--allow-supervised-gui`; Mac Codex remains read-only.
+1. AGENTS.md
+2. docs/MAC_CODEX_HANDOFF.md（本文）
+3. docs/RUNTIME_RUNBOOK.md
+4. docs/PROJECT.md
+5. README.md
+6. docs/WINDOWS_MAC_CODEX.md（仅当 Windows 调度 Mac 时）
 
-Current development branch:
+当前分支通常是 **codex/ruyipage-risk-reduction**，但一切行为以当前已推送、已同步的 HEAD 和测试为准。历史 commit、历史计划只提供背景，不是永久运行基线。
 
-```text
-codex/ruyipage-risk-reduction
-```
+## 2. 平台职责
 
-Latest functional baseline when this handoff was written:
-
-```text
-dbd641d fix: route settings smoke to native helper
-```
-
-The handoff document itself may be committed after that SHA. Always inspect
-the current checked-out commit rather than treating this SHA as permanent.
-
-## 2. Platform Roles
-
-| Environment | Responsibility |
+| 环境 | 职责 |
 | --- | --- |
-| Windows development host | Read source, make changes, run Windows-safe tests, review, commit, and push. |
-| Mac verification host | Pull the exact pushed commit, run user-approved manual checks, collect sanitized evidence, and report results. Do not edit, commit, or push source from Mac Codex. |
+| Windows 开发机 | 读源码、修改、跑 Windows-safe tests、review、commit、push。 |
+| Mac 验证机 | 拉取与 Windows 完全一致的精确 SHA，做只读测试或用户监督的 GUI 验收，回传脱敏证据。 |
+| Mac Codex | 不编辑、提交或推送仓库；不自行启动真实 Apple 登录、Firefox、系统设置或 GUI 自动化。 |
 
-The normal Mac repository path is:
+默认 Mac 仓库路径：
 
-```text
+~~~text
 /Users/admin/Desktop/Apple-AutoMation
-```
+~~~
 
-Before changing anything, read these files in order:
+不要 reset、clean、revert 或删除工作树中的无关改动。
 
-1. `AGENTS.md`
-2. `docs/MAC_CODEX_HANDOFF.md` (this file)
-3. `docs/PROJECT.md`
-4. `README.md`
-5. `docs/WINDOWS_MAC_CODEX.md` only when using the Windows-to-Mac orchestration path
+## 3. 当前浏览器方案
 
-Do not reset, clean, revert, or delete unrelated worktree changes. Treat them
-as user-owned until their owner says otherwise.
+浏览器操作只能使用 **ruyiPage**。Firefox 启动、标签页、导航、查询、输入、点击和截图全部由 **scripts/ruyipage/apple_account_flow.py** 负责。Node 只通过 framed JSONL 做流程编排、2FA provider、脱敏 audit 和报告。
 
-## 3. Current Product Behavior
+禁止将浏览器输入换成 Playwright、Puppeteer、Selenium、AppleScript 浏览器控制、Node browser driver、DOM dispatchEvent 或坐标点击。
 
-### Browser flow
+### Developer-first 顺序
 
-The main entry point is `run.sh`. The browser-only manual test command is:
+~~~text
+初始 Firefox tab
+  -> https://developer.apple.com/account
+  -> 登录 / 共享 2FA / 会员状态
+  -> 立即持久化 developer_membership
+  -> 按 gate 决定是否新建 Account tab
+  -> https://account.apple.com/account/manage/section/information
+  -> 个人信息截图与采集
+~~~
 
-```bash
+| 配置 | 结果 |
+| --- | --- |
+| DEVELOPER_MEMBERSHIP_GATE=0 | 默认测试模式；active、not_enrolled、unknown 和 Developer fixed partial 都继续 Account。 |
+| DEVELOPER_MEMBERSHIP_GATE=1 | 只有 active 新建 Account tab；其他结果是成功的 gate stop。 |
+
+Developer 的固定状态为 active、not_enrolled、unknown。Node 在 developer_membership_checked 到达时就写入私有 developer_membership。仅 active 可生成 **03-developer-membership.png**；个人信息页稳定后才可生成 **02-account-information.png**。
+
+gate=1 的非 active 结果必须同时满足：
+
+- developer_membership_gate_blocked；
+- accountModule.skipped=true；
+- browserLogin.accountHomeConfirmed=false；
+- acceptance_marker_skipped。
+
+它不是 Account 登录失败。
+
+## 4. 2FA provider 契约
+
+默认顺序固定，不能重排或并发竞争：
+
+1. ruyiPage 发出 need_2fa 后，popup watcher 先给可信 Apple popup 30 秒主窗口；
+2. AX 无有效码时，同一可信 window 才允许内存 Vision OCR；
+3. Allow 确认后 popup/OCR 有额外固定宽限；
+4. 只有 popup-primary 无有效新码时，System Settings 才开始；最多两次、有界超时、间隔退避；
+5. Settings 结束且满足最小等待窗口后，真实 TTY 才允许隐藏手输；
+6. 有效新码马上交给 ruyiPage，后续 provider 不再启动；
+7. 第二代验证码只在可信网页明确拒绝第一代时出现，两代共享期限与 Settings 总预算。
+
+OTP 永远不写入 terminal、flow-audit.jsonl、2fa-audit.jsonl、report.json、截图、错误文本或 .env。
+
+网页 handoff 的最小顺序：
+
+~~~text
+twofa_code_delivery_started
+→ twofa_code_delivery_sent
+→ code_received
+→ twofa_code_delivery_acknowledged
+→ target_resolved
+→ input_completed
+→ submit_sent
+→ transition_confirmed
+~~~
+
+更多定位细节见 docs/2FA_HANDOFF_DIAGNOSTICS.md。
+
+## 5. Mac 权限和环境
+
+| 权限 | 用途 |
+| --- | --- |
+| 辅助功能 | native popup 与 System Settings AX helper。 |
+| 屏幕与系统音频录制 | Vision OCR 的硬门槛；缺失时浏览器凭据不会提交。 |
+| 自动化 | 仅 macOS 系统设置登录阶段；浏览器-only 的 --skip-mac 不需要。 |
+
+安装/更新 native helper 后运行：
+
+~~~bash
+./install.sh
+~~~
+
+若 macOS 要求，关闭并重新打开实际运行主体后再测试。不要用 shell hack、AppleScript 或未受信 helper 规避 TCC。
+
+## 6. Mac 同步与人工流程
+
+真实 Apple 登录必须由用户监督。开始前，Mac 必须是干净工作树并 fast-forward 到 Windows 已推送 SHA：
+
+~~~bash
+cd /Users/admin/Desktop/Apple-AutoMation
+git status --short
+git fetch origin
+git switch codex/ruyipage-risk-reduction
+git pull --ff-only origin codex/ruyipage-risk-reduction
+git rev-parse HEAD
+~~~
+
+只有 status 为空且 HEAD 等于 Windows 指定 SHA 才继续。不要使用 git reset --hard、git clean、强制 checkout 或任何覆盖同步。
+
+用户手工执行浏览器验证：
+
+~~~bash
 ./run.sh --skip-mac
-```
+~~~
 
-The high-level path is:
+默认使用 DEVELOPER_MEMBERSHIP_GATE=0，预期顺序是：
 
-```text
-run.sh
-  -> scripts/apple-id-full-flow.mjs
-  -> scripts/lib/account-browser-flow.js
-  -> scripts/lib/ruyipage-backend-runner.js
-  -> scripts/ruyipage/apple_account_flow.py
-```
+~~~text
+developer_membership_checked
+→ account_module_tab_created
+→ account_home_confirmed
+→ profile_capture_*
+~~~
 
-`scripts/ruyipage/apple_account_flow.py` owns every Firefox page operation.
-It uses ruyiPage BiDi-native input for email, password, checkbox, OTP input,
-and page transitions. The Node side exchanges only framed JSONL events and
-commands with it.
+若刻意测试业务 gate，设置 DEVELOPER_MEMBERSHIP_GATE=1，并确认 non-active 的终点是正常跳过，不存在 Account home marker。
 
-Do not replace the trusted ruyiPage input path with DOM `dispatchEvent`, a
-second browser library, or coordinate clicking.
+## 7. 可回传证据
 
-### 2FA provider policy
+优先回传当前报告目录的脱敏固定状态：
 
-The formal 2FA collector is `scripts/lib/two-fa-sidecar.js`, created by
-`scripts/lib/account-browser-flow.js` through `createMac2FACollector(...)`.
+- flow-audit.jsonl 中相关阶段；
+- 2fa-audit.jsonl 中 provider 生命周期；
+- report.json 的固定完成/跳过字段（确认不含个人字段后）；
+- 启动失败时 launcher-audit.jsonl 的固定阶段；
+- 受监督 Windows 调度时的 summary.json、final.json、events.jsonl、stderr.log 路径。
 
-The default is **not** Settings-only. Keep the strict serial fallback:
+不要发送：
 
-1. A real acquisition begins only when ruyiPage emits `need_2fa`. The popup
-   watcher gets a 30-second primary window to read the trusted Apple
-   verification popup through Accessibility (AX).
-2. If AX cannot produce a valid code, the same verified Apple window may use
-   Vision OCR as a read-only fallback. OCR never clicks the screen. A confirmed
-   Allow action gives popup AX/OCR a further 30 seconds before Settings may run.
-3. Only after the popup-primary window ends without a valid fresh code may
-   System Settings start. It can try at most twice, up to 60 seconds per try,
-   with a five-second backoff. Once Settings has started, a late popup candidate
-   cannot win that acquisition.
-4. Only after the bounded Settings attempts finish may a real TTY offer hidden
-   manual code input, and never before 90 seconds from the first acquisition.
-5. A validated six-digit code from the current serial stage is sent immediately
-   to ruyiPage. Later stages are not started; native helper and popup cleanup is
-   bounded background work and must not hold up webpage input.
-6. The shared acquisition deadline is 240 seconds from the first acquisition.
-   The two-attempt Settings budget is shared by the whole collector and is not
-   reset for generation 2. A second OTP generation is requested only when the
-   Apple page explicitly reports an invalid, expired, or rejected first code;
-   it restarts at popup-primary. Captcha, lockout, or unknown login errors stop
-   the flow instead of endlessly retrying.
+- .env、Apple ID、密码、session、Cookie、API key、GitHub 凭据；
+- OTP；
+- 原始 AX tree、OCR 文本、网络载荷、URL query、完整认证页面文本；
+- 未脱敏个人信息截图或视频。
 
-Relevant defaults:
+截图是私有数据。03-developer-membership.png 仅 active 存在；02-account-information.png 可能含姓名/生日。无法确认脱敏时，不发送图片。
 
-```text
-BROWSER_2FA_SETTINGS_AFTER_MS=30000
-BROWSER_2FA_SETTINGS_FALLBACK=1
-BROWSER_2FA_MANUAL_FALLBACK=1
-BROWSER_2FA_POLL_MS=800
-BROWSER_PRESERVE_ON_FAILURE=1
-```
+## 8. 证据分流表
 
-Do not switch `settingsOnly` on, reintroduce a provider race, or disable
-popup/OCR/manual sources merely to work around one failed test. The user's
-current requirement is: popup first, then Settings only after popup-primary
-expires, then manual input only after Settings ends.
-
-Terminal output never prints OTP. It must never be written to audit JSONL,
-reports, screenshots, error text, or evidence handed back to Windows.
-
-### Native helper map
-
-| File | Responsibility |
+| 现象 | 首先查看 |
 | --- | --- |
-| `scripts/swift/mac-2fa-popup-read.swift` | Read a trusted native Apple popup through AX. |
-| `scripts/swift/mac-2fa-popup-ocr.swift` | Read only a trusted popup through Vision OCR; no OCR click path. |
-| `scripts/swift/mac-2fa-click-allow.swift` | Narrow native Allow action with process/window/button checks. |
-| `scripts/swift/mac-settings-2fa-code.swift` | Navigate System Settings to Apple Account, request a verification code, read it, then close the dialog. |
-| `scripts/lib/mac-settings-2fa.js` | Spawn/cancel the Settings helper and map its fixed failure codes. |
-| `scripts/lib/mac-2fa-popup.js` | Popup lifecycle and cleanup helpers. |
-| `scripts/preflight-2fa-permissions.mjs` | Accessibility and Screen Recording preflight for the normal browser flow. |
+| Firefox 不能启动 | scripts/lib/ruyipage-runtime.js、scripts/lib/ruyipage-backend-runner.js。 |
+| Developer 登录/会员异常 | apple_account_flow.py、developer_account_*、developer_membership_checked。 |
+| Developer 后没有 Account | DEVELOPER_MEMBERSHIP_GATE、developer_membership_gate_blocked、accountModule。 |
+| Account tab 创建/认证异常 | account_module_started、account_module_tab_created、account_home_confirmed。 |
+| Account home 已确认但资料 partial | profile_capture_*、personal-information readiness、browser preservation。 |
+| 已取码但网页没有完成 | 2FA handoff 顺序和 owner-frame BiDi 状态。 |
+| OTP 被拒绝 | explicit invalid/expired/rejected 检测与 generation 2。 |
+| Screen Recording 缺失 | preflight 输出和实际运行主体的 TCC 授权。 |
 
-## 4. Permissions and Environment
+修复时从最小拥有模块开始。不要用弱化目标验证、盲输、坐标点击、日志记录秘密来掩盖问题。
 
-Run `./install.sh` on the Mac after a new pull or when native helpers are
-missing/outdated. It handles the project runtime and native helper compilation.
-It may request administrator authorization for a trusted Python installation.
-The project must never save, print, or commit that password.
+## 9. 安全的本地检查
 
-The actual runtime identity needs the following macOS permissions:
+Mac Codex 可以做不触发 GUI 的只读/静态检查：
 
-| Permission | Why it is needed |
-| --- | --- |
-| Accessibility | Native popup and System Settings AX helpers. The item visible in macOS may be Terminal, Codex, or a helper; trust the actual item shown by macOS rather than assuming a different checked app covers it. |
-| Screen & System Audio Recording | Required for Vision OCR. Browser login intentionally stops before credential submission if this permission is missing. |
-| Automation | Needed only for the separate macOS System Settings login stage, not for `./run.sh --skip-mac` browser-only work. |
-
-After macOS changes a permission, close and reopen the runtime application when
-the system asks. Do not try to bypass TCC with AppleScript, shell hacks, or
-untrusted helper replacements.
-
-If Swift compilation fails, collect the fixed compiler diagnostic and the exact
-command shown by `install.sh`. Do not delete Xcode, Python, project runtimes,
-or user data while diagnosing it.
-
-## 5. Current Known State
-
-The most recent focused change, `dbd641d`, fixed a real routing defect in the
-supervised **Settings smoke** mode: it had been launching `./run.sh --skip-mac`
-instead of the dedicated `scripts/supervised-settings-2fa-smoke.mjs` entry.
-The attestation now also binds the digest to the mode-specific production
-command.
-
-The last supervised Settings smoke attempt reached the dedicated route but
-returned the fixed failure class `TWO_FA_CODE_UNAVAILABLE` after roughly two
-per-provider time windows. It did not produce two fresh Settings codes. This
-does **not** prove a particular UI label, dialog, or permission is wrong:
-the smoke runner currently collapses the underlying helper result into a fixed
-privacy-safe failure. No automatic Mac retest is pending.
-
-The next evidence should come from the user's manual test. Concentrate on the
-first actual observable failure point rather than broad refactors:
-
-- Settings never opens.
-- Settings opens but cannot reach Sign-In & Security / Two-Factor
-  Authentication.
-- Get Verification Code is visible but is not pressed.
-- The code dialog appears but no code is read.
-- A code is read but browser OTP entry or final account-home confirmation fails.
-- The main browser flow exits earlier, for example at password input.
-
-## 6. Manual Mac Test Procedure
-
-The user, not Codex, performs the real GUI test. A new Mac Codex session may
-help inspect results after the user finishes.
-
-1. The user (or the Windows orchestrator), not Mac Codex, updates the Mac
-   checkout. First require a clean worktree and obtain the exact Windows SHA
-   that has already been pushed. If either check fails, stop and report the
-   mismatch instead of forcing synchronization:
-
-   ```bash
-   cd /Users/admin/Desktop/Apple-AutoMation
-   git status --short
-   git fetch origin
-   git switch codex/ruyipage-risk-reduction
-   git pull --ff-only origin codex/ruyipage-risk-reduction
-   git rev-parse HEAD
-   ```
-
-   `git status --short` must be empty before synchronization. The final
-   `git rev-parse HEAD` output must equal the Windows SHA. Do not use
-   `git reset --hard`, `git clean`, a forced checkout, or any workaround when
-   that contract is not met.
-
-2. Prepare the environment when needed:
-
-   ```bash
-   ./install.sh
-   ```
-
-3. The user starts the browser-only real flow manually:
-
-   ```bash
-   ./run.sh --skip-mac
-   ```
-
-4. The user records the visible behavior and sends only safe evidence back to
-   the Windows development session. Preferred artifacts are the sanitized
-   `flow-audit.jsonl` and `2fa-audit.jsonl` files from the affected report
-   directory. Do not send a full `report.json` unless it has first been
-   verified to contain no personal profile fields, account-page content,
-   email, session value, credentials, or OTP; otherwise send only the relevant
-   fixed-status JSONL lines. A screenshot or video may be sent only after it
-   is cropped and redacted so it contains no Apple ID, password field, OTP,
-   personal profile data, session value, URL query, authentication-page text,
-   raw AX/OCR, or full authentication page. If that cannot be confirmed before
-   sending, do not send the image or video.
-
-5. Do not run `npm run mac:codex`, `node scripts/supervised-mac-acceptance.mjs`,
-   `test:2fa-allow` manual mode, or a real flow automatically unless the user
-   explicitly restores that authorization.
-
-Never paste or ask for:
-
-- `.env` contents
-- Apple ID, password, session tokens, API keys, or GitHub credentials
-- OTP values
-- raw AX trees, OCR text, network payloads, URL query strings, or full auth-page text
-
-## 7. Evidence Triage Map
-
-| User-visible phase or fixed status | Start reading here |
-| --- | --- |
-| Firefox does not launch | `scripts/lib/ruyipage-runtime.js`, `scripts/lib/ruyipage-backend-runner.js`, `scripts/ruyipage/apple_account_flow.py` |
-| Email/password/remember-account failure | `scripts/ruyipage/apple_account_flow.py` and `scripts/test-account-browser-flow.mjs` |
-| Page requests a code but none arrives | `scripts/lib/account-browser-flow.js`, `scripts/lib/two-fa-sidecar.js`, popup/settings helpers |
-| Popup appears but code is not read | `scripts/swift/mac-2fa-popup-read.swift`, `scripts/swift/mac-2fa-popup-ocr.swift`, `scripts/lib/mac-2fa-popup.js` |
-| Settings path is stuck | `scripts/swift/mac-settings-2fa-code.swift`, `scripts/lib/mac-settings-2fa.js` |
-| Code is acquired but not entered into web page | `scripts/ruyipage/apple_account_flow.py`, especially `need_2fa`, `2fa_code`, generation, focus, and target validation |
-| Code is rejected | `scripts/ruyipage/apple_account_flow.py` explicit invalid/expired-code detection and generation 2 handling |
-
-Start from fixed status lines and sanitized JSONL fields. Do not "fix" a
-failure by suppressing verification, weakening target validation, using raw
-coordinate clicks, or logging secret material.
-
-## 8. Safe Development Loop
-
-When the user provides a concrete failure:
-
-1. Reproduce the state from the sanitized evidence in Windows source analysis.
-2. Change the smallest owning module.
-3. Add or update a focused unit/contract test for that behavior.
-4. Run only the relevant Windows-safe tests, plus `node --check` or
-   `python -m py_compile` for touched code and `git diff --check`.
-5. Review the diff for secret exposure and accidental fallback browser tooling.
-6. Commit only the intended files and push
-   `codex/ruyipage-risk-reduction` from Windows.
-7. Ask the user to pull and run the manual Mac test again.
-
-Do not let local tests become a substitute for real macOS GUI evidence. Also do
-not launch repeated Mac GUI tests automatically: the user has explicitly
-requested a manual-feedback repair cycle.
-
-## 9. Safe Test Commands
-
-Use only tests relevant to the touched module. Typical Windows-safe examples:
-
-```bash
-node scripts/test-two-fa-sidecar.mjs
-node scripts/test-account-browser-flow.mjs
-node scripts/test-ruyipage-protocol.mjs
-node scripts/test-ruyipage-flow.mjs
-node scripts/test-supervised-settings-2fa-smoke.mjs
-node --check scripts/lib/two-fa-sidecar.js
+~~~bash
+node --check scripts/apple-id-full-flow.mjs
 node --check scripts/lib/account-browser-flow.js
+node --check scripts/lib/two-fa-sidecar.js
 python -m py_compile scripts/ruyipage/apple_account_flow.py
 git diff --check
-```
+~~~
 
-Do not run a broad full-suite loop unless the change crosses those modules.
+只有在本轮改动跨越对应模块时，再扩展到关联 Node/Python 测试。真实 Apple 流程、manual 2FA、test:2fa-allow manual 模式与自动 GUI 验收不得由 Mac Codex 自行启动。
 
-## 10. New Mac Codex Session Prompt
+## 10. 新 Mac 会话提示词
 
-Paste this into a new Mac Codex session after opening the repository:
+~~~text
+先阅读 /Users/admin/Desktop/Apple-AutoMation/AGENTS.md、
+/Users/admin/Desktop/Apple-AutoMation/docs/MAC_CODEX_HANDOFF.md 和
+/Users/admin/Desktop/Apple-AutoMation/docs/RUNTIME_RUNBOOK.md。
 
-```text
-Read /Users/admin/Desktop/Apple-AutoMation/AGENTS.md and
-/Users/admin/Desktop/Apple-AutoMation/docs/MAC_CODEX_HANDOFF.md first.
+这是只读人工反馈阶段。不要读取 .env，不要启动真实 Apple 登录、Firefox、系统设置、
+supervised GUI 或自动 Mac 测试。不要输出凭据、OTP、原始 AX/OCR、截图、URL query
+或认证页面正文。
 
-This is a manual-feedback phase. Do not start a real Apple Account flow,
-supervised GUI flow, browser, Settings, or automatic test. Do not read .env or
-output credentials, OTP, raw AX/OCR, screenshots, URLs, or auth-page text.
+浏览器必须保持 ruyiPage-only。当前顺序是 Developer-first：初始 tab 判定会员并持久化
+developer_membership；仅 gate 允许时创建 Account tab。2FA 必须维持 popup AX/OCR →
+Settings → optional hidden manual 的严格串行策略。等待我提供脱敏日志或已脱敏视觉证据，
+再定位最小拥有模块并给 Windows 修改清单。不得编辑、提交或推送 Mac 工作树。
+~~~
 
-Browser actions in this project must remain ruyiPage-only. Keep strict serial
-2FA fallback: popup AX/OCR first, System Settings only after the popup-primary
-window expires, then optional hidden manual entry only after Settings ends. Do
-not switch to Settings-only or reintroduce a provider race.
+## 11. 不可破坏的仓库规则
 
-Wait for my sanitized logs or properly redacted visual evidence. Once I
-provide evidence, identify the smallest owning module and give a targeted
-Windows change list. Mac Codex must not edit, commit, or push source, even if
-I ask for an implementation; hand the change list to the Windows development
-session. Preserve unrelated worktree changes and never use git reset --hard,
-git clean, or recursive deletion.
-```
-
-## 11. Repository Rules That Must Survive Handoff
-
-- Keep browser automation ruyiPage-only.
-- Do not read or expose secrets.
-- Do not use bulk/recursive deletion or destructive Git commands.
-- Preserve unrelated user changes.
-- Keep fixed, sanitized diagnostics; do not insert raw helper stderr, AX/OCR,
-  screenshots, OTP, or page text into reports.
-- Prefer the smallest targeted repair over broad architecture changes.
-- Windows changes source and pushes. Mac verifies manually and returns evidence.
+- 浏览器 automation 只用 ruyiPage。
+- 不读取、不输出秘密。
+- 不使用 bulk/recursive 删除或破坏性 Git 命令。
+- 保留用户无关改动。
+- audit 和报告只保留固定脱敏状态，不插入 raw helper stderr、AX/OCR、截图、OTP 或页面正文。
+- Windows 改源并 push；Mac 只验证精确 SHA 并回传证据。

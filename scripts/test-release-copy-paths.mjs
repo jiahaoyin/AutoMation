@@ -566,32 +566,83 @@ assert.match(envExample, /birthday=.*个人信息页采集后写入/);
 assert.doesNotMatch(envExample, /BROWSER_2FA_POPUP_WAIT_MS/);
 
 const releaseBuilder = fs.readFileSync(new URL("./build-release.mjs", import.meta.url), "utf-8");
-assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
-assert.match(releaseBuilder, /BROWSER_2FA_SETTINGS_FALLBACK=1/);
-assert.match(releaseBuilder, /BROWSER_2FA_MANUAL_FALLBACK=1/);
-assert.match(releaseBuilder, /APPLE_AUTOMATION_TERMINAL_DEBUG=1/);
-assert.match(releaseBuilder, /02-account-information\.png/);
-assert.doesNotMatch(releaseBuilder, /03-account-information\.png/);
+const releaseMainStart = releaseBuilder.indexOf("function main(");
+const releaseMainEnd = releaseBuilder.indexOf("if (process.argv[1]", releaseMainStart);
+assert.ok(releaseMainStart >= 0 && releaseMainEnd > releaseMainStart, "release main is required");
+const releaseBuilderMain = releaseBuilder.slice(releaseMainStart, releaseMainEnd);
 assert.match(
   releaseBuilder,
-  /BROWSER_2FA_MANUAL_FALLBACK[^\n]*默认[^\n]*1/,
-  "release README must document the enabled-by-default manual fallback"
-);
-assert.match(
-  releaseBuilder,
-  /--skip-mac[^\n]*不要求[^\n]*自动化/,
-  "release README must preserve the browser-only permission boundary"
-);
-assert.doesNotMatch(
-  releaseBuilder,
-  /2FA 超时[^\n]*辅助功能\/自动化权限/,
-  "release README must not require Automation for browser 2FA"
+  /fs\.copyFileSync\(path\.join\(ROOT, "README\.md"\), path\.join\(destRoot, "README\.md"\)\)/,
+  "release package must copy the canonical repository README"
 );
 assert.match(
   releaseBuilder,
-  /屏幕与系统音频录制[^\n]*必需权限[\s\S]{0,360}Firefox 启动前复核/,
-  "release README must document Screen Recording as an install and pre-browser hard gate"
+  /fs\.copyFileSync\(path\.join\(ROOT, "\.env\.example"\), path\.join\(destRoot, "\.env\.example"\)\)/,
+  "release package must copy the canonical environment example"
 );
+assert.match(
+  releaseBuilderMain,
+  /for \(const rel of COPY_PATHS\) \{[\s\S]*?copyFile\(rel, OUT_DIR\);[\s\S]*?\}/,
+  "release main must copy every declared runtime and documentation path"
+);
+assert.match(
+  releaseBuilderMain,
+  /buildReadme\(OUT_DIR\);\s*buildEnvExample\(OUT_DIR\);/,
+  "release main must emit the canonical README and environment example"
+);
+for (const rel of [
+  "docs/RUNTIME_RUNBOOK.md",
+  "docs/PROJECT.md",
+  "docs/2FA_HANDOFF_DIAGNOSTICS.md",
+  "docs/MAC_CODEX_HANDOFF.md",
+  "docs/WINDOWS_MAC_CODEX.md",
+]) {
+  assert.ok(COPY_PATHS.includes(rel), `release package must include ${rel}`);
+}
+const repositoryReadme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf-8");
+const environmentExample = fs.readFileSync(
+  new URL("../.env.example", import.meta.url),
+  "utf-8"
+);
+const runtimeRunbook = fs.readFileSync(
+  new URL("../docs/RUNTIME_RUNBOOK.md", import.meta.url),
+  "utf-8"
+);
+const projectReference = fs.readFileSync(new URL("../docs/PROJECT.md", import.meta.url), "utf-8");
+const macHandoff = fs.readFileSync(
+  new URL("../docs/MAC_CODEX_HANDOFF.md", import.meta.url),
+  "utf-8"
+);
+const windowsMacGuide = fs.readFileSync(
+  new URL("../docs/WINDOWS_MAC_CODEX.md", import.meta.url),
+  "utf-8"
+);
+for (const [label, documentSource] of [
+  ["repository README", repositoryReadme],
+  ["runtime runbook", runtimeRunbook],
+  ["project reference", projectReference],
+]) {
+  assert.match(documentSource, /DEVELOPER_MEMBERSHIP_GATE=0/, `${label} must document test-mode gate`);
+  assert.match(documentSource, /developer_membership/, `${label} must document membership persistence`);
+  assert.match(documentSource, /03-developer-membership\.png/, `${label} must document active-member screenshot`);
+  assert.match(documentSource, /02-account-information\.png/, `${label} must document information screenshot`);
+  assert.match(documentSource, /ruyiPage/, `${label} must preserve the ruyiPage-only browser contract`);
+}
+assert.match(repositoryReadme, /Developer-first/);
+assert.match(environmentExample, /DEVELOPER_MEMBERSHIP_GATE=0/);
+assert.match(environmentExample, /BROWSER_ATTACH_EXISTING=1/);
+assert.match(
+  environmentExample,
+  /接管已有 Firefox 会话；仍先执行 Developer-first，再新建 Account 标签页/
+);
+assert.doesNotMatch(environmentExample, /优先复用已打开的 account\.apple\.com 标签页/);
+assert.match(runtimeRunbook, /developer_membership_gate_blocked/);
+assert.match(projectReference, /recordAccountHomeAcceptanceMarker/);
+assert.match(macHandoff, /Developer-first/);
+assert.match(macHandoff, /DEVELOPER_MEMBERSHIP_GATE=1/);
+assert.match(windowsMacGuide, /developer_membership_gate/);
+assert.match(windowsMacGuide, /acceptance_marker_skipped/);
+assert.match(releaseBuilder, /"docs\/RUNTIME_RUNBOOK\.md"/);
 assert.match(
   releaseBuilder,
   /"test:2fa-settings":\s*"node scripts\/test-2fa-settings-code\.mjs"/,
@@ -601,20 +652,6 @@ assert.match(
   releaseBuilder,
   /"test:mac-settings-sms-verification":\s*"node scripts\/test-mac-settings-sms-verification\.mjs"/,
   "release package must expose the supervised SMS verification contract test"
-);
-assert.match(releaseBuilder, /BROWSER_2FA_POLL_MS=800/);
-assert.doesNotMatch(releaseBuilder, /BROWSER_2FA_POPUP_WAIT_MS/);
-assert.match(releaseBuilder, /APPLE_AUTOMATION_SMS_ENABLED=0/);
-assert.match(releaseBuilder, /APPLE_AUTOMATION_SMS_PHONE=/);
-assert.match(releaseBuilder, /APPLE_AUTOMATION_SMS_API_URL=/);
-assert.match(releaseBuilder, /APPLE_AUTOMATION_SMS_RECONFIGURE=0/);
-assert.match(
-  fs.readFileSync(new URL("../README.md", import.meta.url), "utf-8"),
-  /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/
-);
-assert.match(
-  fs.readFileSync(new URL("../docs\/PROJECT.md", import.meta.url), "utf-8"),
-  /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/
 );
 const environmentSetup = fs.readFileSync(
   new URL("./lib/env-setup.js", import.meta.url),

@@ -1,5 +1,7 @@
 # Apple Developer Account Membership Module
 
+> **Historical implementation plan (superseded by sequence):** this document records the original Account-then-Developer design. The current runtime is Developer-first; use [the runtime runbook](../../RUNTIME_RUNBOOK.md) and [the Developer-first plan](2026-07-29-developer-first-account-sequencing.md).
+
 ## Objective
 
 After the existing `account.apple.com` profile workflow succeeds, use the same

@@ -1,449 +1,189 @@
-# Windows 调度 Mac Codex 操作手册
+# Windows 调度 Mac 验证手册
 
-本文档说明如何让 Windows 上的 Codex 负责开发和修复，让 Mac 上的 Codex 独立负责
-macOS 环境识别、检查和测试，再把完整证据交回 Windows 进入下一轮修改与重测。
+> Windows 负责修改、测试、提交与推送；Mac 只在同一精确 SHA 上做只读验证。当前浏览器顺序为 Developer-first：先判定 Apple Developer 会员状态，再选择是否进入 Account 个人信息模块。
 
-文档中的密钥一律使用占位符。不要把真实 API Key、GitHub PAT 或 `.env` 内容写入命令、
-任务文本、日志或 Git。
+## 1. 角色与不可变边界
 
-## 1. 当前机器与角色
+| 环境 | 允许做什么 | 禁止做什么 |
+| --- | --- | --- |
+| Windows 开发机 | 修改源码、运行 Windows-safe tests、review、commit、push、发起 Mac 调度。 | 以 Windows 结果替代 macOS TCC / Swift / GUI 验收。 |
+| Mac 验证机 | 拉取精确 SHA、运行非交互检查、在明确监督下执行生产 GUI 验收、回传证据。 | 修改/提交/推送仓库、强制同步或覆盖脏工作树。 |
+| Mac Codex sandbox | 读取仓库与仅写本轮 TMPDIR。 | 读取 .env、写仓库、读取常见凭据路径、扩展可写目录。 |
 
-| 项目 | Windows | Mac |
-|---|---|---|
-| 角色 | 开发、修改、提交、推送 | 只读检查、macOS 测试、结构化报告 |
-| 仓库 | `D:\work\apple-automation` | `/Users/admin/Desktop/Apple-AutoMation` |
-| 分支 | `codex/ruyipage-risk-reduction` | 与 Windows fast-forward 到相同 SHA |
-| SSH | 别名 `mac-codex` | `admin@192.168.249.148` |
-| 系统 | Windows | macOS 15.6.1, Intel `x86_64` |
-| Codex | Windows Codex | `/Users/admin/.local/bin/codex`, CLI 0.144.3 |
+浏览器一律 ruyiPage-only。不要添加 Playwright、Puppeteer、Selenium、AppleScript browser control 或 Node browser driver。
 
-Mac 已有 Xcode 26.1、Swift 6.2.1、Python 3.12.10、Firefox 和隔离环境
-`.runtime/ruyipage-venv`（ruyiPage 1.2.45）。项目 bootstrap 会安装本地 Node
-22.14.0 到 `.runtime/node`，不依赖 Homebrew。
+## 2. 运行前准备
 
-## 2. Mac 开启 SSH
+Windows 项目根目录：
 
-在 Mac 本机终端执行：
+~~~text
+D:WorkApple-AutoMation
+~~~
 
-```bash
-sudo systemsetup -setremotelogin on
-sudo ssh-keygen -A
-sudo systemsetup -getremotelogin
-sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-nc -vz 127.0.0.1 22
-```
+典型 Mac 项目根目录：
 
-预期：`Remote Login: On`，主机 ED25519 指纹可见，本机 22 端口连接成功。
+~~~text
+/Users/admin/Desktop/Apple-AutoMation
+~~~
 
-Windows 创建专用密钥时使用：
+Windows 启动前先确认：
 
-```powershell
-ssh-keygen -t ed25519 -a 100 -f $HOME\.ssh\codex_mac_ed25519 -C windows-codex-to-mac
-```
-
-把 Windows 公钥内容作为单独一行写入 Mac 的
-`/Users/admin/.ssh/authorized_keys`。当前网络可限制来源为 Windows VMnet8 地址：
-
-```text
-restrict,from="192.168.249.1/32" ssh-ed25519 <WINDOWS_PUBLIC_KEY> windows-codex-to-mac
-```
-
-然后在 Mac 执行：
-
-```bash
-chmod 700 "$HOME/.ssh"
-chmod 600 "$HOME/.ssh/authorized_keys"
-ssh-keygen -lf "$HOME/.ssh/authorized_keys"
-```
-
-Windows 的 `$HOME\.ssh\config` 使用以下结构：
-
-```sshconfig
-Host mac-codex
-    HostName 192.168.249.148
-    User admin
-    IdentityFile C:/Users/hasee/.ssh/codex_mac_ed25519
-    IdentitiesOnly yes
-    BatchMode yes
-    StrictHostKeyChecking yes
-    UserKnownHostsFile C:/Users/hasee/.ssh/known_hosts_mac_codex
-    HostKeyAlias mac-codex
-    HostKeyAlgorithms ssh-ed25519
-```
-
-先在可信局域网内当面核对 Mac 显示的主机指纹，再写入专用 known-hosts 文件。测试：
-
-```powershell
-ssh mac-codex 'printf SSH_OK'
-ssh -G mac-codex | Select-String '^(hostname|user|identityfile|stricthostkeychecking) '
-```
-
-## 3. SSH 改为仅密钥登录
-
-这一步需要在 Mac 本机输入一次 `admin` 的管理员密码，不能从无人值守 Windows 会话
-安全代输。确认密钥登录已经成功后，在 Mac 本机执行：
-
-```bash
-sudo /usr/bin/install -d -o root -g wheel -m 0755 /etc/ssh/sshd_config.d
-printf '%s\n' \
-  'PasswordAuthentication no' \
-  'KbdInteractiveAuthentication no' \
-  'PubkeyAuthentication yes' \
-  | sudo /usr/bin/tee /etc/ssh/sshd_config.d/100-codex-key-only.conf >/dev/null
-sudo /usr/sbin/chown root:wheel /etc/ssh/sshd_config.d/100-codex-key-only.conf
-sudo /bin/chmod 0644 /etc/ssh/sshd_config.d/100-codex-key-only.conf
-sudo /usr/sbin/sshd -t
-sudo /bin/launchctl kickstart -k system/com.openssh.sshd
-```
-
-保持当前 Mac 终端不要关闭，从 Windows 新开终端复测 `ssh mac-codex`。确认密钥仍可登录
-后再结束旧会话。Windows 可用 `ssh -G mac-codex` 查看客户端配置；服务端生效值需在
-Mac 用 `sudo /usr/sbin/sshd -T` 核对。
-
-## 4. Mac Codex CLI 与 PATH
-
-Intel Mac 使用 OpenAI 官方 release 的 `x86_64-apple-darwin` 包。下载后先核对 release
-提供的 SHA-256，再核对 Apple Developer ID 签名，然后安装到用户目录：
-
-```bash
-mkdir -p "$HOME/.local/bin"
-install -m 0755 <VERIFIED_CODEX_BINARY> "$HOME/.local/bin/codex"
-line='export PATH="$HOME/.local/bin:$PATH"'
-touch "$HOME/.zprofile" "$HOME/.zshenv"
-grep -Fqx "$line" "$HOME/.zprofile" || printf '%s\n' "$line" >> "$HOME/.zprofile"
-grep -Fqx "$line" "$HOME/.zshenv" || printf '%s\n' "$line" >> "$HOME/.zshenv"
-chmod 600 "$HOME/.zshenv"
-"$HOME/.local/bin/codex" --version
-```
-
-自动化仍使用绝对路径 `/Users/admin/.local/bin/codex`；`.zprofile` 服务交互登录终端，
-`.zshenv` 让非交互 SSH 的 zsh 也能直接解析短命令 `codex`。
-
-登录 API Key 时不要把密钥放进命令历史：
-
-```bash
-read -s "CODEX_API_KEY?Codex API Key: "
-printf '\n'
-printf '%s' "$CODEX_API_KEY" | "$HOME/.local/bin/codex" login --with-api-key
-unset CODEX_API_KEY
-"$HOME/.local/bin/codex" login status
-```
-
-## 5. 对齐 Windows 与 Mac Codex 配置
-
-Windows 与 Mac 当前统一使用以下非秘密设置：
-
-```toml
-model = "gpt-5.6-sol"
-model_provider = "codex_local_access"
-model_reasoning_effort = "xhigh"
-service_tier = "priority"
-model_context_window = 1000000
-model_auto_compact_token_limit = 900000
-model_catalog_json = "/Users/admin/.codex/cockpit-provider-model-catalog.json"
-
-[model_providers.codex_local_access]
-name = "ai.mypic.qzz.io"
-base_url = "https://ai.mypic.qzz.io/v1"
-wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
-```
-
-Mac 的常规配置放在 `~/.codex/config.toml`。无人值守测试配置放在
-`~/.codex/automation.config.toml`，并在上述内容后增加：
-
-```toml
-approval_policy = "never"
-sandbox_mode = "read-only"
-web_search = "disabled"
-
-[shell_environment_policy]
-include_only = [
-  "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TMPDIR",
-  "APPLE_AUTOMATION_REPORT_ROOT", "APPLE_AUTOMATION_ACCEPTANCE_MARKER",
-  "FIREFOX_PROFILE_DIR", "BROWSER_PROFILE_MODE"
-]
-```
-
-这里的 `sandbox_mode = "read-only"` 是无人值守 profile 的保守基线。调度器启动每轮任务
-时会通过 session `-c` 显式选择本轮自定义 `default_permissions`；Codex 0.144.3 会按
-permissions profile 语法解析该会话，而不是把仓库切成 legacy workspace-write。
-
-设置权限：
-
-```bash
-chmod 700 "$HOME/.codex"
-chmod 600 "$HOME/.codex/config.toml"
-chmod 600 "$HOME/.codex/automation.config.toml"
-chmod 600 "$HOME/.codex/auth.json"
-```
-
-从 Windows 同步模型目录，不包含认证信息：
-
-```powershell
-scp $HOME\.codex\cockpit-provider-model-catalog.json `
-  mac-codex:/Users/admin/.codex/cockpit-provider-model-catalog.json
-```
-
-用两端 SHA-256 确认文件一致。`service_tier = "priority"` 对齐请求服务档位；实际每分钟
-请求数、并发和吞吐上限仍由 `base_url` 对应供应商的账号配额决定，Codex 本地配置无法
-越过服务端限流。
-
-## 6. Mac 项目基础环境
-
-Windows 修复 Intel Node 映射并推送后，在 Mac 仓库执行普通 Bash bootstrap：
-
-```bash
-cd /Users/admin/Desktop/Apple-AutoMation
-/bin/bash -lc 'source scripts/bootstrap-macos.sh; bootstrap_macos_runtime'
-.runtime/node/bin/node --version
-.runtime/node/bin/npm --version
-.runtime/ruyipage-venv/bin/python --version
-.runtime/ruyipage-venv/bin/python -c 'import importlib.metadata as m; print(m.version("ruyipage"))'
-```
-
-这里调用 `bootstrap_macos_runtime`，只安装项目本地 Node，不触发系统 Python 的 sudo
-安装。完整首次安装仍使用 `./install.sh`，并在 Mac 本机按提示输入管理员密码和处理
-macOS 权限。
-
-辅助功能、屏幕录制以及“自动化 -> 系统设置”属于 macOS TCC 权限，必须在实际运行
-终端应用的 Mac 图形界面中授权；SSH 和 `sudo` 不能可靠代替用户完成这些授权。
-
-## 7. 在 Apple-AutoMation 的 Codex 任务中使用
-
-从 Windows 打开 `D:\work\apple-automation` 作为任务根目录。根目录 `AGENTS.md` 会让
-Codex 自动知道：Windows 改代码，Mac 只检查和测试，浏览器自动化只用 ruyiPage。
-
-第一次测试前，在 Windows 完成：
-
-```powershell
+~~~powershell
 git status --short
-npm.cmd run test:mac-codex
-git add <本轮文件>
-git commit -m "<本轮提交说明>"
-git push origin codex/ruyipage-risk-reduction
-git status --short
-```
+git branch --show-current
+git rev-parse HEAD
+npm.cmd run -s test:mac-codex
+~~~
 
-调度器要求 Windows worktree clean，确保 Mac 测到的是刚推送的精确提交。然后在任务
-会话里直接要求 Codex 执行，或手工运行：
+只有 Windows worktree 干净、目标分支已经 push 后，才允许请求 Mac 同步。Mac worktree 脏、分支分叉、HEAD 不一致或无法 fast-forward 时立即停止；不要使用 git reset --hard、git clean、强制 checkout 或目录删除来“修复”。
 
-```powershell
-npm.cmd run -s mac:codex -- --task "识别当前 macOS 环境，运行与本次修改相关的非交互测试，并给出结构化结论"
-```
+## 3. 标准 Windows → Mac 循环
 
-真实账号、2FA 或需要图形界面确认的验收默认禁止。只有用户明确表示正在监督该 Mac 会话
-并授权本轮真实验收时，才能使用同步独占开关：
-
-```powershell
-npm.cmd run -s mac:codex -- --task-file .\mac-supervised-task.txt --round 2 --allow-supervised-gui
-```
-
-`--allow-supervised-gui` 不能与 `--no-sync` 同用，也不会放宽 Mac 仓库只读、唯一
-`$TMPDIR` 可写、秘密脱敏或浏览器只能由 ruyiPage 操作的限制。Mac Codex 不得直接打开
-或打印 `.env`；生产流程可以在进程内部加载凭据，但命令、日志、报告和文件名不得出现
-密码、完整 Apple ID、OTP、URL query、raw AX/OCR 或截图。
-
-受监督模式不会让 Codex sandbox 直接启动 GUI App。调度器会在进入 sandbox 前，通过
-当前 SSH 用户的 LaunchServices 预启动一个一次性 Terminal bridge；bridge 只读取本轮
-`$TMPDIR` 中带随机令牌的 trigger，并且只在已预检的专用只读 sandbox 中执行固定生产
-命令 `./run.sh --skip-mac`。
-Mac Codex 必须使用下面的受控入口触发并等待结果，不得自行调用 `open`、`launchctl`、
-AppleScript 或其他 GUI 启动方案：
-
-```bash
-node scripts/supervised-mac-acceptance.mjs
-```
-
-Codex 可写的 `$TMPDIR` 只保存一次性 trigger/cancel。bridge、helper、进程状态和可信
-attestation 位于 Codex 不可写的本轮 control 目录；生产 sandbox 的唯一 write 条目是
-control 下独立的 `production/`。Terminal、production 与 ruyiPage 的进程状态均为受限
-JSON，不使用裸 PID 文件。三层状态均绑定 PID、PGID、规范化启动时间、本轮 nonce、固定
-命令或完整命令摘要与固定状态枚举；只有 PID=PGID 且完整命令符合固定入口的进程组才允许
-清理。production 和 ruyiPage supervisor 在启动固定目标前等待带 nonce 的一次性 launch gate，
-并重新验证父 PID、PGID、启动时间与完整命令；production 还验证取消状态、绝对截止时间、HEAD 和 Git
-clean。supervisor 本身始终保留为进程组长，目标运行期间持续监控父身份、cancel 与 deadline，
-目标退出后清理同组残留进程再退出。每次 TERM/KILL 紧前都重新核对 PID、PGID、启动时间与
-完整命令；身份不匹配时一律不发送信号，并以 `PROCESS_CLEANUP_FAILED` 保留 writer lock。
-production 可写的 ruyiPage process state 由仓库内 verifier 使用 `O_NOFOLLOW`、同一 fd、
-有界读取和精确 JSON schema 一次验证，外层 shell 不通过多次打开拼接身份。
-
-bridge 最多读取 1 MiB 生产输出，但不透传原文，只在 Terminal 显示固定阶段、隐藏验证码
-输入提示和固定失败类别；原文不进入 events、final 或固定证据清单。模型 permission
-profile 还会对仓库 `.env`、Codex auth、SSH 与常见 Git 凭据路径设置硬 `deny`，启动前用
-无输出读取探针验证模型侧确实被拒绝；生产 profile 则单独验证可读取 `.env`。任一 setup
-探针失败时会在 Codex 启动前清理并写入固定失败证据，模型和生产流程都不会继续。Codex
-退出后，trigger/cancel 通过 `O_NOFOLLOW`、同一文件描述符和严格 JSON schema 复核，已验收
-状态不得残留 cancel。清理状态只有在 Terminal、production 和 ruyiPage 进程组都确认结束后
-才进入 complete 并释放 writer lock。这个机制不改变浏览器只能由 ruyiPage 操作的约束。
-远端 supervised deadline 从脚本入口开始覆盖锁等待、同步、setup 和生产流程；Windows SSH
-总期限另保留 60 秒，仅用于可信证据与进程/锁清理，不延长生产任务本身。
-
-长任务避免 PowerShell 多层引号，写入 UTF-8 文本后运行：
-
-```powershell
-npm.cmd run -s mac:codex -- --task-file .\mac-test-task.txt --round 1
-```
-
-默认同步任务持有独占仓库锁。需要并发只读审查时，先用一次默认任务把 Mac 同步到精确
-Windows SHA，再为并发任务增加 `--no-sync`；这些任务使用共享 reader lock，不能与
-后续同步 writer 并发。出现 `Mac repository is busy` 时等待当前任务结束后重试。
-
-调度器会：
-
-1. 检查 Windows 仓库 clean、读取当前分支和 HEAD。
-2. 通过 SSH 要求 Mac 仓库 clean。
-3. Codex 启动前由调度器在 Mac 执行受控的 `fetch`、`switch`、`merge --ff-only` 并核对
-   相同 SHA；若工作区 dirty、分支分叉或无法 fast-forward，则立即停止。
-4. 使用 `codex sandbox -P mac_verification --include-managed-config` 做零模型权限预检；
-   若 managed requirements 不允许该 profile，立即失败，不接受静默回退。
-5. 以 `/Users/admin/.local/bin/codex exec -p automation` 启动 Mac Codex，并选择一个继承
-   `:read-only` 的本轮自定义权限 profile，使仓库路径保持硬只读。
-6. 自定义 profile 的唯一 write 条目是
-   `/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp`，同时将 `TMPDIR` 指向它；
-   不使用在内置 read-only 下无写权限效果的 legacy `--add-dir`，也不得扩大到 round
-   根目录、仓库、`$HOME` 或共享系统临时目录。调度器还会强制把报告、截图、2FA audit、
-   cancel marker 和 Firefox profile 定向到该 `tmp`，不依赖任务文本自行设置。
-7. Mac Codex 说明任务理解和环境识别；默认运行相关非交互测试，只有显式受监督开关才
-   运行任务限定的真实 GUI/账号验收。受监督模式先在 sandbox 外启动一次性 Terminal
-   bridge，Mac Codex 再通过固定零参数 helper 触发生产流程并只回传固定状态。
-8. 受监督通过同时要求：helper 命令事件退出 0 且只输出固定成功行；可信 attestation
-   绑定随机 nonce、固定命令摘要、前后 HEAD、退出码和 acceptance marker；任一缺失均失败。
-9. 下载固定十项证据文件到 Windows 并输出一行 JSON 摘要。
-
-## 8. 阅读测试结果
-
-Windows 产物目录：
-
-```text
-%LOCALAPPDATA%\CodexOrchestrator\runs\<runId>\mac\round-XX\
-```
-
-关键文件：
-
-| 文件 | 用途 |
-|---|---|
-| `summary.json` | Windows 汇总状态、错误、事件统计、Git 前后状态和固定证据路径 |
-| `final.json` | Mac 模型的任务理解、环境观察、命令、测试、发现和 Windows 建议 |
-| `events.jsonl` | Codex 原始 JSONL 执行事件 |
-| `stderr.log` | Codex/工具标准错误 |
-| `codex-exit.txt` | Mac Codex 退出码 |
-| `supervised-acceptance.txt` | 受监督流程的固定验收哨兵状态；只有生产流程确认账号首页后才为 `accepted` |
-| `supervised-attestation.json` | sandbox 外 bridge 生成的可信验收收据，绑定 nonce、命令摘要、HEAD、退出码和 marker |
-| `git-before.txt`, `git-after.txt` | Mac 执行前后工作区状态 |
-| `head-before.txt`, `head-after.txt` | Mac 执行前后提交 SHA |
-| Mac 端 `tmp/` | 每轮独立的沙箱临时目录；唯一额外可写路径，不在固定证据回传清单中 |
-
-只有以下条件同时满足，顶层 `status` 才是 `passed`：SSH 和 scp 成功、Codex 退出 0、
-JSONL 与 `final.json` 有效、报告状态通过、Mac 前后 Git 状态都为空，并且前后 HEAD 都
-严格等于本轮 Windows 推送的 expected SHA。仅仅“前后同样脏”或“前后同样是错误
-HEAD”也必须失败。
-
-远端调度器使用 `umask 077`；round 与 `tmp` 目录为 0700，普通新建文件默认为 0600。
-`tmp/` 只保留在 Mac，不会被固定十项证据文件的 scp 清单下载到 Windows；它采用同一
-证据保留和逐项清理周期。运行证据的维护策略为保留 30 天；不得向 `tmp/` 写入秘密或
-无界增长的大文件。本项目禁止批量删除，因此到期证据由维护者按单个 run 核对，并逐
-文件、逐目录清理。调度器不会自动递归删除历史证据。
-
-## 9. Windows 修复 -> Mac 重测循环
-
-1. Windows Codex 读取 `final.json` 中的失败测试、findings 和
-   `recommendedWindowsActions`。
-2. 只在 Windows 修改；运行 Windows 可执行的覆盖测试。
-3. 审查 diff，提交并推送当前分支。
-4. 再运行调度器，使用 `--round 2` 标记第二轮；后续依次增加。
-5. 比较各轮 `summary.json` 和 `final.json`，直到 Mac 返回 `passed`。
-
-示例：
-
-```powershell
-npm.cmd run -s mac:codex -- --task-file .\mac-test-task.txt --round 2
-```
-
-每次命令会生成新的 `runId`；`round-XX` 用于标记该命令所属的修复轮次。Windows Codex
-应把上一轮 `final.json` 的路径和本轮修改目标写进新任务，但不要粘贴秘密或整份原始日志。
-
-## 10. 默认允许与禁止的测试
-
-适合无人值守执行：
-
-- `npm run check`
-- `npm run test:python-bootstrap`
-- `npm run test:release-copy-paths`
-- ruyiPage/协议/sidecar/辅助功能 helper 的纯单元测试
-- Swift helper 的 `xcrun swiftc -typecheck`
-
-Mac Codex 沙箱内的 Swift typecheck 应显式增加可写模块缓存：
-
-```bash
-/usr/bin/xcrun swiftc \
-  -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" \
-  -typecheck scripts/swift/<helper>.swift
-```
-
-默认禁止：
-
-- `npm run test:2fa-allow` 的人工模式
-- 真实 Apple ID 登录、真实 2FA 和 `./run.sh` 账号流程
-- 需要用户点击 macOS 权限弹窗或 GUI 确认的测试
-- 任何会修改、提交或推送 Mac 仓库的操作
-
-## 11. 常见故障
-
-### SSH 连接失败
-
-```powershell
-Test-NetConnection 192.168.249.148 -Port 22
-ssh -vv mac-codex 'printf SSH_OK'
-```
-
-检查 Mac Remote Login、IP、VMnet8 网络、Windows 防火墙、专用 key 和 known-hosts。
-
-### SSH 中找不到 codex
-
-非登录 SSH 不一定读取 `.zprofile`。自动化已经使用绝对路径；手工测试也执行：
-
-```powershell
-ssh mac-codex '/Users/admin/.local/bin/codex --version'
-```
-
-### Mac repository is not clean
-
-调度器不会强制覆盖。登录 Mac，执行 `git status --short`，逐项判断文件来源；不要使用
-`git clean` 或批量删除。处理完并保持 clean 后重试。
-
-### Mac HEAD does not match the Windows HEAD
-
-确认 Windows 提交已经推送到当前分支，Mac remote 可访问该私有分支，并且没有分叉。
-调度器只允许 fast-forward，不会 reset。
-
-### Codex 失败但 SSH 成功
-
-查看 `codex-exit.txt`、`stderr.log`、`events.jsonl` 和 `final.json`。先区分配置/schema
-错误、模型供应商限流、测试失败和超时，再在 Windows 修复或缩小测试任务。
-
-### macOS GUI/TCC 权限失败
-
-在 Mac 图形界面打开“系统设置 -> 隐私与安全性”，为 macOS 原生提示显示的实际运行主体
-授予需要的辅助功能、屏幕录制和自动化权限。本地运行通常是 Terminal；受监督生产流程
-通过 Codex sandbox 执行，必须按提示允许 Codex / 原生 helper，而不是只勾选 Terminal。
-授权后按系统提示彻底退出并重新打开对应主体，再测试。
-
-## 12. 一次完整验收清单
-
-```powershell
-ssh mac-codex '/Users/admin/.local/bin/codex --version'
-npm.cmd run test:python-bootstrap
-npm.cmd run test:mac-codex
+~~~powershell
+# 1. Windows 完成实现和定点回归
+npm.cmd run -s test:account-browser-flow
+npm.cmd run -s test:ruyipage-protocol
+npm.cmd run -s test:ruyipage-flow
+npm.cmd run -s test:flow-audit
+npm.cmd run -s test:release-copy-paths
 git diff --check
-```
 
-提交、推送后执行：
+# 2. 仅暂存本轮文件并提交
+git add <本轮文件>
+git commit -m "<本轮说明>"
+git push origin codex/ruyipage-risk-reduction
 
-```powershell
-npm.cmd run -s mac:codex -- --task "核对两端 HEAD，识别 Mac 环境，执行当前改动所需的非交互测试，并返回结构化报告"
-```
+# 3. 确认本地仍干净
+git status --short
 
-验收 `summary.json`：顶层状态通过、Codex exit 0、JSONL 无非法行、Mac Git 未变化、
-`final.json` 包含任务理解、环境识别、每条命令退出码、测试结果和 Windows 后续建议。
+# 4. 调度 Mac 非交互验证
+npm.cmd run -s mac:codex -- --task "运行与本次修改相关的非交互静态检查和定点测试；返回结构化结论、精确 HEAD 与证据路径。"
+~~~
+
+长任务文本使用 UTF-8 文件：
+
+~~~powershell
+npm.cmd run -s mac:codex -- --task-file .mac-test-task.txt --round 1
+~~~
+
+调度器会检查 Windows clean、Mac clean、分支与 HEAD；在 Mac 端执行受控 fetch/switch/merge --ff-only，并验证两个 HEAD 文件都等于 Windows 精确 SHA。返回的 JSON 中必须读取 summary.json、final.json、events.jsonl 和 stderr.log 的路径后再决定是否改代码。
+
+## 4. 只读 sandbox 与并发
+
+默认同步运行持有独占 writer lock。只有 Mac 已同步到准确 Windows SHA 后，才可对独立只读 review 使用 --no-sync：
+
+~~~powershell
+npm.cmd run -s mac:codex -- --no-sync --task "只读审查当前提交的 Developer-first 文档和测试契约，不改源文件。"
+~~~
+
+--no-sync 的 reader lock 不得与同步 writer 并发。出现 Mac repository is busy 时，等待现有任务结束后重试。
+
+Mac Codex 的权限 profile 继承 read-only，唯一可写位置是：
+
+~~~text
+/Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp
+~~~
+
+该目录同时作为 TMPDIR。不要使用 legacy --add-dir，也不要放宽到仓库、round 根目录、HOME 或系统共享临时目录。Swift typecheck 需要明确的模块缓存：
+
+~~~bash
+/usr/bin/xcrun swiftc -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" -typecheck <file>
+~~~
+
+## 5. 受监督 GUI 验收
+
+真实 Apple 登录、2FA 或需要图形界面确认的测试默认不执行。只有用户明确正在监督该 Mac 会话时，才使用同步独占模式：
+
+~~~powershell
+npm.cmd run -s mac:codex -- --task-file .mac-supervised-task.txt --round 2 --allow-supervised-gui
+~~~
+
+该开关不放宽：
+
+- Mac 仓库 read-only；
+- TMPDIR 唯一可写边界；
+- .env 与凭据脱敏；
+- 浏览器 ruyiPage-only；
+- 精确 SHA 与 clean worktree；
+- 报告、截图、2FA audit、Firefox profile 必须位于本轮 TMPDIR。
+
+生产 GUI 命令固定为：
+
+~~~text
+./run.sh --skip-mac
+~~~
+
+Mac Codex 不能通过 open、launchctl、AppleScript 或自定义 GUI 启动器绕开受控 bridge。bridge 只处理带随机 nonce 的一次性 trigger，并把原始生产输出限制为固定阶段/失败类别；任何密钥、OTP、原始页面文本和完整截图都不进入 events、final 或固定证据清单。
+
+## 6. Developer-first 验收合同
+
+默认值 **DEVELOPER_MEMBERSHIP_GATE=0** 是双模块测试模式。受监督浏览器运行的固定证据顺序为：
+
+~~~text
+developer_account_started
+→ developer_membership_checked
+→ account_module_started
+→ account_module_tab_created
+→ account_home_confirmed
+→ profile_capture_*
+~~~
+
+| 检查项 | 正确结果 |
+| --- | --- |
+| Developer 结果 | active、not_enrolled 或 unknown 已记录，并在进入 Account 前私有持久化。 |
+| active 截图 | 仅 active 时可出现 03-developer-membership.png。 |
+| Account 截图 | 仅个人信息页稳定后可出现 02-account-information.png。 |
+| gate=1 非 active | developer_membership_gate_blocked、accountModule.skipped=true、acceptance_marker_skipped；这是成功的 gate stop。 |
+| Account acceptance | 只有 account_home_confirmed=true 时允许 acceptance_marker_completed。 |
+| Developer partial + gate=0 | Account 仍应继续；Developer 结果固定为未确认。 |
+
+不要把 screenshot 的缺失单独当成失败：会员截图只属于 active；个人信息截图只属于 information page ready。
+
+## 7. 证据读取与回传
+
+每个 Mac 调度结果都需要确认：
+
+1. Windows 与 Mac 的 status 文件都为空；
+2. 两个 HEAD 文件都等于 Windows SHA；
+3. summary.json 与 final.json 的结果一致；
+4. events.jsonl 与 stderr.log 中没有固定失败；
+5. 若是受监督 GUI，包含完成的 run.sh --skip-mac command event 和固定 production acceptance artifact。
+
+可回传的首选证据：
+
+- 本轮 TMPDIR 的 flow-audit.jsonl 与 2fa-audit.jsonl；
+- summary.json、final.json、events.jsonl、stderr.log 的路径；
+- report.json 的固定状态字段（确认不含个人字段后）；
+- 无个人数据的固定错误类别。
+
+不要回传：
+
+- .env、Firefox profile、Cookie、session、API key、GitHub 凭据；
+- Apple ID、密码、OTP；
+- raw AX tree、OCR 文本、网络请求/响应、URL query；
+- 完整认证页、未脱敏个人信息截图或视频。
+
+## 8. 常见失败与重测
+
+| 状态 | 处理 |
+| --- | --- |
+| Windows 不是 clean | 停止；保留无关改动，先由拥有者处理。 |
+| Mac worktree 脏或无法 fast-forward | 停止；回报分支、HEAD、status，不强制同步。 |
+| Mac HEAD 不等于 Windows SHA | 停止；修复同步链后新开 round。 |
+| sandbox policy 验证失败 | 立即失败；不要退回更宽的 profile。 |
+| Swift typecheck 缓存失败 | 使用本轮 TMPDIR 的 module-cache-path，不写仓库。 |
+| Developer 后 Account 未打开 | 先核对 DEVELOPER_MEMBERSHIP_GATE 与 developer_membership_gate_blocked。 |
+| Account home 已确认但资料 partial | 以 profile_capture_* 和 browser preservation 为准；不要重写登录链。 |
+| 2FA provider 结束但网页未确认 | 用 2FA handoff 固定状态定位，不输出/重放 OTP。 |
+
+一次修改 → 一次 Windows 定点回归 → 一次干净 push → 一个新的 Mac round。不要让旧 round 的结果替代新 SHA 的验证。
+
+## 9. 交付前清单
+
+- [ ] README、运行手册、PROJECT、Mac/Windows 交接与 release 文档和当前实现一致。
+- [ ] 所有新增固定状态在 audit/report sanitizer、测试和文档中出现。
+- [ ] Windows worktree clean，当前 SHA 已 push。
+- [ ] Windows 定点测试和 git diff --check 通过。
+- [ ] Mac 任务使用适当的同步/锁模式。
+- [ ] Mac 证据属于当前 SHA 和当前 round。
+- [ ] 没有秘密或个人截图被写入日志、报告、提交或回传。

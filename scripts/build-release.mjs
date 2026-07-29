@@ -84,6 +84,11 @@ export const COPY_PATHS = [
   "scripts/bump-patch-version.mjs",
   "scripts/automation-check.applescript",
   "scripts/lib/accessibility.js",
+  "docs/RUNTIME_RUNBOOK.md",
+  "docs/PROJECT.md",
+  "docs/2FA_HANDOFF_DIAGNOSTICS.md",
+  "docs/MAC_CODEX_HANDOFF.md",
+  "docs/WINDOWS_MAC_CODEX.md",
 ];
 
 function normalizeRelPath(relPath) {
@@ -206,171 +211,11 @@ function buildPackageJson(destRoot) {
 }
 
 function buildReadme(destRoot) {
-  const readme = `# Apple ID 自动化测试包 (macOS)
-
-版本: ${VERSION}
-
-## 目标系统
-
-- **macOS 15 (Sequoia)** — 系统设置 Apple Account 脚本按此版本调优
-- 其他 macOS 版本可能可用，但不保证系统设置 UI 自动化正常
-
-## 环境要求
-
-- **macOS 15 Sequoia**（推荐 / 测试平台）
-- **Node.js 18+**（[nodejs.org](https://nodejs.org) 官方安装包，或 \`./install.sh\` 自动下载官方二进制）
-- **Python**：\`./install.sh\` 会自动检测 Python 3.10+；缺失时请求管理员授权，核对 Python.org Python 3.12.10 universal2 PKG 的固定 SHA-256 与 Python Software Foundation Developer ID 签名，再把 ruyiPage 安装到项目内 \`.runtime/ruyipage-venv\`
-- **Firefox**（[mozilla.org/firefox](https://www.mozilla.org/firefox/) 手动安装）
-- **辅助功能权限**：\`./install.sh\` 会自动检测；未授权时会请求当前运行主体的系统授权（本地通常为 Terminal / iTerm；受监督验收会提示 Codex / 原生 helper）
-- **屏幕与系统音频录制**：Vision OCR 自动取码的必需权限；install.sh 会在编译 exact native helper 后请求并确认，run.sh 会在 Firefox 启动前复核。未授权时浏览器不会启动或提交账号密码
-
-## 快速开始
-
-\`\`\`bash
-# 1. 解压后进入目录
-cd apple-id-automation-${VERSION}
-
-# 2. 立即授权并自动安装缺失的 Python/Node、ruyiPage 与辅助工具
-./install.sh
-
-# 3. 运行（终端按提示输入账号密码，自动备份至 .env）
-./run.sh
-\`\`\`
-
-\`./install.sh\` 启动后会立即请求一次管理员授权；密码仅由 \`sudo\` 读取。
-安装完成后的日常 \`./run.sh\` 不会再次请求管理员密码。
-
-## 流程说明
-
-1. **Mac 系统设置**：自动填入 Apple ID / 密码；配置 `.env` 的短信 provider 后可自动完成手机验证码，未启用时在系统界面人工完成
-2. **等待**：脚本轮询直至检测到系统设置已登录
-3. **Firefox**：启动、导航、页面读取、输入、截图与关闭全部由 ruyiPage 完成，不提供其他浏览器后端
-4. **account.apple.com**：登录 → \`need_2fa\` 后 popup AX/OCR 优先 30 秒；确认 Allow 后再给 30 秒；无新码才串行回退到系统设置，最后才可隐藏终端手输
-5. **个人信息**：精确访问 \`/account/manage/section/information\`，姓名/生日卡稳定后保存 \`02-account-information.png\`，先读取生日，再打开姓名弹窗
-6. **输出**：姓名、生日写入私有 \`.env\` 的 \`name\`、\`birthday\`；完整脱敏事件写入 \`flow-audit.jsonl\`
-
-2FA 按严格串行顺序处理：popup 主阶段拿到有效新码后会立即交给 ruyiPage，Settings 和
-手输不会启动；Settings 最多两次（每次最多 60 秒、间隔 5 秒），手输只会在 Settings
-有界尝试结束后且不早于首次取码 90 秒出现。两代验证码共享 240 秒期限和 Settings 总预算。
-终端不显示 OTP；验证码绝不写入 audit、报告、截图或错误文本。取码后的交接阶段通过固定
-状态记录，便于定位 stdin 投递、目标解析、输入、提交或登录状态确认失败。
-普通终端只显示简洁业务进度；使用
-\`APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac\` 可额外镜像脱敏机器协议。该开关
-只接受 shell/export 运行时值，\`.env\` 中的同名项会忽略。
-姓名和生日只出现在私有 \`.env\` 与直接交互终端，report/audit 仅记录落盘状态。
-
-## 命令
-
-| 命令 | 说明 |
-|------|------|
-| \`./install.sh\` | 前置管理员授权；自动安装缺失的 Python/Node、ruyiPage，并确认辅助功能与屏幕录制 |
-| \`./run.sh\` | 完整流程；**终端输入**账号密码并备份至 \`.env\` |
-| \`./run.sh --skip-mac\` | 跳过 Mac 设置（仅浏览器）；仍需辅助功能和屏幕录制，不要求自动化 |
-| \`./run.sh --skip-browser\` | 仅 Mac 设置登录 |
-| \`npm run check\` | 环境自检 |
-| \`npm run check:automation\` | 检测终端对「系统设置」的自动化权限 |
-| \`npm run dump:mac-ui\` | 导出系统设置 Apple Account 页 AX 树（调试） |
-
-## 环境变量（.env）
-
-运行 \`./run.sh\` 时会在终端提示输入，并**自动备份**到 \`.env\`（也可手动编辑）：
-
-| 变量 | 说明 |
-|------|------|
-| \`APPLE_ID\` | Apple ID 邮箱 |
-| \`APPLE_PASSWORD\` | 密码 |
-| \`FIREFOX_EXECUTABLE\` | 可选，非默认 Firefox 路径 |
-| \`FIREFOX_PROFILE_DIR\` | 可选，默认 \`./data/firefox-apple-automation\` |
-| \`BROWSER_BACKEND\` | 可选，固定为 \`ruyipage\`；\`auto\` 仅作旧配置兼容别名 |
-| \`RUYIPAGE_PYTHON\` | 可选，自定义 Python；默认优先项目内隔离虚拟环境 |
-| \`BROWSER_PROFILE_MODE\` | 可选，\`persistent\` / \`fresh\` |
-| \`BROWSER_2FA_SETTINGS_AFTER_MS\` | 可选，默认 \`30000\`；从 \`need_2fa\` 起等待 popup 主窗口，确认 Allow 后另有固定 30 秒宽限，之后才启动系统设置 |
-| \`BROWSER_2FA_SETTINGS_FALLBACK\` | 可选，默认 \`1\`；设为 \`0\` 禁用系统设置取码 |
-| \`BROWSER_2FA_MANUAL_FALLBACK\` | 可选，默认 \`1\`；仅在 Settings 有界尝试结束后、且不早于首次取码 90 秒时允许在真实 TTY 隐藏手输验证码 |
-| \`BROWSER_2FA_POLL_MS\` | 可选，默认 \`800\`；FollowUpUI 轮询间隔 |
-| \`BROWSER_PRESERVE_ON_FAILURE\` | 可选，直接运行默认 \`1\`；失败后保留 Firefox 供人工检查当前页面，设为 \`0\` 才关闭；受监督 broker 会话仍严格清理 |
-| \`BROWSER_PRESERVE_ON_SUCCESS\` | 可选，默认 \`1\`；成功后保留已登录 Firefox 窗口、标签页和持久 Profile |
-| \`DEVELOPER_MEMBERSHIP_GATE\` | 可选，默认 \`0\` 测试模式始终继续 Account；设为 \`1\` 时仅已加入 Developer Program 的账号继续 |
-| \`APPLE_AUTOMATION_TERMINAL_DEBUG\` | shell/export 运行时开关，设为 \`1\` 时终端镜像脱敏机器协议；不从 \`.env\` 读取，完整日志始终写入 \`flow-audit.jsonl\` |
-| \`name\` / \`birthday\` | 个人信息页成功采集后自动写入；不要手动放入日志或报告 |
-
-### 系统设置短信验证
-
-在私有 `.env` 中配置：
-
-\`\`\`bash
-APPLE_AUTOMATION_SMS_ENABLED=1
-APPLE_AUTOMATION_SMS_PHONE=+8613800130051
-APPLE_AUTOMATION_SMS_API_URL='https://provider.example/record?token=private'
-APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1
-\`\`\`
-
-有效的完整 pair 会直接复用，不再询问。缺失、partial 或无效时，终端会重录完整 pair 并在格式校验通过后以 \`0600\` 权限原子写回 \`.env\`。设 \`APPLE_AUTOMATION_SMS_RECONFIGURE=1\` 可替换已保存 pair；成功保存后自动改回 \`0\`。设 \`APPLE_AUTOMATION_SMS_ENABLED=0\` 可保留 pair 但禁用短信自动化。验证码不会保存到 \`.env\` 或任何诊断产物。
-
-将 \`APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1\` 打开后，短信提交后的条款、Mac 密码、iPhone 解锁和位置弹窗会使用同一受信 AX/CGWindow 绑定逐个处理：条款勾选后点“同意”，Mac 密码写入固定测试值 \`000000\`，iPhone 用 Vision 确认 4/6 格后自动填入同长度的 \`0\`，位置只点 \`action-button-2\` 的“以后”。输入只经 stdin，不写入 \`.env\`、日志、报告、参数或环境；任何识别不稳定会保留页面供人工处理。
-
-## 故障排查
-
-- **安装 ruyiPage 时出现 PyPI TLS 证书错误**：\`install.sh\` 始终保持 HTTPS 证书校验；仅项目管理的 macOS 虚拟环境且 pip 支持 \`truststore\` 时优先使用系统信任库，显式 \`RUYIPAGE_PYTHON\` 不承诺该行为。如处于企业代理环境，请先将代理根证书安装到 macOS 系统钥匙串，再重新执行 \`./install.sh\`。
-- **辅助功能未授权**：运行 \`./install.sh\`，按 macOS 原生提示允许实际运行主体；受监督验收不是只勾选 Terminal
-- **系统设置填表失败（macOS 15）**：确认已打开 Apple Account 页；辅助功能已授权 Terminal
-- **邮箱未填入**：在 系统设置 → 隐私与安全性 → **自动化** 中允许 Terminal 控制「系统设置」；运行 \`npm run dump:mac-ui\` 查看 AX 树（v1.0.22 修复 tell 上下文 + 自动化预检）
-- **调试 UI 结构**：\`osascript scripts/mac-settings-ui-dump.applescript\`（登录页打开后运行）
-- **AppleScript 填表失败**：确认辅助功能已授权；在 Sequoia 上从侧边栏进入「Apple Account」
-- **ruyiPage 不可用**：运行 \`./install.sh\`；项目会明确停止，不会回退到其他页面自动化方案
-- **Firefox 启动失败**：安装 Firefox 或设置 \`FIREFOX_EXECUTABLE\`
-- **屏幕录制未授权**：在「隐私与安全性 -> 屏幕与系统音频录制」允许实际运行主体；按 macOS 提示重开终端或 Codex 后重新运行 \`./install.sh\`
-- **2FA 超时**：确认 Mac 已登录同一 Apple ID，实际运行主体已获辅助功能和屏幕录制权限，并查看 \`2fa-audit.jsonl\` 中各来源的固定失败原因；仅 Mac 设置登录阶段需要自动化权限
-- **姓名/生日为空**：查看 \`screenshots/02-account-information.png\` 和 \`flow-audit.jsonl\`；需要同步机器协议时设置 \`APPLE_AUTOMATION_TERMINAL_DEBUG=1\`
-
-## 安全
-
-- \`.env\` 含敏感信息，勿分享、勿上传
-- \`data/\` 含 Firefox Profile 与报告，注意保管
-`;
-  fs.writeFileSync(path.join(destRoot, "README.md"), readme);
+  fs.copyFileSync(path.join(ROOT, "README.md"), path.join(destRoot, "README.md"));
 }
 
 function buildEnvExample(destRoot) {
-  fs.writeFileSync(
-    path.join(destRoot, ".env.example"),
-    `\uFEFF# 复制为 .env 后填写
-APPLE_ID=your@email.com
-APPLE_PASSWORD=your_password
-
-# 可选
-# FIREFOX_EXECUTABLE=/Applications/Firefox.app/Contents/MacOS/firefox
-# FIREFOX_PROFILE_DIR=./data/firefox-apple-automation
-# BROWSER_BACKEND=ruyipage
-# RUYIPAGE_PYTHON=python3
-# BROWSER_PROFILE_MODE=persistent
-# RUYIPAGE_BACKEND_TIMEOUT_MS=720000
-# RUYIPAGE_KILL_GRACE_MS=5000
-# BROWSER_2FA_SETTINGS_AFTER_MS=30000
-# BROWSER_2FA_SETTINGS_FALLBACK=1
-# BROWSER_2FA_MANUAL_FALLBACK=1
-# BROWSER_2FA_POLL_MS=800
-# BROWSER_PRESERVE_ON_FAILURE=1
-# BROWSER_PRESERVE_ON_SUCCESS=1
-# BROWSER_ATTACH_EXISTING=1
-# BROWSER_ATTACH_ADDRESS=127.0.0.1:9222
-# DEVELOPER_MEMBERSHIP_GATE=0
-# 终端诊断仅接受 shell/export 运行时开关，不从 .env 读取：
-# APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
-# name=                              # 已登录个人信息页采集后写入
-# birthday=                          # 已登录个人信息页采集后写入
-# developer_membership=              # 已加入 | 未加入 | 未确认（采集后写入）
-
-# Mac 系统设置短信验证：完整 pair 已保存时直接复用。
-APPLE_AUTOMATION_SMS_ENABLED=0
-APPLE_AUTOMATION_SMS_PHONE=
-APPLE_AUTOMATION_SMS_API_URL=
-# 设为 1 可在下一次运行时重录 pair；保存成功后自动改回 0。
-APPLE_AUTOMATION_SMS_RECONFIGURE=0
-# 可选：短信后处理条款、Mac 密码、iPhone 解锁和位置弹窗；iPhone 自动填 4/6 个 0，Mac 密码使用 000000。
-APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0
-`
-  );
+  fs.copyFileSync(path.join(ROOT, ".env.example"), path.join(destRoot, ".env.example"));
 }
 
 function buildGitignore(destRoot) {
