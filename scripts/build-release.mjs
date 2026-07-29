@@ -357,6 +357,7 @@ APPLE_PASSWORD=your_password
 # APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 # name=                              # 已登录个人信息页采集后写入
 # birthday=                          # 已登录个人信息页采集后写入
+# developer_membership=              # 已加入 | 未加入 | 未确认（采集后写入）
 
 # Mac 系统设置短信验证：完整 pair 已保存时直接复用。
 APPLE_AUTOMATION_SMS_ENABLED=0

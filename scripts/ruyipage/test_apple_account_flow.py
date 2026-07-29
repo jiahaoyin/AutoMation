@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 RUYIPAGE_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if RUYIPAGE_SCRIPT_DIR not in sys.path:
@@ -953,6 +953,16 @@ class FakeElement:
                     },
                 )
             )
+        if "ruyipage-developer-membership-navigation" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "developerMembershipNavigation",
+                    {
+                        "visible": self.states.is_displayed,
+                        "label": self.text,
+                    },
+                )
+            )
         if "ruyipage-otp-length-check" in script:
             expected = re.search(r"value\.length === (\d+)", script)
             return bool(expected and len(str(self.value)) == int(expected.group(1)))
@@ -1057,6 +1067,37 @@ class FakePage:
                 )
             )
         return serialize_scope_state(self.state)
+
+
+class DeveloperFakePage(FakePage):
+    def __init__(
+        self,
+        *args,
+        account_snapshot=None,
+        membership_details=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.account_snapshot = account_snapshot or {
+            "authenticated": False,
+            "accountShell": False,
+            "joinProgram": False,
+            "membershipNavigation": False,
+        }
+        self.membership_details = membership_details or {
+            "detailsPage": False,
+            "appleDeveloperProgram": False,
+        }
+        self.developer_scripts = []
+
+    def run_js(self, script):
+        if "ruyipage-developer-account-snapshot" in script:
+            self.developer_scripts.append(script)
+            return json.dumps(self.account_snapshot)
+        if "ruyipage-developer-membership-details" in script:
+            self.developer_scripts.append(script)
+            return json.dumps(self.membership_details)
+        return super().run_js(script)
 
 
 class FakeActions:
@@ -3714,6 +3755,9 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                     "browserPreserved": True,
                     "browserPreservationRequested": True,
                 },
+            )
+            self.assertFalse(
+                result["postLoginDeveloperAccount"]["browserPreserved"]
             )
             self.assertLess(
                 events.index(
@@ -9250,6 +9294,604 @@ class BrowserBrokerLaunchTests(unittest.TestCase):
                 account_flow.construct_firefox_page(FailingFirefoxPage, "options")
 
         self.assertIs(runtime_subprocess.Popen, original_popen)
+
+
+class DeveloperAccountTests(unittest.TestCase):
+    def authenticated_page(self, *, join_program=False, membership_navigation=False):
+        page = DeveloperFakePage(
+            state={
+                "href": account_flow.DEVELOPER_ACCOUNT_URL,
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "password": False,
+                "email": False,
+                "codeInputCount": 0,
+            },
+            account_snapshot={
+                "authenticated": True,
+                "accountShell": True,
+                "joinProgram": join_program,
+                "membershipNavigation": membership_navigation,
+            },
+        )
+        page.states = FakeStates(alive=True)
+        return page
+
+    def test_developer_account_url_is_exact_https_origin(self):
+        for url in (
+            "https://developer.apple.com/account",
+            "https://developer.apple.com/account/",
+            "https://developer.apple.com/account/membership",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(account_flow.is_developer_account_url(url))
+        for url in (
+            "http://developer.apple.com/account",
+            "https://developer.apple.com.evil.example/account",
+            "https://developer.apple.com:444/account",
+            "https://developer.apple.com/sign-in?returnUrl=/account",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(account_flow.is_developer_account_url(url))
+
+    def test_join_program_banner_is_authenticated_not_enrolled_evidence(self):
+        page = self.authenticated_page(join_program=True)
+
+        state = account_flow.confirmed_developer_account_state(page)
+
+        self.assertIsNotNone(state)
+        self.assertTrue(state["joinProgram"])
+        self.assertFalse(state["membershipNavigation"])
+
+    def test_join_program_query_accepts_private_use_icon_prefix(self):
+        page = self.authenticated_page(join_program=True)
+        private_icon_banner = (
+            "\U000f0000 \u52a0\u5165 Apple Developer Program "
+            "\u5f53\u4f60\u51c6\u5907\u597d\u6784\u5efa\u66f4\u591a\u9ad8\u7ea7\u529f\u80fd"
+        )
+
+        account_flow.developer_account_snapshot(page)
+
+        query = page.developer_scripts[-1]
+        self.assertIn(
+            "\u52a0\u5165 apple developer program",
+            private_icon_banner.casefold(),
+        )
+        self.assertIn(
+            r"label.includes('\u52a0\u5165 apple developer program')",
+            query,
+        )
+        self.assertIn("authenticated: accountShell", query)
+        self.assertNotIn(
+            r"label.startsWith('\u52a0\u5165 apple developer program')",
+            query,
+        )
+
+    def test_membership_markers_without_account_shell_never_confirm_authentication(self):
+        for marker in ("joinProgram", "membershipNavigation"):
+            snapshot = {
+                "authenticated": True,
+                "accountShell": False,
+                "joinProgram": False,
+                "membershipNavigation": False,
+            }
+            snapshot[marker] = True
+            page = DeveloperFakePage(
+                state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+                account_snapshot=snapshot,
+            )
+            page.states = FakeStates(alive=True)
+
+            with self.subTest(marker=marker):
+                self.assertIsNone(
+                    account_flow.confirmed_developer_account_state(page)
+                )
+
+    def test_live_login_controls_block_account_shell_and_membership_marker(self):
+        page = self.authenticated_page(join_program=True)
+        page.state["email"] = True
+
+        self.assertIsNone(account_flow.confirmed_developer_account_state(page))
+
+    def test_missing_membership_evidence_fails_closed_without_claiming_active(self):
+        page = self.authenticated_page()
+
+        state = account_flow.confirmed_developer_account_state(page)
+
+        self.assertIsNotNone(state)
+        self.assertFalse(state["joinProgram"])
+        self.assertFalse(state["membershipNavigation"])
+
+    def test_active_requires_membership_navigation_and_program_details(self):
+        membership_link = FakeElement(
+            text="会员资格详细信息",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "会员资格详细信息",
+                }
+            },
+        )
+        page = DeveloperFakePage(
+            {"css:a": [membership_link]},
+            state={"href": "https://developer.apple.com/account"},
+            account_snapshot={
+                "authenticated": True,
+                "accountShell": True,
+                "joinProgram": False,
+                "membershipNavigation": True,
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch("apple_account_flow.time.monotonic", side_effect=[0.0, 0.1, 0.2]), patch(
+            "apple_account_flow.human_pause", lambda *_: None
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertIn(("human_click", membership_link), page.actions.calls)
+        details_queries = [
+            script
+            for script in page.developer_scripts
+            if "ruyipage-developer-membership-details" in script
+        ]
+        self.assertEqual(len(details_queries), 2)
+
+    def test_plain_list_item_can_open_membership_details(self):
+        membership_item = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+        )
+        page = DeveloperFakePage(
+            {"css:main li": [membership_item]},
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertIn(("human_click", membership_item), page.actions.calls)
+
+    def test_selector_priority_avoids_counting_nested_wrappers_twice(self):
+        membership_item = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+        )
+        nested_link_wrapper = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+        )
+        page = DeveloperFakePage(
+            {
+                "css:main li": [membership_item],
+                "css:a": [nested_link_wrapper],
+            },
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+        )
+
+        resolved = account_flow.resolve_developer_membership_navigation(page)
+
+        self.assertEqual(resolved, (page, membership_item))
+
+    def test_duplicate_membership_items_in_one_selector_fail_closed(self):
+        first = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+        )
+        second = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+        )
+        page = DeveloperFakePage(
+            {"css:main li": [first, second]},
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+        )
+
+        self.assertIsNone(
+            account_flow.resolve_developer_membership_navigation(page)
+        )
+
+    def test_program_details_without_membership_navigation_never_claims_active(self):
+        page = DeveloperFakePage(
+            state={"href": "https://developer.apple.com/account"},
+            account_snapshot={
+                "authenticated": True,
+                "joinProgram": False,
+                "membershipNavigation": False,
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+            },
+        )
+
+        self.assertFalse(
+            account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=0,
+                pause=lambda *_: None,
+            )
+        )
+
+    def test_collects_not_enrolled_in_a_new_tab_without_requesting_another_code(self):
+        developer_page = self.authenticated_page(join_program=True)
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class RootPage:
+            def __init__(self):
+                self.opened = []
+
+            def new_tab(self, url):
+                self.opened.append(url)
+                return developer_page
+
+        context = {"twofaPrepared": True, "nextGeneration": 2}
+        page_holder = {}
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "developerAccountShell": True,
+                    "joinProgram": True,
+                    "membershipNavigation": False,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ) as authenticate, patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit"
+        ):
+            result, returned_page, screenshot = (
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    context,
+                    Path("unused.png"),
+                    page_holder=page_holder,
+                )
+            )
+
+        self.assertEqual(result["membershipStatus"], "not_enrolled")
+        self.assertIs(returned_page, developer_page)
+        self.assertIs(page_holder["page"], developer_page)
+        self.assertIsNone(screenshot)
+        authenticate.assert_called_once_with(
+            developer_page,
+            "person@example.com",
+            "secret",
+            FakeKeys,
+            account_home_confirmed=True,
+            authentication_context=context,
+            session_probe=account_flow.confirmed_developer_account_state,
+        )
+
+    def test_collects_active_membership_and_returns_fixed_screenshot(self):
+        developer_page = self.authenticated_page(membership_navigation=True)
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class RootPage:
+            def new_tab(self, _url):
+                return developer_page
+
+        screenshot_path = Path("03-developer-membership.png")
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "developerAccountShell": True,
+                    "joinProgram": False,
+                    "membershipNavigation": True,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ), patch(
+            "apple_account_flow.confirm_active_developer_membership",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=str(screenshot_path),
+        ) as screenshot, patch(
+            "apple_account_flow.human_pause",
+            lambda *_: None,
+        ), patch("apple_account_flow.emit"):
+            result, returned_page, captured = (
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    {"twofaPrepared": True, "nextGeneration": 2},
+                    screenshot_path,
+                )
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["membershipStatus"], "active")
+        self.assertIs(returned_page, developer_page)
+        self.assertEqual(captured, str(screenshot_path))
+        screenshot.assert_called_once_with(
+            developer_page,
+            screenshot_path,
+            checkpoint="developer_membership",
+            full_page=False,
+        )
+
+    def test_membership_markers_cannot_be_classified_without_confirmed_account_shell(self):
+        developer_page = self.authenticated_page()
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class RootPage:
+            def new_tab(self, _url):
+                return developer_page
+
+        for marker in ("joinProgram", "membershipNavigation"):
+            confirmed_state = {
+                "trusted": True,
+                "developerAccountShell": False,
+                "joinProgram": False,
+                "membershipNavigation": False,
+            }
+            confirmed_state[marker] = True
+            with self.subTest(marker=marker), patch(
+                "apple_account_flow.complete_account_authentication",
+                return_value={
+                    "confirmedState": confirmed_state,
+                    "skippedLogin": False,
+                    "skipped2FA": False,
+                    "rememberAccount": None,
+                },
+            ), patch(
+                "apple_account_flow.confirm_active_developer_membership"
+            ) as confirm_active, patch(
+                "apple_account_flow.human_pause",
+                lambda *_: None,
+            ), patch("apple_account_flow.emit"), self.assertRaisesRegex(
+                RuntimeError,
+                "account shell was not confirmed",
+            ):
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    {"twofaPrepared": True, "nextGeneration": 2},
+                    Path("unused.png"),
+                )
+            confirm_active.assert_not_called()
+
+    def test_preservation_is_partial_when_only_developer_tab_disconnects(self):
+        account_page = FakePage()
+        account_page.states = FakeStates(alive=True)
+        developer_page = FakePage()
+        developer_page.states = FakeStates(alive=False)
+        events = []
+
+        with patch("apple_account_flow.emit", side_effect=events.append):
+            result = account_flow.finalize_post_login_browser(
+                account_page,
+                preserve_requested=True,
+                profile_capture_success=True,
+                required_pages=(developer_page,),
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "browserFinalizationCompleted": False,
+                "browserPreservationRequested": True,
+                "browserSessionPreserved": False,
+                "finalizationClass": "browser_connection_lost",
+            },
+        )
+        self.assertIn(
+            {
+                "event": "status",
+                "status": "browser_finalization_partial",
+                **result,
+            },
+            events,
+        )
+        self.assertNotIn(
+            "browser_session_preserved",
+            [event.get("status") for event in events],
+        )
+
+    def test_developer_redirect_waits_for_exact_target_dom_hydration(self):
+        page = FakePage(
+            state={
+                "href": account_flow.DEVELOPER_ACCOUNT_URL,
+                "twofa": False,
+                "error": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+            }
+        )
+        confirmed = {
+            "href": account_flow.DEVELOPER_ACCOUNT_URL,
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "developerAccount": True,
+            "developerAccountShell": True,
+            "joinProgram": True,
+            "membershipNavigation": False,
+        }
+        session_probe = Mock(side_effect=[None, confirmed])
+        with patch(
+            "apple_account_flow.confirmed_account_manage_state",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            return_value=page.state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            result = account_flow.wait_for_signed_in(
+                page,
+                timeout_s=1,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                session_probe=session_probe,
+            )
+
+        self.assertIs(result, confirmed)
+        self.assertEqual(session_probe.call_count, 2)
+
+    def test_developer_two_factor_exhaustion_has_a_fixed_partial_class(self):
+        for error in (
+            RuntimeError("2FA generation limit exhausted"),
+            RuntimeError("2FA shared acquisition deadline exhausted"),
+            RuntimeError("2FA collector unavailable for generation 2"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertEqual(
+                    account_flow.classify_developer_account_failure(error),
+                    "developer_twofa_unavailable",
+                )
+
+    def test_expired_shared_two_factor_deadline_stops_before_generation_two(self):
+        context = {
+            "twofaPrepared": True,
+            "nextGeneration": 2,
+            "twofaAcquisitionStartedAt": 10.0,
+        }
+
+        with patch("apple_account_flow.time.monotonic", return_value=250.0):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "shared acquisition deadline exhausted",
+            ):
+                account_flow.ensure_two_factor_generation_available(context, 2)
+
+    def test_second_developer_authentication_uses_generation_two_without_reprepare(self):
+        initial_state = {
+            "href": "https://idmsa.apple.com/appleauth/auth/signin",
+            "twofa": True,
+            "error": False,
+        }
+        context = {"twofaPrepared": True, "nextGeneration": 2}
+        with patch(
+            "apple_account_flow.confirmed_developer_account_state",
+            side_effect=[None, None],
+        ), patch(
+            "apple_account_flow.detect_login_state", return_value=initial_state
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch(
+            "apple_account_flow.wait_for_2fa_or_session",
+            return_value=initial_state,
+        ), patch(
+            "apple_account_flow.read_command",
+            return_value={"type": "2fa_code", "generation": 2, "code": "123456"},
+        ), patch(
+            "apple_account_flow.wait_for_otp_target",
+            return_value=[FakeElement()],
+        ), patch("apple_account_flow.fill_security_code"), patch(
+            "apple_account_flow.wait_for_signed_in",
+            return_value={
+                "trusted": True,
+                "joinProgram": True,
+                "membershipNavigation": False,
+            },
+        ), patch(
+            "apple_account_flow.request_two_factor_preparation"
+        ) as prepare, patch(
+            "apple_account_flow.emit_browser_observation"
+        ), patch(
+            "apple_account_flow.set_browser_startup_stage"
+        ), patch(
+            "apple_account_flow.human_pause"
+        ), patch(
+            "apple_account_flow.emit"
+        ) as emitted:
+            result = account_flow.complete_account_authentication(
+                FakePage(state=initial_state),
+                "person@example.com",
+                "secret",
+                FakeKeys,
+                account_home_confirmed=True,
+                authentication_context=context,
+                session_probe=account_flow.confirmed_developer_account_state,
+            )
+
+        prepare.assert_not_called()
+        self.assertEqual(context["nextGeneration"], 3)
+        self.assertTrue(result["confirmedState"]["joinProgram"])
+        need_twofa = [
+            call.args[0]
+            for call in emitted.call_args_list
+            if call.args[0].get("event") == "need_2fa"
+        ]
+        self.assertEqual([event["generation"] for event in need_twofa], [2])
 
 
 class PersonalInformationTests(unittest.TestCase):

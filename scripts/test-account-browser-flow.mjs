@@ -26,6 +26,7 @@ import {
   saveMacSettingsSmsProviderConfig,
   saveCredentialsToEnv,
   saveAppleProfileToEnv,
+  saveDeveloperMembershipToEnv,
   shouldAutoConfirmAppleCredentials,
 } from "./lib/credentials.js";
 import {
@@ -80,6 +81,10 @@ function createRuntime(runBackend, options = {}) {
     },
     saveAppleProfileToEnv(profile) {
       return options.saveAppleProfileToEnv?.(profile) ?? "/tmp/test-profile.env";
+    },
+    saveDeveloperMembershipToEnv(status) {
+      return options.saveDeveloperMembershipToEnv?.(status) ??
+        "/tmp/test-developer-membership.env";
     },
     shouldPrintCapturedProfile() {
       return options.shouldPrintCapturedProfile === true;
@@ -138,6 +143,16 @@ function successfulResult() {
       finalizationClass: "completed",
     },
     personalInfo: { name: "Test Given Test Family", birthday: "2000-01-02" },
+    postLoginDeveloperAccount: {
+      success: true,
+      authenticated: true,
+      membershipStatus: "not_enrolled",
+      failureStage: "unknown",
+      failureClass: "unknown",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: false,
+    },
     screenshots: {},
   };
 }
@@ -1350,6 +1365,202 @@ async function runProfilePersistenceAndAuditRedactionTest() {
     if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
     fs.rmdirSync(reportDir);
   }
+}
+
+async function runDeveloperMembershipPersistenceTest() {
+  const storedMemberships = [];
+  const auditEntries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+  const cases = [
+    {
+      membershipStatus: "active",
+      label: "已加入",
+      screenshots: {
+        developerMembership: "/private/run/03-developer-membership.png",
+      },
+      expectedScreenshots: {
+        developerMembership: "03-developer-membership.png",
+      },
+    },
+    {
+      membershipStatus: "not_enrolled",
+      label: "未加入",
+      screenshots: {},
+      expectedScreenshots: {},
+    },
+    {
+      membershipStatus: "unknown",
+      label: "未确认",
+      screenshots: {},
+      expectedScreenshots: {},
+    },
+  ];
+  const sanitizedResults = [];
+
+  for (const fixture of cases) {
+    const harness = createRuntime(async () => ({
+      ...successfulResult(),
+      postLoginDeveloperAccount: {
+        success: true,
+        authenticated: true,
+        membershipStatus: fixture.membershipStatus,
+        failureStage: "unknown",
+        failureClass: "unknown",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: true,
+        rawMembershipDetails: SECRET_FIXTURE,
+      },
+      screenshots: {
+        ...fixture.screenshots,
+        rawMembershipScreenshot: SECRET_FIXTURE,
+      },
+    }), {
+      saveDeveloperMembershipToEnv(value) {
+        storedMemberships.push(value);
+        return "/tmp/test-developer-membership.env";
+      },
+      shouldPrintCapturedProfile: true,
+    });
+
+    let result;
+    const logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase(
+        { ...params, flowAudit },
+        harness.runtime
+      );
+    });
+    sanitizedResults.push(result);
+
+    assert.deepEqual(result.postLoginDeveloperAccount, {
+      success: true,
+      authenticated: true,
+      membershipStatus: fixture.membershipStatus,
+      failureStage: "unknown",
+      failureClass: "unknown",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: true,
+    });
+    assert.deepEqual(result.developerAccount, {
+      checked: true,
+      membershipStatus: fixture.membershipStatus,
+      membershipStored: true,
+    });
+    assert.deepEqual(result.screenshots, fixture.expectedScreenshots);
+    assert.ok(logs.includes("[✓] 已写入 .env：developer_membership"));
+    assert.ok(
+      logs.includes(`[✓] Apple Developer Program：${fixture.label}`)
+    );
+  }
+
+  assert.deepEqual(storedMemberships, [
+    "active",
+    "not_enrolled",
+    "unknown",
+  ]);
+  assert.equal(
+    JSON.stringify({ sanitizedResults, auditEntries }).includes(SECRET_FIXTURE),
+    false
+  );
+
+  const reportDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "apple-developer-membership-report-")
+  );
+  const reportFile = path.join(reportDir, "report.json");
+  try {
+    writeReport(reportDir, {
+      phases: { developerMembership: sanitizedResults },
+    });
+    const reportText = fs.readFileSync(reportFile, "utf8");
+    assert.equal(reportText.includes(SECRET_FIXTURE), false);
+  } finally {
+    if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
+    fs.rmdirSync(reportDir);
+  }
+}
+
+async function runDeveloperTwoFactorUnavailablePartialTest() {
+  const storedMemberships = [];
+  const auditEntries = [];
+  const harness = createRuntime(async () => ({
+    ...successfulResult(),
+    postLoginDeveloperAccount: {
+      success: false,
+      authenticated: false,
+      membershipStatus: "unknown",
+      failureStage: "developer_login",
+      failureClass: "developer_twofa_unavailable",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: true,
+      rawMembershipDetails: SECRET_FIXTURE,
+    },
+  }), {
+    saveDeveloperMembershipToEnv(value) {
+      storedMemberships.push(value);
+      return "/tmp/test-developer-membership.env";
+    },
+  });
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+
+  let result;
+  const warnings = await captureConsole("warn", async () => {
+    result = await runAccountBrowserPhase(
+      { ...params, flowAudit },
+      harness.runtime
+    );
+  });
+
+  assert.deepEqual(storedMemberships, []);
+  assert.deepEqual(result.postLoginDeveloperAccount, {
+    success: false,
+    authenticated: false,
+    membershipStatus: "unknown",
+    failureStage: "developer_login",
+    failureClass: "developer_twofa_unavailable",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: true,
+  });
+  assert.deepEqual(result.developerAccount, {
+    checked: false,
+    membershipStatus: "unknown",
+    membershipStored: false,
+  });
+  assert.ok(
+    warnings.includes(
+      "[!] Apple Developer 会员状态检查未完成（原因：developer_twofa_unavailable），详情已写入日志"
+    )
+  );
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "developer_account" &&
+        entry.event === "partial" &&
+        entry.details.failureClass === "developer_twofa_unavailable"
+    )
+  );
+  assert.equal(
+    JSON.stringify({ result, auditEntries }).includes(SECRET_FIXTURE),
+    false
+  );
 }
 
 async function runBrowserResultMetadataAllowlistTest() {
@@ -2624,6 +2835,17 @@ function runEnvDataParsingTest() {
       }),
       envPath
     );
+    assert.equal(saveDeveloperMembershipToEnv("active"), envPath);
+    assert.match(
+      fs.readFileSync(envPath, "utf8"),
+      /^developer_membership=已加入$/m
+    );
+    assert.equal(saveDeveloperMembershipToEnv("not_enrolled"), envPath);
+    assert.match(
+      fs.readFileSync(envPath, "utf8"),
+      /^developer_membership=未加入$/m
+    );
+    assert.equal(saveDeveloperMembershipToEnv("unknown"), envPath);
     assert.equal(
       saveMacSettingsSmsProviderConfig({
         phoneNumber: "+8613800130052",
@@ -2634,8 +2856,10 @@ function runEnvDataParsingTest() {
     const saved = fs.readFileSync(envPath, "utf8");
     assert.match(saved, /^name="Test Given Test Family"$/m);
     assert.match(saved, /^birthday=2000-01-02$/m);
+    assert.match(saved, /^developer_membership=未确认$/m);
     assert.equal((saved.match(/^name=/gm) ?? []).length, 1);
     assert.equal((saved.match(/^birthday=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^developer_membership=/gm) ?? []).length, 1);
     assert.match(saved, /^APPLE_AUTOMATION_SMS_ENABLED=1$/m);
     assert.match(saved, /^APPLE_AUTOMATION_SMS_PHONE=\+8613800130052$/m);
     assert.match(saved, /^APPLE_AUTOMATION_SMS_API_URL=https:\/\/example\.test\/record\?token=replaced$/m);
@@ -2658,6 +2882,10 @@ function runEnvDataParsingTest() {
     assert.throws(
       () => saveAppleProfileToEnv({ name: "line\nbreak", birthday: "2000-01-02" }),
       /profile name/
+    );
+    assert.throws(
+      () => saveDeveloperMembershipToEnv("paid"),
+      /developer membership status/
     );
   } finally {
     process.chdir(originalCwd);
@@ -3181,6 +3409,10 @@ const focusedTests = {
     runAcceptanceMarkerFailureIsNonfatalTest();
   },
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
+  "developer-membership": async () => {
+    await runDeveloperMembershipPersistenceTest();
+    await runDeveloperTwoFactorUnavailablePartialTest();
+  },
   "profile-persistence-partial": runProfilePersistenceFailureReturnsPartialTest,
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
@@ -3244,6 +3476,8 @@ await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
 await runProfilePersistenceAndAuditRedactionTest();
+await runDeveloperMembershipPersistenceTest();
+await runDeveloperTwoFactorUnavailablePartialTest();
 await runBrowserResultMetadataAllowlistTest();
 await runPostHomeProfileFailureRetentionTest();
 await runProfilePersistenceFailureReturnsPartialTest();

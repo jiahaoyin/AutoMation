@@ -6,7 +6,10 @@
  */
 
 import { isAccessibilityGranted } from "./accessibility.js";
-import { saveAppleProfileToEnv } from "./credentials.js";
+import {
+  saveAppleProfileToEnv,
+  saveDeveloperMembershipToEnv,
+} from "./credentials.js";
 import { getBrowserEnvironmentSummary } from "./env-setup.js";
 import { createRuyiPageBackendRunner } from "./ruyipage-backend-runner.js";
 import { createMac2FACollector } from "./two-fa-sidecar.js";
@@ -22,6 +25,22 @@ const ALLOWED_READY_MODES = new Set([
 
 const FIXED_ENVIRONMENT_WARNING = "[!] Firefox 环境提示：详情已写入日志";
 const TWO_FACTOR_TIMEOUT_MS = 240_000;
+const DEVELOPER_MEMBERSHIP_STATUSES = new Set([
+  "active",
+  "not_enrolled",
+  "unknown",
+]);
+const DEVELOPER_ACCOUNT_FAILURE_CLASSES = new Set([
+  "developer_authentication_error",
+  "developer_connection_lost",
+  "developer_login_unconfirmed",
+  "developer_membership_unknown",
+  "developer_navigation_failed",
+  "developer_result_missing",
+  "developer_twofa_unavailable",
+  "developer_account_failed",
+  "unknown",
+]);
 const TWO_FACTOR_STATUS_MESSAGES = Object.freeze({
   popup_primary: "[2FA] 优先等待 Apple 验证弹窗，暂不启动系统设置取码。",
   settings_fallback: "[2FA] 弹窗未取得有效验证码，正在回退系统设置取码。",
@@ -98,6 +117,13 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "profile_reauthentication_completed",
   "profile_reauthentication_exhausted",
   "profile_reauthentication_twofa_exhausted",
+  "developer_account_started",
+  "developer_account_tab_created",
+  "developer_account_authentication_started",
+  "developer_account_authenticated",
+  "developer_membership_checked",
+  "developer_account_completed",
+  "developer_account_failed",
   "input_progress",
   "remember_progress",
   "twofa_progress",
@@ -150,6 +176,11 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   profile_page_ready: "[✓] 个人信息页面已就绪",
   profile_birthday_collected: "[✓] 已读取出生日期",
   profile_name_collected: "[✓] 已读取姓名",
+  developer_account_started: "[→] 正在打开 Apple Developer 账户页面",
+  developer_account_authentication_started:
+    "[→] Apple Developer 页面需要登录，正在继续认证",
+  developer_account_authenticated: "[✓] 已确认 Apple Developer 账户登录成功",
+  developer_account_completed: "[✓] Apple Developer 会员状态检查完成",
   browser_session_preserved: "[✓] 已保留 Firefox 窗口和账户标签页",
 });
 const RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES = Object.freeze({
@@ -187,6 +218,7 @@ const RUYIPAGE_OBSERVATION_CHECKPOINTS = new Set([
 const RUYIPAGE_SCREENSHOT_CHECKPOINTS = new Set([
   "account_home",
   "account_information",
+  "developer_membership",
 ]);
 const RUYIPAGE_PAGE_KINDS = new Set([
   "sign_in",
@@ -308,6 +340,9 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "profile_capture",
   "profile_birthday",
   "profile_name",
+  "developer_account",
+  "developer_login",
+  "developer_membership",
   "post_login_finalization",
   "result_emitting",
   "result_emitted",
@@ -819,11 +854,39 @@ function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile)
   return { collected: true, nameStored: true, birthdayStored: true };
 }
 
+function saveDeveloperMembership(
+  membershipStatus,
+  flowAudit,
+  saveMembership,
+  printResult
+) {
+  const normalized = sanitizeDeveloperMembershipStatus(membershipStatus);
+  saveMembership(normalized);
+  if (printResult === true) {
+    const labels = {
+      active: "已加入",
+      not_enrolled: "未加入",
+      unknown: "未确认",
+    };
+    console.log("[✓] 已写入 .env：developer_membership");
+    console.log(`[✓] Apple Developer Program：${labels[normalized]}`);
+  }
+  writeFlowAudit(flowAudit, "developer_account", "membership_persisted", {
+    membershipStatus: normalized,
+  });
+  return {
+    checked: true,
+    membershipStatus: normalized,
+    membershipStored: true,
+  };
+}
+
 function sanitizeScreenshotMetadata(screenshots) {
   const source = screenshots && typeof screenshots === "object" ? screenshots : {};
   const result = {};
   const expectedFiles = {
     personalInformation: "02-account-information.png",
+    developerMembership: "03-developer-membership.png",
   };
   for (const [key, expectedFile] of Object.entries(expectedFiles)) {
     const value = source[key];
@@ -866,6 +929,44 @@ function sanitizePostLoginProfileCapture(profileCapture) {
       : isPresent
         ? sanitizeProfileCaptureFailureClass(source.failureClass)
         : "profile_result_missing",
+    browserAlive: source.browserAlive === true,
+    browserPreserved: source.browserPreserved === true,
+    browserPreservationRequested: source.browserPreservationRequested === true,
+  };
+}
+
+function sanitizeDeveloperMembershipStatus(value) {
+  return DEVELOPER_MEMBERSHIP_STATUSES.has(value) ? value : "unknown";
+}
+
+function sanitizeDeveloperAccountFailureClass(value) {
+  return DEVELOPER_ACCOUNT_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizePostLoginDeveloperAccount(developerAccount) {
+  const isPresent = developerAccount && typeof developerAccount === "object";
+  const source = isPresent ? developerAccount : {};
+  const membershipStatus = sanitizeDeveloperMembershipStatus(
+    source.membershipStatus
+  );
+  const success =
+    source.success === true &&
+    source.authenticated === true &&
+    DEVELOPER_MEMBERSHIP_STATUSES.has(source.membershipStatus);
+  return {
+    success,
+    authenticated: source.authenticated === true,
+    membershipStatus,
+    failureStage: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeBrowserFailureStage(source.failureStage)
+        : "developer_account",
+    failureClass: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeDeveloperAccountFailureClass(source.failureClass)
+        : "developer_result_missing",
     browserAlive: source.browserAlive === true,
     browserPreserved: source.browserPreserved === true,
     browserPreservationRequested: source.browserPreservationRequested === true,
@@ -998,6 +1099,9 @@ function sanitizeAccountBrowserBackendResult(result) {
     postLoginProfileCapture: sanitizePostLoginProfileCapture(
       source.postLoginProfileCapture
     ),
+    postLoginDeveloperAccount: sanitizePostLoginDeveloperAccount(
+      source.postLoginDeveloperAccount
+    ),
     postLoginFinalization: sanitizePostLoginFinalization(
       source.postLoginFinalization
     ),
@@ -1099,6 +1203,21 @@ function auditRuyiPageEvent(flowAudit, event) {
       details.browserPreservationRequested =
         event.browserPreservationRequested === true;
     }
+    if (event.status === "developer_membership_checked") {
+      details.membershipStatus = sanitizeDeveloperMembershipStatus(
+        event.membershipStatus
+      );
+    }
+    if (event.status === "developer_account_failed") {
+      details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
+      details.failureClass = sanitizeDeveloperAccountFailureClass(
+        event.failureClass
+      );
+      details.authenticated = event.authenticated === true;
+      details.membershipStatus = sanitizeDeveloperMembershipStatus(
+        event.membershipStatus
+      );
+    }
     if (
       event.status.startsWith("profile_navigation_") ||
       event.status.startsWith("profile_reauthentication_")
@@ -1152,6 +1271,11 @@ function auditRuyiPageEvent(flowAudit, event) {
       accountHomeConfirmed:
         event.browserLogin?.accountHomeConfirmed === true,
       profileCaptureSuccess: event.postLoginProfileCapture?.success === true,
+      developerAccountSuccess:
+        event.postLoginDeveloperAccount?.success === true,
+      developerMembershipStatus: sanitizeDeveloperMembershipStatus(
+        event.postLoginDeveloperAccount?.membershipStatus
+      ),
     });
     return;
   }
@@ -1234,6 +1358,8 @@ export async function runAccountBrowserPhase(
     runtime.createRuyiPageBackendRunner ?? createRuyiPageBackendRunner;
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
   const saveProfile = runtime.saveAppleProfileToEnv ?? saveAppleProfileToEnv;
+  const saveMembership =
+    runtime.saveDeveloperMembershipToEnv ?? saveDeveloperMembershipToEnv;
   const shouldPrintProfile = runtime.shouldPrintCapturedProfile ?? shouldPrintCapturedProfile;
   const showTerminalDebug =
     typeof runtime.isTerminalDebugEnabled === "function"
@@ -1402,9 +1528,15 @@ export async function runAccountBrowserPhase(
             console.log(`[ruyipage] status:${event.status}:checkpoint:${checkpoint}`);
           }
           if (event.status === "screenshot_failed") {
-            console.warn("[!] 个人信息页面截图保存失败，详情已写入日志");
+            console.warn(
+              checkpoint === "developer_membership"
+                ? "[!] Apple Developer 会员详情截图保存失败，详情已写入日志"
+                : "[!] 个人信息页面截图保存失败，详情已写入日志"
+            );
           } else if (checkpoint === "account_information") {
             console.log("[✓] 已保存个人信息页面截图");
+          } else if (checkpoint === "developer_membership") {
+            console.log("[✓] 已保存 Apple Developer 会员详情截图");
           }
         } else if (event.event === "status" && event.status === "profile_capture_started") {
           console.log("[→] 正在打开个人信息页面");
@@ -1619,11 +1751,19 @@ export async function runAccountBrowserPhase(
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
+    postLoginDeveloperAccount: sanitizePostLoginDeveloperAccount(
+      result.postLoginDeveloperAccount
+    ),
     postLoginFinalization,
     personalInfo: {
       collected: false,
       nameStored: false,
       birthdayStored: false,
+    },
+    developerAccount: {
+      checked: false,
+      membershipStatus: "unknown",
+      membershipStored: false,
     },
     screenshots: sanitizeScreenshotMetadata(result.screenshots),
   });
@@ -1684,12 +1824,52 @@ export async function runAccountBrowserPhase(
     birthdayStored: true,
   });
 
+  const postLoginDeveloperAccount = sanitizePostLoginDeveloperAccount(
+    result.postLoginDeveloperAccount
+  );
+  let developerAccount = {
+    checked: false,
+    membershipStatus: postLoginDeveloperAccount.membershipStatus,
+    membershipStored: false,
+  };
+  if (postLoginDeveloperAccount.success) {
+    try {
+      developerAccount = saveDeveloperMembership(
+        postLoginDeveloperAccount.membershipStatus,
+        flowAudit,
+        saveMembership,
+        shouldPrintProfile()
+      );
+    } catch (error) {
+      writeFlowAuditError(
+        flowAudit,
+        "developer_account",
+        "membership_persistence_failed",
+        error,
+        { membershipStatus: postLoginDeveloperAccount.membershipStatus }
+      );
+      console.warn("[!] Apple Developer 会员状态写入 .env 失败，详情已写入日志");
+    }
+  } else {
+    writeFlowAudit(flowAudit, "developer_account", "partial", {
+      failureStage: postLoginDeveloperAccount.failureStage,
+      failureClass: postLoginDeveloperAccount.failureClass,
+      authenticated: postLoginDeveloperAccount.authenticated,
+      membershipStatus: postLoginDeveloperAccount.membershipStatus,
+    });
+    console.warn(
+      `[!] Apple Developer 会员状态检查未完成（原因：${postLoginDeveloperAccount.failureClass}），详情已写入日志`
+    );
+  }
+
   return {
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
+    postLoginDeveloperAccount,
     postLoginFinalization,
     personalInfo,
+    developerAccount,
     screenshots: sanitizeScreenshotMetadata(result.screenshots),
   };
 }

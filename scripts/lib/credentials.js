@@ -242,6 +242,28 @@ export function saveAppleProfileToEnv({ name, birthday }) {
   return envPath;
 }
 
+const DEVELOPER_MEMBERSHIP_VALUES = new Map([
+  ["active", "已加入"],
+  ["not_enrolled", "未加入"],
+  ["unknown", "未确认"],
+]);
+
+export function saveDeveloperMembershipToEnv(membershipStatus) {
+  const envValue = DEVELOPER_MEMBERSHIP_VALUES.get(membershipStatus);
+  if (envValue === undefined) {
+    throw new Error("developer membership status is invalid");
+  }
+  const envPath = resolveEnvPath();
+  const { lines, lineEnding } = fs.existsSync(envPath)
+    ? readEnvDocument(envPath)
+    : { lines: [], lineEnding: "\n" };
+  const updated = upsertEnvLines(lines, {
+    developer_membership: envValue,
+  });
+  writePrivateEnvFile(envPath, updated, lineEnding);
+  return envPath;
+}
+
 async function questionPassword(promptText) {
   if (!input.isTTY) {
     const rl = readline.createInterface({ input, output });

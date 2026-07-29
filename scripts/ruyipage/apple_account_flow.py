@@ -24,6 +24,7 @@ from urllib.parse import urljoin, urlsplit
 
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
+DEVELOPER_ACCOUNT_URL = "https://developer.apple.com/account"
 PERSONAL_INFORMATION_PATH = "/account/manage/section/information"
 ACCOUNT_SIGN_IN_PATH = "/sign-in"
 PROFILE_NAVIGATION_LINK_SELECTORS = (
@@ -137,7 +138,9 @@ APPLE_AUTH_HOSTS = frozenset(
 )
 ACCOUNT_SIGN_IN_HOSTS = frozenset({"account.apple.com", "appleid.apple.com"})
 OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
-SCREENSHOT_CHECKPOINTS = frozenset({"account_information"})
+SCREENSHOT_CHECKPOINTS = frozenset(
+    {"account_information", "developer_membership"}
+)
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
 FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
@@ -147,6 +150,7 @@ FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
 TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 60.0
 TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S = 5.0
 TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S = 1.5
+TWO_FACTOR_SHARED_ACQUISITION_TIMEOUT_S = 240.0
 TWO_FACTOR_INPUT_UNCONFIRMED_REASON = "2FA code input was not confirmed"
 BROWSER_ATTACH_STATE_FILE_SUFFIX = ".ruyipage-attach.json"
 BROWSER_ATTACH_STATE_MAX_BYTES = 1024
@@ -177,6 +181,9 @@ BROWSER_STARTUP_STAGES = {
     "profile_capture",
     "profile_birthday",
     "profile_name",
+    "developer_account",
+    "developer_login",
+    "developer_membership",
     "post_login_finalization",
     "result_emitting",
     "result_emitted",
@@ -541,6 +548,7 @@ def finalize_post_login_browser(
     *,
     preserve_requested: bool,
     profile_capture_success: bool,
+    required_pages: tuple[Any, ...] = (),
 ) -> dict[str, Any]:
     """Settle the post-login browser disposition before emitting the success result.
 
@@ -561,7 +569,12 @@ def finalize_post_login_browser(
         }
     )
     if preserve_requested:
-        if browser_connection_is_alive(page):
+        required_pages_alive = all(
+            required_page is not None
+            and browser_connection_is_alive(required_page)
+            for required_page in required_pages
+        )
+        if browser_connection_is_alive(page) and required_pages_alive:
             finalization["browserSessionPreserved"] = True
             emit(
                 {
@@ -3160,6 +3173,21 @@ def is_account_sign_in_url(url: str) -> bool:
     )
 
 
+def is_developer_account_url(url: str) -> bool:
+    parsed = urlsplit(str(url or "").strip())
+    return bool(
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == "developer.apple.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in (None, 443)
+        and (
+            parsed.path.rstrip("/") == "/account"
+            or parsed.path.startswith("/account/")
+        )
+    )
+
+
 def is_personal_information_url(url: str) -> bool:
     parsed = parse_valid_apple_url(url)
     return bool(
@@ -3543,6 +3571,299 @@ def has_confirmed_account_session(state: dict[str, Any]) -> bool:
     )
 
 
+DEVELOPER_MEMBERSHIP_NAVIGATION_LABELS = frozenset(
+    {
+        "membership details",
+        "\u4f1a\u5458\u8d44\u683c\u8be6\u7ec6\u4fe1\u606f",
+        "\u4f1a\u5458\u8d44\u683c\u8be6\u60c5",
+        "\u6703\u54e1\u8cc7\u683c\u8a73\u7d30\u8cc7\u8a0a",
+        "\u6703\u54e1\u8cc7\u683c\u8a73\u60c5",
+    }
+)
+DEVELOPER_NAVIGATION_SELECTORS = (
+    "css:main li",
+    "css:a",
+    "css:button",
+    "css:[role='link']",
+    "css:[role='button']",
+)
+
+
+def developer_account_snapshot(page: Any) -> dict[str, bool]:
+    """Return fixed Developer account evidence without exposing raw page text."""
+    if not is_developer_account_url(scope_location_url(page)):
+        return {
+            "authenticated": False,
+            "accountShell": False,
+            "joinProgram": False,
+            "membershipNavigation": False,
+        }
+    raw = page.run_js(
+        r"""
+        return JSON.stringify((() => {
+          // ruyipage-developer-account-snapshot
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              el.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleLowerCase();
+          const semantic = [...document.querySelectorAll(
+            'main [role="alert"], main h1, main h2, main h3, main li, main a, main button, ' +
+            'main [role="link"], main [role="button"], [role="alert"]'
+          )].filter(visible);
+          const labels = semantic.map((el) => normalize(
+            el.getAttribute('aria-label') || el.innerText || el.textContent || ''
+          )).filter(Boolean);
+          const joinProgram = labels.some((label) =>
+            label.includes('join apple developer program') ||
+            label.includes('\u52a0\u5165 apple developer program')
+          );
+          const membershipLabels = new Set([
+            'membership details',
+            '\u4f1a\u5458\u8d44\u683c\u8be6\u7ec6\u4fe1\u606f',
+            '\u4f1a\u5458\u8d44\u683c\u8be6\u60c5',
+            '\u6703\u54e1\u8cc7\u683c\u8a73\u7d30\u8cc7\u8a0a',
+            '\u6703\u54e1\u8cc7\u683c\u8a73\u60c5'
+          ]);
+          const membershipNavigation = labels.some((label) =>
+            membershipLabels.has(label)
+          );
+          const accountHeading = labels.some((label) =>
+            label === 'account' || label === '\u8d26\u6237' || label === '\u5e33\u6236'
+          );
+          const featureLabels = [
+            ['tools and resources', '\u5de5\u5177\u548c\u8d44\u6e90', '\u5de5\u5177\u8207\u8cc7\u6e90'],
+            ['personal details', '\u4e2a\u4eba\u8d44\u6599', '\u500b\u4eba\u8cc7\u6599'],
+            ['email', '\u7535\u5b50\u90ae\u4ef6', '\u96fb\u5b50\u90f5\u4ef6'],
+            ['agreements', '\u534f\u8bae', '\u5354\u8b70']
+          ];
+          const featureCount = featureLabels.filter((expected) =>
+            labels.some((label) => expected.includes(label))
+          ).length;
+          const accountShell = accountHeading && featureCount >= 2;
+          return {
+            authenticated: accountShell,
+            accountShell,
+            joinProgram,
+            membershipNavigation
+          };
+        })())
+        """
+    )
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        result = None
+    if not isinstance(result, dict):
+        raise RuntimeError("developer account query returned an invalid result")
+    return {
+        "authenticated": result.get("authenticated") is True,
+        "accountShell": result.get("accountShell") is True,
+        "joinProgram": result.get("joinProgram") is True,
+        "membershipNavigation": result.get("membershipNavigation") is True,
+    }
+
+
+def developer_scope_has_auth_blocker(page: Any) -> bool:
+    for scope in iter_page_scopes(page):
+        href = scope_location_url(scope)
+        if scope is not page:
+            if parse_valid_apple_url(href) is None:
+                continue
+            if not scope_has_live_frame_chain(page, scope):
+                continue
+        try:
+            state = detect_scope_login_state(scope)
+        except Exception:
+            return True
+        if any(
+            bool(state.get(key))
+            for key in (
+                "email",
+                "password",
+                "twofa",
+                "trustPrompt",
+                "error",
+                "otpRejected",
+                "blocked",
+            )
+        ):
+            return True
+    return False
+
+
+def confirmed_developer_account_state(page: Any) -> dict[str, Any] | None:
+    """Confirm the Developer shell while failing closed on live auth controls."""
+    if not browser_connection_is_alive(page):
+        return None
+    try:
+        snapshot = developer_account_snapshot(page)
+    except Exception:
+        return None
+    if (
+        snapshot.get("accountShell") is not True
+        or developer_scope_has_auth_blocker(page)
+    ):
+        return None
+    return {
+        "href": DEVELOPER_ACCOUNT_URL,
+        "trusted": True,
+        "rootSessionTrusted": True,
+        "rootError": False,
+        "developerAccount": True,
+        "developerAccountShell": True,
+        "joinProgram": snapshot["joinProgram"],
+        "membershipNavigation": snapshot["membershipNavigation"],
+    }
+
+
+def developer_navigation_summary(element: Any) -> dict[str, Any]:
+    raw = element.run_js(
+        r"""
+        function () {
+          // ruyipage-developer-membership-navigation
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          return JSON.stringify({
+            visible: rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              this.getAttribute('aria-hidden') !== 'true',
+            label: String(
+              this.getAttribute('aria-label') ||
+              this.innerText ||
+              this.textContent ||
+              ''
+            ).replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+          });
+        }
+        """
+    )
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        result = None
+    if not isinstance(result, dict):
+        raise RuntimeError("developer membership navigation query returned an invalid result")
+    return {
+        "visible": result.get("visible") is True,
+        "label": " ".join(str(result.get("label") or "").split()).casefold(),
+    }
+
+
+def resolve_developer_membership_navigation(page: Any) -> tuple[Any, Any] | None:
+    if not is_developer_account_url(scope_location_url(page)):
+        return None
+    for selector in DEVELOPER_NAVIGATION_SELECTORS:
+        matches: list[Any] = []
+        for element in safe_elements(page, selector, timeout_s=0):
+            if not element_is_interactable(element):
+                continue
+            try:
+                summary = developer_navigation_summary(element)
+            except Exception:
+                continue
+            if (
+                summary["visible"]
+                and summary["label"] in DEVELOPER_MEMBERSHIP_NAVIGATION_LABELS
+            ):
+                matches.append(element)
+        if len(matches) == 1:
+            return page, matches[0]
+        if len(matches) > 1:
+            return None
+    return None
+
+
+def developer_membership_details_snapshot(page: Any) -> dict[str, bool]:
+    if not is_developer_account_url(scope_location_url(page)):
+        return {"detailsPage": False, "appleDeveloperProgram": False}
+    raw = page.run_js(
+        r"""
+        return JSON.stringify((() => {
+          // ruyipage-developer-membership-details
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              el.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleLowerCase();
+          const detailsLabels = new Set([
+            'membership details',
+            '\u4f1a\u5458\u8d44\u683c\u8be6\u7ec6\u4fe1\u606f',
+            '\u4f1a\u5458\u8d44\u683c\u8be6\u60c5',
+            '\u6703\u54e1\u8cc7\u683c\u8a73\u7d30\u8cc7\u8a0a',
+            '\u6703\u54e1\u8cc7\u683c\u8a73\u60c5'
+          ]);
+          const candidates = [...document.querySelectorAll(
+            'main h1, main h2, main h3, main h4, main [role="heading"], ' +
+            'main [aria-current="page"], main [aria-selected="true"], main dt, main dd, main strong'
+          )].filter(visible);
+          const labels = candidates.map((el) => normalize(
+            el.getAttribute('aria-label') || el.innerText || el.textContent || ''
+          )).filter(Boolean);
+          const path = String(location.pathname || '').toLocaleLowerCase();
+          return {
+            detailsPage: labels.some((label) => detailsLabels.has(label)) ||
+              path.includes('membership'),
+            appleDeveloperProgram: labels.some((label) =>
+              label === 'apple developer program'
+            )
+          };
+        })())
+        """
+    )
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        result = None
+    if not isinstance(result, dict):
+        raise RuntimeError("developer membership details query returned an invalid result")
+    return {
+        "detailsPage": result.get("detailsPage") is True,
+        "appleDeveloperProgram": result.get("appleDeveloperProgram") is True,
+    }
+
+
+def confirm_active_developer_membership(
+    page: Any,
+    *,
+    timeout_s: float = 20.0,
+    pause: Callable[[int, int], None] = human_pause,
+) -> bool:
+    navigation = resolve_developer_membership_navigation(page)
+    if navigation is None:
+        return False
+    scope, element = navigation
+    human_click(scope, element, pause=pause)
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    stable_count = 0
+    while time.monotonic() < deadline:
+        if not browser_connection_is_alive(page):
+            raise RuntimeError("developer browser connection was lost")
+        snapshot = developer_membership_details_snapshot(page)
+        if snapshot["detailsPage"] and snapshot["appleDeveloperProgram"]:
+            stable_count += 1
+            if stable_count >= 2:
+                return True
+        else:
+            stable_count = 0
+        pause(250, 500)
+    return False
+
+
 def settle_trust_state(
     page: Any,
     state: dict[str, Any],
@@ -3590,11 +3911,20 @@ def otp_retry_allowed(state: dict[str, Any], generation: int | None) -> bool:
     )
 
 
-def wait_for_2fa_or_session(page: Any, timeout_s: int = 75) -> dict[str, Any]:
+def wait_for_2fa_or_session(
+    page: Any,
+    timeout_s: int = 75,
+    session_probe: Callable[[Any], dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
     deadline = started + timeout_s
     last_state: dict[str, Any] = {}
     while time.monotonic() < deadline:
+        if session_probe is not None:
+            confirmed_state = session_probe(page)
+            if confirmed_state is not None:
+                confirmed_state["trusted"] = True
+                return confirmed_state
         try:
             last_state = detect_login_state(page)
             last_state = settle_trust_state(page, last_state, deadline=deadline)
@@ -3648,6 +3978,7 @@ def wait_for_signed_in(
     otp_generation: int | None = None,
     submission_method: str | None = None,
     transition_observer: Callable[[dict[str, Any]], None] | None = None,
+    session_probe: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Wait for the signed-in root and surface redacted post-OTP observations."""
     if otp_generation is not None:
@@ -3659,8 +3990,9 @@ def wait_for_signed_in(
         else None
     )
     last_state: dict[str, Any] = {}
-    allow_post_otp_clicks = not (
-        submitted and submission_method == "automatic"
+    allow_post_otp_clicks = (
+        session_probe is not None
+        or not (submitted and submission_method == "automatic")
     )
     allow_retiring_child_errors = bool(
         submitted and submission_method == "automatic" and otp_generation is not None
@@ -3674,6 +4006,11 @@ def wait_for_signed_in(
             transition_observer(observation)
 
     while time.monotonic() < deadline:
+        if session_probe is not None:
+            direct_target_state = session_probe(page)
+            if direct_target_state is not None:
+                observe_transition(direct_target_state)
+                return direct_target_state
         direct_session_state = confirmed_account_manage_state(
             page,
             allow_retiring_child_errors=allow_retiring_child_errors,
@@ -3703,6 +4040,18 @@ def wait_for_signed_in(
         if otp_generation is not None and not is_apple_url(
             str(last_state.get("href") or "")
         ):
+            if (
+                session_probe is not None
+                and is_developer_account_url(str(last_state.get("href") or ""))
+                and not any(
+                    bool(last_state.get(key))
+                    for key in ("error", "otpRejected", "blocked")
+                )
+            ):
+                # The Developer shell URL can win before its stable account
+                # markers hydrate. Keep polling only on the exact target origin.
+                human_pause(350, 700)
+                continue
             raise RuntimeError("2FA state left the verified Apple HTTPS origin")
         if has_confirmed_account_session(last_state):
             # A retiring idmsa frame can still expose generic error text after
@@ -4660,13 +5009,14 @@ def take_screenshot(
     path: Path,
     *,
     checkpoint: str,
+    full_page: bool = True,
 ) -> str | None:
     safe_checkpoint = checkpoint if checkpoint in SCREENSHOT_CHECKPOINTS else "unknown"
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if hasattr(path.parent, "chmod"):
             path.parent.chmod(0o700)
-        page.screenshot(str(path), full_page=True)
+        page.screenshot(str(path), full_page=full_page)
         if hasattr(path, "chmod"):
             path.chmod(0o600)
         emit(
@@ -5326,6 +5676,24 @@ def ensure_two_factor_preparation(
     authentication_context["twofaPrepared"] = True
 
 
+def ensure_two_factor_generation_available(
+    authentication_context: dict[str, Any],
+    generation: int,
+) -> None:
+    """Fail before asking the shared collector for an impossible generation."""
+    validate_otp_generation(generation)
+    if generation != 2:
+        return
+    started_at = authentication_context.get("twofaAcquisitionStartedAt")
+    if (
+        isinstance(started_at, (int, float))
+        and not isinstance(started_at, bool)
+        and time.monotonic() - float(started_at)
+        >= TWO_FACTOR_SHARED_ACQUISITION_TIMEOUT_S
+    ):
+        raise RuntimeError("2FA shared acquisition deadline exhausted")
+
+
 def complete_account_authentication(
     page: Any,
     apple_id: str,
@@ -5334,13 +5702,16 @@ def complete_account_authentication(
     *,
     account_home_confirmed: bool,
     authentication_context: dict[str, Any],
+    session_probe: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
-    initial_state = detect_login_state(page)
-    initial_state = settle_trust_state(
-        page,
-        initial_state,
-        deadline=time.monotonic() + 5.0,
-    )
+    initial_state = session_probe(page) if session_probe is not None else None
+    if initial_state is None:
+        initial_state = detect_login_state(page)
+        initial_state = settle_trust_state(
+            page,
+            initial_state,
+            deadline=time.monotonic() + 5.0,
+        )
     emit_browser_observation(
         "login_state",
         page,
@@ -5431,7 +5802,13 @@ def complete_account_authentication(
             wait_for_document_settle(page)
 
         set_browser_startup_stage("twofa_page_wait")
-        login_state = wait_for_2fa_or_session(page)
+        if session_probe is None:
+            login_state = wait_for_2fa_or_session(page)
+        else:
+            login_state = wait_for_2fa_or_session(
+                page,
+                session_probe=session_probe,
+            )
         emit_browser_observation(
             "twofa_wait",
             page,
@@ -5447,6 +5824,17 @@ def complete_account_authentication(
             if isinstance(next_generation, bool) or next_generation not in (1, 2):
                 raise RuntimeError("2FA generation limit exhausted")
             for generation in range(next_generation, 3):
+                ensure_two_factor_generation_available(
+                    authentication_context,
+                    generation,
+                )
+                if (
+                    generation == 1
+                    and "twofaAcquisitionStartedAt" not in authentication_context
+                ):
+                    authentication_context["twofaAcquisitionStartedAt"] = (
+                        time.monotonic()
+                    )
                 set_browser_startup_stage("twofa_code_wait")
                 emit(
                     {
@@ -5469,10 +5857,13 @@ def complete_account_authentication(
                         },
                     }
                 )
-                code = validate_two_factor_code_command(
-                    read_command(),
-                    generation,
-                )
+                try:
+                    command = read_command()
+                except Exception as error:
+                    raise RuntimeError(
+                        f"2FA collector unavailable for generation {generation}"
+                    ) from error
+                code = validate_two_factor_code_command(command, generation)
                 authentication_context["nextGeneration"] = generation + 1
                 add_diagnostic_secret(code)
                 set_browser_startup_stage("twofa_input")
@@ -5503,18 +5894,23 @@ def complete_account_authentication(
                         generation=generation,
                         submitted=submitted,
                     )
-                    signed_in_state = wait_for_signed_in(
-                        page,
-                        submitted=True,
-                        otp_generation=generation,
-                        submission_method="automatic",
-                        transition_observer=lambda transition_state: emit_browser_observation(
+                    wait_for_signed_in_kwargs: dict[str, Any] = {
+                        "submitted": True,
+                        "otp_generation": generation,
+                        "submission_method": "automatic",
+                        "transition_observer": lambda transition_state: emit_browser_observation(
                             "twofa_transition",
                             page,
                             transition_state,
                             account_home_confirmed=account_home_confirmed,
                             generation=generation,
                         ),
+                    }
+                    if session_probe is not None:
+                        wait_for_signed_in_kwargs["session_probe"] = session_probe
+                    signed_in_state = wait_for_signed_in(
+                        page,
+                        **wait_for_signed_in_kwargs,
                     )
                 except Exception:
                     emit_two_factor_progress("handoff_failed", generation=generation)
@@ -5625,6 +6021,121 @@ def reach_personal_information_page(
     )
 
 
+def classify_developer_account_failure(error: Exception) -> str:
+    message = str(error).lower()
+    if any(
+        marker in message
+        for marker in (
+            "2fa generation limit exhausted",
+            "2fa shared acquisition deadline exhausted",
+            "2fa collector unavailable",
+        )
+    ):
+        return "developer_twofa_unavailable"
+    if "connection" in message:
+        return "developer_connection_lost"
+    if "new developer account tab" in message or "opening developer account" in message:
+        return "developer_navigation_failed"
+    if "membership" in message:
+        return "developer_membership_unknown"
+    if "session was not confirmed" in message or "login" in message:
+        return "developer_login_unconfirmed"
+    if "authentication" in message or "2fa" in message:
+        return "developer_authentication_error"
+    return "developer_account_failed"
+
+
+def collect_developer_account_membership(
+    page: Any,
+    apple_id: str,
+    password: str,
+    Keys: Any,
+    authentication_context: dict[str, Any],
+    screenshot_path: Path,
+    page_holder: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any, str | None]:
+    """Open a distinct Developer tab and resolve its fixed membership state."""
+    set_browser_startup_stage("developer_account")
+    emit({"event": "status", "status": "developer_account_started"})
+    try:
+        developer_page = page.new_tab(DEVELOPER_ACCOUNT_URL)
+    except Exception as error:
+        raise RuntimeError("new developer account tab could not be created") from error
+    if page_holder is not None:
+        page_holder["page"] = developer_page
+    if developer_page is None or not browser_connection_is_alive(developer_page):
+        raise RuntimeError("new developer account tab could not be created")
+    emit({"event": "status", "status": "developer_account_tab_created"})
+    try:
+        developer_page.wait.doc_loaded(timeout=20)
+    except Exception:
+        if not browser_connection_is_alive(developer_page):
+            raise RuntimeError(
+                "developer browser connection was lost while opening developer account"
+            )
+    human_pause(700, 1400)
+
+    set_browser_startup_stage("developer_login")
+    emit(
+        {
+            "event": "status",
+            "status": "developer_account_authentication_started",
+        }
+    )
+    authentication = complete_account_authentication(
+        developer_page,
+        apple_id,
+        password,
+        Keys,
+        account_home_confirmed=True,
+        authentication_context=authentication_context,
+        session_probe=confirmed_developer_account_state,
+    )
+    confirmed_state = authentication["confirmedState"]
+    if confirmed_state.get("developerAccountShell") is not True:
+        raise RuntimeError(
+            "developer account shell was not confirmed after authentication"
+        )
+    emit({"event": "status", "status": "developer_account_authenticated"})
+
+    set_browser_startup_stage("developer_membership")
+    membership_status = "unknown"
+    screenshot: str | None = None
+    if confirmed_state.get("joinProgram") is True:
+        membership_status = "not_enrolled"
+    elif confirmed_state.get("membershipNavigation") is True:
+        if confirm_active_developer_membership(developer_page):
+            membership_status = "active"
+            screenshot = take_screenshot(
+                developer_page,
+                screenshot_path,
+                checkpoint="developer_membership",
+                full_page=False,
+            )
+    emit(
+        {
+            "event": "status",
+            "status": "developer_membership_checked",
+            "membershipStatus": membership_status,
+        }
+    )
+    emit({"event": "status", "status": "developer_account_completed"})
+    return (
+        {
+            "success": True,
+            "authenticated": True,
+            "membershipStatus": membership_status,
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": browser_connection_is_alive(developer_page),
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        },
+        developer_page,
+        screenshot,
+    )
+
+
 def browser_flow(args: argparse.Namespace) -> int:
     begin_browser_flow_run()
     try:
@@ -5690,6 +6201,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
 
     screenshots_dir = report_dir / "screenshots"
     success_screenshot_path = screenshots_dir / "02-account-information.png"
+    developer_screenshot_path = screenshots_dir / "03-developer-membership.png"
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     account_home_confirmed = False
@@ -5862,22 +6374,98 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 account_home_confirmed=True,
             )
 
+        post_login_developer_account: dict[str, Any] = {
+            "success": False,
+            "authenticated": False,
+            "membershipStatus": "unknown",
+            "failureStage": "developer_account",
+            "failureClass": "developer_result_missing",
+            "browserAlive": browser_connection_is_alive(page),
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+        developer_page: Any | None = None
+        developer_page_holder: dict[str, Any] = {}
+        developer_module_attempted = post_login_profile_capture["success"] is True
+        if developer_module_attempted:
+            try:
+                (
+                    post_login_developer_account,
+                    developer_page,
+                    screenshots["developerMembership"],
+                ) = collect_developer_account_membership(
+                    page,
+                    apple_id,
+                    password,
+                    Keys,
+                    authentication_context,
+                    developer_screenshot_path,
+                    page_holder=developer_page_holder,
+                )
+                if screenshots["developerMembership"] is not None:
+                    generated_screenshot_paths.append(developer_screenshot_path)
+            except Exception as developer_error:
+                developer_page = developer_page_holder.get("page")
+                failure_stage = browser_startup_stage
+                failure_class = classify_developer_account_failure(developer_error)
+                browser_alive = (
+                    developer_page is not None
+                    and browser_connection_is_alive(developer_page)
+                )
+                post_login_developer_account = {
+                    "success": False,
+                    "authenticated": failure_stage == "developer_membership",
+                    "membershipStatus": "unknown",
+                    "failureStage": failure_stage,
+                    "failureClass": failure_class,
+                    "browserAlive": browser_alive,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": (
+                        preserve_on_success or preserve_on_failure
+                    ),
+                }
+                emit(
+                    {
+                        "event": "status",
+                        "status": "developer_account_failed",
+                        "failureStage": failure_stage,
+                        "failureClass": failure_class,
+                        "authenticated": failure_stage == "developer_membership",
+                        "membershipStatus": "unknown",
+                    }
+                )
+
         preserve_after_flow = preserve_on_success or (
             post_login_profile_capture["success"] is False and preserve_on_failure
+        ) or (
+            post_login_developer_account["success"] is False and preserve_on_failure
         )
         post_login_profile_capture["browserPreservationRequested"] = (
             preserve_after_flow
         )
+        if developer_module_attempted:
+            post_login_developer_account["browserAlive"] = (
+                developer_page is not None
+                and browser_connection_is_alive(developer_page)
+            )
         set_browser_startup_stage("post_login_finalization")
         post_login_finalization = finalize_post_login_browser(
             page,
             preserve_requested=preserve_after_flow,
             profile_capture_success=post_login_profile_capture["success"],
+            required_pages=(developer_page,) if developer_module_attempted else (),
         )
         post_login_browser_finalized = True
         post_login_profile_capture["browserPreserved"] = post_login_finalization[
             "browserSessionPreserved"
         ]
+        post_login_developer_account["browserPreservationRequested"] = (
+            preserve_after_flow
+        )
+        post_login_developer_account["browserPreserved"] = bool(
+            developer_module_attempted
+            and post_login_finalization["browserSessionPreserved"]
+        )
 
         emit_browser_result(
             {
@@ -5893,6 +6481,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     "rememberAccount": remember_checked,
                 },
                 "postLoginProfileCapture": post_login_profile_capture,
+                "postLoginDeveloperAccount": post_login_developer_account,
                 "postLoginFinalization": post_login_finalization,
                 "personalInfo": personal_info
                 if post_login_profile_capture["success"] is True
