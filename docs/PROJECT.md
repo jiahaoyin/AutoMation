@@ -47,6 +47,7 @@ flowchart LR
 browser_ready
   -> developer_account
   -> developer_login
+  -> [Developer auth failure] browser failure / preserve policy
   -> developer_membership
   -> developer_membership_checked
   -> [gate=1 && non-active] developer_membership_gate_blocked -> finalization
@@ -59,11 +60,11 @@ browser_ready
 
 ### Developer-first 与 gate
 
-**DEVELOPER_MEMBERSHIP_GATE=0** 是测试默认。它允许 active、not_enrolled、unknown 和 Developer partial 继续 Account，便于同一次浏览器运行覆盖双模块。
+**DEVELOPER_MEMBERSHIP_GATE=0** 是测试默认。Developer 登录已确认后，它允许 active、not_enrolled、unknown 继续 Account，便于同一次浏览器运行覆盖双模块。Developer 登录失败、仍可见 Apple 登录控件或 2FA 未完成时，绝不创建 Account tab。
 
-**DEVELOPER_MEMBERSHIP_GATE=1** 是业务 gate。只有 postLoginDeveloperAccount.success=true 且 membershipStatus=active 才会创建 Account tab。其余路径发送 developer_membership_gate_blocked，返回浏览器阶段成功但 accountModule.skipped=true 的固定结果。
+**DEVELOPER_MEMBERSHIP_GATE=1** 是业务 gate。只有 postLoginDeveloperAccount.authenticated=true、success=true 且 membershipStatus=active 才会创建 Account tab。已认证的非 active 路径发送 developer_membership_gate_blocked，返回浏览器阶段成功但 accountModule.skipped=true 的固定结果；登录失败不是 gate stop。
 
-Developer 会员状态在 developer_membership_checked 到达 Node 时立即私有持久化。Developer 失败固定持久化为 unknown；这样 Account tab 创建或后续 Account 认证失败不会丢失已完成的判定。
+Developer 会员状态在 developer_membership_checked 到达 Node 时立即私有持久化。只允许已认证后的 membership partial 持久化 unknown；Developer 登录失败不写 developer_membership。这样 Account tab 创建或后续 Account 认证失败不会丢失已完成的判定，也不会把失败登录冒充会员结果。
 
 ## 4. 结果、截图与 acceptance
 

@@ -3734,6 +3734,8 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
         developer_result=None,
         developer_error=None,
         gate="0",
+        expected_error: str | None = None,
+        preserve_on_failure="0",
     ):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
@@ -3768,7 +3770,7 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
                 "APPLE_ID": "person@example.com",
                 "APPLE_PASSWORD": "secret",
                 "DEVELOPER_MEMBERSHIP_GATE": gate,
-                "BROWSER_PRESERVE_ON_FAILURE": "0",
+                "BROWSER_PRESERVE_ON_FAILURE": preserve_on_failure,
                 "BROWSER_PRESERVE_ON_SUCCESS": "0",
             },
             clear=False,
@@ -3808,7 +3810,11 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
         ), patch("apple_account_flow.human_pause", return_value=None), patch(
             "apple_account_flow.emit", side_effect=events.append
         ):
-            self.assertEqual(browser_flow(args), 0)
+            if expected_error is None:
+                self.assertEqual(browser_flow(args), 0)
+            else:
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    browser_flow(args)
 
         return events, developer_contexts, account_contexts
 
@@ -3844,47 +3850,103 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
         self.assertEqual(len(account_contexts), 1)
         self.assertEqual(developer_page.opened_account_url, "https://appleid.apple.com/sign-in")
 
-    def test_gate_disabled_continues_to_account_for_unknown_and_developer_failure(self):
-        cases = (
-            (self._developer_result("unknown"), None),
-            (None, RuntimeError("developer membership unavailable")),
+    def test_gate_disabled_continues_to_account_for_authenticated_unknown_membership(self):
+        developer_page = self._page()
+        account_page = self._page()
+
+        events, _developer_contexts, account_contexts = self._run_with_pages(
+            developer_page,
+            account_page,
+            developer_result=self._developer_result("unknown"),
+            gate="0",
         )
-        for developer_result, developer_error in cases:
-            with self.subTest(
-                membership=(developer_result or {}).get("membershipStatus", "failure")
-            ):
+
+        self.assertEqual(len(account_contexts), 1)
+        self.assertEqual(
+            developer_page.opened_account_url,
+            "https://appleid.apple.com/sign-in",
+        )
+        result = next(event for event in events if event.get("event") == "result")
+        self.assertEqual(
+            result["accountModule"],
+            {
+                "attempted": True,
+                "skipped": False,
+                "skipReason": "unknown",
+                "membershipGateEnabled": False,
+                "membershipGatePassed": True,
+            },
+        )
+
+    def test_unauthenticated_developer_failure_never_opens_account_tab_for_any_gate(self):
+        for gate in ("0", "1"):
+            with self.subTest(gate=gate):
                 developer_page = self._page()
                 account_page = self._page()
                 events, _developer_contexts, account_contexts = self._run_with_pages(
                     developer_page,
                     account_page,
-                    developer_result=developer_result,
-                    developer_error=developer_error,
-                    gate="0",
+                    developer_error=RuntimeError("developer login session was not confirmed"),
+                    gate=gate,
+                    expected_error="developer account authentication did not complete before account module",
+                    preserve_on_failure="1",
                 )
 
-                self.assertEqual(len(account_contexts), 1)
-                self.assertEqual(
-                    developer_page.opened_account_url,
-                    "https://appleid.apple.com/sign-in",
+                self.assertEqual(account_contexts, [])
+                self.assertFalse(hasattr(developer_page, "opened_account_url"))
+                self.assertFalse(
+                    any(
+                        event.get("status") in {"account_module_started", "account_module_tab_created"}
+                        for event in events
+                    )
                 )
-                result = next(event for event in events if event.get("event") == "result")
-                self.assertEqual(
-                    result["accountModule"],
-                    {
-                        "attempted": True,
-                        "skipped": False,
-                        "skipReason": "unknown",
-                        "membershipGateEnabled": False,
-                        "membershipGatePassed": True,
-                    },
+                failure_event = next(
+                    event
+                    for event in events
+                    if event.get("status") == "developer_account_failed"
+                )
+                self.assertFalse(failure_event["authenticated"])
+                self.assertTrue(
+                    any(
+                        event.get("status") == "browser_preserved"
+                        and event.get("preserved") is True
+                        for event in events
+                    )
                 )
 
-    def test_gate_enabled_blocks_non_active_and_developer_failure_before_new_tab(self):
+    def test_membership_gate_requires_authenticated_developer_account(self):
+        cases = (
+            ("0", True, True, "active", True),
+            ("0", False, True, "unknown", True),
+            ("0", False, False, "unknown", False),
+            ("1", True, True, "active", True),
+            ("1", False, True, "active", False),
+            ("1", True, True, "unknown", False),
+            ("1", True, False, "active", False),
+        )
+        for gate, success, authenticated, membership_status, expected in cases:
+            with self.subTest(
+                gate=gate,
+                success=success,
+                authenticated=authenticated,
+                membership_status=membership_status,
+            ):
+                self.assertIs(
+                    account_flow.developer_membership_allows_account(
+                        {
+                            "success": success,
+                            "authenticated": authenticated,
+                            "membershipStatus": membership_status,
+                        },
+                        gate_enabled=gate == "1",
+                    ),
+                    expected,
+                )
+
+    def test_gate_enabled_blocks_authenticated_non_active_before_new_tab(self):
         cases = (
             (self._developer_result("not_enrolled"), None),
             (self._developer_result("unknown"), None),
-            (None, RuntimeError("developer membership unavailable")),
         )
         for developer_result, developer_error in cases:
             with self.subTest(
@@ -5698,8 +5760,10 @@ class TwoFactorStateTests(unittest.TestCase):
         self.assertFalse(state["email"])
         self.assertIn("!el.disabled", shadow_root.script)
         self.assertIn("el.getAttribute('aria-disabled') !== 'true'", shadow_root.script)
+        self.assertIn("const id =", shadow_root.script)
+        self.assertIn("/account[_-]?name|username/.test(`${name} ${id}`)", shadow_root.script)
 
-    def test_direct_email_detector_checks_autocomplete_and_name_independently(self):
+    def test_direct_email_detector_accepts_apple_account_name_id(self):
         class CapturingScope:
             def __init__(self):
                 self.script = ""
@@ -5726,9 +5790,10 @@ class TwoFactorStateTests(unittest.TestCase):
 
         self.assertTrue(state["email"])
         self.assertIn("const autocomplete =", scope.script)
+        self.assertIn("const id =", scope.script)
         self.assertIn("autocomplete === 'email'", scope.script)
         self.assertIn("autocomplete === 'username'", scope.script)
-        self.assertIn("/accountname|username/.test(name)", scope.script)
+        self.assertIn("/account[_-]?name|username/.test(`${name} ${id}`)", scope.script)
 
     def test_automatic_post_otp_wait_rejects_live_direct_email_error(self):
         frame = FakePage(

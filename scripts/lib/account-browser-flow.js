@@ -1003,6 +1003,9 @@ function sanitizeAccountModule(accountModule) {
 
 function isIntentionalDeveloperMembershipGateStop(result) {
   const source = result && typeof result === "object" ? result : {};
+  const developerAccount = sanitizePostLoginDeveloperAccount(
+    source.postLoginDeveloperAccount
+  );
   const accountModule = sanitizeAccountModule(source.accountModule);
   const profileCapture = sanitizePostLoginProfileCapture(
     source.postLoginProfileCapture
@@ -1014,6 +1017,7 @@ function isIntentionalDeveloperMembershipGateStop(result) {
     accountModule.skipReason === "developer_membership_gate" &&
     accountModule.membershipGateEnabled === true &&
     accountModule.membershipGatePassed === false &&
+    developerAccount.authenticated === true &&
     profileCapture.success === false &&
     profileCapture.failureClass === "developer_membership_gate"
   );
@@ -1583,7 +1587,11 @@ export async function runAccountBrowserPhase(
         auditRuyiPageEvent(flowAudit, event);
         if (event.event === "status" && event.status === "developer_membership_checked") {
           persistDeveloperMembership(event.membershipStatus, true);
-        } else if (event.event === "status" && event.status === "developer_account_failed") {
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_account_failed" &&
+          event.authenticated === true
+        ) {
           persistDeveloperMembership("unknown", false);
         }
         if (event.event === "ready") {
@@ -1609,6 +1617,22 @@ export async function runAccountBrowserPhase(
           }
         } else if (runnerLifecycleLine) {
           if (showTerminalDebug) console.log(`[ruyipage] status:${runnerLifecycleLine}`);
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_account_authentication_started"
+        ) {
+          console.log("[→] 正在登录 Apple Developer");
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_account_authenticated"
+        ) {
+          console.log("[✓] Apple Developer 登录成功，正在检查会员资格");
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_account_failed" &&
+          event.authenticated !== true
+        ) {
+          console.warn("[×] Apple Developer 登录未完成，Account 阶段未启动");
         } else if (event.event === "status" && event.status === "browser_stage") {
           const stage = sanitizeBrowserFailureStage(event.stage);
           if (showTerminalDebug) {
@@ -1836,7 +1860,7 @@ export async function runAccountBrowserPhase(
   const developerResultReported =
     postLoginDeveloperAccount.success ||
     postLoginDeveloperAccount.failureClass !== "developer_result_missing";
-  if (developerResultReported) {
+  if (developerResultReported && postLoginDeveloperAccount.authenticated) {
     if (!postLoginDeveloperAccount.success) {
       writeFlowAudit(flowAudit, "developer_account", "partial", {
         failureStage: postLoginDeveloperAccount.failureStage,
@@ -1852,6 +1876,29 @@ export async function runAccountBrowserPhase(
   }
 
   const accountHomeConfirmed = hasConfirmedAccountHome(result);
+  const developerAuthenticationResultPresent =
+    postLoginDeveloperAccount.failureClass !== "developer_result_missing";
+  const unauthenticatedDeveloperAdvancedPastBoundary =
+    developerAuthenticationResultPresent &&
+    postLoginDeveloperAccount.authenticated !== true &&
+    (accountHomeConfirmed ||
+      accountModule.attempted === true ||
+      (accountModule.skipped === true &&
+        accountModule.skipReason === "developer_membership_gate"));
+  if (unauthenticatedDeveloperAdvancedPastBoundary) {
+    writeFlowAudit(flowAudit, "developer_account", "authentication_unconfirmed", {
+      failureStage: postLoginDeveloperAccount.failureStage,
+      failureClass: postLoginDeveloperAccount.failureClass,
+      accountModuleAttempted: accountModule.attempted,
+      accountModuleSkipped: accountModule.skipped,
+      accountHomeConfirmed,
+    });
+    throw annotateBrowserRunFailure(
+      new Error("Developer authentication was not confirmed before Account module"),
+      null,
+      postLoginDeveloperAccount.failureStage
+    );
+  }
   const intentionalGateStop = isIntentionalDeveloperMembershipGateStop(result);
   if (!accountHomeConfirmed && !intentionalGateStop) {
     writeFlowAudit(flowAudit, "account_browser", "account_home_unconfirmed");

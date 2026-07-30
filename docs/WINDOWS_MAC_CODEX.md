@@ -121,6 +121,8 @@ Mac Codex 不能通过 open、launchctl、AppleScript 或自定义 GUI 启动器
 
 ~~~text
 developer_account_started
+→ developer_account_authentication_started
+→ developer_account_authenticated
 → developer_membership_checked
 → account_module_started
 → account_module_tab_created
@@ -130,12 +132,12 @@ developer_account_started
 
 | 检查项 | 正确结果 |
 | --- | --- |
-| Developer 结果 | active、not_enrolled 或 unknown 已记录，并在进入 Account 前私有持久化。 |
+| Developer 结果 | 仅在 Developer 登录确认后记录 active、not_enrolled 或 unknown，并在进入 Account 前私有持久化。 |
 | active 截图 | 仅 active 时可出现 03-developer-membership.png。 |
 | Account 截图 | 仅个人信息页稳定后可出现 02-account-information.png。 |
 | gate=1 非 active | developer_membership_gate_blocked、accountModule.skipped=true、acceptance_marker_skipped；这是成功的 gate stop。 |
 | Account acceptance | 只有 account_home_confirmed=true 时允许 acceptance_marker_completed。 |
-| Developer partial + gate=0 | Account 仍应继续；Developer 结果固定为未确认。 |
+| Developer 登录未确认 | 无论 gate 值都不得创建 Account tab；浏览器按失败保留策略保留，会员值不写入。 |
 
 不要把 screenshot 的缺失单独当成失败：会员截图只属于 active；个人信息截图只属于 information page ready。
 

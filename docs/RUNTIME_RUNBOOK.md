@@ -28,14 +28,17 @@ sequenceDiagram
     Dev-->>Ruyi: active | not_enrolled | unknown
     Ruyi-->>Node: developer_membership_checked
     Node->>Node: 立即写入私有 developer_membership
-    alt gate=0 或 active
+    alt Developer 已认证且 (gate=0 或 active)
         Ruyi->>Account: 新建 Account 标签页
         Account-->>Ruyi: Account home 已确认
         Ruyi->>Account: 打开个人信息页
         Ruyi-->>Node: 资料采集状态 / 截图元数据
-    else gate=1 且非 active
+    else Developer 已认证且 gate=1 且非 active
         Ruyi-->>Node: developer_membership_gate_blocked
         Node-->>User: 正常 gate stop
+    else Developer 登录未确认
+        Ruyi-->>Node: developer_account_failed
+        Node-->>User: 失败并保留浏览器；不创建 Account tab
     end
 ~~~
 
@@ -66,7 +69,7 @@ sequenceDiagram
 
 ### 测试模式：DEVELOPER_MEMBERSHIP_GATE=0
 
-默认值。Developer 模块产生 active、not_enrolled、unknown，或者产生固定的 Developer partial 后，都会继续执行 Account 模块。这个模式用于回归两段流程、确认新的 Account tab 和个人信息采集。
+默认值。Developer 登录确认后，模块产生 active、not_enrolled 或 unknown 时都会继续执行 Account 模块。这个模式用于回归两段流程、确认新的 Account tab 和个人信息采集。Developer 仍停在 Apple 登录页、凭据输入失败或 2FA 未完成时属于登录失败：不得把它降级为 unknown，也不得创建 Account tab。
 
 ### 业务模式：DEVELOPER_MEMBERSHIP_GATE=1
 
@@ -77,7 +80,7 @@ sequenceDiagram
 | active | 新建 Account tab 并继续 | 常规 Account 登录/采集路径。 |
 | not_enrolled | skipped | 正常 gate stop；不写 Account home acceptance marker。 |
 | unknown | skipped | 正常 gate stop；保留固定不确定状态以便排查。 |
-| Developer 固定失败 | skipped | 正常 gate stop；会员值写为未确认。 |
+| Developer 登录失败 | 不进入 Account | 流程失败并按失败保留策略保留浏览器；不写会员值。 |
 
 业务模式的“已跳过”与 “Account 登录失败”必须分开看：前者的报告中 accountModule.skipped=true、skipReason=developer_membership_gate，没有 browserLogin.accountHomeConfirmed=true，因此 acceptance marker 是 skipped。
 
@@ -89,7 +92,7 @@ sequenceDiagram
 | not_enrolled | developer_membership=未加入 | 未加入的固定提示 | 不保存。 |
 | unknown | developer_membership=未确认 | 未确认的固定提示 | 不保存。 |
 
-Node 在收到 developer_membership_checked 时就写入私有 .env，不等 Account 模块或最终浏览器结果，因此后续 Account 新标签页、认证或采集失败也不会抹掉已完成的会员判定。
+Node 在收到 developer_membership_checked 时就写入私有 .env，不等 Account 模块或最终浏览器结果，因此后续 Account 新标签页、认证或采集失败也不会抹掉已完成的会员判定。未认证的 developer_account_failed 不会生成 developer_membership。
 
 Account 个人信息页的契约独立于 Developer 截图：
 
@@ -143,7 +146,7 @@ APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 | 3 | developer_account_authenticated | Developer 页面 shell 已确认。 |
 | 4 | developer_membership_checked | 已给出 active / not_enrolled / unknown 固定结果并触发私有持久化。 |
 | 5 | developer_account_completed | Developer 阶段正常收束。 |
-| 异常 | developer_account_failed | 固定 failure stage/class；会员结果按未确认处理。 |
+| 异常 | developer_account_failed | 固定 failure stage/class；若 authenticated=false，终端提示登录未完成、会员结果不写入、Account 不启动。 |
 | gate | developer_membership_gate_blocked | 仅 gate=1 且不通过时出现；这是正常模块跳过。 |
 
 ### Account 模块

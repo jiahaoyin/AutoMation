@@ -14,12 +14,16 @@ ruyiPage Firefox session:
 
 ## Membership Gate
 
-- `DEVELOPER_MEMBERSHIP_GATE=0` is the default test mode. It always runs both
-  modules, regardless of `active`, `not_enrolled`, or `unknown` membership.
+- `DEVELOPER_MEMBERSHIP_GATE=0` is the default test mode. After a confirmed
+  Developer authentication it runs both modules regardless of `active`,
+  `not_enrolled`, or `unknown` membership. A visible Developer sign-in form or
+  failed credential/2FA handoff is not a membership result and must stop before
+  Account tab creation.
 - `DEVELOPER_MEMBERSHIP_GATE=1` is the business mode. It opens Account only
-  when the Developer result is `active`; `not_enrolled`, `unknown`, or a
-  Developer failure produce a successful, explicitly gated terminal result
-  without entering Account.
+  when the authenticated Developer result is `active`; authenticated
+  `not_enrolled` or `unknown` results produce a successful, explicitly gated
+  terminal result without entering Account. Developer authentication failures
+  remain browser failures, not gate stops.
 - The gate decision is fixed metadata only. Logs and reports retain the
   membership class, gate state, page-state booleans, and screenshot filenames;
   they never contain credentials, OTPs, cookies, or page text.
@@ -29,8 +33,10 @@ ruyiPage Firefox session:
 - Reuse the current ruyiPage authentication and shared 2FA generation context.
 - Keep Developer in the initial tab, then create a new Account tab. Do not
   launch another browser or a second 2FA collector.
-- Persist Developer membership before profile persistence in Node so a gated
-  result still writes `developer_membership` to the private `.env`.
+- Persist Developer membership before profile persistence in Node only after
+  `developer_membership_checked`, or an authenticated post-login membership
+  partial, so a gated result still writes `developer_membership` to the private
+  `.env` without treating a failed login as `unknown` membership.
 - Persist immediately when the sanitized `developer_membership_checked` event
   arrives, rather than waiting for the final backend result. This preserves the
   checked membership when Account tab creation or later Account authentication

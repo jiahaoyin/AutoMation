@@ -51,10 +51,10 @@
 
 | 配置 | 结果 |
 | --- | --- |
-| DEVELOPER_MEMBERSHIP_GATE=0 | 默认测试模式；active、not_enrolled、unknown 和 Developer fixed partial 都继续 Account。 |
-| DEVELOPER_MEMBERSHIP_GATE=1 | 只有 active 新建 Account tab；其他结果是成功的 gate stop。 |
+| DEVELOPER_MEMBERSHIP_GATE=0 | 默认测试模式；仅在 Developer 登录已确认后，active、not_enrolled、unknown 都继续 Account。 |
+| DEVELOPER_MEMBERSHIP_GATE=1 | 只有已认证的 active 新建 Account tab；已认证的非 active 是成功的 gate stop。 |
 
-Developer 的固定状态为 active、not_enrolled、unknown。Node 在 developer_membership_checked 到达时就写入私有 developer_membership。仅 active 可生成 **03-developer-membership.png**；个人信息页稳定后才可生成 **02-account-information.png**。
+Developer 的固定状态为 active、not_enrolled、unknown，前提是 Developer 登录已经确认。Node 只在 developer_membership_checked 到达时，或已认证后的 membership partial 时写入私有 developer_membership。登录未完成时不写会员结果、不创建 Account tab。仅 active 可生成 **03-developer-membership.png**；个人信息页稳定后才可生成 **02-account-information.png**。
 
 gate=1 的非 active 结果必须同时满足：
 
@@ -134,6 +134,8 @@ git rev-parse HEAD
 默认使用 DEVELOPER_MEMBERSHIP_GATE=0，预期顺序是：
 
 ~~~text
+developer_account_authentication_started
+→ developer_account_authenticated
 developer_membership_checked
 → account_module_tab_created
 → account_home_confirmed

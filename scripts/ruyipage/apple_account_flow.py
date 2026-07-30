@@ -562,7 +562,14 @@ def developer_membership_allows_account(
     *,
     gate_enabled: bool,
 ) -> bool:
-    """The disabled test gate always continues; the enabled gate accepts active only."""
+    """Require Developer authentication before evaluating the membership gate.
+
+    Test mode relaxes membership only: authenticated ``unknown`` results may
+    continue for regression coverage, but a visible Apple sign-in form or a
+    failed Developer credential handoff cannot open the Account module.
+    """
+    if developer_account.get("authenticated") is not True:
+        return False
     if not gate_enabled:
         return True
     return (
@@ -2291,10 +2298,11 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 const type = String(el.type || '').toLowerCase();
                 const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase();
                 const name = String(el.getAttribute('name') || '').toLowerCase();
+                const id = String(el.getAttribute('id') || '').toLowerCase();
                 return (el.tagName === 'INPUT' && type === 'email') ||
                   autocomplete === 'username' ||
                   autocomplete === 'email' ||
-                  /accountname|username/.test(name);
+                  /account[_-]?name|username/.test(`${name} ${id}`);
               });
               const semantics = (el) => /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
                 el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
@@ -3096,10 +3104,11 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             const type = String(el.type || '').toLowerCase();
             const autocomplete = String(el.getAttribute('autocomplete') || '').toLowerCase();
             const name = String(el.getAttribute('name') || '').toLowerCase();
+            const id = String(el.getAttribute('id') || '').toLowerCase();
             return type === 'email' ||
               autocomplete === 'username' ||
               autocomplete === 'email' ||
-              /accountname|username/.test(name);
+              /account[_-]?name|username/.test(`${name} ${id}`);
           });
           const hasStaticAccountSecurityFeatureCard = () => {
             const featurePattern = /two[-\s]?factor|two[-\s]?step|\u53cc\u91cd\u8ba4\u8bc1|\u96d9\u91cd\u9a57\u8b49|\u96d9\u91cd\u8a8d\u8b49/i;
@@ -3389,8 +3398,13 @@ def is_recoverable_account_sign_in_state(
     page: Any,
     state: dict[str, Any],
 ) -> bool:
+    current_url = scope_location_url(page)
+    developer_child_sign_in = bool(
+        is_developer_account_url(current_url)
+        and state.get("childAuthUiPresent") is True
+    )
     return bool(
-        is_account_sign_in_url(scope_location_url(page))
+        (is_account_sign_in_url(current_url) or developer_child_sign_in)
         and (state.get("email") is True or state.get("password") is True)
         and state.get("blocked") is not True
         and state.get("otpRejected") is not True
@@ -6493,6 +6507,15 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     "authenticated": failure_stage == "developer_membership",
                     "membershipStatus": "unknown",
                 }
+            )
+
+        if post_login_developer_account["authenticated"] is not True:
+            # The disabled membership gate is only for exercising both modules
+            # after a valid Developer login. It must never turn a visible Apple
+            # sign-in page into an ``unknown`` membership decision and then
+            # open the Account tab.
+            raise RuntimeError(
+                "developer account authentication did not complete before account module"
             )
 
         membership_gate_enabled = developer_membership_gate_enabled()
