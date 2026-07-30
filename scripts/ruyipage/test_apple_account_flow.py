@@ -10361,11 +10361,137 @@ class DeveloperAccountTests(unittest.TestCase):
                     account_flow.confirmed_developer_account_state(page)
                 )
 
-    def test_live_login_controls_block_account_shell_and_membership_marker(self):
+    def test_root_broad_text_error_does_not_block_a_verified_developer_shell(self):
         page = self.authenticated_page(join_program=True)
-        page.state["email"] = True
+        page.state["error"] = True
+        page.state["hardAuthenticationError"] = True
+        page.state["assertiveAuthenticationError"] = False
+
+        state = account_flow.confirmed_developer_account_state(page)
+
+        self.assertIsNotNone(state)
+        self.assertTrue(state["developerAccountShell"])
+        self.assertTrue(state["joinProgram"])
+
+    def test_root_assertive_authentication_error_blocks_a_verified_developer_shell(self):
+        page = self.authenticated_page(join_program=True)
+        page.state["error"] = True
+        page.state["hardAuthenticationError"] = True
+        page.state["assertiveAuthenticationError"] = True
 
         self.assertIsNone(account_flow.confirmed_developer_account_state(page))
+
+    def test_root_shadow_broad_text_error_does_not_block_a_verified_shell(self):
+        shadow_root = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": False,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 0,
+                    "codeInputCount": 0,
+                    "password": False,
+                    "email": False,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "error": True,
+                    "hardAuthenticationError": True,
+                    "assertiveAuthenticationError": False,
+                }
+            }
+        )
+        page = self.authenticated_page(join_program=True)
+        page._shadow_roots = [shadow_root]
+
+        state = account_flow.confirmed_developer_account_state(page)
+
+        self.assertIsNotNone(state)
+        self.assertIn(("all", False), page.shadow_roots_calls)
+
+    def test_unreadable_root_shadow_state_blocks_a_verified_shell(self):
+        page = self.authenticated_page(join_program=True)
+        page.shadow_error = RuntimeError("shadow state unavailable")
+
+        self.assertIsNone(account_flow.confirmed_developer_account_state(page))
+
+    def test_live_root_auth_controls_block_account_shell_and_membership_marker(self):
+        for control in (
+            "email",
+            "password",
+            "twofa",
+            "trustPrompt",
+            "blocked",
+            "otpRejected",
+        ):
+            with self.subTest(control=control):
+                page = self.authenticated_page(join_program=True)
+                page.state[control] = True
+
+                self.assertIsNone(
+                    account_flow.confirmed_developer_account_state(page)
+                )
+
+    def test_live_apple_child_error_blocks_a_verified_developer_shell(self):
+        child = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify",
+                "error": True,
+                "email": False,
+                "password": False,
+                "twofa": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+            }
+        )
+        iframe = FakeElement(attrs={"src": child.state["href"]})
+        page = self.authenticated_page(join_program=True)
+        page.elements_by_selector["css:iframe"] = [iframe]
+        page.frames = [child]
+        child.parent = page
+
+        self.assertIsNone(account_flow.confirmed_developer_account_state(page))
+
+    def test_live_apple_child_shadow_error_blocks_a_verified_developer_shell(self):
+        child_shadow = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": False,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 0,
+                    "codeInputCount": 0,
+                    "password": False,
+                    "email": False,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "error": True,
+                    "hardAuthenticationError": True,
+                    "assertiveAuthenticationError": False,
+                }
+            }
+        )
+        child = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify",
+                "error": False,
+                "email": False,
+                "password": False,
+                "twofa": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+            },
+            shadow_roots=[child_shadow],
+        )
+        iframe = FakeElement(attrs={"src": child.state["href"]})
+        page = self.authenticated_page(join_program=True)
+        page.elements_by_selector["css:iframe"] = [iframe]
+        page.frames = [child]
+        child.parent = page
+
+        self.assertIsNone(account_flow.confirmed_developer_account_state(page))
+        self.assertIn(("all", False), child.shadow_roots_calls)
 
     def test_missing_membership_evidence_fails_closed_without_claiming_active(self):
         page = self.authenticated_page()
@@ -10740,7 +10866,9 @@ class DeveloperAccountTests(unittest.TestCase):
             state={
                 "href": account_flow.DEVELOPER_ACCOUNT_URL,
                 "twofa": False,
-                "error": False,
+                "error": True,
+                "hardAuthenticationError": True,
+                "assertiveAuthenticationError": False,
                 "otpRejected": False,
                 "blocked": False,
                 "trusted": False,
@@ -10777,6 +10905,83 @@ class DeveloperAccountTests(unittest.TestCase):
 
         self.assertIs(result, confirmed)
         self.assertEqual(session_probe.call_count, 2)
+
+    def test_developer_redirect_rejects_live_apple_child_error_while_hydrating(self):
+        child_shadow = FakePage(
+            state={
+                "shadowEvidence": {
+                    "hasStrongText": False,
+                    "semanticTargetCount": 0,
+                    "digitCellCount": 0,
+                    "codeInputCount": 0,
+                    "password": False,
+                    "email": False,
+                    "trustPrompt": False,
+                    "otpRejected": False,
+                    "blocked": False,
+                    "error": True,
+                    "hardAuthenticationError": True,
+                    "assertiveAuthenticationError": False,
+                }
+            }
+        )
+        child = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify",
+                "error": False,
+                "hardAuthenticationError": False,
+                "assertiveAuthenticationError": False,
+                "email": False,
+                "password": False,
+                "twofa": False,
+                "trustPrompt": False,
+                "otpRejected": False,
+                "blocked": False,
+            },
+            shadow_roots=[child_shadow],
+        )
+        iframe = FakeElement(attrs={"src": child.state["href"]})
+        page = FakePage(
+            state={
+                "href": account_flow.DEVELOPER_ACCOUNT_URL,
+                "twofa": False,
+                "error": True,
+                "hardAuthenticationError": True,
+                "assertiveAuthenticationError": False,
+                "otpRejected": False,
+                "blocked": False,
+                "trusted": False,
+            },
+            elements_by_selector={"css:iframe": [iframe]},
+            frames=[child],
+        )
+        child.parent = page
+        session_probe = Mock(return_value=None)
+
+        with patch(
+            "apple_account_flow.confirmed_account_manage_state",
+            return_value=None,
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            return_value=page.state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None), self.assertRaisesRegex(
+            RuntimeError,
+            "2FA state left the verified Apple HTTPS origin",
+        ):
+            account_flow.wait_for_signed_in(
+                page,
+                timeout_s=1,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                session_probe=session_probe,
+            )
+
+        self.assertEqual(session_probe.call_count, 1)
+        self.assertIn(("all", False), child.shadow_roots_calls)
 
     def test_developer_two_factor_exhaustion_has_a_fixed_partial_class(self):
         for error in (

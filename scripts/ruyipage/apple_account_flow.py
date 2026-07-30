@@ -2272,6 +2272,7 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                   trustPrompt: false,
                   otpRejected: false,
                   blocked: false,
+                  assertiveAuthenticationError: false,
                   hardAuthenticationError: false,
                   genericAuthText: false,
                   securityFeatureCopy: false,
@@ -2364,7 +2365,7 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
               const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
               const assertiveAuthenticationError = visibleTextElements.some((el) => {
                 const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
-                if (!/unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i.test(text)) return false;
+                if (!/unable to sign in|something went wrong|incorrect|invalid|expired|wrong password|try again|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(text)) return false;
                 let current = el;
                 for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
                   const role = String(current.getAttribute('role') || '').toLowerCase();
@@ -2427,6 +2428,7 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
                 trustPrompt: /trust this browser|信任此浏览器|信任此瀏覽器/i.test(body),
                 otpRejected,
                 blocked,
+                assertiveAuthenticationError,
                 hardAuthenticationError,
                 genericAuthText,
                 securityFeatureCopy,
@@ -2457,6 +2459,8 @@ def detect_shadow_root_state(root: Any) -> dict[str, Any]:
             ),
             "hasStrongText": evidence.get("hasStrongText") is True,
             "securityFeatureCopy": evidence.get("securityFeatureCopy") is True,
+            "assertiveAuthenticationError": evidence.get("assertiveAuthenticationError")
+            is True,
             "hardAuthenticationError": evidence.get("hardAuthenticationError")
             is True,
             "genericAuthText": evidence.get("genericAuthText") is True,
@@ -3197,7 +3201,7 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
           const blocked = /captcha|locked|account locked|被锁定|被鎖定|账户锁定|帳戶鎖定/i.test(body);
           const assertiveAuthenticationError = visibleTextElements.some((el) => {
             const text = typeof el.innerText === 'string' ? el.innerText : (el.textContent || '');
-            if (!/unable to sign in|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165/i.test(text)) return false;
+            if (!/unable to sign in|something went wrong|incorrect|invalid|expired|wrong password|try again|\u65e0\u6cd5\u767b\u5f55|\u7121\u6cd5\u767b\u5165|\u9519\u8bef|\u932f\u8aa4|\u4e0d\u6b63\u786e|\u4e0d\u6b63\u78ba|\u65e0\u6548|\u7121\u6548/i.test(text)) return false;
             let current = el;
             for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
               const role = String(current.getAttribute('role') || '').toLowerCase();
@@ -3261,6 +3265,7 @@ def detect_scope_login_state(scope: Any) -> dict[str, Any]:
             error,
             otpRejected,
             blocked,
+            assertiveAuthenticationError,
             hardAuthenticationError,
             genericAuthText,
             securityFeatureCopy,
@@ -3916,7 +3921,41 @@ def developer_account_snapshot(page: Any) -> dict[str, bool]:
     }
 
 
-def developer_scope_has_auth_blocker(page: Any) -> bool:
+def developer_state_has_auth_blocker(
+    state: dict[str, Any],
+    *,
+    allow_text_only_error: bool,
+) -> bool:
+    """Classify one live Developer document or open Shadow DOM state."""
+    if not state:
+        return True
+    if any(
+        bool(state.get(key))
+        for key in (
+            "email",
+            "password",
+            "twofa",
+            "trustPrompt",
+            "otpRejected",
+            "blocked",
+        )
+    ):
+        return True
+    # ``error`` alone is deliberately not enough to reject a verified
+    # Developer shell: the page contains static recovery/security copy that
+    # can match the broad classifier.  A visible assertive error is actual
+    # live auth UI, even when its controls have not hydrated yet.
+    if state.get("assertiveAuthenticationError") is True:
+        return True
+    return state.get("error") is True and not allow_text_only_error
+
+
+def developer_scope_has_auth_blocker(
+    page: Any,
+    *,
+    allow_root_text_only_error: bool = False,
+) -> bool:
+    """Reject live Developer auth UI across documents and open Shadow DOM."""
     for scope in iter_page_scopes(page):
         href = scope_location_url(scope)
         if scope is not page:
@@ -3928,19 +3967,25 @@ def developer_scope_has_auth_blocker(page: Any) -> bool:
             state = detect_scope_login_state(scope)
         except Exception:
             return True
-        if any(
-            bool(state.get(key))
-            for key in (
-                "email",
-                "password",
-                "twofa",
-                "trustPrompt",
-                "error",
-                "otpRejected",
-                "blocked",
-            )
+        allow_scope_text_only_error = bool(
+            allow_root_text_only_error and scope is page
+        )
+        if developer_state_has_auth_blocker(
+            state,
+            allow_text_only_error=allow_scope_text_only_error,
         ):
             return True
+        try:
+            shadow_roots = scope.shadow_roots(mode="all", include_frames=False)
+        except Exception:
+            return True
+        for root in list(shadow_roots or []):
+            shadow_state = detect_shadow_root_state(root)
+            if developer_state_has_auth_blocker(
+                shadow_state,
+                allow_text_only_error=allow_scope_text_only_error,
+            ):
+                return True
     return False
 
 
@@ -3954,7 +3999,10 @@ def confirmed_developer_account_state(page: Any) -> dict[str, Any] | None:
         return None
     if (
         snapshot.get("accountShell") is not True
-        or developer_scope_has_auth_blocker(page)
+        or developer_scope_has_auth_blocker(
+            page,
+            allow_root_text_only_error=True,
+        )
     ):
         return None
     return {
@@ -4322,13 +4370,16 @@ def wait_for_signed_in(
             if (
                 session_probe is not None
                 and is_developer_account_url(str(last_state.get("href") or ""))
-                and not any(
-                    bool(last_state.get(key))
-                    for key in ("error", "otpRejected", "blocked")
+                and not developer_scope_has_auth_blocker(
+                    page,
+                    allow_root_text_only_error=True,
                 )
             ):
                 # The Developer shell URL can win before its stable account
-                # markers hydrate. Keep polling only on the exact target origin.
+                # markers hydrate.  Keep polling only when the exact target has
+                # no concrete auth UI, assertive root alert, or live Apple
+                # child-frame error; a root text-only false positive is not
+                # terminal here.
                 human_pause(350, 700)
                 continue
             raise RuntimeError("2FA state left the verified Apple HTTPS origin")
