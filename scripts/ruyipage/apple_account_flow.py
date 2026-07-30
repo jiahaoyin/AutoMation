@@ -122,8 +122,14 @@ OTP_REJECTION_JS_PATTERN = (
     r"|(?:不正确|不正確|无效|無效|(?:已)?过期|(?:已)?過期)"
     r"\s*(?:的)?\s*(?:验证码|驗證碼))"
 )
-TRUST_BUTTON_RE = re.compile(r"^(trust(?: this browser)?|continue|信任(?:此浏览器)?|继续)$", re.IGNORECASE)
-REJECT_TRUST_RE = re.compile(r"don't trust|do not trust|not now|cancel|不信任|取消|暂不", re.IGNORECASE)
+TRUST_BUTTON_RE = re.compile(
+    r"^(trust(?: this browser)?|信任(?:此浏览器)?|信任此瀏覽器)$",
+    re.IGNORECASE,
+)
+REJECT_TRUST_RE = re.compile(
+    r"don't trust|do not trust|not now|later|cancel|不信任|取消|暂不|暫不|以后再说|以後再說|稍后|稍後",
+    re.IGNORECASE,
+)
 TWO_FACTOR_SUBMIT_RE = re.compile(r"^(verify|continue|submit|next|验证|继续|提交|下一步)$", re.IGNORECASE)
 TWO_FACTOR_SUBMIT_SELECTORS = (
     "css:button",
@@ -151,7 +157,8 @@ FOCUS_NOT_CONFIRMED_REASON = "ruyiPage input target focus was not confirmed"
 # Apple can replace the authentication iframe before its account shell and
 # profile data finish hydrating. Keep the submit transition bounded, but do
 # not turn an ordinary slow account-page handoff into a false OTP failure.
-TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 60.0
+TWO_FACTOR_SUBMIT_TRANSITION_TIMEOUT_S = 90.0
+TRUST_PROMPT_HYDRATION_TIMEOUT_S = 20.0
 TWO_FACTOR_TARGET_REFRESH_TIMEOUT_S = 5.0
 TWO_FACTOR_EMPTY_CELL_FALLBACK_PROBE_TIMEOUT_S = 1.5
 TWO_FACTOR_SHARED_ACQUISITION_TIMEOUT_S = 240.0
@@ -219,6 +226,8 @@ TWO_FACTOR_PROGRESS_PHASES = frozenset(
         "submit_started",
         "submit_sent",
         "transition_waiting",
+        "trust_prompt_detected",
+        "trust_click_sent",
         "transition_retry_requested",
         "transition_confirmed",
         "handoff_failed",
@@ -240,6 +249,7 @@ BROWSER_PAGE_KINDS = frozenset(
         "sign_in",
         "password",
         "two_factor",
+        "trust_prompt",
         "account_manage",
         "account_information",
         "authentication_error",
@@ -444,6 +454,8 @@ def classify_browser_page_kind(page: Any, state: dict[str, Any] | None) -> str:
         current_url = ""
         current_path = ""
         information_path = ""
+    if source.get("trustPrompt") is True:
+        return "trust_prompt"
     if information_path and current_path == information_path:
         return "account_information"
     if current_url and is_account_manage_url(current_url):
@@ -492,6 +504,7 @@ def emit_browser_observation(
             "sessionConfirmed": session_confirmed,
             "accountHomeConfirmed": account_home_confirmed is True,
             "twofaVisible": bool(source.get("twofa") or source.get("twofaVisible")),
+            "trustPrompt": source.get("trustPrompt") is True,
             "inputReady": source.get("inputReady") is True,
             "codeInputCount": code_input_count if code_input_count in (1, 6) else 0,
             "authenticationError": source.get("error") is True,
@@ -2813,12 +2826,6 @@ def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
     script = r"""
     function() {
       const expectedPrompt = '__PROMPT_KIND__';
-      const container = this.closest([
-        'form', '[role="dialog"]', '[aria-modal="true"]', 'fieldset',
-        '.si-container', '.signin-container', '.auth-content',
-        '.security-code-input', '.form-security-code-inputs', 'hsa2-sk7'
-      ].join(', '));
-      if (!container) return false;
       const visible = (el) => {
         if (!el) return false;
         const rect = el.getBoundingClientRect();
@@ -2831,11 +2838,33 @@ def button_has_prompt_semantics(button: Any, prompt_kind: str) -> bool:
         return ['text', 'search', 'tel', 'url', 'email', 'password', 'number']
           .includes(String(el.type || 'text').toLowerCase());
       };
-      if (!visible(container)) return false;
-      const text = container.innerText || '';
       if (expectedPrompt === 'trust') {
-        return /trust this browser|信任此浏览器|信任此瀏覽器/i.test(text);
+        // Apple's Trust action itself can live inside a fieldset which only
+        // contains the buttons.  The title is often one or two containers
+        // higher, so inspect a bounded chain of *visible* ancestors instead
+        // of accepting the first closest fieldset.  Never fall through to
+        // body/html: unrelated account text must not authorize a click.
+        let current = this;
+        for (let depth = 0; current && depth < 12; depth += 1) {
+          const tag = String(current.tagName || '').toLowerCase();
+          if (tag === 'body' || tag === 'html') break;
+          if (visible(current)) {
+            const text = String(current.innerText || current.textContent || '');
+            if (/trust this browser|信任此浏览器|信任此瀏覽器/i.test(text)) {
+              return true;
+            }
+          }
+          current = current.parentElement;
+        }
+        return false;
       }
+      const container = this.closest([
+        'form', '[role="dialog"]', '[aria-modal="true"]', 'fieldset',
+        '.si-container', '.signin-container', '.auth-content',
+        '.security-code-input', '.form-security-code-inputs', 'hsa2-sk7'
+      ].join(', '));
+      if (!container || !visible(container)) return false;
+      const text = container.innerText || '';
       const otpSemantics = (el) =>
         /one[\s_-]?time|verification|security[\s_-]*code|\botp\b|passcode|\bcode\b|验证码|驗證碼|双重认证|雙重認證/i.test([
           el.getAttribute('aria-label'), el.getAttribute('aria-describedby'), el.getAttribute('aria-description'),
@@ -2866,27 +2895,52 @@ def click_trust_browser(
     page: Any,
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
+    candidates: list[tuple[Any, Any]] = []
+    seen: set[tuple[int, int]] = set()
     for scope, root in current_element_search_roots(page):
         try:
             state = detect_scope_login_state(scope)
-            validate_apple_url(str(state.get("href") or ""))
+            trusted_scope_url = trusted_two_factor_scope_url(scope)
         except Exception:
             continue
-        for button in safe_elements(root, "css:button", timeout_s=0):
-            if not element_is_interactable(button):
-                continue
-            try:
-                text = str(button.text or "").strip()
-            except Exception:
-                continue
-            if REJECT_TRUST_RE.search(text) or not TRUST_BUTTON_RE.fullmatch(text):
-                continue
-            if not button_has_prompt_semantics(button, "trust"):
-                continue
-            pause(320, 760)
-            human_click(scope, button, pause=pause)
-            return True
-    return False
+        if state.get("trustPrompt") is not True:
+            continue
+        if trusted_scope_url is None:
+            continue
+        if scope is not page and not scope_has_live_frame_chain(page, scope):
+            continue
+        for selector in ("css:button",):
+            for button in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(button):
+                    continue
+                try:
+                    text = str(button.text or "").strip()
+                except Exception:
+                    text = ""
+                if not text:
+                    for name in ("aria-label", "value", "title"):
+                        try:
+                            value = button.attr(name)
+                        except Exception:
+                            continue
+                        if value is not None and str(value).strip():
+                            text = str(value).strip()
+                            break
+                if REJECT_TRUST_RE.search(text) or not TRUST_BUTTON_RE.fullmatch(text):
+                    continue
+                if not button_has_prompt_semantics(button, "trust"):
+                    continue
+                identity = (id(scope), id(button))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                candidates.append((scope, button))
+    if len(candidates) != 1:
+        return False
+    scope, button = candidates[0]
+    pause(320, 760)
+    human_click(scope, button, pause=pause)
+    return True
 
 
 def two_factor_submit_label(element: Any) -> str:
@@ -4061,10 +4115,21 @@ def settle_trust_state(
     *,
     deadline: float,
     pause: Callable[[int, int], None] | None = None,
-    hydration_timeout_s: float = 5.0,
+    hydration_timeout_s: float = TRUST_PROMPT_HYDRATION_TIMEOUT_S,
+    trust_click_state: dict[str, bool] | None = None,
+    trust_progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if pause is None:
         pause = human_pause
+    if trust_click_state is None:
+        trust_click_state = {}
+    trust_click_state.setdefault("detected", False)
+    trust_click_state.setdefault("clicked", False)
+
+    def emit_trust_progress(phase: str) -> None:
+        if trust_progress is not None:
+            trust_progress(phase)
+
     hydration_deadline = min(deadline, time.monotonic() + hydration_timeout_s)
     scanned_current_state = False
     while True:
@@ -4072,19 +4137,31 @@ def settle_trust_state(
             return state
         if scanned_current_state and time.monotonic() >= hydration_deadline:
             if state.get("trustPrompt"):
+                if trust_click_state["clicked"]:
+                    raise RuntimeError(
+                        "trust-browser prompt click did not transition before deadline"
+                    )
                 raise RuntimeError(
                     "trust-browser prompt detected but no matching button was found"
                 )
             raise RuntimeError("trust-browser state did not settle before deadline")
-        if click_trust_browser(page, pause=pause):
-            pause(700, 1400)
-            state = detect_login_state(page)
-            scanned_current_state = True
-            continue
         scanned_current_state = True
         if not state.get("trustPrompt"):
             return state
+        if not trust_click_state["detected"]:
+            trust_click_state["detected"] = True
+            emit_trust_progress("trust_prompt_detected")
+        if not trust_click_state["clicked"] and click_trust_browser(page, pause=pause):
+            trust_click_state["clicked"] = True
+            emit_trust_progress("trust_click_sent")
+            pause(700, 1400)
+            state = detect_login_state(page)
+            continue
         if time.monotonic() >= hydration_deadline:
+            if trust_click_state["clicked"]:
+                raise RuntimeError(
+                    "trust-browser prompt click did not transition before deadline"
+                )
             raise RuntimeError(
                 "trust-browser prompt detected but no matching button was found"
             )
@@ -4104,7 +4181,7 @@ def otp_retry_allowed(state: dict[str, Any], generation: int | None) -> bool:
 
 def wait_for_2fa_or_session(
     page: Any,
-    timeout_s: int = 75,
+    timeout_s: int = 90,
     session_probe: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
@@ -4164,7 +4241,7 @@ def wait_for_2fa_or_session(
 
 def wait_for_signed_in(
     page: Any,
-    timeout_s: int = 90,
+    timeout_s: int = 120,
     submitted: bool = False,
     otp_generation: int | None = None,
     submission_method: str | None = None,
@@ -4188,6 +4265,11 @@ def wait_for_signed_in(
     allow_retiring_child_errors = bool(
         submitted and submission_method == "automatic" and otp_generation is not None
     )
+    trust_click_state: dict[str, bool] = {"detected": False, "clicked": False}
+
+    def emit_developer_trust_progress(phase: str) -> None:
+        if session_probe is not None and otp_generation is not None:
+            emit_two_factor_progress(phase, generation=otp_generation)
 
     def observe_transition(state: dict[str, Any]) -> None:
         if transition_observer is not None:
@@ -4212,7 +4294,13 @@ def wait_for_signed_in(
         try:
             last_state = detect_login_state(page)
             if allow_post_otp_clicks:
-                last_state = settle_trust_state(page, last_state, deadline=deadline)
+                last_state = settle_trust_state(
+                    page,
+                    last_state,
+                    deadline=deadline,
+                    trust_click_state=trust_click_state,
+                    trust_progress=emit_developer_trust_progress,
+                )
         except RuntimeError as error:
             if str(error) != "unable to inspect login page state through ruyiPage":
                 raise
@@ -5901,7 +5989,7 @@ def complete_account_authentication(
         initial_state = settle_trust_state(
             page,
             initial_state,
-            deadline=time.monotonic() + 5.0,
+            deadline=time.monotonic() + TRUST_PROMPT_HYDRATION_TIMEOUT_S,
         )
     emit_browser_observation(
         "login_state",
@@ -6669,7 +6757,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             profile_state = settle_trust_state(
                 page,
                 profile_state,
-                deadline=time.monotonic() + 5.0,
+                deadline=time.monotonic() + TRUST_PROMPT_HYDRATION_TIMEOUT_S,
             )
             emit_browser_observation(
                 "account_information",

@@ -147,6 +147,8 @@ const RUYIPAGE_TWO_FACTOR_PROGRESS_PHASES = new Set([
   "transition_waiting",
   "transition_retry_requested",
   "transition_confirmed",
+  "trust_prompt_detected",
+  "trust_click_sent",
   "handoff_failed",
 ]);
 const RUYIPAGE_RUNNER_STATUS_CODES = new Set([
@@ -196,6 +198,8 @@ const RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES = Object.freeze({
   input_completed: "[✓] Apple 验证码已填写",
   transition_waiting: "[→] 正在确认 Apple 登录状态",
   transition_confirmed: "[✓] Apple 验证已通过",
+  trust_prompt_detected: "[→] 正在处理“信任此浏览器”确认",
+  trust_click_sent: "[✓] 已点击“信任此浏览器”确认",
   handoff_failed: "[×] 验证码提交未确认，详情已写入日志",
 });
 const RUYIPAGE_BROWSER_STAGE_PROGRESS_MESSAGES = Object.freeze({
@@ -232,6 +236,7 @@ const RUYIPAGE_PAGE_KINDS = new Set([
   "sign_in",
   "password",
   "two_factor",
+  "trust_prompt",
   "account_manage",
   "account_information",
   "authentication_error",
@@ -510,6 +515,7 @@ function sanitizeBrowserObservation(event) {
     sessionConfirmed: event?.sessionConfirmed === true,
     accountHomeConfirmed: event?.accountHomeConfirmed === true,
     twofaVisible: event?.twofaVisible === true,
+    trustPrompt: event?.trustPrompt === true,
     inputReady: event?.inputReady === true,
     codeInputCount: event?.codeInputCount === 1 || event?.codeInputCount === 6
       ? event.codeInputCount
@@ -1613,7 +1619,15 @@ export async function runAccountBrowserPhase(
               ? sanitizeTwoFactorProgressPhase(event.phase)
               : "unknown";
           if (Object.hasOwn(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES, phase)) {
-            console.log(RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES[phase]);
+            const message = RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES[phase];
+            if (phase === "trust_prompt_detected" || phase === "trust_click_sent") {
+              reportTerminalProgress(
+                phase === "trust_click_sent" ? "developer-trust:click" : "developer-trust:prompt",
+                message
+              );
+            } else {
+              console.log(message);
+            }
           }
         } else if (runnerLifecycleLine) {
           if (showTerminalDebug) console.log(`[ruyipage] status:${runnerLifecycleLine}`);
@@ -1662,7 +1676,7 @@ export async function runAccountBrowserPhase(
           if (showTerminalDebug) {
             const observation = sanitizeBrowserObservation(event);
             console.log(
-              `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:root_security_copy:${observation.rootSecurityCopyOnly ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
+              `[ruyipage] observation:${observation.checkpoint}:generation:${observation.generation}:page:${observation.pageKind}:session:${observation.sessionConfirmed ? 1 : 0}:home:${observation.accountHomeConfirmed ? 1 : 0}:alive:${observation.connectionAlive ? 1 : 0}:inspection_available:${observation.inspectionAvailable ? 1 : 0}:twofa:${observation.twofaVisible ? 1 : 0}:trust_prompt:${observation.trustPrompt ? 1 : 0}:input:${observation.inputReady ? 1 : 0}:cells:${observation.codeInputCount}:auth_error:${observation.authenticationError ? 1 : 0}:root_manage:${observation.rootManageUrl ? 1 : 0}:root_marker:${observation.rootAccountMarker ? 1 : 0}:root_error:${observation.rootAuthenticationError ? 1 : 0}:root_security_copy:${observation.rootSecurityCopyOnly ? 1 : 0}:retiring_child:${observation.retiringChildError ? 1 : 0}:child_auth:${observation.childAuthUiPresent ? 1 : 0}`
             );
           }
         } else if (

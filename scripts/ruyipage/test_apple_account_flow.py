@@ -174,6 +174,7 @@ class BrowserObservationTests(unittest.TestCase):
                 "sessionConfirmed": True,
                 "accountHomeConfirmed": True,
                 "twofaVisible": False,
+                "trustPrompt": False,
                 "inputReady": False,
                 "codeInputCount": 6,
                 "authenticationError": False,
@@ -226,8 +227,38 @@ class BrowserObservationTests(unittest.TestCase):
         self.assertTrue(event["rootSecurityCopyOnly"])
         self.assertTrue(event["retiringChildError"])
         self.assertTrue(event["childAuthUiPresent"])
+        self.assertFalse(event["trustPrompt"])
         self.assertNotIn("person@example.com", json.dumps(event))
         self.assertNotIn("123456", json.dumps(event))
+
+    def test_trust_prompt_observation_uses_a_fixed_page_kind_and_boolean_only(self):
+        page = object()
+        state = {
+            "trustPrompt": True,
+            "twofa": True,
+            "pageCopy": "Trust this browser for person@example.com code 123456",
+        }
+        with patch(
+            "apple_account_flow.scope_location_url",
+            return_value="https://idmsa.apple.com/IDMSWebAuth/signin?query=secret",
+        ), patch(
+            "apple_account_flow.browser_connection_is_alive", return_value=True
+        ), patch("apple_account_flow.emit") as emit_event:
+            account_flow.emit_browser_observation(
+                "twofa_transition",
+                page,
+                state,
+                account_home_confirmed=False,
+                generation=1,
+            )
+
+        event = emit_event.call_args.args[0]
+        self.assertEqual(event["pageKind"], "trust_prompt")
+        self.assertTrue(event["trustPrompt"])
+        serialized = json.dumps(event)
+        self.assertNotIn("person@example.com", serialized)
+        self.assertNotIn("123456", serialized)
+        self.assertNotIn("query=secret", serialized)
 
 
 class ExistingBrowserAttachTests(unittest.TestCase):
@@ -3062,6 +3093,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "sessionConfirmed": True,
                 "accountHomeConfirmed": False,
                 "twofaVisible": False,
+                "trustPrompt": False,
                 "inputReady": False,
                 "codeInputCount": 0,
                 "authenticationError": False,
@@ -3093,6 +3125,7 @@ class BrowserFlowTests(unittest.TestCase):
                 "sessionConfirmed": True,
                 "accountHomeConfirmed": True,
                 "twofaVisible": False,
+                "trustPrompt": False,
                 "inputReady": False,
                 "codeInputCount": 0,
                 "authenticationError": False,
@@ -3589,9 +3622,13 @@ class BrowserFlowTests(unittest.TestCase):
                 "href": "https://account.apple.com/account/manage",
                 "accountMarker": True,
                 "trusted": True,
+                "trustPrompt": True,
             },
         )
-        trust.on_click = lambda: setattr(root, "_shadow_roots", [])
+        trust.on_click = lambda: (
+            root.state.__setitem__("trustPrompt", False),
+            setattr(root, "_shadow_roots", []),
+        )
         root.get = lambda url: (
             root.state.__setitem__("href", url)
             if url == account_flow.ACCOUNT_INFORMATION_URL
@@ -3639,13 +3676,17 @@ class BrowserFlowTests(unittest.TestCase):
                 "trusted": True,
             }
         )
-        trust.on_click = lambda: setattr(root, "_shadow_roots", [])
+        trust.on_click = lambda: (
+            root.state.__setitem__("trustPrompt", False),
+            setattr(root, "_shadow_roots", []),
+        )
         get_calls = []
 
         def navigate(url):
             get_calls.append(url)
             if len(get_calls) == 2:
                 root.state["href"] = url
+                root.state["trustPrompt"] = True
                 root._shadow_roots = [shadow_root]
 
         root.get = navigate
@@ -8381,7 +8422,7 @@ class TrustBrowserTests(unittest.TestCase):
         self.assertEqual(trust.clicks, 0)
         self.assertIn(("human_click", trust), page.actions.calls)
 
-    def test_trust_skips_unrelated_continue_outside_prompt_container(self):
+    def test_trust_never_substitutes_a_continue_button_for_the_explicit_trust_action(self):
         unrelated_continue = FakeElement(
             "Continue",
             prompt_semantics={"trust": False},
@@ -8395,10 +8436,10 @@ class TrustBrowserTests(unittest.TestCase):
             state={"trustPrompt": True},
         )
 
-        self.assertTrue(click_trust_browser(page, pause=lambda *_: None))
+        self.assertFalse(click_trust_browser(page, pause=lambda *_: None))
 
         self.assertNotIn(("human_click", unrelated_continue), page.actions.calls)
-        self.assertIn(("human_click", prompt_continue), page.actions.calls)
+        self.assertNotIn(("human_click", prompt_continue), page.actions.calls)
 
     def test_trust_clicks_shadow_button_through_its_owner_scope(self):
         trust = FakeElement(
@@ -8408,7 +8449,7 @@ class TrustBrowserTests(unittest.TestCase):
         shadow_root = FakePage(buttons=[trust])
         page = FakePage(
             shadow_roots=[shadow_root],
-            state={"trustPrompt": False},
+            state={"trustPrompt": True},
         )
 
         self.assertTrue(click_trust_browser(page, pause=lambda *_: None))
@@ -8416,6 +8457,45 @@ class TrustBrowserTests(unittest.TestCase):
         self.assertEqual(page.shadow_roots_calls, [("all", False)])
         self.assertIn(("human_click", trust), page.actions.calls)
         self.assertEqual(shadow_root.actions.calls, [])
+
+    def test_trust_uses_an_accessible_label_when_button_text_is_empty(self):
+        trust = FakeElement(
+            attrs={"aria-label": "Trust"},
+            prompt_semantics={"trust": True},
+        )
+        page = FakePage(buttons=[trust], state={"trustPrompt": True})
+
+        self.assertTrue(click_trust_browser(page, pause=lambda *_: None))
+
+        self.assertIn(("human_click", trust), page.actions.calls)
+
+    def test_trust_requires_a_unique_explicit_trust_candidate(self):
+        first = FakeElement("Trust", prompt_semantics={"trust": True})
+        second = FakeElement("Trust", prompt_semantics={"trust": True})
+        page = FakePage(buttons=[first, second], state={"trustPrompt": True})
+
+        self.assertFalse(click_trust_browser(page, pause=lambda *_: None))
+
+        self.assertEqual(page.actions.calls, [])
+
+    def test_trust_semantics_walks_visible_ancestors_without_using_document_body(self):
+        trust = FakeElement("Trust", prompt_semantics={"trust": True})
+
+        self.assertTrue(account_flow.button_has_prompt_semantics(trust, "trust"))
+
+        # The fake only exposes the semantic return; capture the generated JS
+        # through a tiny wrapper so the regression locks the fieldset-parent
+        # traversal that fixed Apple's current markup.
+        captured = {}
+
+        def capture(script_text):
+            captured["script"] = script_text
+            return True
+
+        trust.run_js = capture
+        self.assertTrue(account_flow.button_has_prompt_semantics(trust, "trust"))
+        self.assertIn("current = current.parentElement", captured["script"])
+        self.assertIn("tag === 'body' || tag === 'html'", captured["script"])
 
     def test_never_clicks_a_dont_trust_button(self):
         reject = FakeElement("Don't Trust")
@@ -8711,11 +8791,14 @@ class TrustBrowserTests(unittest.TestCase):
         unrelated_continue = FakeElement("Continue")
         trust = FakeElement("Trust")
         frame = FakePage(buttons=[trust], state={"trustPrompt": True})
+        iframe = FakeElement(attrs={"src": frame.state["href"]})
         page = FakePage(
+            {"css:iframe": [iframe]},
             buttons=[unrelated_continue],
             frames=[frame],
             state={"trustPrompt": False},
         )
+        frame.parent = page
 
         clicked = click_trust_browser(page, pause=lambda *_: None)
 
@@ -8724,6 +8807,62 @@ class TrustBrowserTests(unittest.TestCase):
         self.assertEqual(trust.clicks, 0)
         self.assertNotIn(("human_click", unrelated_continue), page.actions.calls)
         self.assertIn(("human_click", trust), frame.actions.calls)
+
+    def test_trust_clicks_an_opaque_child_only_when_anchored_to_an_apple_root(self):
+        for opaque_url in ("about:blank", "about:srcdoc"):
+            with self.subTest(opaque_url=opaque_url):
+                root_trust = FakeElement("Trust", prompt_semantics={"trust": True})
+                child_trust = FakeElement("Trust", prompt_semantics={"trust": True})
+                opaque_child = FakePage(
+                    buttons=[child_trust],
+                    state={"href": opaque_url, "trustPrompt": True},
+                )
+                iframe = FakeElement(attrs={"src": opaque_url})
+                apple_root = FakePage(
+                    {"css:iframe": [iframe]},
+                    buttons=[root_trust],
+                    frames=[opaque_child],
+                    state={
+                        "href": "https://idmsa.apple.com/IDMSWebAuth/signin",
+                        "trustPrompt": False,
+                    },
+                )
+                opaque_child.parent = apple_root
+
+                self.assertTrue(click_trust_browser(apple_root, pause=lambda *_: None))
+
+                self.assertNotIn(("human_click", root_trust), apple_root.actions.calls)
+                self.assertIn(("human_click", child_trust), opaque_child.actions.calls)
+
+    def test_trust_rejects_an_opaque_child_under_a_non_apple_parent(self):
+        trust = FakeElement("Trust", prompt_semantics={"trust": True})
+        opaque_child = FakePage(
+            buttons=[trust],
+            state={"href": "about:blank", "trustPrompt": True},
+        )
+        iframe = FakeElement(attrs={"src": "about:blank"})
+        non_apple_parent = FakePage(
+            {"css:iframe": [iframe]},
+            frames=[opaque_child],
+            state={"href": "https://evil.example/trust", "trustPrompt": False},
+        )
+        opaque_child.parent = non_apple_parent
+
+        self.assertFalse(click_trust_browser(non_apple_parent, pause=lambda *_: None))
+
+        self.assertEqual(non_apple_parent.actions.calls, [])
+        self.assertEqual(opaque_child.actions.calls, [])
+
+    def test_trust_rejects_an_opaque_top_level_document(self):
+        trust = FakeElement("Trust", prompt_semantics={"trust": True})
+        opaque_top_level = FakePage(
+            buttons=[trust],
+            state={"href": "about:blank", "trustPrompt": True},
+        )
+
+        self.assertFalse(click_trust_browser(opaque_top_level, pause=lambda *_: None))
+
+        self.assertEqual(opaque_top_level.actions.calls, [])
 
     def test_trust_click_rejects_a_non_apple_prompt_frame(self):
         trust = FakeElement("Trust")
@@ -8785,7 +8924,7 @@ class TrustBrowserTests(unittest.TestCase):
         page = FakePage(
             shadow_roots=[shadow_root],
             state={
-                "trustPrompt": False,
+                "trustPrompt": True,
                 "twofa": False,
                 "trusted": False,
                 "error": False,
@@ -8800,6 +8939,7 @@ class TrustBrowserTests(unittest.TestCase):
                     "href": "https://account.apple.com/account/manage",
                     "trusted": True,
                     "accountMarker": True,
+                    "trustPrompt": False,
                 }
             )
             page._shadow_roots = []
@@ -8833,14 +8973,17 @@ class TrustBrowserTests(unittest.TestCase):
             state={
                 "href": "https://account.apple.com/account/manage",
                 "accountMarker": True,
-                "trustPrompt": False,
+                "trustPrompt": True,
                 "twofa": False,
                 "error": False,
                 "password": False,
                 "email": False,
             },
         )
-        trust.on_click = lambda: setattr(page, "_shadow_roots", [])
+        trust.on_click = lambda: (
+            page.state.__setitem__("trustPrompt", False),
+            setattr(page, "_shadow_roots", []),
+        )
 
         def click_without_pause(current_page, **_kwargs):
             return click_trust_browser(current_page, pause=lambda *_: None)
@@ -8867,14 +9010,17 @@ class TrustBrowserTests(unittest.TestCase):
             state={
                 "href": "https://account.apple.com/account/manage",
                 "accountMarker": True,
-                "trustPrompt": False,
+                "trustPrompt": True,
                 "twofa": False,
                 "error": False,
                 "password": False,
                 "email": False,
             },
         )
-        trust.on_click = lambda: setattr(page, "_shadow_roots", [])
+        trust.on_click = lambda: (
+            page.state.__setitem__("trustPrompt", False),
+            setattr(page, "_shadow_roots", []),
+        )
 
         def click_without_pause(current_page, **_kwargs):
             return click_trust_browser(current_page, pause=lambda *_: None)
@@ -9007,10 +9153,70 @@ class TrustBrowserTests(unittest.TestCase):
                     pause=lambda *_: None,
                 )
 
+    def test_developer_automatic_otp_clicks_trust_once_then_confirms_the_shell(self):
+        page = FakePage(
+            state={
+                "href": "https://idmsa.apple.com/appleauth/auth/verify",
+                "trustPrompt": True,
+                "twofa": False,
+                "trusted": False,
+                "error": False,
+                "password": False,
+                "email": False,
+            }
+        )
+        clicks = []
+        events = []
+
+        def click_trust(_page, **_kwargs):
+            clicks.append("trust")
+            page.state.update(
+                {
+                    "href": "https://developer.apple.com/account",
+                    "trustPrompt": False,
+                    "twofa": False,
+                    "error": False,
+                }
+            )
+            return True
+
+        def developer_shell_probe(_page):
+            if not clicks:
+                return None
+            return {
+                "href": "https://developer.apple.com/account",
+                "developerAccountShell": True,
+                "trusted": True,
+                "error": False,
+            }
+
+        with patch(
+            "apple_account_flow.click_trust_browser", side_effect=click_trust
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                session_probe=developer_shell_probe,
+            )
+
+        self.assertTrue(state["developerAccountShell"])
+        self.assertEqual(clicks, ["trust"])
+        phases = [
+            event.get("phase")
+            for event in events
+            if event.get("status") == "twofa_progress"
+        ]
+        self.assertEqual(phases, ["trust_prompt_detected", "trust_click_sent"])
+
     def test_shadow_trust_cannot_be_clicked_again_after_deadline_when_state_omits_prompt(self):
         initial_state = {
             "href": "https://idmsa.apple.com/appleauth/auth/verify",
-            "trustPrompt": False,
+            "trustPrompt": True,
             "twofa": False,
             "trusted": False,
             "error": False,
@@ -9027,7 +9233,7 @@ class TrustBrowserTests(unittest.TestCase):
             "apple_account_flow.time.monotonic",
             side_effect=[0.0, 1.0],
         ):
-            with self.assertRaisesRegex(RuntimeError, "trust-browser state did not settle"):
+            with self.assertRaisesRegex(RuntimeError, "trust-browser prompt"):
                 account_flow.settle_trust_state(
                     FakePage(),
                     initial_state,

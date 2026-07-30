@@ -287,6 +287,7 @@ async function runFlowAuditForwardingTest() {
       sessionConfirmed: true,
       accountHomeConfirmed: false,
       twofaVisible: true,
+      trustPrompt: false,
       inputReady: true,
       codeInputCount: 6,
       authenticationError: false,
@@ -520,6 +521,7 @@ async function runFlowAuditForwardingTest() {
       sessionConfirmed: true,
       accountHomeConfirmed: false,
       twofaVisible: true,
+      trustPrompt: false,
       inputReady: true,
       codeInputCount: 6,
       authenticationError: false,
@@ -1624,6 +1626,131 @@ async function runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest(
   assert.equal(JSON.stringify({ result, entries }).includes(SECRET_FIXTURE), false);
 }
 
+async function runDeveloperTrustPromptStatusSanitizationTest() {
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  const harness = createRuntime(
+    async (options) => {
+      for (const event of [
+        {
+          event: "status",
+          status: "twofa_progress",
+          phase: "trust_prompt_detected",
+          generation: 1,
+          url: SECRET_FIXTURE,
+          query: SECRET_FIXTURE,
+          otp: SECRET_FIXTURE,
+          pageText: SECRET_FIXTURE,
+        },
+        {
+          event: "status",
+          status: "browser_observation",
+          checkpoint: "twofa_transition",
+          generation: 1,
+          pageKind: "trust_prompt",
+          trustPrompt: true,
+          url: SECRET_FIXTURE,
+          href: SECRET_FIXTURE,
+          pageText: SECRET_FIXTURE,
+        },
+        {
+          event: "status",
+          status: "twofa_progress",
+          phase: "trust_prompt_detected",
+          generation: 1,
+          message: SECRET_FIXTURE,
+        },
+        {
+          event: "status",
+          status: "twofa_progress",
+          phase: "trust_click_sent",
+          generation: 1,
+          code: SECRET_FIXTURE,
+          pageText: SECRET_FIXTURE,
+        },
+      ]) {
+        await options.onEvent(event);
+      }
+      return successfulResult();
+    },
+    { terminalDebug: true }
+  );
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+    });
+  });
+
+  assert.equal(result.browserLogin.accountHomeConfirmed, true);
+  assert.deepEqual(warnings, []);
+  const trustProgressEvents = entries.filter(
+    (entry) =>
+      entry.source === "ruyipage" &&
+      entry.event === "status" &&
+      entry.details.status === "twofa_progress" &&
+      ["trust_prompt_detected", "trust_click_sent"].includes(entry.details.phase)
+  );
+  assert.deepEqual(
+    trustProgressEvents.map((entry) => entry.details),
+    [
+      {
+        status: "twofa_progress",
+        phase: "trust_prompt_detected",
+        generation: 1,
+      },
+      {
+        status: "twofa_progress",
+        phase: "trust_prompt_detected",
+        generation: 1,
+      },
+      {
+        status: "twofa_progress",
+        phase: "trust_click_sent",
+        generation: 1,
+      },
+    ]
+  );
+  const trustObservation = entries.find(
+    (entry) =>
+      entry.source === "ruyipage" &&
+      entry.event === "status" &&
+      entry.details.status === "browser_observation" &&
+      entry.details.pageKind === "trust_prompt"
+  );
+  assert.equal(trustObservation?.details.trustPrompt, true);
+  assert.equal(Object.hasOwn(trustObservation?.details ?? {}, "url"), false);
+  assert.equal(Object.hasOwn(trustObservation?.details ?? {}, "href"), false);
+  assert.equal(Object.hasOwn(trustObservation?.details ?? {}, "pageText"), false);
+  assert.equal(
+    logs.filter((line) => line === "[→] 正在处理“信任此浏览器”确认").length,
+    1
+  );
+  assert.equal(
+    logs.filter((line) => line === "[✓] 已点击“信任此浏览器”确认").length,
+    1
+  );
+  assert.equal(
+    logs.filter(
+      (line) => line === "[ruyipage] status:twofa:trust_prompt_detected:generation:1"
+    ).length,
+    2
+  );
+  assert.ok(logs.includes("[ruyipage] status:twofa:trust_click_sent:generation:1"));
+  assert.ok(
+    logs.some(
+        (line) =>
+          line.includes("[ruyipage] observation:twofa_transition:generation:1:page:trust_prompt:") &&
+        line.includes(":trust_prompt:1:")
+    )
+  );
+  assert.equal(
+    JSON.stringify({ entries, logs, warnings, result }).includes(SECRET_FIXTURE),
+    false
+  );
+}
+
 async function runUnauthenticatedDeveloperFailureStopsAccountModuleTest() {
   const storedMemberships = [];
   const { entries, flowAudit } = createDeveloperMembershipAudit();
@@ -2600,7 +2727,7 @@ async function runBrowserStageTerminalOutputTest() {
   );
   assert.ok(
     debugLogs.includes(
-      "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:root_security_copy:0:retiring_child:0:child_auth:0"
+      "[ruyipage] observation:account_information:generation:0:page:account_information:session:1:home:1:alive:1:inspection_available:1:twofa:0:trust_prompt:0:input:0:cells:0:auth_error:0:root_manage:0:root_marker:0:root_error:0:root_security_copy:0:retiring_child:0:child_auth:0"
     )
   );
   assert.ok(
@@ -3830,11 +3957,13 @@ const focusedTests = {
     await runDeveloperMembershipPersistenceTest();
     await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
     await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+    await runDeveloperTrustPromptStatusSanitizationTest();
     await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();
     await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();
     await runDeveloperTwoFactorUnavailableStopsAccountModuleTest();
     await runDeveloperMembershipGateStopTest();
   },
+  "developer-trust": runDeveloperTrustPromptStatusSanitizationTest,
   "developer-membership-gate": runDeveloperMembershipGateStopTest,
   "profile-persistence-partial": runProfilePersistenceFailureReturnsPartialTest,
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
@@ -3902,6 +4031,7 @@ await runProfilePersistenceAndAuditRedactionTest();
 await runDeveloperMembershipPersistenceTest();
 await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
 await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+await runDeveloperTrustPromptStatusSanitizationTest();
 await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();
 await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();
 await runDeveloperTwoFactorUnavailableStopsAccountModuleTest();
