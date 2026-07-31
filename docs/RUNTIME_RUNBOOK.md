@@ -75,7 +75,7 @@ APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0
 waiting / dynamic hydration
   -> optional phone_selection (max 3 bound actions)
   -> stable code_entry twice
-  -> provider poll + one bounded code write
+  -> provider poll + up to three bounded writes of the same verified code
   -> code_pending / transition grace
   -> waiting observed twice
   -> initial post-SMS observation grace (up to 90s)
@@ -84,6 +84,8 @@ waiting / dynamic hydration
 ~~~
 
 - 号码选择页可能不出现；六码页必须实际出现并稳定后才会开始取码。
+- 同一个已验证验证码只会在重新确认的空六码页上最多写入三次；超过额度保留当前
+  页面，等待人工完成并按回车恢复状态扫描。
 - 六码页消失后的首次后置扫描保留最长 90 秒观察窗口；即使 signed-in probe 已经
   为真，也会继续探测动态条款、定位或人工页面，直到窗口结束或出现具体模块。
 - 每个同一 `stage + PID + window` 的自动后置动作最多三次。条款和定位可自动处理；

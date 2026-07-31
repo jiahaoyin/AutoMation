@@ -46,9 +46,10 @@ then waits for the existing signed-in confirmation.
    six-digit candidate.  A candidate explicitly associated with a different
    suffix is rejected; an unassociated single candidate is accepted because
    provider responses are single-number pages.
-5. Submit the code to the AX helper.  Apple advances automatically, so the
-   coordinator must not invoke a second submit action. It first waits for the
-   populated group to disappear and observes the empty transition twice.
+5. Submit the code to the AX helper. It first waits for the populated group to
+   disappear and observes the empty transition twice. If the same verified
+   six-cell surface resets empty, the coordinator may retry the same code up to
+   three bounded writes; it never fetches or writes a second code speculatively.
 6. Keep an initial post-SMS observation window for up to 90 seconds before a
    signed-in result may finish the run. This allows network-loaded Terms,
    Location, or manual pages to appear after the code sheet disappears.
