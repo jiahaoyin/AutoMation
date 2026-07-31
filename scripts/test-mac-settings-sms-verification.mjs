@@ -413,14 +413,28 @@ await expectCode("MAC_SETTINGS_SMS_TIMEOUT", async () => {
     { ok: true, stage: "waiting" },
   ]);
   const progress = [];
+  let providerObservedAfterStateReads = null;
   const result = await completeSupervisedMacSettingsSmsVerification(
     baseOptions({
       nativeRunner: sequence.runner,
-      manualCodeProvider: async () => "246810",
+      codeProvider: async () => {
+        providerObservedAfterStateReads = sequence.calls.filter(
+          ({ phase }) => phase === "sms-state"
+        ).length;
+        return "246810";
+      },
+      manualCodeProvider: async () => {
+        throw new Error("provider code must be used after the stable six-cell page");
+      },
       onProgress: (event) => progress.push(event),
     })
   );
   assert.deepEqual(result, { status: "submitted" });
+  assert.equal(
+    providerObservedAfterStateReads,
+    4,
+    "provider polling must wait for two consecutive code-entry reads, after the transient waiting probes"
+  );
   assert.deepEqual(
     sequence.calls.map(({ phase }) => phase),
     [
@@ -765,7 +779,9 @@ const loginSource = fs.readFileSync(
 assert.match(loginSource, /isMacSettingsSmsHelperAvailable/);
 assert.match(
   loginSource,
-  /if \(!isMacSettingsSmsHelperAvailable\(\)\)[\s\S]{0,320}complete SMS verification manually/
+  /if \(!isMacSettingsSmsHelperAvailable\(\)\)[\s\S]{0,320}请在系统设置中人工完成短信验证/
 );
+assert.doesNotMatch(loginSource, /\[Mac Settings\]|\[SMS\]/);
+assert.match(loginSource, /按回车键/);
 
 console.log("mac settings supervised sms verification: ok");

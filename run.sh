@@ -5,9 +5,8 @@ cd "$(dirname "$0")"
 # Never pass a shell-provided SMS pair through bootstrap or preflight children.
 # credentials.js later reads the saved .env pair as data and immediately hands it
 # to the SMS runtime snapshot, keeping child environments clear of those values.
-if [[ -n "${APPLE_AUTOMATION_SMS_PHONE:-}" || -n "${APPLE_AUTOMATION_SMS_API_URL:-}" ]]; then
-  export APPLE_AUTOMATION_SMS_ENABLED=1
-fi
+# SMS defaults to enabled in the coordinator; this launcher must not overwrite
+# an explicit APPLE_AUTOMATION_SMS_ENABLED=0 from the saved configuration.
 unset APPLE_AUTOMATION_SMS_PHONE APPLE_AUTOMATION_SMS_API_URL APPLE_AUTOMATION_MANUAL_SMS_CODE
 
 launcher_trim_value() {

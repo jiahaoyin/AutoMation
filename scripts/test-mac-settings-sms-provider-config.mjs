@@ -13,7 +13,7 @@ import {
 } from "./lib/mac-settings-login.js";
 import { sanitizedAxFillChildEnv } from "./lib/mac-settings-ax-fill.js";
 
-assert.equal(isMacSettingsSmsRuntimeEnabled({}), false);
+assert.equal(isMacSettingsSmsRuntimeEnabled({}), true);
 assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_ENABLED: "1" }), true);
 assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_PHONE: "+8613800130051" }), true);
 assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_API_URL: "https://example.test/record?token=private" }), true);
@@ -26,6 +26,13 @@ assert.equal(
   false
 );
 assert.equal(isMacSettingsSmsRuntimeEnabled({ APPLE_AUTOMATION_SMS_RECONFIGURE: "1" }), true);
+assert.equal(
+  isMacSettingsSmsRuntimeEnabled({
+    APPLE_AUTOMATION_SMS_ENABLED: "0",
+    APPLE_AUTOMATION_SMS_RECONFIGURE: "1",
+  }),
+  false
+);
 assert.equal(isMacSettingsSmsReconfigureRequested({ APPLE_AUTOMATION_SMS_RECONFIGURE: "1" }), true);
 assert.equal(isMacSettingsSmsReconfigureRequested({ APPLE_AUTOMATION_SMS_RECONFIGURE: "0" }), false);
 const secretEnvFixture = {
@@ -211,6 +218,66 @@ assert.equal(
   assert.ok(
     signedInProbeTimes[0] - submissionAt >= transitionGraceMs,
     "a transient no-modal observation must not release signed-in detection before transition grace"
+  );
+}
+
+// Immediately after the mandatory six-cell page advances, System Settings can
+// report an empty surface before a network-loaded Terms/Location module is
+// available. A positive signed-in probe must not end the flow during that
+// initial observation window.
+{
+  let postSmsCalls = 0;
+  let actionCalls = 0;
+  let signedInChecks = 0;
+  const transitionEvents = [];
+  const delayedBinding = { axOwnerPid: 351, visualOwnerPid: 352, windowId: 353 };
+  const delayedTerms = {
+    ok: true,
+    stage: "terms",
+    digits: null,
+    binding: delayedBinding,
+  };
+
+  assert.deepEqual(
+    await waitForMacSettingsLoginComplete({
+      timeoutMs: 2_000,
+      intervalMs: 1,
+      settleMs: 0,
+      postSmsIntervalMs: 1,
+      postSmsTransitionGraceMs: 600,
+      postSmsInitialObservationGraceMs: 1_000,
+      initialPostSmsObservation: true,
+      sleep: async () => {},
+      isSignedIn: async () => {
+        signedInChecks += 1;
+        return true;
+      },
+      onEvent: (event) => transitionEvents.push(event),
+      postSmsFinalization: async ({ beforeSubmit, probeOnly }) => {
+        postSmsCalls += 1;
+        if (postSmsCalls <= 2) {
+          assert.equal(probeOnly, false);
+          return { status: "not_required" };
+        }
+        if (postSmsCalls === 3) {
+          assert.equal(probeOnly, false);
+          assert.equal(beforeSubmit(delayedTerms), true);
+          actionCalls += 1;
+          return { status: "submitted", stage: "terms", binding: delayedBinding };
+        }
+        return { status: "not_required" };
+      },
+    }),
+    { signedIn: true }
+  );
+  assert.equal(actionCalls, 1, "the delayed post-SMS module must be handled before sign-in is accepted");
+  assert.ok(postSmsCalls >= 4, "the scanner must observe the post-action transition before accepting sign-in");
+  assert.equal(signedInChecks, 2, "the only signed-in probes are the final and settle checks");
+  assert.ok(
+    transitionEvents.some(
+      (event) => event.event === "post_sms_transition_waiting" && event.stage === "waiting"
+    ),
+    "the initial dynamic-load grace must be visible in the audit stream"
   );
 }
 

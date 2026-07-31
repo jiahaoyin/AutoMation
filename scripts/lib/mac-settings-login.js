@@ -382,13 +382,9 @@ export async function isMacSettingsSignedIn() {
 }
 
 export function isMacSettingsSmsRuntimeEnabled(env = process.env) {
-  if (env.APPLE_AUTOMATION_SMS_RECONFIGURE === "1") return true;
-  if (env.APPLE_AUTOMATION_SMS_ENABLED === "0") return false;
-  if (env.APPLE_AUTOMATION_SMS_ENABLED === "1") return true;
-  return (
-    Boolean(env.APPLE_AUTOMATION_SMS_PHONE?.trim()) ||
-    Boolean(env.APPLE_AUTOMATION_SMS_API_URL?.trim())
-  );
+  // SMS is on by default. Reconfiguration only controls how provider details
+  // are collected and must never override an explicit runtime opt-out.
+  return env.APPLE_AUTOMATION_SMS_ENABLED !== "0";
 }
 
 /**
@@ -531,6 +527,14 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
     options.postSmsProbeGraceMs,
     90_000
   );
+  // The six-cell page can disappear before System Settings has rendered the
+  // next optional module. Keep one bounded observation window after a known
+  // SMS completion so a transient empty surface cannot be mistaken for the
+  // final signed-in state.
+  const postSmsInitialObservationGraceMs = boundedPositiveInteger(
+    options.postSmsInitialObservationGraceMs,
+    postSmsProbeGraceMs
+  );
   const now = options.now ?? Date.now;
   const maxPostSmsModuleRounds = boundedPositiveInteger(
     options.maxPostSmsModuleRounds,
@@ -540,6 +544,9 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
   const blockedPostSmsModules = new Set();
   const promptedPostSmsModules = new Set();
   let pendingPostSmsTransition = null;
+  let initialPostSmsObservationUntil = options.initialPostSmsObservation === true
+    ? now() + postSmsInitialObservationGraceMs
+    : 0;
   let unboundPostSmsProbeFailures = 0;
   let unboundPostSmsProbeStartedAt = 0;
   let postSmsDisabled = false;
@@ -568,7 +575,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
     if (promptedPostSmsModules.has(manualKey)) return false;
     promptedPostSmsModules.add(manualKey);
     console.warn(
-      `[Mac Settings] ${postSmsStageLabel(result?.stage)} requires manual completion; press Enter after that step to resume dynamic scanning.`
+      `[Mac 设置] ${postSmsStageLabel(result?.stage)}需要人工完成；完成后请按回车键，脚本将继续扫描后续页面。`
     );
     emitMacSettingsEvent(onEvent, "post_sms_manual_required", {
       module: "post_sms",
@@ -601,7 +608,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
   };
 
   await waitUntil(
-    "[Mac Settings] Complete any remaining System Settings verification steps. The script will keep scanning until the signed-in state is confirmed.",
+    "[Mac 设置] 请完成剩余的系统设置验证步骤。脚本会持续扫描，直到确认登录成功。",
     async () => {
       if (
         typeof postSmsFinalization === "function" &&
@@ -666,6 +673,15 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
           identity: identity ?? "unidentified",
           probeOnly: Boolean(pending),
         });
+        if (
+          initialPostSmsObservationUntil > 0 &&
+          result?.status !== "not_required" &&
+          !(result?.status === "retryable" && !identity)
+        ) {
+          // A concrete module (or its own retry state) now owns the next
+          // transition. The initial no-modal guard has done its job.
+          initialPostSmsObservationUntil = 0;
+        }
         if (pending) {
           if (result?.status === "state_observed" && identity === pending.identity) {
             // During the grace window only observe the same modal. No duplicate
@@ -775,6 +791,24 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
         });
         return false;
       }
+      if (initialPostSmsObservationUntil > 0) {
+        if (now() < initialPostSmsObservationUntil) {
+          // The preceding probe already scheduled its next observation.
+          // Do not re-arm that timer on every outer login tick: doing so can
+          // defer the scan until this whole grace window expires.
+          emitMacSettingsEvent(onEvent, "post_sms_transition_waiting", {
+            module: "post_sms",
+            stage: "waiting",
+          });
+          emitMacSettingsEvent(onEvent, "signed_in_probe", {
+            module: "login",
+            signedIn: false,
+            outcome: "deferred",
+          });
+          return false;
+        }
+        initialPostSmsObservationUntil = 0;
+      }
       // Enter only resumes the scanner. It never acts as a signed-in marker.
       const signedInResult = await signedInProbe();
       const signedIn = signedInResult.signedIn === true;
@@ -804,7 +838,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
   if (!ok) {
     throw new Error("MAC_SETTINGS_LOGIN_NOT_CONFIRMED");
   }
-  console.log("[Mac Settings] Signed-in state confirmed.");
+  console.log("[Mac 设置] 已确认 Apple ID 登录成功。");
   return { signedIn: true };
 }
 /**
@@ -839,6 +873,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
 
   const smsEnv = { ...process.env, ...(options.smsEnv ?? {}) };
   let smsConfig = null;
+  let smsCompletionObserved = false;
   if (isMacSettingsSmsRuntimeEnabled(smsEnv)) {
     try {
       smsConfig = await resolveMacSettingsSmsProviderConfig({ env: smsEnv });
@@ -860,7 +895,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
     try {
       saveMacSettingsSmsProviderConfig(smsConfig);
       emitMacSettingsEvent(options.onEvent, "sms_provider_config_saved", { module: "sms" });
-      console.log("[Mac Settings][SMS] SMS provider configuration saved to .env.");
+      console.log("[Mac 设置][短信] 已将短信服务配置写入 .env。");
     } catch {
       emitMacSettingsEvent(options.onEvent, "sms_provider_config_failed", {
         module: "sms",
@@ -881,7 +916,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
     if (!isMacSettingsSmsHelperAvailable()) {
       emitMacSettingsEvent(options.onEvent, "sms_helper_unavailable", { module: "sms" });
       console.warn(
-        "[Mac Settings][SMS] Native SMS helper is unavailable; complete SMS verification manually in System Settings."
+        "[Mac 设置][短信] 原生短信组件不可用，请在系统设置中人工完成短信验证。"
       );
       if (!canConfirmMacSettingsManually) {
         const error = new Error("MAC_SETTINGS_SMS_HELPER_UNAVAILABLE");
@@ -893,11 +928,12 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
         throw error;
       }
       await waitForEnter(
-        "\n[Mac Settings][SMS] Complete the mandatory six-digit verification page, then press Enter to begin post-SMS scanning…"
+        "\n[Mac 设置][短信] 请在当前六位验证码页面人工完成验证，然后按回车键开始扫描后续页面…"
       );
       emitMacSettingsEvent(options.onEvent, "sms_manual_handoff_acknowledged", { module: "sms" });
+      smsCompletionObserved = true;
     } else {
-      console.log("[Mac Settings][SMS] Waiting for the trusted destination and code entry.");
+      console.log("[Mac 设置][短信] 正在等待已配置号码的验证码输入页面。");
       emitMacSettingsEvent(options.onEvent, "sms_module_started", { module: "sms" });
       let smsResult;
       try {
@@ -909,7 +945,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
           canConfirmMacSettingsManually
             ? async ({ stage }) => {
                 await waitForEnter(
-                  `\n[Mac 设置] 已保留当前系统设置页面（${smsStageLabel(stage)}）。请人工完成后按 Enter 继续…`
+                  `\n[Mac 设置] 已保留当前系统设置页面（${smsStageLabel(stage)}）。请人工完成后按回车键继续…`
                 );
                 return true;
               }
@@ -925,7 +961,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
             code_submitted: "验证码已写入，等待下一确认模块",
             code_transition_observed: "验证码页面已跳转，继续后续确认",
           }[event];
-          if (message) console.log(`[Mac 设置][SMS] ${message}`);
+          if (message) console.log(`[Mac 设置][短信] ${message}`);
         },
           onEvent: options.onEvent,
         });
@@ -941,18 +977,20 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
         status: smsResult?.status ?? "invalid",
         stage: smsResult?.stage ?? "waiting",
       });
+      smsCompletionObserved =
+        smsResult?.status === "submitted" || smsResult?.status === "manual_completed";
       if (smsResult?.status === "manual_completed") {
         console.log(
-          "[Mac Settings][SMS] Manual step acknowledged; SMS state advanced. Re-scanning before post-SMS."
+          "[Mac 设置][短信] 已确认人工步骤完成，短信页面已推进；正在重新扫描后续页面。"
         );
       } else {
         console.log(
-          "[Mac Settings][SMS] Verification code submitted. Apple will continue automatically; finish any remaining screens in System Settings."
+          "[Mac 设置][短信] 验证码已提交，等待 Apple 自动继续；如出现后续系统设置页面，请按终端提示处理。"
         );
       }
     }
   } else {
-    console.log("\n[Mac Settings] Credentials submitted. Complete SMS verification manually if shown.");
+    console.log("\n[Mac 设置] 账号密码已提交；如出现短信验证，请在系统设置中人工完成。");
   }
   const postSmsEnabled = isMacSettingsPostSmsFinalizationEnabled(smsEnv);
   if (!postSmsEnabled) {
@@ -961,8 +999,12 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
       outcome: "unavailable",
     });
   }
+  if (postSmsEnabled && smsCompletionObserved) {
+    console.log("[Mac 设置][后续确认] 正在等待动态页面加载并扫描后续确认。");
+  }
   try {
     await waitForMacSettingsLoginComplete({
+    initialPostSmsObservation: postSmsEnabled && smsCompletionObserved,
     postSmsFinalization: postSmsEnabled
       ? ({ beforeSubmit, probeOnly } = {}) =>
           completeMacSettingsPostSmsFinalization({
@@ -978,7 +1020,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
       postSmsEnabled && canConfirmMacSettingsManually
         ? async ({ stage }) => {
             await waitForEnter(
-              `\n[Mac 设置] 请人工完成${postSmsStageLabel(stage)}，然后按 Enter 继续自动扫描…`
+              `\n[Mac 设置] 请人工完成${postSmsStageLabel(stage)}，然后按回车键继续自动扫描…`
             );
             return true;
           }

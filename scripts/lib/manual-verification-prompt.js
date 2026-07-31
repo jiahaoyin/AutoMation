@@ -1,8 +1,8 @@
 const VERIFICATION_PROMPT =
-  "[Verification] Enter the 6-digit verification code shown on this Mac: ";
+  "[验证码] 请输入此 Mac 显示的 6 位验证码（输入内容不会显示）: ";
 
 const DEVICE_PASSCODE_PROMPT =
-  "[Mac Settings] Enter the iPhone passcode in this terminal (input is hidden): ";
+  "[Mac 设置] 请在此终端输入 iPhone 解锁密码（输入内容不会显示）: ";
 
 /**
  * Read a caller-bounded ASCII numeric value without echoing terminal input.

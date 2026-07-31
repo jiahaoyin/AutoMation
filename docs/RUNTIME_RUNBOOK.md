@@ -59,6 +59,18 @@ sequenceDiagram
 
 完整 `./run.sh` 的 System Settings 阶段按页面状态推进，不按固定等待时间推进：
 
+SMS 与后置动态接续默认都开启：开关未设置或设为 `1` 均表示开启，设为 `0` 才表示关闭。
+正常情况下不需要在 `.env` 写入这两个开关；仅在需要关闭对应模块时加入：
+
+~~~bash
+APPLE_AUTOMATION_SMS_ENABLED=0
+APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0
+~~~
+
+旧 `.env` 中已有的 `=0` 仍表示明确关闭；删除对应行或改为 `1`，即可恢复默认开启。
+
+`APPLE_AUTOMATION_SMS_RECONFIGURE` 只控制号码和短信服务地址是否重新录入：`1` 开启重新配置，`0` 关闭重新配置并沿用已有配置。它不会覆盖 `APPLE_AUTOMATION_SMS_ENABLED=0`。
+
 ~~~text
 waiting / dynamic hydration
   -> optional phone_selection (max 3 bound actions)

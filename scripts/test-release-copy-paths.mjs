@@ -487,6 +487,11 @@ assert.match(
 );
 
 const rootRunSh = fs.readFileSync(new URL("../run.sh", import.meta.url), "utf-8");
+assert.doesNotMatch(
+  rootRunSh,
+  /export APPLE_AUTOMATION_SMS_ENABLED=1/,
+  "launcher must not override an explicit SMS opt-out"
+);
 assert.equal(
   rootRunSh.replaceAll("\r\n", "\n"),
   generatedRunSh.replaceAll("\r\n", "\n"),
@@ -551,10 +556,11 @@ assert.match(
 const envExample = fs.readFileSync(new URL("../.env.example", import.meta.url), "utf-8");
 assert.match(envExample, /运行 \.\/run\.sh/);
 assert.doesNotMatch(envExample, /杩愯/);
-assert.match(envExample, /^APPLE_AUTOMATION_SMS_ENABLED=0$/m);
+assert.match(envExample, /^# APPLE_AUTOMATION_SMS_ENABLED=0$/m);
 assert.match(envExample, /^APPLE_AUTOMATION_SMS_PHONE=$/m);
 assert.match(envExample, /^APPLE_AUTOMATION_SMS_API_URL=$/m);
 assert.match(envExample, /^APPLE_AUTOMATION_SMS_RECONFIGURE=0$/m);
+assert.match(envExample, /^# APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0$/m);
 assert.match(envExample, /RUYIPAGE_BACKEND_TIMEOUT_MS=720000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_AFTER_MS=30000/);
 assert.match(envExample, /BROWSER_2FA_SETTINGS_FALLBACK=1/);

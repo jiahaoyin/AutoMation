@@ -12,12 +12,14 @@ then waits for the existing signed-in confirmation.
 
 ## Activation and Boundaries
 
-- The flow remains macOS-only, TTY-only, and requires explicit operator intent.
-- `APPLE_AUTOMATION_SMS_ENABLED=1` enables the flow.  A valid saved phone/URL
-  pair is reused without prompting.  An absent, partial, or invalid pair is
+- The flow remains macOS-only and TTY-only. It is enabled by default: an
+  omitted value or `APPLE_AUTOMATION_SMS_ENABLED=1` enables it, while `=0`
+  explicitly disables it. A valid saved phone/URL pair is reused without
+  prompting. An absent, partial, or invalid pair is
   treated as an incomplete terminal entry: it emits a fixed, non-secret prompt
   and asks for the complete pair again instead of aborting the account flow.
-- `APPLE_AUTOMATION_SMS_RECONFIGURE=1` explicitly requests replacement input.
+- `APPLE_AUTOMATION_SMS_RECONFIGURE=1` enables replacement input; `=0` keeps
+  the saved pair. It does not override `APPLE_AUTOMATION_SMS_ENABLED=0`.
   The complete validated pair is atomically written to `.env` with mode `0600`,
   and the saved reconfigure flag is reset to `0` only after the write succeeds.
 - The existing supervised-GUI orchestration continues to work unchanged; the

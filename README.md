@@ -181,7 +181,14 @@ BROWSER_2FA_SETTINGS_AFTER_MS=30000
 BROWSER_2FA_SETTINGS_FALLBACK=1
 BROWSER_2FA_MANUAL_FALLBACK=1
 BROWSER_2FA_POLL_MS=800
+# Mac 系统设置：SMS 与后置动态接续默认开启；1=开启，0=关闭。
+# 只有需要关闭时才在 .env 中写入：
+# APPLE_AUTOMATION_SMS_ENABLED=0
+# APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=0
+APPLE_AUTOMATION_SMS_RECONFIGURE=0 # 1=重新录入号码与服务地址；0=沿用已有配置
 ~~~
+
+旧 `.env` 中已有的这两个 `=0` 会继续按明确关闭处理；删除对应行或改为 `1` 即恢复默认开启。
 
 切换账号时优先用 **BROWSER_PROFILE_MODE=fresh**；连续调试同一会话时可使用默认 persistent profile。**BROWSER_ATTACH_EXISTING=1** 可接管已有 Firefox 会话，但执行顺序仍然是 Developer 判定在前、Account 资料采集在后。
 

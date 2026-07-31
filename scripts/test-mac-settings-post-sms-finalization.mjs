@@ -38,9 +38,13 @@ assert.equal(
 assert.equal(macSettingsPostSmsModuleIdentity({ stage: "waiting", binding: null }), null);
 assert.equal(macSettingsPostSmsModuleIdentity({ stage: "terms", binding: null }), null);
 
-assert.equal(isMacSettingsPostSmsFinalizationEnabled({}), false);
+assert.equal(isMacSettingsPostSmsFinalizationEnabled({}), true);
 assert.equal(
   isMacSettingsPostSmsFinalizationEnabled({ APPLE_AUTOMATION_SMS_ENABLED: "1" }),
+  true
+);
+assert.equal(
+  isMacSettingsPostSmsFinalizationEnabled({ APPLE_AUTOMATION_SMS_ENABLED: "0" }),
   true
 );
 assert.equal(
@@ -324,6 +328,46 @@ for (const [stateStage, phase, submittedStage] of [
   assert.deepEqual(result, { status: "submitted", stage: stateStage, binding });
   assert.deepEqual(calls.map(({ phase: calledPhase }) => calledPhase), ["state", phase]);
   assert.deepEqual(calls[1].binding, binding);
+}
+
+{
+  const terminal = { logs: [], warnings: [] };
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args) => terminal.logs.push(args.join(" "));
+  console.warn = (...args) => terminal.warnings.push(args.join(" "));
+  try {
+    const completed = await completeMacSettingsPostSmsFinalization({
+      platform: "darwin",
+      supervised: true,
+      isTTY: true,
+      nativeRunner: async (phase) =>
+        phase === "state"
+          ? { ok: true, stage: "terms", binding }
+          : { ok: true, stage: "terms_submitted" },
+    });
+    const failed = await completeMacSettingsPostSmsFinalization({
+      platform: "darwin",
+      supervised: true,
+      isTTY: true,
+      nativeRunner: async (phase) =>
+        phase === "state"
+          ? { ok: true, stage: "location", binding }
+          : { ok: false, stage: "manual_required" },
+    });
+    assert.deepEqual(completed, { status: "submitted", stage: "terms", binding });
+    assert.deepEqual(failed, {
+      status: "retryable",
+      stage: "location",
+      binding,
+      reason: "manual_required",
+    });
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(terminal.logs, ["[Mac 设置] 已处理后置弹窗：条款确认"]);
+  assert.deepEqual(terminal.warnings, ["[Mac 设置] 定位/查找 Mac 确认处理失败，保留页面供人工核对。"]);
 }
 
 {

@@ -11,11 +11,21 @@ const ACTION_BY_STAGE = new Map([
   ["iphone_unlock", "unlock-code"],
   ["location", "location"],
 ]);
+const TERMINAL_STAGE_LABELS = Object.freeze({
+  terms: "条款确认",
+  mac_password: "Mac 密码确认",
+  iphone_unlock: "iPhone 解锁码确认",
+  location: "定位/查找 Mac 确认",
+});
 // These two screens require a device-local secret that is intentionally not
 // kept in the automation runtime. Detect them accurately, retain the bound
 // Settings page, and hand them to the supervised operator instead of entering
 // placeholder values or repeatedly submitting a wrong secret.
 const MANUAL_STAGES = new Set(["mac_password", "iphone_unlock"]);
+
+function terminalStageLabel(stage) {
+  return TERMINAL_STAGE_LABELS[stage] ?? "后置确认页面";
+}
 
 function boundedPositive(value, fallback) {
   const candidate = value ?? fallback;
@@ -32,12 +42,9 @@ function resultFor(status, state = null, details = {}) {
 }
 
 export function isMacSettingsPostSmsFinalizationEnabled(env = process.env) {
-  if (env.APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED === "0") return false;
-  if (env.APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED === "1") return true;
-  // When the trusted SMS module is enabled, continue through its optional
-  // follow-up sheets by default. Explicit `=0` remains the opt-out for a
-  // supervised run that wants every post-SMS screen handled manually.
-  return env.APPLE_AUTOMATION_SMS_ENABLED === "1";
+  // The dynamic follow-up scan is independent of provider configuration and
+  // remains on unless it is explicitly disabled.
+  return env.APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED !== "0";
 }
 
 export function normalizeMacSettingsPostSmsState(value) {
@@ -168,12 +175,12 @@ export async function completeMacSettingsPostSmsFinalization(options = {}) {
     location: "location_submitted",
   }[state.stage];
   if (submitted?.ok === true && submitted.stage === expectedStage) {
-    console.log(`[Mac 设置] 已处理后置弹窗: ${state.stage}`);
+    console.log(`[Mac 设置] 已处理后置弹窗：${terminalStageLabel(state.stage)}`);
     emitEvent("action_completed", { stage: state.stage, phase });
     return resultFor("submitted", state);
   }
 
-  console.warn(`[Mac 设置] 后置弹窗处理失败: ${state.stage}，保留页面供人工核对。`);
+  console.warn(`[Mac 设置] ${terminalStageLabel(state.stage)}处理失败，保留页面供人工核对。`);
   const reason = normalizeMacSettingsPostSmsFailureReason(submitted?.reason ?? submitted?.stage);
   emitEvent("action_unconfirmed", { stage: state.stage, phase, reason });
   return resultFor("retryable", state, { reason });
