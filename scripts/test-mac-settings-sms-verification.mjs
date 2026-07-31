@@ -35,6 +35,7 @@ function baseOptions(overrides = {}) {
     supervised: true,
     isTTY: true,
     timeoutMs: 1_000,
+    manualContinuationGraceMs: 50,
     pollIntervalMs: 1,
     sleep: async () => {},
     ...overrides,
@@ -87,11 +88,11 @@ assert.deepEqual(sanitizeMacSettingsSmsNativeResult("sms-select", { ok: true, st
 });
 assert.deepEqual(
   sanitizeMacSettingsSmsNativeResult("sms-select", { ok: true, stage: "code_submitted" }),
-  { ok: false, stage: "invalid" }
+  { ok: false, stage: "invalid", reason: "invalid" }
 );
 assert.deepEqual(
   sanitizeMacSettingsSmsNativeResult("sms-code", { ok: true, stage: "continued" }),
-  { ok: false, stage: "invalid" }
+  { ok: false, stage: "invalid", reason: "invalid" }
 );
 
 {
@@ -182,6 +183,10 @@ await expectCode("MAC_SETTINGS_SMS_POLL_INTERVAL_INVALID", () =>
   const sequence = createSequenceRunner([
     { ok: true, stage: "phone_selection" },
     { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_pending" },
+    { ok: true, stage: "waiting" },
+    { ok: true, stage: "waiting" },
   ]);
   const result = await completeSupervisedMacSettingsSmsVerification(
     baseOptions({
@@ -192,15 +197,33 @@ await expectCode("MAC_SETTINGS_SMS_POLL_INTERVAL_INVALID", () =>
   assert.deepEqual(result, { status: "submitted" });
   assert.deepEqual(
     sequence.calls.map(({ phase }) => phase),
-    ["sms-state", "sms-select", "sms-continue", "sms-state", "sms-code"]
+    [
+      "sms-state",
+      "sms-select",
+      "sms-continue",
+      "sms-state",
+      "sms-state",
+      "sms-code",
+      "sms-state",
+      "sms-state",
+      "sms-state",
+    ]
   );
   assert.equal(sequence.calls[1].suffix, "51");
-  assert.equal(sequence.calls[4].suffix, "51");
-  assert.equal(sequence.calls[4].code, "123456");
+  const codeCall = sequence.calls.find(({ phase }) => phase === "sms-code");
+  assert.ok(codeCall, "the six-cell code page must be written only after stable detection");
+  assert.equal(codeCall.suffix, "51");
+  assert.equal(codeCall.code, "123456");
 }
 
 {
-  const sequence = createSequenceRunner([{ ok: true, stage: "code_entry" }]);
+  const sequence = createSequenceRunner([
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_pending" },
+    { ok: true, stage: "waiting" },
+    { ok: true, stage: "waiting" },
+  ]);
   await completeSupervisedMacSettingsSmsVerification(
     baseOptions({
       nativeRunner: sequence.runner,
@@ -209,7 +232,7 @@ await expectCode("MAC_SETTINGS_SMS_POLL_INTERVAL_INVALID", () =>
   );
   assert.deepEqual(
     sequence.calls.map(({ phase }) => phase),
-    ["sms-state", "sms-code"],
+    ["sms-state", "sms-state", "sms-code", "sms-state", "sms-state", "sms-state"],
     "a single trusted phone reaches the code page without a selection action"
   );
 }
@@ -259,6 +282,54 @@ await expectCode("MAC_SETTINGS_SMS_TIMEOUT", async () => {
   );
   assert.deepEqual(sequence.calls.map(({ phase }) => phase), ["sms-state"]);
 });
+
+// A populated six-cell page may still be validating when the original overall
+// deadline expires.  A supervised manual handoff extends observation only; two
+// independent waiting reads are still required before post-SMS can begin.
+{
+  let clock = 0;
+  let codeWritten = false;
+  let manualCalls = 0;
+  const calls = [];
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      timeoutMs: 20,
+      codeTransitionGraceMs: 1_000,
+      manualContinuationGraceMs: 100,
+      pollIntervalMs: 5,
+      stateReadAttempts: 1,
+      stableCodeEntryReads: 1,
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      nativeRunner: async (phase) => {
+        calls.push(phase);
+        if (phase === "sms-code") {
+          codeWritten = true;
+          return { ok: true, stage: "code_submitted" };
+        }
+        if (!codeWritten) return { ok: true, stage: "code_entry" };
+        if (manualCalls === 0) return { ok: true, stage: "code_pending" };
+        return { ok: true, stage: "waiting" };
+      },
+      manualCodeProvider: async () => "246810",
+      manualContinuation: async (context) => {
+        manualCalls += 1;
+        assert.deepEqual(context, {
+          module: "sms",
+          stage: "code_entry",
+          reason: "timeout",
+          attempts: 1,
+        });
+        return true;
+      },
+    })
+  );
+  assert.deepEqual(result, { status: "manual_completed", stage: "code_entry" });
+  assert.equal(manualCalls, 1);
+  assert.equal(calls.filter((phase) => phase === "sms-code").length, 1);
+}
 
 await expectCode("MAC_SETTINGS_SMS_STATE_UNAVAILABLE", async () => {
   await completeSupervisedMacSettingsSmsVerification(
@@ -328,6 +399,233 @@ await expectCode("MAC_SETTINGS_SMS_TIMEOUT", async () => {
   assert.deepEqual(calls.map(({ phase }) => phase), ["sms-state", "sms-code"]);
 });
 
+// The AX surface can be temporarily absent while System Settings hydrates.
+// `waiting` is a valid transient state, not a failure, and the mandatory code
+// page must still be discovered before the provider is polled.
+{
+  const sequence = createSequenceRunner([
+    { ok: true, stage: "waiting" },
+    { ok: true, stage: "waiting" },
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_pending" },
+    { ok: true, stage: "waiting" },
+    { ok: true, stage: "waiting" },
+  ]);
+  const progress = [];
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      nativeRunner: sequence.runner,
+      manualCodeProvider: async () => "246810",
+      onProgress: (event) => progress.push(event),
+    })
+  );
+  assert.deepEqual(result, { status: "submitted" });
+  assert.deepEqual(
+    sequence.calls.map(({ phase }) => phase),
+    [
+      "sms-state",
+      "sms-state",
+      "sms-state",
+      "sms-state",
+      "sms-code",
+      "sms-state",
+      "sms-state",
+      "sms-state",
+    ]
+  );
+  assert.deepEqual(
+    progress.map(({ event }) => event),
+    ["waiting_for_sms_surface", "code_entry_detected", "code_polling_started", "code_written", "code_transition_waiting", "code_transition_observed"]
+  );
+}
+
+// Three transient invalid probes are tolerated inside one read window; a
+// loading race must not turn into an early SMS_STATE_UNAVAILABLE failure.
+{
+  let stateReads = 0;
+  let codeWritten = false;
+  const calls = [];
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      nativeRunner: async (phase) => {
+        calls.push(phase);
+        if (phase === "sms-code") {
+          codeWritten = true;
+          return { ok: true, stage: "code_submitted" };
+        }
+        if (phase !== "sms-state") return { ok: true, stage: "code_submitted" };
+        stateReads += 1;
+        if (codeWritten) {
+          return stateReads === 6 ? { ok: true, stage: "code_pending" } : { ok: true, stage: "waiting" };
+        }
+        return stateReads < 3 ? { ok: false } : { ok: true, stage: "code_entry" };
+      },
+      manualCodeProvider: async () => "135790",
+    })
+  );
+  assert.deepEqual(result, { status: "submitted" });
+  assert.deepEqual(calls, [
+    "sms-state",
+    "sms-state",
+    "sms-state",
+    "sms-state",
+    "sms-state",
+    "sms-code",
+    "sms-state",
+    "sms-state",
+    "sms-state",
+  ]);
+}
+
+// A phone-selection action is bounded to three attempts. After Enter, the
+// coordinator must keep scanning until the mandatory six-cell page appears;
+// it must not return to post-SMS after manual phone selection alone.
+{
+  const calls = [];
+  const progress = [];
+  let manualContext = null;
+  let manualConfirmed = false;
+  let codeWritten = false;
+  let postCodeStateReads = 0;
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      nativeRunner: async (phase) => {
+        calls.push(phase);
+        if (phase === "sms-state") {
+          if (manualConfirmed && codeWritten) {
+            postCodeStateReads += 1;
+            return postCodeStateReads === 1
+              ? { ok: true, stage: "code_pending" }
+              : { ok: true, stage: "waiting" };
+          }
+          return manualConfirmed
+            ? { ok: true, stage: "code_entry" }
+            : { ok: true, stage: "phone_selection" };
+        }
+        if (phase === "sms-code") {
+          codeWritten = true;
+          return { ok: true, stage: "code_submitted" };
+        }
+        return { ok: false };
+      },
+      actionRetryDelayMs: 1,
+      phoneTransitionGraceMs: 5,
+      onProgress: (event) => progress.push(event),
+      manualContinuation: async (context) => {
+        manualContext = context;
+        manualConfirmed = true;
+        return true;
+      },
+      manualCodeProvider: async () => "123456",
+    })
+  );
+  assert.deepEqual(result, { status: "submitted" });
+  assert.equal(calls.filter((phase) => phase === "sms-select").length, 3);
+  assert.equal(calls.filter((phase) => phase === "sms-continue").length, 0);
+  assert.equal(calls.filter((phase) => phase === "sms-code").length, 1);
+  assert.deepEqual(manualContext, {
+    module: "sms",
+    stage: "phone_selection",
+    reason: "action_attempt_limit",
+    attempts: 3,
+  });
+  assert.ok(progress.some(({ event }) => event === "manual_required"));
+}
+
+// If the helper loses its reply during a slow final-cell transition, a still
+// visible empty code page is retried with the same verified code, at most three
+// times. The provider itself is polled only once for that code.
+{
+  const calls = [];
+  let codeProviderCalls = 0;
+  let codeWrites = 0;
+  let postSuccessStateReads = 0;
+  const states = [
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_entry" },
+    { ok: true, stage: "code_entry" },
+  ];
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      nativeRunner: async (phase) => {
+        calls.push(phase);
+        if (phase === "sms-state") {
+          if (codeWrites >= 3) {
+            postSuccessStateReads += 1;
+            return postSuccessStateReads === 1
+              ? { ok: true, stage: "code_pending" }
+              : { ok: true, stage: "waiting" };
+          }
+          return states.shift() ?? { ok: true, stage: "code_entry" };
+        }
+        if (phase === "sms-code") {
+          codeWrites += 1;
+          return codeWrites === 3 ? { ok: true, stage: "code_submitted" } : { ok: false };
+        }
+        return { ok: false };
+      },
+      codeProvider: async () => {
+        codeProviderCalls += 1;
+        return "112233";
+      },
+      actionRetryDelayMs: 1,
+    })
+  );
+  assert.deepEqual(result, { status: "submitted" });
+  assert.equal(codeProviderCalls, 1);
+  assert.equal(codeWrites, 3);
+  // Every retry re-probes the stable six-cell surface before and after the
+  // write.  The exact interleaving is an implementation detail; the hard
+  // contract is stable probing around every write plus the final populated
+  // code page and two transition observations, with no fourth write.
+  assert.ok(calls.filter((phase) => phase === "sms-state").length >= 10);
+  assert.equal(calls.filter((phase) => phase === "sms-code").length, 3);
+  assert.equal(calls.at(-1), "sms-state");
+}
+
+// A code page that stays live after all bounded writes is handed to the
+// operator. After manual entry, the next stable waiting state is required;
+// Enter itself never counts as a submitted code and no fourth write occurs.
+{
+  const calls = [];
+  let providerCalls = 0;
+  let manualContext = null;
+  let manualConfirmed = false;
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      nativeRunner: async (phase) => {
+        calls.push(phase);
+        if (phase === "sms-state") {
+          return manualConfirmed
+            ? { ok: true, stage: "waiting" }
+            : { ok: true, stage: "code_entry" };
+        }
+        return { ok: false };
+      },
+      codeProvider: async () => {
+        providerCalls += 1;
+        return "445566";
+      },
+      actionRetryDelayMs: 1,
+      manualContinuation: async (context) => {
+        manualContext = context;
+        manualConfirmed = true;
+        return true;
+      },
+    })
+  );
+  assert.deepEqual(result, { status: "manual_completed", stage: "code_entry" });
+  assert.equal(providerCalls, 1);
+  assert.equal(calls.filter((phase) => phase === "sms-code").length, 3);
+  assert.deepEqual(manualContext, {
+    module: "sms",
+    stage: "code_entry",
+    reason: "action_attempt_limit",
+    attempts: 3,
+  });
+}
+
 const source = fs.readFileSync(
   new URL("./lib/mac-settings-sms-verification.js", import.meta.url),
   "utf8"
@@ -384,25 +682,56 @@ assert.doesNotMatch(
   swiftSource,
   /private func visibleNodes[\s\S]*?queue\.append\(contentsOf: axSheets\(node\)\)/
 );
-assert.match(swiftSource, /codeSnapshots\.count == 1, phoneSnapshots\.isEmpty/);
-assert.match(swiftSource, /phoneSnapshots\.count == 1, codeSnapshots\.isEmpty/);
+assert.match(
+  swiftSource,
+  /if stableCodeCandidates\.count == 1,\s*phoneSnapshots\.isEmpty/
+);
+assert.match(swiftSource, /phoneSnapshots\.count == 1,[\s\n]+populatedCodeCandidates\.isEmpty/);
+assert.match(swiftSource, /private let nativePhoneControlRoles/);
+assert.match(swiftSource, /private let wrappedPhoneControlRoles/);
+assert.match(swiftSource, /private func hasNestedPhoneControl/);
+assert.doesNotMatch(swiftSource, /"AXStaticText"|"AXGroup"/);
 assert.match(swiftSource, /let entries = matchingCodeEntries\(suffix: suffix\)/);
+assert.match(
+  swiftSource,
+  /let populatedCodeCandidates = matchingCodeEntries\(suffix: suffix, requireEmpty: false\)/
+);
+assert.match(swiftSource, /emit\(true, "code_pending"\)/);
+assert.match(swiftSource, /private func isSixCellCodeEntry\(_ entry: CodeEntry\) -> Bool/);
+assert.match(swiftSource, /let fallbackCandidates = candidates\.filter \{ isSixCellCodeEntry\(\$0\.1\) \}/);
+assert.match(swiftSource, /sixCellCandidates\.isEmpty/);
 assert.match(swiftSource, /matches\.count == 1/);
 assert.match(swiftSource, /axBool\(element, kAXEnabledAttribute as String\) == true/);
 assert.match(swiftSource, /private let phoneMarkers = \[/);
 assert.match(swiftSource, /phoneMarkers\.contains/);
-assert.match(swiftSource, /fields\.count == 1/);
+assert.doesNotMatch(swiftSource, /fields\.count == 1/);
+assert.match(swiftSource, /fields\.count == 6/);
 assert.doesNotMatch(swiftSource, /fields\.count == 1, isSemanticCodeField\(fields\[0\]\) \|\|/);
 assert.doesNotMatch(swiftSource, /private func hasCodeContext/);
+assert.match(swiftSource, /private func sixCellFieldGroups/);
+assert.match(swiftSource, /guard let parent = axParent\(field\) else/);
+assert.match(swiftSource, /\$0\.count == 6 && isValidSixCellLayout/);
+assert.match(swiftSource, /let semanticGroups = sixCellFieldGroups/);
+assert.match(swiftSource, /sixCellFieldGroups\(fields, requireEmpty: requireEmpty\)/);
 assert.match(swiftSource, /private func hasCodeDeliverySuffix/);
-assert.match(swiftSource, /hasCodeDeliverySuffix\(in: \$0\.nodes, pid: \$0\.pid, suffix: suffix\)/);
+assert.match(swiftSource, /hasCodeDeliverySuffix\(in: snapshot\.nodes, pid: snapshot\.pid, suffix: suffix\)/);
 assert.match(swiftSource, /deliverySuffixes\.count == 1/);
 assert.match(swiftSource, /axChildren\(\$0\)\.isEmpty/);
-assert.match(swiftSource, /let semanticCodeFields = fields\.filter\(isSemanticCodeField\)/);
-assert.match(swiftSource, /fields\.count == 6 \? fields : \[\]/);
-assert.match(swiftSource, /codeFields\.count == 6/);
-assert.match(swiftSource, /transitionSuffix: suffix/);
-assert.match(swiftSource, /matchingCodeEntries\(suffix: suffix\)\.isEmpty/);
+assert.match(swiftSource, /private func hasSharedDirectParent/);
+assert.match(swiftSource, /private func isValidSixCellLayout/);
+assert.match(swiftSource, /requireEmpty: Bool = true/);
+assert.match(swiftSource, /private func codeEntry\([\s\S]*?requireEmpty: Bool = true/);
+assert.match(swiftSource, /isValidSixCellLayout\(\$0, requireEmpty: requireEmpty\)/);
+assert.match(swiftSource, /let phoneSelectionPresent = snapshots\.contains/);
+assert.match(swiftSource, /private func sameCodeEntryShape/);
+assert.match(swiftSource, /usleep\(140_000\)/);
+assert.match(
+  swiftSource,
+  /let transitionSuffix = index == fields\.count - 1 \? suffix : nil/
+);
+assert.match(swiftSource, /transitionSuffix:\s*transitionSuffix/);
+assert.match(swiftSource, /matchingCodeEntries\(suffix: suffix, requireEmpty: false\)\.isEmpty/);
+assert.match(swiftSource, /if axString\(element, kAXValueAttribute as String\) == value \{/);
 const smsCodeCase = swiftSource.slice(
   swiftSource.indexOf('case "sms-code"'),
   swiftSource.indexOf("default:", swiftSource.indexOf('case "sms-code"'))

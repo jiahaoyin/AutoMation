@@ -207,6 +207,286 @@ function sanitizeMacSettingsStatus(status = {}) {
   };
 }
 
+const MAC_SETTINGS_EVENT_NAMES = new Set([
+  "automation_preflight_started",
+  "automation_preflight_completed",
+  "automation_preflight_failed",
+  "automation_control_check_completed",
+  "automation_control_check_failed",
+  "login_window_preflight_started",
+  "login_window_preflight_completed",
+  "applescript_fill_started",
+  "applescript_step_completed",
+  "applescript_fill_completed",
+  "login_fill_started",
+  "swift_ax_helper_checked",
+  "apple_account_deep_link_opened",
+  "swift_ax_fill_started",
+  "swift_ax_fill_completed",
+  "swift_ax_fallback_started",
+  "login_fill_completed",
+  "mac_settings_phase_started",
+  "initial_signed_in_probe",
+  "mac_settings_already_signed_in",
+  "mac_settings_phase_completed",
+  "sms_provider_config_saved",
+  "sms_provider_config_failed",
+  "sms_provider_not_configured",
+  "sms_module_started",
+  "sms_module_completed",
+  "sms_module_failed",
+  "sms_helper_unavailable",
+  "sms_manual_handoff_acknowledged",
+  "native_call_started",
+  "native_call_failed",
+  "native_call_completed",
+  "code_provider_poll_started",
+  "code_provider_poll_empty",
+  "code_provider_code_ready",
+  "state_probe",
+  "state_stable",
+  "waiting_for_sms_surface",
+  "phone_selection_detected",
+  "phone_selection_submitted",
+  "phone_selection_transition_waiting",
+  "code_entry_detected",
+  "code_polling_started",
+  "code_write_started",
+  "code_written",
+  "code_transition_waiting",
+  "code_transition_probe",
+  "code_transition_observed",
+  "code_surface_reset",
+  "code_surface_returned_to_phone_selection",
+  "manual_required",
+  "manual_sms_step_confirmed",
+  "manual_sms_step_advanced",
+  "manual_code_transition_waiting",
+  "manual_code_transition_probe",
+  "manual_surface_reprobe_waiting",
+  "post_sms_probe_started",
+  "post_sms_probe_result",
+  "post_sms_transition_waiting",
+  "post_sms_retry_scheduled",
+  "post_sms_probe_limit_reached",
+  "post_sms_action_blocked",
+  "post_sms_action_limit_reached",
+  "post_sms_action_authorized",
+  "post_sms_manual_required",
+  "post_sms_manual_continuation",
+  "signed_in_probe",
+  "signed_in_settle_probe",
+  "mac_settings_login_wait_failed",
+  "post_sms_supervision_unavailable",
+  "post_sms_module_disabled",
+  "state_probe_started",
+  "state_probe_failed",
+  "state_probe_invalid",
+  "state_observed",
+  "state_observed_probe_only",
+  "action_not_authorized",
+  "action_started",
+  "action_completed",
+  "action_unconfirmed",
+  "supervision_unavailable",
+]);
+const MAC_SETTINGS_EVENT_MODULES = new Set(["login", "sms", "post_sms"]);
+const MAC_SETTINGS_EVENT_STAGES = new Set([
+  "phone_selection",
+  "code_entry",
+  "code_pending",
+  "waiting",
+  "surface_unavailable",
+  "terms",
+  "mac_password",
+  "iphone_unlock",
+  "location",
+  "unidentified",
+]);
+const MAC_SETTINGS_EVENT_PHASES = new Set([
+  "sms-state",
+  "sms-select",
+  "sms-continue",
+  "sms-code",
+  "terms",
+  "mac-password",
+  "unlock-code",
+  "location",
+  "email",
+  "password",
+  "dump",
+  "continue",
+  "state",
+  "preflight",
+  "fallback_recovery",
+]);
+const MAC_SETTINGS_EVENT_STATUSES = new Set([
+  "submitted",
+  "retryable",
+  "manual_required",
+  "not_required",
+  "state_observed",
+  "manual_completed",
+  "invalid",
+]);
+const MAC_SETTINGS_EVENT_OUTCOMES = new Set([
+  "granted",
+  "prompted",
+  "ready",
+  "unavailable",
+  "probe_failed",
+  "succeeded",
+  "failed",
+  "fallback",
+  "resumed",
+  "not_resumed",
+  "completed",
+  "external",
+  "skipped",
+  "deferred",
+]);
+const MAC_SETTINGS_EVENT_REASONS = new Set([
+  "ok",
+  "target_unavailable_before_write",
+  "target_focus_unavailable",
+  "target_changed_before_write",
+  "ax_value_unconfirmed",
+  "keyboard_fallback_unsafe",
+  "keyboard_target_changed",
+  "keyboard_unconfirmed",
+  "login_state_unknown",
+  "login_window_not_found",
+  "exact_username_field_not_found",
+  "exact_password_field_not_found",
+  "enabled_login_button_not_found",
+  "enabled_login_button_not_found_after_password",
+  "missing_email_value",
+  "missing_password_value",
+  "settings_process_not_found",
+  "helper_invalid_output",
+  "helper_unavailable",
+  "compile_failed",
+  "preflight_unavailable",
+  "automation_control_unavailable",
+  "fallback_recovery_failed",
+  "applescript_failed",
+  "applescript_invalid_output",
+  "state_unavailable",
+  "state_probe_failed",
+  "state_probe_invalid",
+  "state_probe_unavailable",
+  "controller_failed",
+  "visual_unavailable",
+  "binding_invalid",
+  "helper_exit",
+  "invalid_request",
+  "timeout",
+  "manual_required",
+  "invalid",
+  "action_attempt_limit",
+  "action_unconfirmed",
+  "code_unavailable",
+  "code_write_unconfirmed",
+  "code_transition_timeout",
+  "phone_not_matched",
+  "phone_not_unique",
+  "phone_selection_unavailable",
+  "selection_not_confirmed",
+  "continue_failed",
+  "code_entry_unavailable",
+  "code_write_failed",
+  "manual_code_invalid",
+  "timeout",
+  "accessibility_unavailable",
+  "helper_exit",
+  "invalid",
+  "unknown",
+]);
+const MAC_SETTINGS_FAILURE_CODES = new Set([
+  "mac_settings_login_failed",
+  "mac_settings_login_not_confirmed",
+  "mac_settings_login_wait_timeout",
+  "mac_settings_sms_config_save_failed",
+  "mac_settings_sms_helper_unavailable",
+  "mac_settings_sms_phone_invalid",
+  "mac_settings_sms_phone_not_matched",
+  "mac_settings_sms_unsupported_platform",
+  "mac_settings_sms_supervision_required",
+  "mac_settings_sms_tty_required",
+  "mac_settings_sms_timeout_invalid",
+  "mac_settings_sms_provider_timeout_invalid",
+  "mac_settings_sms_manual_timeout_invalid",
+  "mac_settings_sms_poll_interval_invalid",
+  "mac_settings_sms_state_attempts_invalid",
+  "mac_settings_sms_state_failure_windows_invalid",
+  "mac_settings_sms_stable_code_reads_invalid",
+  "mac_settings_sms_action_attempts_invalid",
+  "mac_settings_sms_action_retry_delay_invalid",
+  "mac_settings_sms_phone_transition_grace_invalid",
+  "mac_settings_sms_code_transition_grace_invalid",
+  "mac_settings_sms_provider_poll_interval_invalid",
+  "mac_settings_sms_manual_continuation_grace_invalid",
+  "mac_settings_sms_state_probe_timeout_invalid",
+  "mac_settings_sms_phone_select_timeout_invalid",
+  "mac_settings_sms_phone_continue_timeout_invalid",
+  "mac_settings_sms_code_write_timeout_invalid",
+  "mac_settings_sms_timeout",
+  "mac_settings_sms_native_failed",
+  "mac_settings_sms_state_unavailable",
+  "mac_settings_sms_manual_code_invalid",
+  "mac_settings_sms_code_fill_failed",
+  "mac_settings_sms_provider_config_invalid",
+  "mac_settings_sms_provider_url_invalid",
+  "mac_settings_sms_provider_unavailable",
+]);
+
+function safeMacSettingsEventNumber(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= 1_200_000 ? value : undefined;
+}
+
+export function sanitizeMacSettingsEvent(event = {}) {
+  const safe = {
+    module: MAC_SETTINGS_EVENT_MODULES.has(event?.module) ? event.module : "login",
+    event: MAC_SETTINGS_EVENT_NAMES.has(event?.event) ? event.event : "unknown",
+  };
+  if (MAC_SETTINGS_EVENT_STAGES.has(event?.stage)) safe.stage = event.stage;
+  if (MAC_SETTINGS_EVENT_PHASES.has(event?.phase)) safe.phase = event.phase;
+  if (MAC_SETTINGS_EVENT_STATUSES.has(event?.status)) safe.status = event.status;
+  if (MAC_SETTINGS_EVENT_OUTCOMES.has(event?.outcome)) safe.outcome = event.outcome;
+  if (MAC_SETTINGS_EVENT_REASONS.has(event?.reason)) safe.reason = event.reason;
+  if (MAC_SETTINGS_FAILURE_CODES.has(event?.failureCode)) {
+    safe.failureCode = event.failureCode;
+  }
+  if (typeof event?.probeOnly === "boolean") safe.probeOnly = event.probeOnly;
+  if (typeof event?.ok === "boolean") safe.ok = event.ok;
+  if (typeof event?.signedIn === "boolean") safe.signedIn = event.signedIn;
+  for (const key of ["step", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "timeoutMs", "axOwnerPid", "visualOwnerPid", "windowId"]) {
+    const value = safeMacSettingsEventNumber(event?.[key]);
+    if (value !== undefined) safe[key] = value;
+  }
+  if (typeof event?.identity === "string") {
+    const identityMatch = /^([a-z_]+):([0-9]+):([0-9]+):([0-9]+)$/.exec(event.identity);
+    if (identityMatch) {
+      safe.stage = MAC_SETTINGS_EVENT_STAGES.has(identityMatch[1]) ? identityMatch[1] : safe.stage;
+      for (const [key, raw] of [["axOwnerPid", identityMatch[2]], ["visualOwnerPid", identityMatch[3]], ["windowId", identityMatch[4]]]) {
+        const value = safeMacSettingsEventNumber(Number(raw));
+        if (value !== undefined) safe[key] = value;
+      }
+    }
+  }
+  return safe;
+}
+
+export function sanitizeMacSettingsFailureCode(error) {
+  const candidate = typeof error?.code === "string"
+    ? error.code
+    : typeof error?.message === "string"
+      ? error.message
+      : "";
+  const normalized = candidate.toLowerCase();
+  return MAC_SETTINGS_FAILURE_CODES.has(normalized) ? normalized : "unknown";
+}
+
 export function resolveMacSettingsFailureStatus(error, lastStatus) {
   const directStatus =
     error?.macSettingsStatus && typeof error.macSettingsStatus === "object"
@@ -497,21 +777,27 @@ export async function main() {
           );
         }
       };
+      const onMacSettingsEvent = (event) => {
+        flowAudit.write("mac_settings", "event", sanitizeMacSettingsEvent(event));
+      };
       try {
         flowAudit.write("mac_settings", "started");
         report.phases.macSettings = await runMacSettingsLoginPhase(creds, {
           smsEnv: smsRuntimeEnv,
           onStatus: onMacSettingsStatus,
+          onEvent: onMacSettingsEvent,
         });
         flowAudit.write("mac_settings", "completed", { success: true });
         recordFlowPhase(flowAudit, "mac_settings", "completed");
       } catch (e) {
         const failureStatus = resolveMacSettingsFailureStatus(e, lastMacSettingsStatus);
+        const diagnosticFailureCode = sanitizeMacSettingsFailureCode(e);
         flowAudit.write("mac_settings", "login_failure", failureStatus);
         recordFlowPhaseError(flowAudit, "mac_settings", e, { failureStage, failureCode });
         flowAudit.write("mac_settings", "failed", {
           failureStage,
           failureCode,
+          diagnosticFailureCode,
           ...failureStatus,
         });
         report.phases.macSettings = {
@@ -519,6 +805,7 @@ export async function main() {
           error: "Mac Settings phase failed",
           failureStage,
           failureCode,
+          diagnosticFailureCode,
           diagnostics: failureStatus,
         };
         throw e;

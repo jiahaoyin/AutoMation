@@ -14,15 +14,34 @@ const SMS_AX_BIN = resolveNativeHelperPath(
   SMS_AX_HELPER_NAME
 );
 const VALID_PHASES = new Set(["sms-state", "sms-select", "sms-continue", "sms-code"]);
-const VALID_STAGES = new Set(["phone_selection", "code_entry", "waiting"]);
+const VALID_STAGES = new Set(["phone_selection", "code_entry", "code_pending", "waiting"]);
 const SUCCESS_STAGES_BY_PHASE = new Map([
   ["sms-select", "selected"],
   ["sms-continue", "continued"],
   ["sms-code", "code_submitted"],
 ]);
 
-function nativeFailure() {
-  return { ok: false, stage: "invalid" };
+const NATIVE_FAILURE_REASONS = new Set([
+  "invalid",
+  "suffix_invalid",
+  "phone_selection_unavailable",
+  "phone_not_matched",
+  "phone_not_unique",
+  "selection_not_confirmed",
+  "continue_failed",
+  "code_entry_unavailable",
+  "manual_code_invalid",
+  "code_write_failed",
+  "accessibility_unavailable",
+  "helper_exit",
+]);
+
+function nativeFailure(reason = "invalid") {
+  return {
+    ok: false,
+    stage: "invalid",
+    reason: NATIVE_FAILURE_REASONS.has(reason) ? reason : "invalid",
+  };
 }
 
 function hasSafeOwnership(stat, uid) {
@@ -123,12 +142,16 @@ export function isMacSettingsSmsHelperAvailable() {
 }
 
 export function sanitizeMacSettingsSmsNativeResult(phase, value) {
-  if (!value || typeof value !== "object" || value.ok !== true) return nativeFailure();
+  if (!value || typeof value !== "object") return nativeFailure();
   if (phase === "sms-state") {
-    return VALID_STAGES.has(value.stage) ? { ok: true, stage: value.stage } : nativeFailure();
+    return value.ok === true && VALID_STAGES.has(value.stage)
+      ? { ok: true, stage: value.stage }
+      : nativeFailure(value.stage);
   }
   const expectedStage = SUCCESS_STAGES_BY_PHASE.get(phase);
-  return value.stage === expectedStage ? { ok: true, stage: expectedStage } : nativeFailure();
+  return value.ok === true && value.stage === expectedStage
+    ? { ok: true, stage: expectedStage }
+    : nativeFailure(value.stage);
 }
 
 /**

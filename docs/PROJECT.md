@@ -38,6 +38,9 @@ flowchart LR
 | scripts/lib/ruyipage-backend-runner.js | JSONL framing、超时、子进程组与 bounded cleanup。 |
 | scripts/ruyipage/apple_account_flow.py | 唯一浏览器实现；Developer、Account、截图、profile、tab 和可信页面状态。 |
 | scripts/lib/two-fa-sidecar.js | popup → Settings → TTY 严格串行取码。 |
+| scripts/lib/mac-settings-login.js | System Settings 登录、动态 SMS/post-SMS 协调、人工接续和固定审计事件。 |
+| scripts/lib/mac-settings-sms-verification.js | 可选号码选择、稳定六码页检测、provider 轮询、写码与转场确认。 |
+| scripts/lib/mac-settings-post-sms-finalization.js | 单个可信后置页面的探测；条款/定位自动动作，Mac 密码/iPhone 解锁人工交接。 |
 | scripts/lib/flow-audit.js / scripts/lib/2fa-audit.js | 版本化、脱敏、runId 关联 audit。 |
 | scripts/build-release.mjs | 分发包和独立 README/.env.example；同时打包当前文档。 |
 
@@ -103,20 +106,48 @@ recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=tru
 
 .env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、name、birthday。它不进入命令行、audit、report 或 Git。
 
-## 6. 日志与脱敏
+## 6. System Settings 状态机与审计
+
+System Settings 只在受监督的 macOS 会话中处理，且不与网页 2FA 共享验证码。
+短信状态机把号码选择视为可选页面，把六位验证码页视为必经页面：只有同一稳定
+六码页连续被观测两次后才轮询 provider。写入后先等待 `code_pending` 消失，再
+要求两次 `waiting` 观察；这样动态加载或网络抖动不会被误当作完成。
+
+后置状态机一次只处理一个绑定的页面。条款和定位页最多自动动作三次；同一
+PID/window/stage 超限后保留页面给人工。人工 Enter 只恢复探测，绝不重置该页面
+的动作额度。Mac 密码和 iPhone 解锁页不自动输入，始终停在人工接续点。每个
+成功动作都有 probe-only 转场宽限，避免同一按钮在慢网络下被重复点击。
+
+所有设置事件由 `runMacSettingsLoginPhase(..., { onEvent })` 汇总为
+`flow-audit.jsonl` 的 `source=mac_settings,event=event` 条目。sanitizer 只允许
+固定事件、阶段、原因、次数、超时和已验证的 PID/window 数字。以下事件是失败
+收口点，均带固定 `failureCode`（如果有）：
+
+~~~text
+sms_provider_config_failed
+sms_module_failed
+mac_settings_login_wait_failed
+~~~
+
+`report.json` 保留高层失败阶段；精确的设置模块根因在同一 run 的
+`flow-audit.jsonl` 中。事件 contract 的回归由
+`scripts/test-mac-settings-login-observability.mjs` 固定，任何新事件未加入
+allowlist 都会失败。
+
+## 7. 日志与脱敏
 
 | 通道 | 内容 |
 | --- | --- |
 | 普通终端 | [→]、[✓]、[!]、[×] 等少量业务进度。 |
 | APPLE_AUTOMATION_TERMINAL_DEBUG=1 | 额外镜像脱敏机器状态；不显示秘密、页面正文和个人资料。 |
-| flow-audit.jsonl | Browser、Developer、Account、screenshot、gate、finalization 与 flow completion 的完整固定状态。 |
+| flow-audit.jsonl | Browser、Developer、Account、mac_settings、screenshot、gate、finalization 与 flow completion 的完整固定状态。 |
 | 2fa-audit.jsonl | popup/AX/OCR/Settings/manual 的 provider 生命周期和固定失败分类。 |
 | launcher-audit.jsonl | 进入、bootstrap、环境、preflight、主流程、完成/失败阶段。 |
 | report.json | 脱敏结果汇总与固定截图文件名。 |
 
 每份 JSONL 单独使用从 1 递增的 sequence，同一 runId 将四类报告关联起来。新增状态必须同步允许列表、sanitizer、audit、report、文档与回归测试。
 
-## 7. 测试矩阵
+## 8. 测试矩阵
 
 | 命令 | 覆盖面 |
 | --- | --- |
@@ -129,7 +160,7 @@ recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=tru
 
 Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只在当前精确 push 的 SHA 上做只读/受监督验证；流程见 docs/WINDOWS_MAC_CODEX.md。
 
-## 8. 故障归属
+## 9. 故障归属
 
 | 状态/现象 | 拥有模块 | 首个排查文件 |
 | --- | --- | --- |
@@ -141,7 +172,7 @@ Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只�
 | 报告/acceptance marker | Main flow | apple-id-full-flow.mjs。 |
 | 分发文档偏离 | Release builder / static docs check | build-release.mjs、test-release-copy-paths.mjs。 |
 
-## 9. 文档治理
+## 10. 文档治理
 
 - [README](../README.md)：最短的上手、模式、产物与入口。
 - [运行手册](RUNTIME_RUNBOOK.md)：当前行为、验收和排错唯一入口。

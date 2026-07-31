@@ -947,7 +947,10 @@ private func activateBoundModalTarget(
 private func waitForModalToDisappear(
     _ kind: ModalKind,
     binding: UnlockBinding,
-    polls: Int = 25
+    // Apple can keep the sheet alive while the next state is fetched from the
+    // network.  Three seconds was too short and turned successful clicks into
+    // retryable failures; keep the bound window under observation for 24s.
+    polls: Int = 200
 ) async -> Bool {
     for _ in 0..<polls {
         if let remaining = uniqueModalTarget(kind), remaining.binding == binding {

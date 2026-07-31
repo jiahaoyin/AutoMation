@@ -22,6 +22,15 @@ const ACTION_STAGE_BY_PHASE = new Map([
 ]);
 const MAX_PID = 0x7fffffff;
 const MAX_CG_WINDOW_ID = 0xffffffff;
+const NATIVE_FAILURE_REASONS = new Set([
+  "invalid",
+  "visual_unavailable",
+  "binding_invalid",
+  "helper_exit",
+  "invalid_request",
+  "timeout",
+  "manual_required",
+]);
 const CHILD_SECRET_ENV_KEYS = [
   "APPLE_ID",
   "APPLE_PASSWORD",
@@ -33,8 +42,43 @@ const CHILD_SECRET_ENV_KEYS = [
   "APPLE_AUTOMATION_SUPERVISED_TOKEN",
 ];
 
-function invalidResult() {
-  return { ok: false, stage: "invalid", digits: null, binding: null };
+export function normalizeMacSettingsPostSmsFailureReason(value) {
+  return typeof value === "string" && NATIVE_FAILURE_REASONS.has(value)
+    ? value
+    : "invalid";
+}
+
+function invalidResult(reason = "invalid") {
+  return {
+    ok: false,
+    stage: "invalid",
+    digits: null,
+    binding: null,
+    reason: normalizeMacSettingsPostSmsFailureReason(reason),
+  };
+}
+
+function nativeExecutionFailureReason(error) {
+  return error?.killed === true || error?.code === "ETIMEDOUT" || error?.signal === "SIGTERM"
+    ? "timeout"
+    : "helper_exit";
+}
+
+/**
+ * Preserve only a valid fixed failure token emitted by the helper when its
+ * process exits non-zero. Raw stdout stays process-local and is discarded.
+ */
+export function sanitizeMacSettingsPostSmsProcessFailure(phase, error) {
+  const stdout = typeof error?.stdout === "string" ? error.stdout : "";
+  if (stdout) {
+    try {
+      const result = sanitizeMacSettingsPostSmsResult(phase, JSON.parse(stdout));
+      if (result.ok === false) return result;
+    } catch {
+      // Fall through to the fixed process-level reason.
+    }
+  }
+  return invalidResult(nativeExecutionFailureReason(error));
 }
 
 function isValidActionPhase(phase) {
@@ -76,6 +120,12 @@ function stdinExec(file, args, input, options) {
   return new Promise((resolve, reject) => {
     const child = execFile(file, args, options, (error, stdout) => {
       if (error) {
+        // The Swift helper emits a fixed JSON failure before its non-zero exit.
+        // Preserve that private in-memory payload for the sanitizer below; it
+        // is never logged or returned verbatim.
+        if (typeof stdout === "string" && typeof error === "object" && error !== null) {
+          error.stdout ??= stdout;
+        }
         reject(error);
         return;
       }
@@ -154,7 +204,10 @@ export function isMacSettingsPostSmsHelperAvailable() {
 }
 
 export function sanitizeMacSettingsPostSmsResult(phase, value) {
-  if (!value || typeof value !== "object" || value.ok !== true) return invalidResult();
+  if (!value || typeof value !== "object") return invalidResult();
+  if (value.ok !== true) {
+    return invalidResult(value.reason ?? value.stage);
+  }
   if (phase === "state") {
     if (value.stage === "waiting") {
       return { ok: true, stage: "waiting", digits: null, binding: null };
@@ -163,13 +216,13 @@ export function sanitizeMacSettingsPostSmsResult(phase, value) {
       const binding = normalizeMacSettingsPostSmsBinding(value.binding);
       return binding
         ? { ok: true, stage: "iphone_unlock", digits: value.digits, binding }
-        : invalidResult();
+        : invalidResult("binding_invalid");
     }
     if (["terms", "mac_password", "location"].includes(value.stage)) {
       const binding = normalizeMacSettingsPostSmsBinding(value.binding);
       return binding
         ? { ok: true, stage: value.stage, digits: null, binding }
-        : invalidResult();
+        : invalidResult("binding_invalid");
     }
     return invalidResult();
   }
@@ -184,17 +237,16 @@ export function sanitizeMacSettingsPostSmsResult(phase, value) {
  * accepted only over stdin and never appear in argv or the child environment.
  */
 export async function runMacSettingsPostSmsHelper(phase, options = {}) {
-  if (!VALID_PHASES.has(phase) || !isMacSettingsPostSmsHelperAvailable()) {
-    return invalidResult();
-  }
+  if (!VALID_PHASES.has(phase)) return invalidResult("invalid_request");
+  if (!isMacSettingsPostSmsHelperAvailable()) return invalidResult("helper_exit");
   const timeoutMs = Math.trunc(options.timeoutMs ?? 30_000);
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return invalidResult();
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return invalidResult("invalid_request");
 
   let input;
   const args = ["--phase", phase];
   if (isValidActionPhase(phase)) {
     const binding = normalizeMacSettingsPostSmsBinding(options.binding);
-    if (!binding) return invalidResult();
+    if (!binding) return invalidResult("binding_invalid");
     args.push(
       "--ax-owner-pid",
       String(binding.axOwnerPid),
@@ -206,11 +258,11 @@ export async function runMacSettingsPostSmsHelper(phase, options = {}) {
   }
   if (phase === "unlock-code") {
     if (!/^[0-9]{4}(?:[0-9]{2})?$/.test(options.passcode ?? "")) {
-      return invalidResult();
+      return invalidResult("invalid_request");
     }
     input = `${options.passcode}\n`;
   } else if (phase === "mac-password") {
-    if (options.password !== "000000") return invalidResult();
+    if (options.password !== "000000") return invalidResult("invalid_request");
     input = `${options.password}\n`;
   }
 
@@ -223,8 +275,8 @@ export async function runMacSettingsPostSmsHelper(phase, options = {}) {
         ? await execFileAsync(HELPER_PATH, args, executionOptions)
         : await stdinExec(HELPER_PATH, args, input, executionOptions);
     return sanitizeMacSettingsPostSmsResult(phase, JSON.parse(stdout));
-  } catch {
-    return invalidResult();
+  } catch (error) {
+    return sanitizeMacSettingsPostSmsProcessFailure(phase, error);
   }
 }
 

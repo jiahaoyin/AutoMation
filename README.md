@@ -90,6 +90,43 @@ screenshots/02-account-information.png
 
 终端、**report.json**、**flow-audit.jsonl**、**2fa-audit.jsonl**、截图和错误文本都不会输出 OTP。完整手接链路见 [2FA 交接诊断](docs/2FA_HANDOFF_DIAGNOSTICS.md)。
 
+## macOS 设置动态验证
+
+这部分只在未使用 `--skip-mac` 的受监督 macOS 会话中运行。浏览器 2FA 与
+System Settings SMS 是两条独立链路，后者不复用浏览器验证码。
+
+1. 短信接收号码页是可选的：出现时只匹配已配置号码末两位，并以最多三次
+   已绑定动作处理。没有号码页时直接继续扫描。
+2. 六位验证码页是必经页：连续两次识别到稳定的空六码输入格后，才开始轮询
+   provider 并写入验证码。写入后必须先看到 `code_pending` 消失，再得到两次
+   `waiting` 观察，才会进入后置页面扫描。
+3. AX 短暂空白、动态 hydration 和网络慢加载都只会延长观察；它们不会被当作
+   已登录。自动动作达到三次仍未推进时，终端保留当前页面并提示人工完成。
+   人工按 Enter 仅恢复观察，不重置同一页面的自动动作额度。
+4. 后置页面按实际出现顺序处理。条款和定位页只会在可信 PID/window 绑定下
+   自动提交；Mac 密码和 iPhone 解锁页始终保留给人工输入。每次成功点击后有
+   转场宽限窗口，避免慢页面重复点击。
+
+### 设置阶段日志
+
+终端只显示当前业务进度。完整的脱敏诊断写入 `flow-audit.jsonl` 的
+`source=mac_settings` 条目，字段只包含固定 `event`、`stage`、`phase`、次数、
+超时、布尔状态，以及受限的 PID/window 数字。不会记录号码、验证码、Apple ID、
+密码、原始 AX/OCR 或页面文本。
+
+关键收口事件如下：
+
+~~~text
+sms_provider_config_failed     -> failureCode
+sms_module_failed              -> failureCode
+mac_settings_login_wait_failed -> failureCode
+~~~
+
+`failureCode` 仅会是固定的 `mac_settings_*` 分类；结合同一 run 的前序事件就能
+定位在 provider 配置、短信状态/写码，还是后置页面/最终登录确认。反馈问题时提供
+对应 run 的 `flow-audit.jsonl`、`launcher-audit.jsonl`、`report.json`，不要提供
+`.env`、截图正文、账号、密码或验证码。
+
 ## 运行产物与排错入口
 
 每次运行生成同一 **runId** 对应的报告目录：

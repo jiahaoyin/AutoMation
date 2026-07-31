@@ -4,7 +4,8 @@
 
 After the supervised System Settings SMS flow submits its verification code,
 optionally handle the observed terms, Mac password, iPhone passcode, and Find
-My Mac location sheets.
+My Mac location sheets. Phone selection is optional; a stable six-digit page
+is mandatory before provider polling begins.
 The supplied AX evidence exposes recovery controls and secondary Apple Account
 evidence, but can omit both the sheet title and the four or six visual passcode
 cells.
@@ -26,9 +27,9 @@ provider polling, and the existing read-only 2FA OCR helper.
 - Vision detects an empty four- or six-cell rectangle group only between the
   title and the button row. Two independent captures must agree on the count,
   ordering, geometry, and window frame.
-- The passcode is collected only from a hidden supervised terminal prompt and
-  sent to the native helper through stdin. It is never stored in `.env`, argv,
-  environment variables, diagnostics, reports, screenshots, or Apple ID
+- The Mac password and iPhone passcode pages are always manual handoff points.
+  They are never filled with a fixture, placeholder, or value from `.env`,
+  argv, environment variables, diagnostics, reports, screenshots, or Apple ID
   password state.
 - Because hidden terminal input moves foreground focus, the helper first
   re-resolves the same PID/window binding, raises only that trusted window,
@@ -51,11 +52,25 @@ provider polling, and the existing read-only 2FA OCR helper.
 for supervised Mac Settings sessions. It polls briefly after SMS submission:
 
 1. no unlock sheet: return to the normal signed-in wait;
-2. terms, Mac password, verified four/six cell, or location sheet: perform the
-   corresponding bound action and return to the poll;
-3. successful native submission: return to the normal signed-in wait;
-4. no stable target, unavailable visual capability, invalid input, or an
-   unknown sheet: retain the page for manual completion.
+2. terms or location sheet: perform the corresponding bound action and return
+   to a probe-only transition wait;
+3. Mac password or verified four/six cell sheet: retain the exact bound page
+   for manual completion, then resume scanning after Enter;
+4. every same stage/window action is limited to three tries; manual Enter does
+   not reset that limit;
+5. no stable target, unavailable visual capability, invalid input, or an
+   unknown sheet: remain in the bounded dynamic observation window before
+   requesting manual completion.
 
 The real success condition remains the existing signed-in check; the helper
 does not infer Apple Account completion from a button state.
+
+## Audit Contract
+
+The outer coordinator writes only fixed and redacted `source=mac_settings`
+events to `flow-audit.jsonl`. Event data may include state/stage/phase,
+attempts, timeout, boolean results, and bound PID/window numbers. It never
+includes phone numbers, SMS codes, account credentials, raw AX/OCR text,
+device labels, screenshots, or page content. `sms_provider_config_failed`,
+`sms_module_failed`, and `mac_settings_login_wait_failed` are the terminal
+module closure events; any `failureCode` is a fixed `mac_settings_*` token.

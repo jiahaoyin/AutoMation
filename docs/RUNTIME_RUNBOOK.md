@@ -55,6 +55,32 @@ sequenceDiagram
 ./run.sh --skip-mac
 ~~~
 
+## System Settings 动态 SMS 与后置页面
+
+完整 `./run.sh` 的 System Settings 阶段按页面状态推进，不按固定等待时间推进：
+
+~~~text
+waiting / dynamic hydration
+  -> optional phone_selection (max 3 bound actions)
+  -> stable code_entry twice
+  -> provider poll + one bounded code write
+  -> code_pending / transition grace
+  -> waiting observed twice
+  -> optional post-SMS pages in the order Apple presents them
+  -> signed-in probe + settle probe
+~~~
+
+- 号码选择页可能不出现；六码页必须实际出现并稳定后才会开始取码。
+- 每个同一 `stage + PID + window` 的自动后置动作最多三次。条款和定位可自动处理；
+  Mac 密码、iPhone 解锁和所有不确定页面都保留给人工。
+- 点击成功和人工 Enter 都只进入 probe-only 观察窗口。当前页面仍然存在时不会
+  自动重放动作；页面变化后才继续扫描下一模块。
+- 慢加载、短暂 AX 空白和未知绑定会留在观察窗口中，不会因几次快速空探测就被
+  误判成登录完成。
+
+人工接续时，先在保留的 System Settings 页面完成当前步骤，再按终端提示 Enter。
+Enter 不代表成功，只是让扫描器重新读取状态。最终仍以 signed-in probe 为准。
+
 ./install.sh 负责：
 
 - 检测 Node 18+、Python 3.10+、Firefox；
@@ -129,11 +155,35 @@ APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 | 文件 | 用途 | 是否包含个人/认证秘密 |
 | --- | --- | --- |
 | launcher-audit.jsonl | launcher 的启动、环境、预检、退出阶段。 | 否。 |
-| flow-audit.jsonl | Node、ruyiPage、Developer、Account、截图、gate、最终完成状态。 | 否，只含固定分类与布尔字段。 |
+| flow-audit.jsonl | Node、ruyiPage、Developer、Account、mac_settings、截图、gate、最终完成状态。 | 否，只含固定分类与布尔字段。 |
 | 2fa-audit.jsonl | popup / OCR / Settings / manual 的 provider 生命周期。 | 否，绝不含 OTP。 |
 | report.json | 面向调用方的状态汇总、截图文件名和失败分类。 | 不含账号、密码、OTP、Cookie、个人资料值。 |
 | screenshots/ | 仅 active 会员详情和稳定个人信息页面。 | 是，按私有数据保管，勿上传。 |
 | .env | 本机输入凭据与成功采集的 developer_membership、name、birthday。 | 是，私有文件，勿读取/共享/提交。 |
+
+System Settings 的详细记录也在 `flow-audit.jsonl` 中，以
+`source=mac_settings,event=event` 形式出现。`event` 的字段经过固定 allowlist
+清洗；仅可见状态、阶段、次数、超时与 PID/window 数字，绝不会写号码、验证码、
+账号、密码、AX/OCR 或页面正文。
+
+### 设置阶段快速定位
+
+针对同一报告目录，先按时间顺序查看 `source=mac_settings`：
+
+~~~bash
+rg '"source":"mac_settings"' data/reports/apple-id-flow-*/flow-audit.jsonl
+~~~
+
+| 看到的末尾事件 | 说明 | 下一份需要的脱敏材料 |
+| --- | --- | --- |
+| `sms_provider_config_failed` | provider 配置或交互配置未完成 | flow-audit、launcher-audit、report |
+| `sms_module_failed` | 短信识别、取码、写码或转场未完成 | flow-audit、2fa-audit（若存在）、report |
+| `mac_settings_login_wait_failed` | 后置页面完成后仍未得到登录确认 | flow-audit、launcher-audit、report |
+| `post_sms_manual_required` | 当前绑定页面需要人工完成 | flow-audit 末尾 40 行和终端固定进度 |
+| `post_sms_transition_waiting` | 已点击，正在等待动态页面切换 | 等待同一 run 的下一轮事件，不重复启动流程 |
+
+以上失败收口事件的 `failureCode` 仅包含固定 `mac_settings_*` token。不要上传
+`.env`、原始 AX tree、截图内容、手机号、验证码、Apple ID 或密码。
 
 ## 6. 固定状态机与定位顺序
 

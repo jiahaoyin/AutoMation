@@ -462,6 +462,8 @@ def classify_browser_page_kind(page: Any, state: dict[str, Any] | None) -> str:
         return "account_manage"
     if current_url and is_account_sign_in_url(current_url):
         return "sign_in"
+    if current_url and is_developer_account_url(current_url):
+        return "developer_account"
     if source.get("error") is True:
         return "authentication_error"
     if source.get("twofa") is True or source.get("twofaVisible") is True:
@@ -3832,6 +3834,7 @@ DEVELOPER_MEMBERSHIP_NAVIGATION_LABELS = frozenset(
 )
 DEVELOPER_NAVIGATION_SELECTORS = (
     "css:main li",
+    "css:[class*='DeveloperTabNav'] li",
     "css:a",
     "css:button",
     "css:[role='link']",
@@ -3839,12 +3842,15 @@ DEVELOPER_NAVIGATION_SELECTORS = (
 )
 
 
-def developer_account_snapshot(page: Any) -> dict[str, bool]:
+def developer_account_snapshot(page: Any) -> dict[str, bool | int]:
     """Return fixed Developer account evidence without exposing raw page text."""
     if not is_developer_account_url(scope_location_url(page)):
         return {
             "authenticated": False,
             "accountShell": False,
+            "accountHeading": False,
+            "navigationFeatureCount": 0,
+            "tabNavigationSeen": False,
             "joinProgram": False,
             "membershipNavigation": False,
         }
@@ -3864,10 +3870,18 @@ def developer_account_snapshot(page: Any) -> dict[str, bool]:
             .replace(/\s+/g, ' ')
             .trim()
             .toLocaleLowerCase();
-          const semantic = [...document.querySelectorAll(
-            'main [role="alert"], main h1, main h2, main h3, main li, main a, main button, ' +
-            'main [role="link"], main [role="button"], [role="alert"]'
+          const tabNavigation = [...document.querySelectorAll(
+            '[class*="DeveloperTabNav"]'
           )].filter(visible);
+          const semantic = [...new Set([
+            ...document.querySelectorAll(
+              'main [role="alert"], main h1, main h2, main h3, main li, main a, main button, ' +
+              'main [role="link"], main [role="button"], h1, h2, h3, [role="heading"], [role="alert"], ' +
+              '[class*="DeveloperTabNav"] li, [class*="DeveloperTabNav"] a, ' +
+              '[class*="DeveloperTabNav"] button, [class*="DeveloperTabNav"] [role="link"], ' +
+              '[class*="DeveloperTabNav"] [role="button"]'
+            )
+          ])].filter(visible);
           const labels = semantic.map((el) => normalize(
             el.getAttribute('aria-label') || el.innerText || el.textContent || ''
           )).filter(Boolean);
@@ -3889,18 +3903,34 @@ def developer_account_snapshot(page: Any) -> dict[str, bool]:
             label === 'account' || label === '\u8d26\u6237' || label === '\u5e33\u6236'
           );
           const featureLabels = [
-            ['tools and resources', '\u5de5\u5177\u548c\u8d44\u6e90', '\u5de5\u5177\u8207\u8cc7\u6e90'],
+            [
+              'tools and resources',
+              'program resources',
+              '\u8ba1\u5212\u8d44\u6e90',
+              '\u5de5\u5177\u548c\u8d44\u6e90',
+              '\u5de5\u5177\u8207\u8cc7\u6e90'
+            ],
             ['personal details', '\u4e2a\u4eba\u8d44\u6599', '\u500b\u4eba\u8cc7\u6599'],
             ['email', '\u7535\u5b50\u90ae\u4ef6', '\u96fb\u5b50\u90f5\u4ef6'],
             ['agreements', '\u534f\u8bae', '\u5354\u8b70']
           ];
+          const labelMatches = (label, expected) => expected.some((token) =>
+            label === token ||
+            label.startsWith(`${token} `) ||
+            label.startsWith(`${token}:`) ||
+            label.startsWith(`${token}\uFF1A`)
+          );
           const featureCount = featureLabels.filter((expected) =>
-            labels.some((label) => expected.includes(label))
+            labels.some((label) => labelMatches(label, expected))
           ).length;
-          const accountShell = accountHeading && featureCount >= 2;
+          const accountShell = (accountHeading || tabNavigation.length > 0) &&
+            featureCount >= 2;
           return {
             authenticated: accountShell,
             accountShell,
+            accountHeading,
+            navigationFeatureCount: featureCount,
+            tabNavigationSeen: tabNavigation.length > 0,
             joinProgram,
             membershipNavigation
           };
@@ -3916,6 +3946,19 @@ def developer_account_snapshot(page: Any) -> dict[str, bool]:
     return {
         "authenticated": result.get("authenticated") is True,
         "accountShell": result.get("accountShell") is True,
+        "accountHeading": result.get("accountHeading") is True,
+        "navigationFeatureCount": min(
+            4,
+            max(
+                0,
+                (
+                    int(result.get("navigationFeatureCount") or 0)
+                    if type(result.get("navigationFeatureCount")) is int
+                    else 0
+                ),
+            ),
+        ),
+        "tabNavigationSeen": result.get("tabNavigationSeen") is True,
         "joinProgram": result.get("joinProgram") is True,
         "membershipNavigation": result.get("membershipNavigation") is True,
     }
@@ -3954,12 +3997,17 @@ def developer_scope_has_auth_blocker(
     page: Any,
     *,
     allow_root_text_only_error: bool = False,
+    allow_retiring_child_text_only_error: bool = False,
 ) -> bool:
     """Reject live Developer auth UI across documents and open Shadow DOM."""
+    root_is_developer_account = is_developer_account_url(scope_location_url(page))
     for scope in iter_page_scopes(page):
         href = scope_location_url(scope)
         if scope is not page:
-            if parse_valid_apple_url(href) is None:
+            if (
+                parse_valid_apple_url(href) is None
+                and not is_opaque_two_factor_frame_url(href)
+            ):
                 continue
             if not scope_has_live_frame_chain(page, scope):
                 continue
@@ -3968,7 +4016,13 @@ def developer_scope_has_auth_blocker(
         except Exception:
             return True
         allow_scope_text_only_error = bool(
-            allow_root_text_only_error and scope is page
+            (allow_root_text_only_error and scope is page)
+            or (
+                allow_retiring_child_text_only_error
+                and root_is_developer_account
+                and scope is not page
+                and is_retiring_post_otp_child_error(state)
+            )
         )
         if developer_state_has_auth_blocker(
             state,
@@ -3981,9 +4035,18 @@ def developer_scope_has_auth_blocker(
             return True
         for root in list(shadow_roots or []):
             shadow_state = detect_shadow_root_state(root)
+            allow_shadow_text_only_error = bool(
+                allow_scope_text_only_error
+                or (
+                    allow_retiring_child_text_only_error
+                    and root_is_developer_account
+                    and scope is not page
+                    and is_retiring_post_otp_child_error(shadow_state)
+                )
+            )
             if developer_state_has_auth_blocker(
                 shadow_state,
-                allow_text_only_error=allow_scope_text_only_error,
+                allow_text_only_error=allow_shadow_text_only_error,
             ):
                 return True
     return False
@@ -4002,6 +4065,7 @@ def confirmed_developer_account_state(page: Any) -> dict[str, Any] | None:
         or developer_scope_has_auth_blocker(
             page,
             allow_root_text_only_error=True,
+            allow_retiring_child_text_only_error=True,
         )
     ):
         return None
@@ -4364,24 +4428,33 @@ def wait_for_signed_in(
             human_pause(350, 700)
             continue
         observe_transition(last_state)
+        top_level_url = scope_location_url(page)
+        if (
+            submitted
+            and session_probe is not None
+            and is_developer_account_url(top_level_url)
+            and not developer_scope_has_auth_blocker(
+                page,
+                allow_root_text_only_error=True,
+                allow_retiring_child_text_only_error=True,
+            )
+        ):
+            # Apple can redirect the top-level tab to Developer before the
+            # old idmsa iframe has fully retired. Allow a bounded hydration
+            # poll only for the exact Developer target; a verified account
+            # shell remains the sole success condition.
+            human_pause(400, 800)
+            hydrated_target_state = session_probe(page)
+            if (
+                hydrated_target_state is not None
+                and hydrated_target_state.get("developerAccountShell") is True
+            ):
+                observe_transition(hydrated_target_state)
+                return hydrated_target_state
+            continue
         if otp_generation is not None and not is_apple_url(
             str(last_state.get("href") or "")
         ):
-            if (
-                session_probe is not None
-                and is_developer_account_url(str(last_state.get("href") or ""))
-                and not developer_scope_has_auth_blocker(
-                    page,
-                    allow_root_text_only_error=True,
-                )
-            ):
-                # The Developer shell URL can win before its stable account
-                # markers hydrate.  Keep polling only when the exact target has
-                # no concrete auth UI, assertive root alert, or live Apple
-                # child-frame error; a root text-only false positive is not
-                # terminal here.
-                human_pause(350, 700)
-                continue
             raise RuntimeError("2FA state left the verified Apple HTTPS origin")
         if has_confirmed_account_session(last_state):
             # A retiring idmsa frame can still expose generic error text after

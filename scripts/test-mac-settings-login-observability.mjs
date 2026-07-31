@@ -6,7 +6,12 @@ import {
   appleScriptPhaseFromStep,
   mayUseAppleScriptFallback,
 } from "./lib/mac-settings-login.js";
-import { resolveMacSettingsFailureStatus } from "./apple-id-full-flow.mjs";
+import { waitUntil } from "./lib/prompt.js";
+import {
+  resolveMacSettingsFailureStatus,
+  sanitizeMacSettingsEvent,
+  sanitizeMacSettingsFailureCode,
+} from "./apple-id-full-flow.mjs";
 
 const SECRET = "person@example.com TOP-SECRET 123456 AXWindow helper stderr";
 
@@ -190,6 +195,179 @@ function postLoginFailureDoesNotReuseSuccessTest() {
   assert.deepEqual(resolveMacSettingsFailureStatus(new Error("login failure"), failed), failed);
 }
 
+function macSettingsEventSanitizationTest() {
+  const smsEvent = sanitizeMacSettingsEvent({
+    module: "sms",
+    event: "native_call_completed",
+    phase: "sms-code",
+    reason: "code_write_failed",
+    attempts: 2,
+    identity: "code_entry:401:402:403",
+    rawAx: SECRET,
+    code: "123456",
+  });
+  assert.deepEqual(smsEvent, {
+    module: "sms",
+    event: "native_call_completed",
+    phase: "sms-code",
+    reason: "code_write_failed",
+    attempts: 2,
+    stage: "code_entry",
+    axOwnerPid: 401,
+    visualOwnerPid: 402,
+    windowId: 403,
+  });
+  assertNoSecret(smsEvent);
+
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "login",
+      event: "initial_signed_in_probe",
+      outcome: "probe_failed",
+      signedIn: false,
+    }),
+    {
+      module: "login",
+      event: "initial_signed_in_probe",
+      outcome: "probe_failed",
+      signedIn: false,
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "login",
+      event: "mac_settings_phase_completed",
+      outcome: "skipped",
+    }),
+    {
+      module: "login",
+      event: "mac_settings_phase_completed",
+      outcome: "skipped",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "post_sms",
+      event: "post_sms_module_disabled",
+      outcome: "unavailable",
+      unexpected: SECRET,
+    }),
+    {
+      module: "post_sms",
+      event: "post_sms_module_disabled",
+      outcome: "unavailable",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "post_sms",
+      event: "post_sms_manual_required",
+      reason: "state_probe_unavailable",
+    }),
+    {
+      module: "post_sms",
+      event: "post_sms_manual_required",
+      reason: "state_probe_unavailable",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "sms_module_failed",
+      failureCode: "mac_settings_sms_code_fill_failed",
+      diagnostic: SECRET,
+    }),
+    {
+      module: "sms",
+      event: "sms_module_failed",
+      failureCode: "mac_settings_sms_code_fill_failed",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "sms_provider_config_failed",
+      failureCode: "mac_settings_sms_provider_url_invalid",
+    }),
+    {
+      module: "sms",
+      event: "sms_provider_config_failed",
+      failureCode: "mac_settings_sms_provider_url_invalid",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "login",
+      event: "mac_settings_login_wait_failed",
+      failureCode: "mac_settings_login_wait_timeout",
+    }),
+    {
+      module: "login",
+      event: "mac_settings_login_wait_failed",
+      failureCode: "mac_settings_login_wait_timeout",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "login",
+      event: "mac_settings_login_wait_failed",
+      failureCode: SECRET,
+    }),
+    {
+      module: "login",
+      event: "mac_settings_login_wait_failed",
+    }
+  );
+}
+
+function macSettingsFailureCodeSanitizationTest() {
+  const timeout = Object.assign(new Error("ignored"), {
+    code: "MAC_SETTINGS_LOGIN_WAIT_TIMEOUT",
+  });
+  assert.equal(sanitizeMacSettingsFailureCode(timeout), "mac_settings_login_wait_timeout");
+  assert.equal(
+    sanitizeMacSettingsFailureCode(new Error("MAC_SETTINGS_SMS_PROVIDER_URL_INVALID")),
+    "mac_settings_sms_provider_url_invalid"
+  );
+  assert.equal(sanitizeMacSettingsFailureCode(new Error(SECRET)), "unknown");
+}
+
+async function waitUntilTimeoutCodeTest() {
+  await assert.rejects(
+    () =>
+      waitUntil("[test] timeout", () => false, {
+        timeoutMs: 0,
+        allowManualContinuation: false,
+        timeoutCode: "MAC_SETTINGS_LOGIN_WAIT_TIMEOUT",
+      }),
+    (error) => error?.code === "MAC_SETTINGS_LOGIN_WAIT_TIMEOUT"
+  );
+}
+
+function macSettingsEventAllowlistParityTest() {
+  const flow = fs.readFileSync(new URL("./apple-id-full-flow.mjs", import.meta.url), "utf8");
+  const sources = [
+    fs.readFileSync(new URL("./lib/mac-settings-login.js", import.meta.url), "utf8"),
+    fs.readFileSync(new URL("./lib/mac-settings-sms-verification.js", import.meta.url), "utf8"),
+    fs.readFileSync(new URL("./lib/mac-settings-post-sms-finalization.js", import.meta.url), "utf8"),
+  ];
+  const literalEventPattern =
+    /(?:emitMacSettingsEvent\s*\(\s*[^,]+,\s*|(?:reportEvent|reportProgress|emitEvent)\s*\()"([a-z_]+)"/g;
+  const emitted = new Set();
+  for (const source of sources) {
+    for (const match of source.matchAll(literalEventPattern)) emitted.add(match[1]);
+  }
+  const unlisted = [...emitted].filter((event) => !flow.includes(`"${event}"`));
+  assert.deepEqual(unlisted, [], "every emitted settings event must survive the flow-audit allowlist");
+  for (const event of emitted) {
+    assert.equal(
+      sanitizeMacSettingsEvent({ module: "login", event }).event,
+      event,
+      `settings event ${event} must not be downgraded to unknown`
+    );
+  }
+}
+
 function sourceContractTest() {
   const wrapper = fs.readFileSync(new URL("./lib/mac-settings-ax-fill.js", import.meta.url), "utf8");
   const login = fs.readFileSync(new URL("./lib/mac-settings-login.js", import.meta.url), "utf8");
@@ -210,14 +388,22 @@ function sourceContractTest() {
   assert.match(login, /export function mayUseAppleScriptFallback/);
   assert.match(login, /MAC_LOGIN_PREWRITE_FAILURE_REASONS\.has\(status\?\.reason\)/);
   assert.match(login, /if \(!mayUseAppleScriptFallback\(swiftStatus\)\)/);
-  assert.match(login, /await fillViaAppleScript\(creds, \{ onStatus: options\.onStatus \}\)/);
+  assert.match(
+    login,
+    /await fillViaAppleScript\(creds, \{ onStatus: options\.onStatus, onEvent: options\.onEvent \}\)/
+  );
   assert.match(login, /appleScriptPhaseFromStep\(lastStep\)/);
   const fallbackGate = login.indexOf("if (!mayUseAppleScriptFallback(swiftStatus))");
   assert.ok(fallbackGate >= 0);
   assert.ok(fallbackGate < login.indexOf('outcome: "fallback"', fallbackGate));
   assert.match(swift, /if isEmail && valueMatchesRequest\(liveHit\.element, text, isEmail: true\)/);
   assert.match(swift, /waitForExactLoginValue\(/);
-  assert.match(swift, /requireValueChange: !isEmail/);
+  assert.match(swift, /let keyboardTargetIsCleared: Bool/);
+  assert.match(swift, /if keyboardTargetIsCleared \{/);
+  assert.match(swift, /postUnicodeText\(text\)/);
+  assert.match(swift, /requireValueChange: false/);
+  assert.match(swift, /requireValueChange: true/);
+  assert.doesNotMatch(swift, /postCmdA|postCommandKey/);
   assert.match(appleScript, /on currentFrontmostLoginTarget\(/);
   assert.match(appleScript, /set loginTarget to my currentFrontmostLoginTarget\(18, 0\.25\)/);
   assert.match(
@@ -226,6 +412,21 @@ function sourceContractTest() {
   );
   assert.match(flow, /"login_status", safeStatus/);
   assert.match(flow, /"login_failure", failureStatus/);
+  assert.match(flow, /"initial_signed_in_probe"/);
+  assert.match(flow, /"sms_provider_not_configured"/);
+  assert.match(flow, /"post_sms_module_disabled"/);
+  assert.match(flow, /MAC_SETTINGS_FAILURE_CODES/);
+  assert.match(flow, /diagnosticFailureCode/);
+  assert.match(flow, /"mac_settings_login_wait_timeout"/);
+  assert.match(flow, /"mac_settings_sms_provider_url_invalid"/);
+  assert.match(login, /"sms_provider_config_failed"/);
+  assert.match(login, /"sms_module_failed"/);
+  assert.match(login, /"mac_settings_login_wait_failed"/);
+  assert.match(login, /timeoutCode: "MAC_SETTINGS_LOGIN_WAIT_TIMEOUT"/);
+  assert.match(
+    login,
+    /if \(!canConfirmMacSettingsManually\) \{[\s\S]*?error\.code = "MAC_SETTINGS_SMS_HELPER_UNAVAILABLE";[\s\S]*?"sms_module_failed"[\s\S]*?failureCode: macSettingsFailureCode\(error\),[\s\S]*?throw error;/
+  );
 }
 
 structuredSwiftFailureIsAllowlistedTest();
@@ -234,6 +435,10 @@ malformedHelperOutputIsFixedTest();
 credentialReplayGateTest();
 appleScriptFailurePhaseTest();
 postLoginFailureDoesNotReuseSuccessTest();
+macSettingsEventSanitizationTest();
+macSettingsFailureCodeSanitizationTest();
+macSettingsEventAllowlistParityTest();
+await waitUntilTimeoutCodeTest();
 sourceContractTest();
 
 console.log("mac settings login observability: ok");

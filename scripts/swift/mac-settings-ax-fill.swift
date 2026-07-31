@@ -346,20 +346,6 @@ func findSettingsApp() -> NSRunningApplication? {
     }
 }
 
-func postCommandKey(_ key: CGKeyCode) {
-    let src = CGEventSource(stateID: .combinedSessionState)
-    let keyDown = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: true)!
-    keyDown.flags = .maskCommand
-    let keyUp = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: false)!
-    keyUp.flags = .maskCommand
-    keyDown.post(tap: .cghidEventTap)
-    keyUp.post(tap: .cghidEventTap)
-}
-
-func postCmdA() {
-    postCommandKey(0x00)
-}
-
 func isEnabledAndFocused(_ field: AXUIElement) -> Bool {
     axBool(field, kAXEnabledAttribute as String) == true &&
         axBool(field, kAXFocusedAttribute as String) == true
@@ -586,9 +572,107 @@ func focusAndSetLoginValue(
         )
     }
 
+    // System Settings enables Continue only after real keystrokes reach the
+    // email field. Do not use Command+A here: the SwiftUI login surface can
+    // intercept that global shortcut and render the pane blank. Clear via AX
+    // first, then use the HID path for the actual email text.
+    if isEmail {
+        let originalEmailValue = axString(liveHit.element, kAXValueAttribute as String)
+        if let keyboardHit = resolveFocusedLoginTextField(
+            appElement: appElement,
+            state: state,
+            identifier: identifier
+        ), isEnabledAndFocused(keyboardHit.element) {
+            let beforeClear = axString(keyboardHit.element, kAXValueAttribute as String)
+            let keyboardTargetIsCleared: Bool
+            if let beforeClear {
+                if beforeClear.isEmpty {
+                    keyboardTargetIsCleared = true
+                } else {
+                    let cleared = AXUIElementSetAttributeValue(
+                        keyboardHit.element,
+                        kAXValueAttribute as CFString,
+                        "" as CFString
+                    ) == .success
+                    keyboardTargetIsCleared = cleared && waitForExactLoginValue(
+                        appElement: appElement,
+                        state: state,
+                        identifier: identifier,
+                        expectedValue: ""
+                    )
+                }
+            } else {
+                // An unreadable value cannot prove that keyboard typing will
+                // replace rather than append. Keep the HID route bounded to
+                // a confirmed-empty email control.
+                keyboardTargetIsCleared = false
+            }
+
+            if keyboardTargetIsCleared {
+                usleep(60_000)
+                if let beforeTypeHit = activeFocusedLoginControl(
+                    appElement: appElement,
+                    state: state,
+                    identifier: identifier,
+                    matches: isTextInput
+                ), isEnabledAndFocused(beforeTypeHit.element),
+                   postUnicodeText(text),
+                   waitForLoginValueMatch(
+                       appElement: appElement,
+                       state: state,
+                       identifier: identifier,
+                       text: text,
+                       isEmail: true,
+                       previousValue: originalEmailValue,
+                       requireValueChange: false
+                   ) {
+                    return LoginValueInputResult(
+                        ok: true,
+                        route: "keyboard",
+                        reason: "verified"
+                    )
+                }
+            }
+        }
+
+        // Some macOS builds do not expose a focused field long enough for the
+        // keyboard route. Retain an AX value fallback for manual recovery.
+        let beforeAxFallback = originalEmailValue ?? ""
+        let axResult = AXUIElementSetAttributeValue(
+            liveHit.element,
+            kAXValueAttribute as CFString,
+            text as CFString
+        )
+        if axResult == .success,
+           waitForLoginValueMatch(
+               appElement: appElement,
+               state: state,
+               identifier: identifier,
+               text: text,
+               isEmail: true,
+               previousValue: beforeAxFallback,
+               requireValueChange: false
+           ) {
+            return LoginValueInputResult(
+                ok: true,
+                route: "ax_value",
+                reason: "verified"
+            )
+        }
+        return LoginValueInputResult(
+            ok: false,
+            route: axResult == .success ? "ax_value" : nil,
+            reason: axResult == .success
+                ? "ax_value_unconfirmed"
+                : "keyboard_unconfirmed"
+        )
+    }
+
+    // Password path: AX first, then keyboard fallback if the AX value did
+    // not become visible on the same focused secure field.
     let originalValue = axString(liveHit.element, kAXValueAttribute as String)
     var valueBeforeWrite = originalValue
-    if !isEmail, let originalValue, !originalValue.isEmpty {
+    if let originalValue, !originalValue.isEmpty {
         let clearResult = AXUIElementSetAttributeValue(
             liveHit.element,
             kAXValueAttribute as CFString,
@@ -623,9 +707,9 @@ func focusAndSetLoginValue(
            state: state,
            identifier: identifier,
            text: text,
-           isEmail: isEmail,
+           isEmail: false,
            previousValue: valueBeforeWrite,
-           requireValueChange: !isEmail
+           requireValueChange: true
        ) {
         return LoginValueInputResult(
             ok: true,
@@ -659,7 +743,7 @@ func focusAndSetLoginValue(
         )
     }
 
-    postCmdA()
+    // The password field was cleared above, so selecting all is unnecessary.
     usleep(100_000)
     guard let beforeTypeHit = activeFocusedLoginControl(
         appElement: appElement,
@@ -681,9 +765,9 @@ func focusAndSetLoginValue(
         state: state,
         identifier: identifier,
         text: text,
-        isEmail: isEmail,
+        isEmail: false,
         previousValue: valueBeforeWrite,
-        requireValueChange: !isEmail
+        requireValueChange: true
     ) {
         return LoginValueInputResult(
             ok: true,

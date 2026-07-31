@@ -9,6 +9,7 @@ import {
   redactFlowAuditText,
   serializeFlowAuditError,
 } from "./lib/flow-audit.js";
+import { sanitizeMacSettingsEvent } from "./apple-id-full-flow.mjs";
 
 const PASSWORD = "Synthetic-Password-Canary";
 const EMAIL = "synthetic.person@example.invalid";
@@ -214,9 +215,45 @@ function runIdNormalizationTest() {
   }
 }
 
+function runPostSmsFailureReasonAuditTest() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-flow-audit-post-sms-"));
+  const auditPath = path.join(tempDir, "flow-audit.jsonl");
+  try {
+    const safeEvent = sanitizeMacSettingsEvent({
+      module: "post_sms",
+      event: "state_probe_invalid",
+      reason: "visual_unavailable",
+      rawAx: AX,
+      stdout: `${OTP} ${OCR}`,
+      helperStderr: SCREENSHOT,
+    });
+    assert.deepEqual(safeEvent, {
+      module: "post_sms",
+      event: "state_probe_invalid",
+      reason: "visual_unavailable",
+    });
+
+    const audit = createFlowAudit(tempDir);
+    audit.write("mac_settings", "event", safeEvent);
+    assert.equal(audit.close(), true);
+
+    const [entry] = fs
+      .readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(entry.details, safeEvent);
+    assertNoSecret(JSON.stringify(entry));
+  } finally {
+    if (fs.existsSync(auditPath)) fs.unlinkSync(auditPath);
+    fs.rmdirSync(tempDir);
+  }
+}
+
 runAuditRedactionTest();
 runRedactBeforeTruncateTest();
 runSplitOtpAndRelativeQueryRedactionTest();
 runIdNormalizationTest();
+runPostSmsFailureReasonAuditTest();
 
 console.log("flow audit: ok");

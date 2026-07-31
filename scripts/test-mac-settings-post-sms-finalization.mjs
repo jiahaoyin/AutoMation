@@ -8,23 +8,50 @@ import { fileURLToPath } from "node:url";
 import {
   completeMacSettingsPostSmsFinalization,
   isMacSettingsPostSmsFinalizationEnabled,
+  macSettingsPostSmsModuleIdentity,
   normalizeMacSettingsPostSmsState,
 } from "./lib/mac-settings-post-sms-finalization.js";
 import {
   isTrustedMacSettingsPostSmsHelperOverride,
+  normalizeMacSettingsPostSmsFailureReason,
   normalizeMacSettingsPostSmsBinding,
+  sanitizeMacSettingsPostSmsProcessFailure,
   sanitizeMacSettingsPostSmsResult,
 } from "./lib/mac-settings-post-sms-finalization-ax.js";
+import { sanitizeMacSettingsEvent } from "./apple-id-full-flow.mjs";
 
 const binding = { axOwnerPid: 401, visualOwnerPid: 402, windowId: 403 };
+const alternateBinding = { axOwnerPid: 401, visualOwnerPid: 402, windowId: 404 };
+
+assert.equal(
+  macSettingsPostSmsModuleIdentity({ stage: "terms", binding }),
+  "terms:401:402:403"
+);
+assert.equal(
+  macSettingsPostSmsModuleIdentity({ stage: "location", binding }),
+  "location:401:402:403"
+);
+assert.equal(
+  macSettingsPostSmsModuleIdentity({ stage: "terms", binding: alternateBinding }),
+  "terms:401:402:404"
+);
+assert.equal(macSettingsPostSmsModuleIdentity({ stage: "waiting", binding: null }), null);
+assert.equal(macSettingsPostSmsModuleIdentity({ stage: "terms", binding: null }), null);
 
 assert.equal(isMacSettingsPostSmsFinalizationEnabled({}), false);
+assert.equal(
+  isMacSettingsPostSmsFinalizationEnabled({ APPLE_AUTOMATION_SMS_ENABLED: "1" }),
+  true
+);
 assert.equal(
   isMacSettingsPostSmsFinalizationEnabled({ APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED: "1" }),
   true
 );
 assert.equal(
-  isMacSettingsPostSmsFinalizationEnabled({ APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED: "0" }),
+  isMacSettingsPostSmsFinalizationEnabled({
+    APPLE_AUTOMATION_SMS_ENABLED: "1",
+    APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED: "0",
+  }),
   false
 );
 assert.deepEqual(normalizeMacSettingsPostSmsState({ ok: true, stage: "waiting" }), {
@@ -58,6 +85,18 @@ assert.equal(normalizeMacSettingsPostSmsBinding({ ...binding, windowId: 0 }), nu
 assert.equal(normalizeMacSettingsPostSmsBinding({ ...binding, axOwnerPid: 1.5 }), null);
 assert.equal(normalizeMacSettingsPostSmsBinding({ ...binding, visualOwnerPid: 0x80000000 }), null);
 assert.equal(normalizeMacSettingsPostSmsBinding({ ...binding, windowId: 0x1_0000_0000 }), null);
+for (const reason of [
+  "visual_unavailable",
+  "binding_invalid",
+  "helper_exit",
+  "invalid_request",
+  "timeout",
+  "manual_required",
+  "invalid",
+]) {
+  assert.equal(normalizeMacSettingsPostSmsFailureReason(reason), reason);
+}
+assert.equal(normalizeMacSettingsPostSmsFailureReason("raw AX text 123456"), "invalid");
 assert.deepEqual(sanitizeMacSettingsPostSmsResult("state", { ok: true, stage: "iphone_unlock", digits: 6, binding }), {
   ok: true,
   stage: "iphone_unlock",
@@ -69,7 +108,71 @@ assert.deepEqual(sanitizeMacSettingsPostSmsResult("state", { ok: true, stage: "i
   stage: "invalid",
   digits: null,
   binding: null,
+  reason: "binding_invalid",
 });
+assert.deepEqual(
+  sanitizeMacSettingsPostSmsResult("state", {
+    ok: false,
+    stage: "visual_unavailable",
+    rawAx: "RAW_AX_CANARY 123456",
+  }),
+  {
+    ok: false,
+    stage: "invalid",
+    digits: null,
+    binding: null,
+    reason: "visual_unavailable",
+  }
+);
+assert.deepEqual(
+  sanitizeMacSettingsPostSmsResult("state", {
+    ok: false,
+    stage: "raw AX text 123456",
+    stderr: "RAW_AX_CANARY",
+  }),
+  {
+    ok: false,
+    stage: "invalid",
+    digits: null,
+    binding: null,
+    reason: "invalid",
+  }
+);
+assert.deepEqual(
+  sanitizeMacSettingsPostSmsProcessFailure(
+    "state",
+    Object.assign(new Error("helper exited"), {
+      stdout: JSON.stringify({
+        ok: false,
+        stage: "visual_unavailable",
+        rawAx: "RAW_AX_CANARY 123456",
+      }),
+    })
+  ),
+  {
+    ok: false,
+    stage: "invalid",
+    digits: null,
+    binding: null,
+    reason: "visual_unavailable",
+  }
+);
+assert.deepEqual(
+  sanitizeMacSettingsPostSmsProcessFailure(
+    "state",
+    Object.assign(new Error("helper timed out"), {
+      code: "ETIMEDOUT",
+      stdout: "RAW_AX_CANARY 123456",
+    })
+  ),
+  {
+    ok: false,
+    stage: "invalid",
+    digits: null,
+    binding: null,
+    reason: "timeout",
+  }
+);
 for (const [phase, stage] of [
   ["terms", "terms_submitted"],
   ["mac-password", "mac_password_submitted"],
@@ -88,7 +191,58 @@ assert.deepEqual(sanitizeMacSettingsPostSmsResult("unlock-code", { ok: true, sta
   stage: "invalid",
   digits: null,
   binding: null,
+  reason: "invalid",
 });
+
+{
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    nativeRunner: async () => ({
+      ok: false,
+      stage: "visual_unavailable",
+      rawAx: "RAW_AX_CANARY 123456",
+    }),
+  });
+  assert.deepEqual(result, { status: "retryable", reason: "visual_unavailable" });
+}
+
+{
+  const events = [];
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    onEvent: (event) => events.push(event),
+    nativeRunner: async (phase) =>
+      phase === "state"
+        ? { ok: true, stage: "terms", binding }
+        : { ok: false, stage: "manual_required", rawAx: "RAW_AX_CANARY 123456" },
+  });
+  assert.deepEqual(result, {
+    status: "retryable",
+    stage: "terms",
+    binding,
+    reason: "manual_required",
+  });
+  const actionFailure = events.find((event) => event.event === "action_unconfirmed");
+  assert.deepEqual(actionFailure, {
+    module: "post_sms",
+    event: "action_unconfirmed",
+    stage: "terms",
+    phase: "terms",
+    reason: "manual_required",
+  });
+  const safeAuditEvent = sanitizeMacSettingsEvent({
+    ...actionFailure,
+    stdout: "RAW_AX_CANARY 123456",
+    rawAx: "RAW_AX_CANARY",
+  });
+  assert.deepEqual(safeAuditEvent, actionFailure);
+  assert.equal(JSON.stringify(safeAuditEvent).includes("RAW_AX_CANARY"), false);
+  assert.equal(JSON.stringify(safeAuditEvent).includes("123456"), false);
+}
 
 {
   const home = "C:\\Users\\post-sms-test";
@@ -142,17 +296,17 @@ assert.deepEqual(sanitizeMacSettingsPostSmsResult("unlock-code", { ok: true, sta
         ? { ok: true, stage: "iphone_unlock", digits: 6, binding }
         : { ok: true, stage: "iphone_unlock_submitted" };
     },
-    passcodeProvider: async (digits) => (digits === 6 ? "123456" : null),
   });
-  assert.deepEqual(result, { status: "submitted" });
-  assert.deepEqual(calls.map(({ phase }) => phase), ["state", "unlock-code"]);
-  assert.equal(calls[1].passcode, "000000");
-  assert.deepEqual(calls[1].binding, binding);
+  assert.deepEqual(result, { status: "manual_required", stage: "iphone_unlock", binding });
+  assert.deepEqual(
+    calls.map(({ phase }) => phase),
+    ["state"],
+    "a device passcode page must stay manual and receive no placeholder input"
+  );
 }
 
 for (const [stateStage, phase, submittedStage] of [
   ["terms", "terms", "terms_submitted"],
-  ["mac_password", "mac-password", "mac_password_submitted"],
   ["location", "location", "location_submitted"],
 ]) {
   const calls = [];
@@ -167,10 +321,9 @@ for (const [stateStage, phase, submittedStage] of [
         : { ok: true, stage: submittedStage };
     },
   });
-  assert.deepEqual(result, { status: "submitted" });
+  assert.deepEqual(result, { status: "submitted", stage: stateStage, binding });
   assert.deepEqual(calls.map(({ phase: calledPhase }) => calledPhase), ["state", phase]);
   assert.deepEqual(calls[1].binding, binding);
-  if (stateStage === "mac_password") assert.equal(calls[1].password, "000000");
 }
 
 {
@@ -186,8 +339,57 @@ for (const [stateStage, phase, submittedStage] of [
         : { ok: true, stage: "iphone_unlock_submitted" };
     },
   });
-  assert.deepEqual(result, { status: "submitted" });
-  assert.deepEqual(calls, ["state", "unlock-code"]);
+  assert.deepEqual(result, { status: "manual_required", stage: "iphone_unlock", binding });
+  assert.deepEqual(calls, ["state"]);
+}
+
+{
+  const calls = [];
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    nativeRunner: async (phase) => {
+      calls.push(phase);
+      return phase === "state"
+        ? { ok: true, stage: "mac_password", binding }
+        : { ok: true, stage: "mac_password_submitted" };
+    },
+  });
+  assert.deepEqual(result, { status: "manual_required", stage: "mac_password", binding });
+  assert.deepEqual(
+    calls,
+    ["state"],
+    "a local Mac password page must stay manual and receive no placeholder input"
+  );
+}
+
+for (const [stage, digits] of [
+  ["mac_password", null],
+  ["iphone_unlock", 6],
+]) {
+  const events = [];
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    probeOnly: true,
+    onEvent: (event) => events.push(event),
+    nativeRunner: async (phase) => {
+      assert.equal(phase, "state");
+      return { ok: true, stage, digits, binding };
+    },
+  });
+  assert.deepEqual(result, { status: "state_observed", stage, binding });
+  assert.ok(
+    events.some((event) => event.event === "state_observed_probe_only" && event.stage === stage),
+    "a probe-only manual handoff must be observed without requesting another prompt"
+  );
+  assert.equal(
+    events.some((event) => event.event === "manual_required"),
+    false,
+    "a probe-only manual handoff must not duplicate the manual prompt"
+  );
 }
 
 {
@@ -204,25 +406,64 @@ for (const [stateStage, phase, submittedStage] of [
       throw new Error("a state without its original binding must not prompt");
     },
   });
-  assert.deepEqual(result, { status: "manual_required" });
+  assert.deepEqual(result, { status: "retryable", reason: "invalid" });
   assert.deepEqual(calls, ["state"]);
 }
 
 {
   let clock = 0;
+  const stateTimeouts = [];
   const result = await completeMacSettingsPostSmsFinalization({
     platform: "darwin",
     supervised: true,
     isTTY: true,
-    scanTimeoutMs: 100,
+    scanTimeoutMs: 1_000,
     pollIntervalMs: 100,
     now: () => clock,
     sleep: async (ms) => {
       clock += ms;
     },
-    nativeRunner: async () => ({ ok: true, stage: "waiting" }),
+    nativeRunner: async (_phase, options) => {
+      stateTimeouts.push(options.timeoutMs);
+      return { ok: true, stage: "waiting" };
+    },
   });
   assert.deepEqual(result, { status: "not_required" });
+  assert.ok(stateTimeouts.length >= 1);
+  assert.ok(
+    stateTimeouts.every((timeoutMs) => timeoutMs > 0 && timeoutMs <= 1_000),
+    "a no-modal state probe must stay bounded by the short scan window"
+  );
+}
+
+{
+  const calls = [];
+  let policyCalls = 0;
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    nativeRunner: async (phase) => {
+      calls.push(phase);
+      return phase === "state"
+        ? { ok: true, stage: "terms", binding }
+        : { ok: true, stage: "terms_submitted" };
+    },
+    beforeSubmit: (state) => {
+      policyCalls += 1;
+      assert.deepEqual(state, { ok: true, stage: "terms", digits: null, binding });
+      return false;
+    },
+  });
+  assert.equal(result.status, "manual_required");
+  assert.equal(result.stage, "terms");
+  assert.deepEqual(result.binding, binding);
+  assert.equal(policyCalls, 1);
+  assert.deepEqual(
+    calls,
+    ["state"],
+    "a rejected round policy must prevent the native action phase from running"
+  );
 }
 
 assert.deepEqual(
@@ -406,11 +647,27 @@ const controllerSource = fs.readFileSync(
   "utf8"
 );
 assert.doesNotMatch(controllerSource, /promptForHiddenDevicePasscode/);
-assert.match(controllerSource, /"0"\.repeat\(state\.digits\)/);
-assert.match(controllerSource, /actionOptions\.password = "000000"/);
+assert.match(controllerSource, /const MANUAL_STAGES = new Set\(\["mac_password", "iphone_unlock"\]\)/);
+assert.match(
+  controllerSource,
+  /if \(MANUAL_STAGES\.has\(state\.stage\)\) \{[\s\S]*?return resultFor\("manual_required", state\)/
+);
+assert.doesNotMatch(controllerSource, /"0"\.repeat\(state\.digits\)/);
+assert.doesNotMatch(controllerSource, /actionOptions\.password = "000000"/);
 assert.match(controllerSource, /mac-password/);
 assert.match(controllerSource, /location/);
 assert.match(controllerSource, /APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED/);
+assert.match(controllerSource, /export function macSettingsPostSmsModuleIdentity\(/);
+assert.match(controllerSource, /options\.beforeSubmit/);
+const defaultScanTimeout = /const scanTimeoutMs = boundedPositive\(options\.scanTimeoutMs,\s*([0-9_]+)\)/.exec(
+  controllerSource
+);
+assert.ok(defaultScanTimeout, "the controller must retain an explicit short state-scan default");
+assert.ok(
+  Number(defaultScanTimeout[1].replaceAll("_", "")) <= 5_000,
+  "a missing modal must remain a bounded probe rather than monopolizing signed-in detection"
+);
+assert.doesNotMatch(controllerSource, /boundedPositive\(options\.scanTimeoutMs,\s*45_000\)/);
 assert.doesNotMatch(controllerSource, /readFile(?:Sync)?\([^)]*\.env/);
 assert.doesNotMatch(controllerSource, /APPLE_PASSWORD|APPLE_ID(?:\W|$)/);
 
