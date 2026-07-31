@@ -332,15 +332,31 @@ await expectCode("MAC_SETTINGS_SMS_TIMEOUT", async () => {
 }
 
 await expectCode("MAC_SETTINGS_SMS_STATE_UNAVAILABLE", async () => {
+  let clock = 0;
   await completeSupervisedMacSettingsSmsVerification(
-    baseOptions({ nativeRunner: async () => ({ ok: false }) })
+    baseOptions({
+      surfaceUnreadyGraceMs: 10,
+      now: () => clock,
+      sleep: async (milliseconds) => {
+        clock += milliseconds;
+      },
+      nativeRunner: async () => ({ ok: false }),
+    })
   );
 });
 
 await expectCode("MAC_SETTINGS_SMS_STATE_UNAVAILABLE", async () => {
+  let clock = 0;
   const sequence = createSequenceRunner([{ ok: true, stage: "unexpected" }]);
   await completeSupervisedMacSettingsSmsVerification(
-    baseOptions({ nativeRunner: sequence.runner })
+    baseOptions({
+      surfaceUnreadyGraceMs: 10,
+      now: () => clock,
+      sleep: async (milliseconds) => {
+        clock += milliseconds;
+      },
+      nativeRunner: sequence.runner,
+    })
   );
   assert.deepEqual(sequence.calls.map(({ phase }) => phase), ["sms-state"]);
 });
@@ -678,6 +694,67 @@ if (process.platform === "darwin") {
     typecheck.stderr || typecheck.stdout || typecheck.error?.message
   );
 }
+
+// A dynamically hydrated Settings page can stay AX-blank across multiple
+// complete probe windows.  The mandatory six-cell page must still be awaited;
+// provider polling cannot begin and a manual handoff cannot be requested just
+// because a short diagnostic threshold was crossed.
+{
+  let clock = 0;
+  let stateReads = 0;
+  let codeWritten = false;
+  let providerObservedAfterStateReads = null;
+  const progress = [];
+  const result = await completeSupervisedMacSettingsSmsVerification(
+    baseOptions({
+      timeoutMs: 1_000,
+      pollIntervalMs: 5,
+      stateReadAttempts: 2,
+      maxStateFailureWindows: 2,
+      surfaceUnreadyGraceMs: 300,
+      now: () => clock,
+      sleep: async (milliseconds) => {
+        clock += milliseconds;
+      },
+      nativeRunner: async (phase) => {
+        if (phase === "sms-code") {
+          codeWritten = true;
+          return { ok: true, stage: "code_submitted" };
+        }
+        stateReads += 1;
+        if (!codeWritten) {
+          if (stateReads <= 3) return { ok: false };
+          return { ok: true, stage: "code_entry" };
+        }
+        if (stateReads === 7) return { ok: true, stage: "code_pending" };
+        return { ok: true, stage: "waiting" };
+      },
+      codeProvider: async () => {
+        providerObservedAfterStateReads = stateReads;
+        return "864209";
+      },
+      manualCodeProvider: async () => {
+        throw new Error("provider polling must wait for the stable six-cell page");
+      },
+      onProgress: (event) => progress.push(event),
+    })
+  );
+  assert.deepEqual(result, { status: "submitted" });
+  assert.equal(
+    providerObservedAfterStateReads,
+    6,
+    "provider polling begins only after the two stable code-entry observations"
+  );
+  assert.ok(
+    progress.some(({ event }) => event === "sms_surface_loading"),
+    "extended dynamic loading must be observable without forcing a manual handoff"
+  );
+  assert.equal(
+    progress.some(({ event }) => event === "manual_required"),
+    false,
+    "a short AX blank before the mandatory code page must not enter manual mode"
+  );
+}
 assert.match(swiftSource, /CFGetTypeID\(positionValue\) == AXValueGetTypeID\(\)/);
 assert.match(swiftSource, /CFGetTypeID\(sizeValue\) == AXValueGetTypeID\(\)/);
 assert.doesNotMatch(swiftSource, /as\?\s+AXValue/);
@@ -783,5 +860,7 @@ assert.match(
 );
 assert.doesNotMatch(loginSource, /\[Mac Settings\]|\[SMS\]/);
 assert.match(loginSource, /按回车键/);
+assert.match(loginSource, /postSmsInitialObservationGraceMs/);
+assert.match(loginSource, /initialPostSmsObservation: postSmsEnabled && smsCompletionObserved/);
 
 console.log("mac settings supervised sms verification: ok");

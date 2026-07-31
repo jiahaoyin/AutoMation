@@ -40,6 +40,16 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
     5,
     "MAC_SETTINGS_SMS_STATE_FAILURE_WINDOWS_INVALID"
   );
+  // System Settings can leave the AX tree temporarily blank while the SMS
+  // surface is hydrated over the network.  A short run of failed snapshots is
+  // only a diagnostic threshold; it is not proof that the mandatory six-cell
+  // page will never appear.  Keep observing the same SMS module for this
+  // bounded window before requesting a supervised manual handoff.
+  const surfaceUnreadyGraceMs = boundedPositiveInteger(
+    options.surfaceUnreadyGraceMs,
+    Math.min(timeoutMs, 120_000),
+    "MAC_SETTINGS_SMS_SURFACE_UNREADY_GRACE_INVALID"
+  );
   const stableCodeEntryReads = boundedPositiveInteger(
     options.stableCodeEntryReads,
     2,
@@ -52,7 +62,7 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   );
   const phoneTransitionGraceMs = boundedPositiveInteger(
     options.phoneTransitionGraceMs,
-    30_000,
+    90_000,
     "MAC_SETTINGS_SMS_PHONE_TRANSITION_GRACE_INVALID"
   );
   const codeTransitionGraceMs = boundedPositiveInteger(
@@ -107,6 +117,7 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   let deadline = now() + timeoutMs;
   let lastProgress = null;
   let stateFailures = 0;
+  let surfaceUnavailableStartedAt = null;
   let phoneSelectionAttempts = 0;
   let codeSubmissionAttempts = 0;
   let codeSurfaceFailures = 0;
@@ -277,23 +288,37 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
     const state = await readStableSmsState();
     if (!state) {
       stateFailures += 1;
+      if (surfaceUnavailableStartedAt === null) surfaceUnavailableStartedAt = now();
+      const surfaceUnavailableElapsedMs = Math.max(0, now() - surfaceUnavailableStartedAt);
+      if (manualSurfaceHandoffPending) {
+        // AX can remain blank while a remote Settings surface hydrates.  The
+        // operator has already acknowledged the handoff, so keep the mandatory
+        // SMS module alive until its overall deadline rather than turning
+        // another short blank window into a terminal failure.
+        reportEvent("manual_surface_reprobe_waiting", { attempts: stateFailures });
+        await waitBounded(pollIntervalMs);
+        continue;
+      }
+      if (stateFailures >= maxStateFailureWindows && surfaceUnavailableElapsedMs < surfaceUnreadyGraceMs) {
+        // The old implementation switched to manual handling after a handful
+        // of sub-second probes.  That race is common between the phone picker
+        // and the mandatory six-cell page on a slow network.  Keep probing;
+        // provider polling remains impossible until `code_entry` is stable.
+        reportProgress("sms_surface_loading", {
+          attempts: stateFailures,
+          elapsedMs: surfaceUnavailableElapsedMs,
+        });
+        await waitBounded(pollIntervalMs);
+        continue;
+      }
       if (stateFailures >= maxStateFailureWindows) {
-        if (manualSurfaceHandoffPending) {
-          // AX can remain blank while a remote Settings surface hydrates.
-          // The operator has already acknowledged the handoff, so keep the
-          // mandatory SMS module alive until its overall deadline rather than
-          // turning another short blank window into a terminal failure.
-          reportEvent("manual_surface_reprobe_waiting", { attempts: stateFailures });
-          stateFailures = 0;
-          await waitBounded(pollIntervalMs);
-          continue;
-        }
-        if (!manualSurfaceHandoffPending && await finishManualModule("surface_unavailable", "state_unavailable", stateFailures)) {
+        if (await finishManualModule("surface_unavailable", "state_unavailable", stateFailures)) {
           // The six-cell page is mandatory. Enter only acknowledges the
           // handoff; continue probing until that page is observed and its
           // transition is confirmed. Never jump directly to post-SMS here.
           manualSurfaceHandoffPending = true;
           stateFailures = 0;
+          surfaceUnavailableStartedAt = null;
           reportProgress("manual_sms_step_confirmed", { stage: "surface_unavailable" });
           continue;
         }
@@ -304,6 +329,7 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
     }
 
     stateFailures = 0;
+    surfaceUnavailableStartedAt = null;
     if (manualSurfaceHandoffPending && state.stage === "code_entry") {
       manualSurfaceHandoffPending = false;
       reportProgress("code_entry_detected", { attempts: codeSubmissionAttempts });

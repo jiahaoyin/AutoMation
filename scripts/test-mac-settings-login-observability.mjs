@@ -260,6 +260,21 @@ function macSettingsEventSanitizationTest() {
   );
   assert.deepEqual(
     sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "sms_surface_loading",
+      attempts: 5,
+      elapsedMs: 60_000,
+      unexpected: SECRET,
+    }),
+    {
+      module: "sms",
+      event: "sms_surface_loading",
+      attempts: 5,
+      elapsedMs: 60_000,
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
       module: "post_sms",
       event: "post_sms_manual_required",
       reason: "state_probe_unavailable",

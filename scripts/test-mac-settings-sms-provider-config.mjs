@@ -289,6 +289,7 @@ const postSmsAlternateBinding = { axOwnerPid: 401, visualOwnerPid: 402, windowId
   let actionCalls = 0;
   let manualCalls = 0;
   let signedInChecks = 0;
+  let signedInChecksAfterManual = 0;
   const roundDecisions = [];
   const repeatedState = {
     ok: true,
@@ -297,9 +298,9 @@ const postSmsAlternateBinding = { axOwnerPid: 401, visualOwnerPid: 402, windowId
     binding: postSmsTermsBinding,
   };
 
-  assert.deepEqual(
-    await waitForMacSettingsLoginComplete({
-      timeoutMs: 2_500,
+  await assert.rejects(
+    () => waitForMacSettingsLoginComplete({
+      timeoutMs: 1_500,
       intervalMs: 1,
       settleMs: 0,
       postSmsIntervalMs: 250,
@@ -307,7 +308,8 @@ const postSmsAlternateBinding = { axOwnerPid: 401, visualOwnerPid: 402, windowId
       sleep: async () => {},
       isSignedIn: async () => {
         signedInChecks += 1;
-        return manualCalls === 1 && signedInChecks >= 2;
+        if (manualCalls > 0) signedInChecksAfterManual += 1;
+        return manualCalls > 0;
       },
       postSmsFinalization: async ({ beforeSubmit }) => {
         postSmsCalls += 1;
@@ -327,13 +329,13 @@ const postSmsAlternateBinding = { axOwnerPid: 401, visualOwnerPid: 402, windowId
         return false;
       },
     }),
-    { signedIn: true }
+    (error) => error?.code === "MAC_SETTINGS_LOGIN_WAIT_TIMEOUT"
   );
   assert.equal(postSmsCalls, 4, "the fourth identical modal must be blocked before action");
   assert.equal(actionCalls, 3, "one stable stage/binding can receive at most three actions");
   assert.deepEqual(roundDecisions, [true, true, true, false]);
   assert.equal(manualCalls, 1, "a declined manual continuation remains suppressed");
-  assert.ok(signedInChecks >= 2, "manual handling cannot itself be treated as signed-in success");
+  assert.equal(signedInChecksAfterManual, 0, "an unacknowledged manual page must block signed-in acceptance");
 }
 
 {

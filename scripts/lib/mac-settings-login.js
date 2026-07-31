@@ -544,6 +544,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
   const blockedPostSmsModules = new Set();
   const promptedPostSmsModules = new Set();
   let pendingPostSmsTransition = null;
+  let manualPostSmsContinuationPending = false;
   let initialPostSmsObservationUntil = options.initialPostSmsObservation === true
     ? now() + postSmsInitialObservationGraceMs
     : 0;
@@ -556,6 +557,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
     nextPostSmsAt = now() + Math.max(250, delayMs);
   };
   const resumeManualObservation = (identity, manualKey) => {
+    manualPostSmsContinuationPending = false;
     if (identity) {
       // A supervised Enter means the operator handled this exact module.
       // Keep its action budget blocked and observe only its transition; a
@@ -567,6 +569,13 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
     } else {
       unboundPostSmsProbeFailures = 0;
       unboundPostSmsProbeStartedAt = 0;
+      // A manually completed unbound surface has no PID/window identity to
+      // protect it with. Re-arm the same observation guard so a short blank
+      // handoff cannot let signed-in detection skip a network-loaded next page.
+      initialPostSmsObservationUntil = Math.max(
+        initialPostSmsObservationUntil,
+        now() + postSmsTransitionGraceMs
+      );
     }
     promptedPostSmsModules.delete(manualKey);
     schedulePostSms();
@@ -613,6 +622,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
       if (
         typeof postSmsFinalization === "function" &&
         !postSmsDisabled &&
+        !manualPostSmsContinuationPending &&
         now() >= nextPostSmsAt
       ) {
         const pending = pendingPostSmsTransition && now() < pendingPostSmsTransition.until
@@ -676,6 +686,7 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
         if (
           initialPostSmsObservationUntil > 0 &&
           result?.status !== "not_required" &&
+          result?.status !== "manual_required" &&
           !(result?.status === "retryable" && !identity)
         ) {
           // A concrete module (or its own retry state) now owns the next
@@ -774,7 +785,24 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
         if (result?.status === "manual_required") {
           const manualKey = identity ?? "unidentified";
           if (identity) blockedPostSmsModules.add(identity);
-          await requestManualContinuation(result, identity, manualKey);
+          // An uncompleted manual page is an active state, not a soft warning.
+          // Never let a temporarily positive signed-in probe end the run until
+          // the supervised operator has explicitly resumed this module.
+          const resumed = await requestManualContinuation(result, identity, manualKey);
+          if (!resumed) {
+            manualPostSmsContinuationPending = true;
+            schedulePostSms();
+            emitMacSettingsEvent(onEvent, "signed_in_probe", {
+              module: "login",
+              signedIn: false,
+              outcome: "deferred",
+            });
+            return false;
+          }
+          // `resumeManualObservation()` has scheduled a probe-only scan (or
+          // re-armed the unbound observation guard). Start the next outer tick
+          // from that state; Enter never itself proves login completion.
+          return false;
         }
 
         if (result?.status !== "submitted") schedulePostSms();
@@ -784,6 +812,14 @@ export async function waitForMacSettingsLoginComplete(options = {}) {
       // probe-only transition observation before accepting that signed-in
       // result, otherwise slow Settings hydration truncates the next module.
       if (pendingPostSmsTransition && now() < pendingPostSmsTransition.until) {
+        emitMacSettingsEvent(onEvent, "signed_in_probe", {
+          module: "login",
+          signedIn: false,
+          outcome: "deferred",
+        });
+        return false;
+      }
+      if (manualPostSmsContinuationPending) {
         emitMacSettingsEvent(onEvent, "signed_in_probe", {
           module: "login",
           signedIn: false,
@@ -954,6 +990,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
           const message = {
             phone_selection_detected: "检测到验证码接收方式，正在匹配已配置号码",
             phone_selection_submitted: "验证码接收方式已提交，等待验证码输入页加载",
+            sms_surface_loading: "验证码页面正在加载，继续等待",
             code_entry_detected: "验证码输入页已就绪",
             code_polling_started: "正在轮询验证码",
             code_written: "验证码已写入，等待页面切换确认",

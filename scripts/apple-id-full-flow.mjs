@@ -245,6 +245,7 @@ const MAC_SETTINGS_EVENT_NAMES = new Set([
   "code_provider_code_ready",
   "state_probe",
   "state_stable",
+  "sms_surface_loading",
   "waiting_for_sms_surface",
   "phone_selection_detected",
   "phone_selection_submitted",
@@ -419,6 +420,7 @@ const MAC_SETTINGS_FAILURE_CODES = new Set([
   "mac_settings_sms_poll_interval_invalid",
   "mac_settings_sms_state_attempts_invalid",
   "mac_settings_sms_state_failure_windows_invalid",
+  "mac_settings_sms_surface_unready_grace_invalid",
   "mac_settings_sms_stable_code_reads_invalid",
   "mac_settings_sms_action_attempts_invalid",
   "mac_settings_sms_action_retry_delay_invalid",
@@ -460,7 +462,7 @@ export function sanitizeMacSettingsEvent(event = {}) {
   if (typeof event?.probeOnly === "boolean") safe.probeOnly = event.probeOnly;
   if (typeof event?.ok === "boolean") safe.ok = event.ok;
   if (typeof event?.signedIn === "boolean") safe.signedIn = event.signedIn;
-  for (const key of ["step", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "timeoutMs", "axOwnerPid", "visualOwnerPid", "windowId"]) {
+  for (const key of ["step", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "axOwnerPid", "visualOwnerPid", "windowId"]) {
     const value = safeMacSettingsEventNumber(event?.[key]);
     if (value !== undefined) safe[key] = value;
   }
