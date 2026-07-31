@@ -78,11 +78,14 @@ waiting / dynamic hydration
   -> provider poll + one bounded code write
   -> code_pending / transition grace
   -> waiting observed twice
+  -> initial post-SMS observation grace (up to 90s)
   -> optional post-SMS pages in the order Apple presents them
   -> signed-in probe + settle probe
 ~~~
 
 - 号码选择页可能不出现；六码页必须实际出现并稳定后才会开始取码。
+- 六码页消失后的首次后置扫描保留最长 90 秒观察窗口；即使 signed-in probe 已经
+  为真，也会继续探测动态条款、定位或人工页面，直到窗口结束或出现具体模块。
 - 每个同一 `stage + PID + window` 的自动后置动作最多三次。条款和定位可自动处理；
   Mac 密码、iPhone 解锁和所有不确定页面都保留给人工。
 - 点击成功和人工 Enter 都只进入 probe-only 观察窗口。当前页面仍然存在时不会

@@ -38,16 +38,21 @@ then waits for the existing signed-in confirmation.
    the requested two-digit suffix, select it, and press a unique enabled
    Continue control.
 3. Wait for a uniquely recognized code-entry screen scoped to the same suffix.
-   This direct route covers accounts with one trusted number: the visible
+   The mandatory six-cell state must be observed twice before provider polling
+   begins. This direct route covers accounts with one trusted number: the visible
    delivery text must independently confirm the final two digits before polling
    begins.
-4. Poll the private provider for up to two minutes.  Parse only an isolated
+4. Poll the private provider within the bounded SMS deadline. Parse only an isolated
    six-digit candidate.  A candidate explicitly associated with a different
    suffix is rejected; an unassociated single candidate is accepted because
    provider responses are single-number pages.
 5. Submit the code to the AX helper.  Apple advances automatically, so the
-   coordinator must not invoke a second submit action.
-6. Leave System Settings open and wait for the existing signed-in detector so
+   coordinator must not invoke a second submit action. It first waits for the
+   populated group to disappear and observes the empty transition twice.
+6. Keep an initial post-SMS observation window for up to 90 seconds before a
+   signed-in result may finish the run. This allows network-loaded Terms,
+   Location, or manual pages to appear after the code sheet disappears.
+7. Leave System Settings open and wait for the existing signed-in detector so
    the operator can finish any additional screen manually.
 
 ## AX Evidence Constraints

@@ -50,7 +50,9 @@ provider polling, and the existing read-only 2FA OCR helper.
 
 The optional path is enabled by default for supervised Mac Settings sessions:
 an omitted value or `APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED=1` enables
-it, while `=0` explicitly disables it. It polls briefly after SMS submission:
+it, while `=0` explicitly disables it. After the mandatory SMS code page
+advances, it keeps an initial bounded observation window before the normal
+signed-in probe may complete the run. It then polls one optional module at a time:
 
 1. no unlock sheet: return to the normal signed-in wait;
 2. terms or location sheet: perform the corresponding bound action and return
