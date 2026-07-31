@@ -275,6 +275,53 @@ function macSettingsEventSanitizationTest() {
   );
   assert.deepEqual(
     sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "manual_required",
+      stage: "surface_unavailable",
+      reason: "state_waiting",
+      observations: 3,
+      rawAx: SECRET,
+    }),
+    {
+      module: "sms",
+      event: "manual_required",
+      stage: "surface_unavailable",
+      reason: "state_waiting",
+      observations: 3,
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "manual_sms_code_entry_waiting",
+      stage: "surface_unavailable",
+      reason: "surface_unclassified",
+      observations: 2,
+      rawAx: SECRET,
+    }),
+    {
+      module: "sms",
+      event: "manual_sms_code_entry_waiting",
+      stage: "surface_unavailable",
+      reason: "surface_unclassified",
+      observations: 2,
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "sms",
+      event: "code_transition_unreadable",
+      reason: "code_value_unreadable",
+      secret: SECRET,
+    }),
+    {
+      module: "sms",
+      event: "code_transition_unreadable",
+      reason: "code_value_unreadable",
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
       module: "post_sms",
       event: "post_sms_manual_required",
       reason: "state_probe_unavailable",

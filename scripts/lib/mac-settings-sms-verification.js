@@ -3,6 +3,14 @@ import { runMacSettingsSmsHelper } from "./mac-settings-sms-ax.js";
 import { sleep } from "./prompt.js";
 
 const VALID_STAGES = new Set(["phone_selection", "code_entry", "code_pending", "waiting"]);
+const SMS_STATE_REASONS = new Set([
+  "no_trusted_surface",
+  "phone_code_transition",
+  "code_surface_unready",
+  "ambiguous_sms_surface",
+  "surface_unclassified",
+  "code_value_unreadable",
+]);
 const SIX_DIGIT_CODE_RE = /^[0-9]{6}$/;
 const TWO_DIGIT_SUFFIX_RE = /^[0-9]{2}$/;
 function failure(code) { const error = new Error(code); error.code = code; return error; }
@@ -10,7 +18,12 @@ function readRemainingMs(deadline, now) { return Math.max(0, deadline - now()); 
 function boundedPositiveInteger(value, fallback, errorCode) { const candidate = value ?? fallback; if (!Number.isFinite(candidate) || candidate <= 0) throw failure(errorCode); const normalized = Math.trunc(candidate); if (normalized <= 0) throw failure(errorCode); return normalized; }
 export function trustedPhoneSuffix(phoneNumber) { const raw = String(phoneNumber ?? "").trim(); if (!/^\+?[0-9()\s.-]+$/.test(raw)) throw failure("MAC_SETTINGS_SMS_PHONE_INVALID"); const digits = raw.replace(/\D/g, ""); if (digits.length < 4) throw failure("MAC_SETTINGS_SMS_PHONE_INVALID"); return digits.slice(-2); }
 export function normalizeManualSmsCode(value) { const code = typeof value === "string" ? value.trim() : ""; return SIX_DIGIT_CODE_RE.test(code) ? code : null; }
-export function normalizeMacSettingsSmsState(value) { if (!value || typeof value !== "object" || value.ok !== true) return { ok: false, stage: "invalid" }; const stage = value.stage; return { ok: true, stage: VALID_STAGES.has(stage) ? stage : "invalid" }; }
+export function normalizeMacSettingsSmsState(value) {
+  if (!value || typeof value !== "object" || value.ok !== true) return { ok: false, stage: "invalid" };
+  const stage = VALID_STAGES.has(value.stage) ? value.stage : "invalid";
+  const reason = SMS_STATE_REASONS.has(value.reason) ? value.reason : undefined;
+  return { ok: true, stage, ...(reason ? { reason } : {}) };
+}
 function requireSupervisedSession({ platform, supervised, isTTY }) { if (platform !== "darwin") throw failure("MAC_SETTINGS_SMS_UNSUPPORTED_PLATFORM"); if (supervised !== true) throw failure("MAC_SETTINGS_SMS_SUPERVISION_REQUIRED"); if (isTTY !== true) throw failure("MAC_SETTINGS_SMS_TTY_REQUIRED"); }
 async function readCodeWithinDeadline(provider, { signal, timeoutMs }) { let removeAbortListener = () => {}; const aborted = new Promise((resolve) => { const onAbort = () => resolve(null); if (signal.aborted) { onAbort(); return; } signal.addEventListener("abort", onAbort, { once: true }); removeAbortListener = () => signal.removeEventListener("abort", onAbort); }); try { return await Promise.race([Promise.resolve().then(() => provider({ signal, timeoutMs })).catch(() => null), aborted]); } finally { removeAbortListener(); } }
 async function defaultNativeRunner(phase, options) { return runMacSettingsSmsHelper(phase, options); }
@@ -118,6 +131,8 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   let lastProgress = null;
   let stateFailures = 0;
   let surfaceUnavailableStartedAt = null;
+  let waitingSurfaceStartedAt = null;
+  let waitingSurfaceObservations = 0;
   let phoneSelectionAttempts = 0;
   let codeSubmissionAttempts = 0;
   let codeSurfaceFailures = 0;
@@ -231,6 +246,7 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
         stage: state.stage,
         ok: state.ok,
         stableReads: consecutive,
+        ...(state.reason ? { reason: state.reason } : {}),
       });
       if (state.ok && state.stage !== "invalid") {
         if (state.stage === previousStage) consecutive += 1;
@@ -240,7 +256,11 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
         }
         const requiredReads = state.stage === "code_entry" ? stableCodeEntryReads : 1;
         if (consecutive >= requiredReads) {
-          reportEvent("state_stable", { stage: state.stage, stableReads: consecutive });
+          reportEvent("state_stable", {
+            stage: state.stage,
+            stableReads: consecutive,
+            ...(state.reason ? { reason: state.reason } : {}),
+          });
           return state;
         }
       } else {
@@ -276,7 +296,6 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
     reportProgress("manual_sms_step_confirmed", { stage: "code_entry" });
     return true;
   };
-
   while (true) {
     if (readRemainingMs(deadline, now) <= 0) {
       // A visible code page is a safe, supervised handoff point.  Enter gives
@@ -291,11 +310,18 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
       if (surfaceUnavailableStartedAt === null) surfaceUnavailableStartedAt = now();
       const surfaceUnavailableElapsedMs = Math.max(0, now() - surfaceUnavailableStartedAt);
       if (manualSurfaceHandoffPending) {
-        // AX can remain blank while a remote Settings surface hydrates.  The
-        // operator has already acknowledged the handoff, so keep the mandatory
-        // SMS module alive until its overall deadline rather than turning
-        // another short blank window into a terminal failure.
-        reportEvent("manual_surface_reprobe_waiting", { attempts: stateFailures });
+        // The six-cell page is mandatory. A manual acknowledgement only helps
+        // recover the currently blank/transitioning Settings surface; it never
+        // proves the SMS module is complete or permits post-SMS to start.
+        reportProgress("manual_sms_code_entry_waiting", {
+          stage: "surface_unavailable",
+          attempts: stateFailures,
+          elapsedMs: surfaceUnavailableElapsedMs,
+        });
+        reportEvent("manual_surface_reprobe_waiting", {
+          attempts: stateFailures,
+          elapsedMs: surfaceUnavailableElapsedMs,
+        });
         await waitBounded(pollIntervalMs);
         continue;
       }
@@ -330,16 +356,21 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
 
     stateFailures = 0;
     surfaceUnavailableStartedAt = null;
+    if (state.stage !== "waiting") {
+      waitingSurfaceStartedAt = null;
+      waitingSurfaceObservations = 0;
+    }
     if (manualSurfaceHandoffPending && state.stage === "code_entry") {
       manualSurfaceHandoffPending = false;
       reportProgress("code_entry_detected", { attempts: codeSubmissionAttempts });
     }
     if (state.stage !== "phone_selection") phoneTransitionPendingUntil = 0;
-    if (manualCodeHandoffPending && state.stage !== "code_entry") {
-      // The operator confirmed the six-cell handoff and the page has now
-      // advanced.  Only this observed transition may return control to the
-      // outer login state machine.
-      if (state.stage === "code_pending") {
+    if (manualCodeHandoffPending) {
+      // The operator owns this six-cell page until a real transition is
+      // observed. A persistent AXValue-unreadable `code_entry` is not a new
+      // empty form, so it must neither trigger another prompt nor replay the
+      // code while the manual handoff is pending.
+      if (state.stage === "code_entry" || state.stage === "code_pending") {
         reportProgress("manual_code_transition_waiting", { stage: "code_entry" });
         await waitBounded(pollIntervalMs);
         continue;
@@ -392,6 +423,19 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
         continue;
       }
       if (state.stage === "code_entry") {
+        if (state.reason === "code_value_unreadable") {
+          // SwiftUI can keep AXValue absent after the six digits were written.
+          // That is not evidence of a fresh empty form, so wait for the bounded
+          // transition before escalating instead of replaying the same code.
+          reportEvent("code_transition_unreadable", { attempts: codeSubmissionAttempts });
+          reportProgress("code_transition_waiting", { attempts: codeSubmissionAttempts });
+          if (now() >= codeTransitionPendingUntil) {
+            if (await beginManualCodeHandoff("code_value_unreadable")) continue;
+            throw failure("MAC_SETTINGS_SMS_CODE_FILL_FAILED");
+          }
+          await waitBounded(pollIntervalMs);
+          continue;
+        }
         // A fresh, empty six-cell group means the native write did not survive
         // the page transition. It is safe to use one of the remaining bounded
         // attempts; do not classify it as an accepted submission.
@@ -412,6 +456,54 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
         codeTransitionPendingUntil = 0;
         postCodeWaitingObservations = 0;
       }
+    }
+    if (state.stage === "waiting") {
+      // `waiting` is valid during a remote Settings transition, but it must
+      // not turn an unrecognised live SMS page into an invisible loop. Keep a
+      // bounded observation window before asking the supervised operator to
+      // complete the current page and resume the same scanner.
+      if (waitingSurfaceStartedAt === null) waitingSurfaceStartedAt = now();
+      waitingSurfaceObservations += 1;
+      const elapsedMs = Math.max(0, now() - waitingSurfaceStartedAt);
+      const waitingDetails = {
+        observations: waitingSurfaceObservations,
+        elapsedMs,
+        ...(state.reason ? { reason: state.reason } : {}),
+      };
+      if (manualSurfaceHandoffPending) {
+        reportEvent("waiting_for_sms_surface", waitingDetails);
+        reportEvent("manual_surface_reprobe_waiting", {
+          attempts: waitingSurfaceObservations,
+          elapsedMs,
+        });
+        // Keep this handoff inside the mandatory SMS state machine. The next
+        // module may only run after a stable `code_entry`, a provider/manual
+        // code write, and the observed code-page transition.
+        reportProgress("manual_sms_code_entry_waiting", {
+          stage: "surface_unavailable",
+          ...waitingDetails,
+        });
+        await waitBounded(pollIntervalMs);
+        continue;
+      }
+      if (elapsedMs < surfaceUnreadyGraceMs) {
+        reportProgress(
+          waitingSurfaceObservations === 1 ? "waiting_for_sms_surface" : "sms_surface_loading",
+          waitingDetails
+        );
+        await waitBounded(pollIntervalMs);
+        continue;
+      }
+      reportEvent("waiting_for_sms_surface", waitingDetails);
+      if (await finishManualModule("surface_unavailable", "state_waiting", waitingSurfaceObservations)) {
+        manualSurfaceHandoffPending = true;
+        waitingSurfaceStartedAt = null;
+        waitingSurfaceObservations = 0;
+        reportProgress("manual_sms_step_confirmed", { stage: "surface_unavailable" });
+        await waitBounded(pollIntervalMs);
+        continue;
+      }
+      throw failure("MAC_SETTINGS_SMS_STATE_UNAVAILABLE");
     }
     if (state.stage === "phone_selection") {
       reportProgress("phone_selection_detected", { attempts: phoneSelectionAttempts });

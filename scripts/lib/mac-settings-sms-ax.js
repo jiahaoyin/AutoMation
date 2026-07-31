@@ -15,6 +15,14 @@ const SMS_AX_BIN = resolveNativeHelperPath(
 );
 const VALID_PHASES = new Set(["sms-state", "sms-select", "sms-continue", "sms-code"]);
 const VALID_STAGES = new Set(["phone_selection", "code_entry", "code_pending", "waiting"]);
+const SAFE_STATE_REASONS = new Set([
+  "no_trusted_surface",
+  "phone_code_transition",
+  "code_surface_unready",
+  "ambiguous_sms_surface",
+  "surface_unclassified",
+  "code_value_unreadable",
+]);
 const SUCCESS_STAGES_BY_PHASE = new Map([
   ["sms-select", "selected"],
   ["sms-continue", "continued"],
@@ -144,9 +152,9 @@ export function isMacSettingsSmsHelperAvailable() {
 export function sanitizeMacSettingsSmsNativeResult(phase, value) {
   if (!value || typeof value !== "object") return nativeFailure();
   if (phase === "sms-state") {
-    return value.ok === true && VALID_STAGES.has(value.stage)
-      ? { ok: true, stage: value.stage }
-      : nativeFailure(value.stage);
+    if (value.ok !== true || !VALID_STAGES.has(value.stage)) return nativeFailure(value.stage);
+    const reason = SAFE_STATE_REASONS.has(value.reason) ? value.reason : undefined;
+    return { ok: true, stage: value.stage, ...(reason ? { reason } : {}) };
   }
   const expectedStage = SUCCESS_STAGES_BY_PHASE.get(phase);
   return value.ok === true && value.stage === expectedStage

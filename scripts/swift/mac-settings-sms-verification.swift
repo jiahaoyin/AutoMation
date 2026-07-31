@@ -9,6 +9,7 @@ import Foundation
 private struct Output: Codable {
     let ok: Bool
     let stage: String
+    let reason: String?
 }
 
 private enum CodeEntry {
@@ -21,7 +22,7 @@ private struct PhoneSelection {
 }
 
 private struct SettingsSnapshot {
-    let pid: pid_t
+    let allowedPIDs: Set<pid_t>
     let nodes: [AXUIElement]
 }
 
@@ -84,10 +85,10 @@ private let phoneMarkers = [
     "\u{624B}\u{6A5F}",
 ]
 
-private func emit(_ ok: Bool, _ stage: String) -> Never {
+private func emit(_ ok: Bool, _ stage: String, _ reason: String? = nil) -> Never {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
-    let output = Output(ok: ok, stage: stage)
+    let output = Output(ok: ok, stage: stage, reason: reason)
     if let data = try? encoder.encode(output) {
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data([0x0A]))
@@ -142,12 +143,21 @@ private func belongsTo(_ element: AXUIElement, pid: pid_t) -> Bool {
     elementPID(element) == pid
 }
 
+private func belongsToTrustedOwners(_ element: AXUIElement, allowedPIDs: Set<pid_t>) -> Bool {
+    guard let pid = elementPID(element) else { return false }
+    return allowedPIDs.contains(pid)
+}
+
 private func isVisible(_ element: AXUIElement) -> Bool {
     axBool(element, kAXHiddenAttribute as String) != true
 }
 
 private func isEnabled(_ element: AXUIElement) -> Bool {
-    axBool(element, kAXEnabledAttribute as String) == true
+    // SwiftUI-backed System Settings controls can be actionable while omitting
+    // AXEnabled entirely. Treat only an explicit `false` as disabled; every
+    // caller still requires a concrete AX action or a writable value before it
+    // can touch the control.
+    axBool(element, kAXEnabledAttribute as String) != false
 }
 
 private func supportsPress(_ element: AXUIElement) -> Bool {
@@ -187,7 +197,11 @@ private func directTexts(_ element: AXUIElement) -> [String] {
         .filter { !$0.isEmpty }
 }
 
-private func textInSubtree(_ root: AXUIElement, pid: pid_t, maxNodes: Int = 120) -> [String] {
+private func textInSubtree(
+    _ root: AXUIElement,
+    allowedPIDs: Set<pid_t>,
+    maxNodes: Int = 120
+) -> [String] {
     var queue: [AXUIElement] = [root]
     var seen: [AXUIElement] = []
     var texts: [String] = []
@@ -198,14 +212,18 @@ private func textInSubtree(_ root: AXUIElement, pid: pid_t, maxNodes: Int = 120)
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        guard belongsTo(node, pid: pid), isVisible(node) else { continue }
+        guard belongsToTrustedOwners(node, allowedPIDs: allowedPIDs), isVisible(node) else { continue }
         texts.append(contentsOf: directTexts(node))
         queue.append(contentsOf: axChildren(node))
     }
     return texts
 }
 
-private func visibleNodes(in roots: [AXUIElement], pid: pid_t, maxNodes: Int = 1_500) -> [AXUIElement] {
+private func visibleNodes(
+    in roots: [AXUIElement],
+    allowedPIDs: Set<pid_t>,
+    maxNodes: Int = 1_500
+) -> [AXUIElement] {
     var queue = roots
     var seen: [AXUIElement] = []
     var nodes: [AXUIElement] = []
@@ -216,7 +234,7 @@ private func visibleNodes(in roots: [AXUIElement], pid: pid_t, maxNodes: Int = 1
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
         visited += 1
-        guard belongsTo(node, pid: pid), isVisible(node) else { continue }
+        guard belongsToTrustedOwners(node, allowedPIDs: allowedPIDs), isVisible(node) else { continue }
         nodes.append(node)
         queue.append(contentsOf: axChildren(node))
     }
@@ -245,20 +263,29 @@ private func isTrustedSystemSettings(_ app: NSRunningApplication) -> Bool {
     ).count == 1
 }
 
-private func activeSystemSettings() -> NSRunningApplication? {
+private func activeTrustedSettingsApplications() -> [NSRunningApplication] {
     let extensions = NSWorkspace.shared.runningApplications.filter(
         isTrustedAppleIDSettingsExtension
     )
     let hosts = NSWorkspace.shared.runningApplications.filter(isTrustedSystemSettingsHost)
     let activeHosts = hosts.filter { $0.isActive }
+    var applications: [NSRunningApplication] = []
 
-    // The supplied AX evidence is rooted in the active System Settings host.
-    // Prefer that unique window owner even when unrelated Settings extensions
-    // are also running, rather than returning no surface at all.
-    if activeHosts.count == 1 { return activeHosts[0] }
-    if extensions.count == 1 { return extensions[0] }
-    if hosts.count == 1 { return hosts[0] }
-    return nil
+    // System Settings owns the visible window, but AppleIDSettings can own
+    // the actual AX subtree inside that window. Scan both trusted owners as a
+    // single surface, then retain the existing unique-candidate checks before
+    // selecting a phone number or writing a six-digit code.
+    if activeHosts.count == 1 {
+        applications.append(activeHosts[0])
+    } else if hosts.count == 1 {
+        applications.append(hosts[0])
+    }
+    if extensions.count == 1 {
+        applications.append(extensions[0])
+    }
+
+    var seen = Set<pid_t>()
+    return applications.filter { seen.insert($0.processIdentifier).inserted }
 }
 
 private func roots(for appElement: AXUIElement, pid: pid_t) -> [AXUIElement] {
@@ -300,49 +327,110 @@ private func isPhoneControlRole(_ role: String) -> Bool {
     nativePhoneControlRoles.contains(role) || wrappedPhoneControlRoles.contains(role)
 }
 
-private func hasNestedPhoneControl(_ element: AXUIElement, pid: pid_t) -> Bool {
+private func hasNestedPhoneControl(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> Bool {
     var queue = axChildren(element)
     var seen: [AXUIElement] = []
     while !queue.isEmpty {
         let node = queue.removeFirst()
         if seen.contains(where: { $0 == node }) { continue }
         seen.append(node)
-        guard belongsTo(node, pid: pid), isVisible(node) else { continue }
+        guard belongsToTrustedOwners(node, allowedPIDs: allowedPIDs), isVisible(node) else { continue }
         if isPhoneControlRole(axRole(node)) { return true }
         queue.append(contentsOf: axChildren(node))
     }
     return false
 }
 
-private func phoneControlTexts(_ element: AXUIElement, pid: pid_t) -> [String] {
-    var texts = directTexts(element)
-    guard wrappedPhoneControlRoles.contains(axRole(element)) else {
-        return texts
-    }
-    // A wrapper can borrow text from a single direct static label. Do not
-    // inspect deeper descendants; that would re-match a nested checkbox row.
-    for child in axChildren(element) {
-        guard belongsTo(child, pid: pid),
-              isVisible(child),
-              axRole(child) == kAXStaticTextRole as String else {
-            continue
-        }
-        texts.append(contentsOf: directTexts(child))
-    }
-    return texts
-}
-
-private func isSelectablePhoneControl(_ element: AXUIElement, pid: pid_t) -> Bool {
+private func isPhoneControlActionable(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> Bool {
     let role = axRole(element)
     guard isPhoneControlRole(role),
           isEnabled(element),
           supportsPress(element) || hasSettableValue(element) else {
         return false
     }
-    if wrappedPhoneControlRoles.contains(role), hasNestedPhoneControl(element, pid: pid) {
-        return false
+    return !wrappedPhoneControlRoles.contains(role) ||
+        !hasNestedPhoneControl(element, allowedPIDs: allowedPIDs)
+}
+
+private func phoneControlsInSubtree(
+    _ root: AXUIElement,
+    allowedPIDs: Set<pid_t>,
+    maxNodes: Int = 64
+) -> [AXUIElement] {
+    var queue: [AXUIElement] = [root]
+    var seen: [AXUIElement] = []
+    var controls: [AXUIElement] = []
+    while !queue.isEmpty && seen.count < maxNodes {
+        let node = queue.removeFirst()
+        if seen.contains(where: { $0 == node }) { continue }
+        seen.append(node)
+        guard belongsToTrustedOwners(node, allowedPIDs: allowedPIDs), isVisible(node) else {
+            continue
+        }
+        if isPhoneControlActionable(node, allowedPIDs: allowedPIDs) {
+            controls.append(node)
+        }
+        queue.append(contentsOf: axChildren(node))
     }
-    let texts = phoneControlTexts(element, pid: pid)
+    return controls
+}
+
+private func rowTextsForPhoneControl(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> [String] {
+    // SwiftUI can expose the checkbox and its masked-number label as siblings.
+    // Borrow text only from a tightly bounded parent row that contains exactly
+    // this one actionable phone control; never use the whole Settings page.
+    var row = axParent(element)
+    for _ in 0..<2 {
+        guard let current = row,
+              belongsToTrustedOwners(current, allowedPIDs: allowedPIDs),
+              isVisible(current) else {
+            break
+        }
+        let controls = phoneControlsInSubtree(current, allowedPIDs: allowedPIDs)
+        if controls.count == 1, controls[0] == element {
+            return textInSubtree(current, allowedPIDs: allowedPIDs, maxNodes: 48)
+        }
+        row = axParent(current)
+    }
+    return []
+}
+
+private func phoneControlTexts(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> [String] {
+    var texts = directTexts(element)
+    if wrappedPhoneControlRoles.contains(axRole(element)) {
+        // A wrapper can borrow text from a single direct static label. Do not
+        // inspect deeper descendants; that would re-match a nested checkbox row.
+        for child in axChildren(element) {
+            guard belongsToTrustedOwners(child, allowedPIDs: allowedPIDs),
+                  isVisible(child),
+                  axRole(child) == kAXStaticTextRole as String else {
+                continue
+            }
+            texts.append(contentsOf: directTexts(child))
+        }
+    }
+    texts.append(contentsOf: rowTextsForPhoneControl(element, allowedPIDs: allowedPIDs))
+    return texts
+}
+
+private func isSelectablePhoneControl(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> Bool {
+    guard isPhoneControlActionable(element, allowedPIDs: allowedPIDs) else { return false }
+    let texts = phoneControlTexts(element, allowedPIDs: allowedPIDs)
     guard asciiDigits(in: texts.joined(separator: " ")).count >= 2 else { return false }
     return texts.contains { text in
         let value = normalized(text)
@@ -362,8 +450,11 @@ private func continueButton(in nodes: [AXUIElement]) -> AXUIElement? {
     return matches.count == 1 ? matches[0] : nil
 }
 
-private func phoneSelection(in nodes: [AXUIElement], pid: pid_t) -> PhoneSelection? {
-    let controls = nodes.filter { isSelectablePhoneControl($0, pid: pid) }
+private func phoneSelection(
+    in nodes: [AXUIElement],
+    allowedPIDs: Set<pid_t>
+) -> PhoneSelection? {
+    let controls = nodes.filter { isSelectablePhoneControl($0, allowedPIDs: allowedPIDs) }
     guard !controls.isEmpty, let button = continueButton(in: nodes) else { return nil }
     return PhoneSelection(controls: controls, continueButton: button)
 }
@@ -422,8 +513,11 @@ private func axFrame(_ element: AXUIElement) -> CGRect? {
 }
 
 private func isEmptyCodeField(_ field: AXUIElement) -> Bool {
+    // macOS 15 SwiftUI can omit AXValue for a fresh OTP cell. The structural
+    // candidate still has to be one unique, visible, geometrically aligned
+    // six-cell group and survive a second read before any write is attempted.
     guard let value = axString(field, kAXValueAttribute as String) else {
-        return false
+        return true
     }
     return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 }
@@ -438,10 +532,11 @@ private func hasSharedDirectParent(_ fields: [AXUIElement]) -> Bool {
 
 private func isValidSixCellLayout(
     _ fields: [AXUIElement],
-    requireEmpty: Bool = true
+    requireEmpty: Bool = true,
+    requireSharedDirectParent: Bool = true
 ) -> Bool {
     guard fields.count == 6,
-          hasSharedDirectParent(fields) else {
+          !requireSharedDirectParent || hasSharedDirectParent(fields) else {
         return false
     }
     if requireEmpty && fields.contains(where: { !isEmptyCodeField($0) }) {
@@ -484,28 +579,63 @@ private func isValidSixCellLayout(
     return maxGap - minGap <= max(CGFloat(8), averageGap * 0.8)
 }
 
-private func sixCellFieldGroups(
+private func ancestor(of element: AXUIElement, distance: Int) -> AXUIElement? {
+    guard distance >= 1 else { return element }
+    var current: AXUIElement? = element
+    for _ in 0..<distance {
+        guard let node = current else { return nil }
+        current = axParent(node)
+    }
+    return current
+}
+
+private func fieldGroups(
     _ fields: [AXUIElement],
-    requireEmpty: Bool
+    sharedAncestorDistance: Int
 ) -> [[AXUIElement]] {
     var groups: [[AXUIElement]] = []
     for field in fields {
-        guard let parent = axParent(field) else { continue }
+        guard let sharedAncestor = ancestor(of: field, distance: sharedAncestorDistance) else {
+            continue
+        }
         if let existing = groups.firstIndex(where: { group in
             guard let first = group.first,
-                  let firstParent = axParent(first) else {
+                  let firstAncestor = ancestor(of: first, distance: sharedAncestorDistance) else {
                 return false
             }
-            return firstParent == parent
+            return firstAncestor == sharedAncestor
         }) {
             groups[existing].append(field)
         } else {
             groups.append([field])
         }
     }
-    return groups.filter {
+    return groups
+}
+
+private func sixCellFieldGroups(
+    _ fields: [AXUIElement],
+    requireEmpty: Bool
+) -> [[AXUIElement]] {
+    let directGroups = fieldGroups(fields, sharedAncestorDistance: 1).filter {
         $0.count == 6 && isValidSixCellLayout($0, requireEmpty: requireEmpty)
     }
+    if !directGroups.isEmpty { return directGroups }
+
+    // Some System Settings builds insert one wrapper per code cell. Only use
+    // the bounded shared-ancestor fallback when direct grouping found nothing;
+    // uniqueness, six cells and the full geometry checks still apply.
+    for distance in 2...3 {
+        let wrappedGroups = fieldGroups(fields, sharedAncestorDistance: distance).filter {
+            $0.count == 6 && isValidSixCellLayout(
+                $0,
+                requireEmpty: requireEmpty,
+                requireSharedDirectParent: false
+            )
+        }
+        if !wrappedGroups.isEmpty { return wrappedGroups }
+    }
+    return []
 }
 
 private func codeEntry(
@@ -557,9 +687,18 @@ private func isSixCellCodeEntry(_ entry: CodeEntry) -> Bool {
     return false
 }
 
-private func hasCodeDeliverySuffix(in nodes: [AXUIElement], pid: pid_t, suffix: String) -> Bool {
+private func codeEntryHasUnreadableValue(_ entry: CodeEntry) -> Bool {
+    guard case .six(let fields) = entry else { return false }
+    return fields.contains { axString($0, kAXValueAttribute as String) == nil }
+}
+
+private func hasCodeDeliverySuffix(
+    in nodes: [AXUIElement],
+    allowedPIDs: Set<pid_t>,
+    suffix: String
+) -> Bool {
     let texts = nodes
-        .filter { belongsTo($0, pid: pid) && isVisible($0) }
+        .filter { belongsToTrustedOwners($0, allowedPIDs: allowedPIDs) && isVisible($0) }
         .flatMap(directTexts)
     guard texts.contains(where: { text in
         let value = normalized(text)
@@ -672,12 +811,16 @@ private func resolvedCodeEntries(
     // exposes the phone-choice controls. This covers focused/main/window
     // snapshot races during the sheet transition.
     let phoneSelectionPresent = snapshots.contains {
-        phoneSelection(in: $0.nodes, pid: $0.pid) != nil
+        phoneSelection(in: $0.nodes, allowedPIDs: $0.allowedPIDs) != nil
     }
     guard !phoneSelectionPresent else { return [] }
     let candidates = codeEntries(in: snapshots, requireEmpty: requireEmpty)
     let suffixMatched = candidates.filter { snapshot, _ in
-        hasCodeDeliverySuffix(in: snapshot.nodes, pid: snapshot.pid, suffix: suffix)
+        hasCodeDeliverySuffix(
+            in: snapshot.nodes,
+            allowedPIDs: snapshot.allowedPIDs,
+            suffix: suffix
+        )
     }
     if suffixMatched.count == 1 { return suffixMatched }
 
@@ -741,13 +884,38 @@ private func parseArguments() -> (phase: String?, suffix: String?) {
 }
 
 private func currentSnapshots() -> [SettingsSnapshot] {
-    guard let app = activeSystemSettings() else { return [] }
-    let pid = app.processIdentifier
-    let appElement = AXUIElementCreateApplication(pid)
-    let roots = roots(for: appElement, pid: pid)
-    return roots.map { root in
-        SettingsSnapshot(pid: pid, nodes: visibleNodes(in: [root], pid: pid))
-    }.filter { !$0.nodes.isEmpty }
+    let applications = activeTrustedSettingsApplications()
+    let allowedPIDs = Set(applications.map(\.processIdentifier))
+    guard !allowedPIDs.isEmpty else { return [] }
+    var surfaceRoots: [AXUIElement] = []
+    for app in applications {
+        let pid = app.processIdentifier
+        for root in roots(for: AXUIElementCreateApplication(pid), pid: pid) {
+            if !surfaceRoots.contains(where: { $0 == root }) {
+                surfaceRoots.append(root)
+            }
+        }
+    }
+    // Keep each AX root isolated. A trusted host root may contain an
+    // AppleIDSettings child subtree, but controls from two independent roots
+    // must never be combined into one phone-selection or OTP candidate.
+    //
+    // The host can also expose that same extension subtree while the extension
+    // has its own AX root.  Without cross-snapshot identity de-duplication,
+    // one real checkbox or six-cell group appears twice and is misclassified
+    // as an ambiguous SMS surface.
+    var seenNodes: [AXUIElement] = []
+    var snapshots: [SettingsSnapshot] = []
+    for root in surfaceRoots {
+        let uniqueNodes = visibleNodes(in: [root], allowedPIDs: allowedPIDs).filter { node in
+            guard !seenNodes.contains(where: { $0 == node }) else { return false }
+            seenNodes.append(node)
+            return true
+        }
+        guard !uniqueNodes.isEmpty else { continue }
+        snapshots.append(SettingsSnapshot(allowedPIDs: allowedPIDs, nodes: uniqueNodes))
+    }
+    return snapshots
 }
 
 let arguments = parseArguments()
@@ -766,7 +934,7 @@ case "sms-state":
     }
     let snapshots = currentSnapshots()
     guard !snapshots.isEmpty else {
-        emit(true, "waiting")
+        emit(true, "waiting", "no_trusted_surface")
     }
     // A six-cell group that survives the same-parent/geometry re-read is the
     // only accepted code surface.  Single semantic inputs are intentionally
@@ -776,10 +944,13 @@ case "sms-state":
     let populatedCodeCandidates = matchingCodeEntries(suffix: suffix, requireEmpty: false)
     let sixCellCandidates = codeEntries(in: snapshots).filter { isSixCellCodeEntry($0.1) }
     let phoneSnapshots = snapshots.filter {
-        phoneSelection(in: $0.nodes, pid: $0.pid) != nil
+        phoneSelection(in: $0.nodes, allowedPIDs: $0.allowedPIDs) != nil
     }
     if stableCodeCandidates.count == 1, phoneSnapshots.isEmpty {
-        emit(true, "code_entry")
+        let reason = codeEntryHasUnreadableValue(stableCodeCandidates[0].1)
+            ? "code_value_unreadable"
+            : nil
+        emit(true, "code_entry", reason)
     }
     // Once the six cells are populated, retain a distinct state while Apple
     // validates the code. Treating this as generic waiting would let the Node
@@ -794,7 +965,19 @@ case "sms-state":
        sixCellCandidates.isEmpty {
         emit(true, "phone_selection")
     }
-    emit(true, "waiting")
+    let waitingReason: String
+    if !phoneSnapshots.isEmpty && !sixCellCandidates.isEmpty {
+        waitingReason = "phone_code_transition"
+    } else if phoneSnapshots.count > 1 || sixCellCandidates.count > 1 {
+        waitingReason = "ambiguous_sms_surface"
+    } else if sixCellCandidates.count == 1 {
+        waitingReason = "code_surface_unready"
+    } else if !phoneSnapshots.isEmpty {
+        waitingReason = "ambiguous_sms_surface"
+    } else {
+        waitingReason = "surface_unclassified"
+    }
+    emit(true, "waiting", waitingReason)
 
 case "sms-select":
     guard let suffix = arguments.suffix,
@@ -802,7 +985,10 @@ case "sms-select":
         emit(false, "suffix_invalid")
     }
     let selections = currentSnapshots().compactMap { snapshot -> (SettingsSnapshot, PhoneSelection)? in
-        guard let selection = phoneSelection(in: snapshot.nodes, pid: snapshot.pid) else {
+        guard let selection = phoneSelection(
+            in: snapshot.nodes,
+            allowedPIDs: snapshot.allowedPIDs
+        ) else {
             return nil
         }
         return (snapshot, selection)
@@ -813,7 +999,7 @@ case "sms-select":
     let selectionSnapshot = selections[0].0
     let selection = selections[0].1
     let matches = selection.controls.filter { control in
-        phoneControlTexts(control, pid: selectionSnapshot.pid).contains { text in
+        phoneControlTexts(control, allowedPIDs: selectionSnapshot.allowedPIDs).contains { text in
             asciiDigits(in: text).hasSuffix(suffix)
         }
     }
@@ -831,7 +1017,10 @@ case "sms-continue":
         emit(false, "phone_selection_unavailable")
     }
     let selections = currentSnapshots().compactMap { snapshot -> (SettingsSnapshot, PhoneSelection)? in
-        guard let selection = phoneSelection(in: snapshot.nodes, pid: snapshot.pid) else {
+        guard let selection = phoneSelection(
+            in: snapshot.nodes,
+            allowedPIDs: snapshot.allowedPIDs
+        ) else {
             return nil
         }
         return (snapshot, selection)
@@ -842,7 +1031,7 @@ case "sms-continue":
     let selectionSnapshot = selections[0].0
     let selection = selections[0].1
     let selectedMatches = selection.controls.filter { control in
-        selected(control) && phoneControlTexts(control, pid: selectionSnapshot.pid).contains { text in
+        selected(control) && phoneControlTexts(control, allowedPIDs: selectionSnapshot.allowedPIDs).contains { text in
             asciiDigits(in: text).hasSuffix(suffix)
         }
     }

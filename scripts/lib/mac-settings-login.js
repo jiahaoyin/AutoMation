@@ -122,6 +122,19 @@ function smsStageLabel(stage) {
   );
 }
 
+function macSettingsSmsManualPrompt(stage) {
+  if (stage === "surface_unavailable") {
+    return "\n[Mac 设置][短信] 动态短信页面暂未识别。请将系统设置推进到六位验证码输入页；六位输入框显示后按回车，脚本会重新识别页面、轮询验证码并自动填入…";
+  }
+  if (stage === "phone_selection") {
+    return "\n[Mac 设置][短信] 请人工选择验证码接收号码并进入六位验证码页面；六位输入框显示后按回车，脚本会轮询验证码并自动填入…";
+  }
+  if (stage === "code_entry") {
+    return "\n[Mac 设置][短信] 请人工填写六位验证码并确认页面已提交；完成短信验证后按回车键继续…";
+  }
+  return `\n[Mac 设置][短信] 已保留当前系统设置页面（${smsStageLabel(stage)}）。请完成短信验证后按回车键继续…`;
+}
+
 function macLoginToken(value, allowed, fallback = "unknown") {
   return allowed.has(value) ? value : fallback;
 }
@@ -969,7 +982,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
       emitMacSettingsEvent(options.onEvent, "sms_manual_handoff_acknowledged", { module: "sms" });
       smsCompletionObserved = true;
     } else {
-      console.log("[Mac 设置][短信] 正在等待已配置号码的验证码输入页面。");
+      console.log("[Mac 设置][短信] 正在扫描短信验证页面（可能先出现号码选择或六位验证码输入）。");
       emitMacSettingsEvent(options.onEvent, "sms_module_started", { module: "sms" });
       let smsResult;
       try {
@@ -981,7 +994,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
           canConfirmMacSettingsManually
             ? async ({ stage }) => {
                 await waitForEnter(
-                  `\n[Mac 设置] 已保留当前系统设置页面（${smsStageLabel(stage)}）。请人工完成后按回车键继续…`
+                  macSettingsSmsManualPrompt(stage)
                 );
                 return true;
               }
@@ -991,6 +1004,8 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
             phone_selection_detected: "检测到验证码接收方式，正在匹配已配置号码",
             phone_selection_submitted: "验证码接收方式已提交，等待验证码输入页加载",
             sms_surface_loading: "验证码页面正在加载，继续等待",
+            manual_required: "验证码页面暂未识别，已切换人工接续；六码页出现后将自动回查填入",
+            manual_sms_code_entry_waiting: "人工接续后正在等待六位验证码输入页",
             code_entry_detected: "验证码输入页已就绪",
             code_polling_started: "正在轮询验证码",
             code_written: "验证码已写入，等待页面切换确认",
@@ -1014,8 +1029,13 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
         status: smsResult?.status ?? "invalid",
         stage: smsResult?.stage ?? "waiting",
       });
+      // A post-SMS scan may start only after the mandatory six-cell stage has
+      // either been submitted by the helper or explicitly completed through
+      // the code-entry fallback. Do not let any future surface-level handoff
+      // bypass the code-page gate.
       smsCompletionObserved =
-        smsResult?.status === "submitted" || smsResult?.status === "manual_completed";
+        smsResult?.status === "submitted" ||
+        (smsResult?.status === "manual_completed" && smsResult?.stage === "code_entry");
       if (smsResult?.status === "manual_completed") {
         console.log(
           "[Mac 设置][短信] 已确认人工步骤完成，短信页面已推进；正在重新扫描后续页面。"
