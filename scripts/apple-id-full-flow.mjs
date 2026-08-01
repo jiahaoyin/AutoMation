@@ -289,6 +289,7 @@ const MAC_SETTINGS_EVENT_NAMES = new Set([
   "state_observed_probe_only",
   "action_not_authorized",
   "action_started",
+  "action_retry",
   "action_completed",
   "action_unconfirmed",
   "supervision_unavailable",
@@ -471,7 +472,7 @@ export function sanitizeMacSettingsEvent(event = {}) {
   if (typeof event?.probeOnly === "boolean") safe.probeOnly = event.probeOnly;
   if (typeof event?.ok === "boolean") safe.ok = event.ok;
   if (typeof event?.signedIn === "boolean") safe.signedIn = event.signedIn;
-  for (const key of ["step", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "axOwnerPid", "visualOwnerPid", "windowId"]) {
+  for (const key of ["step", "attempt", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "nextPasswordLength", "axOwnerPid", "visualOwnerPid", "windowId"]) {
     const value = safeMacSettingsEventNumber(event?.[key]);
     if (value !== undefined) safe[key] = value;
   }

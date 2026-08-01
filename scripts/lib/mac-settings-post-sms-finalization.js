@@ -19,8 +19,18 @@ const TERMINAL_STAGE_LABELS = Object.freeze({
 });
 // iPhone unlock still requires a device-local secret that is intentionally not
 // kept in the automation runtime. The Mac password prompt is a fixed supervised
-// test surface and is submitted through the native helper over stdin.
+// zero-password surface: the target Mac uses either four or six zeroes.
 const MANUAL_STAGES = new Set(["iphone_unlock"]);
+const FIXED_MAC_PASSWORDS = Object.freeze(["000000", "0000"]);
+
+function normalizeFixedMacPassword(value) {
+  return typeof value === "string" && /^(?:0{4}|0{6})$/.test(value) ? value : null;
+}
+
+function macPasswordCandidates(options) {
+  const preferred = normalizeFixedMacPassword(options?.macPassword);
+  return preferred ? [preferred] : FIXED_MAC_PASSWORDS;
+}
 
 function terminalStageLabel(stage) {
   return TERMINAL_STAGE_LABELS[stage] ?? "后置确认页面";
@@ -156,24 +166,43 @@ export async function completeMacSettingsPostSmsFinalization(options = {}) {
     }
   }
 
-  const actionOptions = {
-    binding: state.binding,
-    timeoutMs: actionTimeoutMs,
-  };
-  if (state.stage === "mac_password") actionOptions.password = "000000";
-  let submitted;
-  try {
-    emitEvent("action_started", { stage: state.stage, phase, timeoutMs: actionTimeoutMs });
-    submitted = await nativeRunner(phase, actionOptions);
-  } catch {
-    submitted = null;
-  }
   const expectedStage = {
     terms: "terms_submitted",
     mac_password: "mac_password_submitted",
     iphone_unlock: "iphone_unlock_submitted",
     location: "location_submitted",
   }[state.stage];
+  const passwords = state.stage === "mac_password" ? macPasswordCandidates(options) : [null];
+  let submitted = null;
+  for (let attempt = 0; attempt < passwords.length; attempt += 1) {
+    const password = passwords[attempt];
+    const actionOptions = {
+      binding: state.binding,
+      timeoutMs: actionTimeoutMs,
+    };
+    if (password !== null) actionOptions.password = password;
+    try {
+      emitEvent("action_started", {
+        stage: state.stage,
+        phase,
+        timeoutMs: actionTimeoutMs,
+        attempt: attempt + 1,
+        ...(password === null ? {} : { passwordLength: password.length }),
+      });
+      submitted = await nativeRunner(phase, actionOptions);
+    } catch {
+      submitted = null;
+    }
+    if (submitted?.ok === true && submitted.stage === expectedStage) break;
+    if (attempt + 1 < passwords.length) {
+      emitEvent("action_retry", {
+        stage: state.stage,
+        phase,
+        attempt: attempt + 1,
+        nextPasswordLength: passwords[attempt + 1].length,
+      });
+    }
+  }
   if (submitted?.ok === true && submitted.stage === expectedStage) {
     console.log(`[Mac 设置] 已处理后置弹窗：${terminalStageLabel(state.stage)}`);
     emitEvent("action_completed", { stage: state.stage, phase });

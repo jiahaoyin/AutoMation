@@ -140,7 +140,7 @@ private let locationMarkers = [
     "\u{67E5}\u{627E}\u{6211}\u{7684}\u{7535}\u{8111}",
 ]
 
-private let fixedMacPassword = String(repeating: "0", count: 6)
+private let fixedMacPasswords: Set<String> = ["0000", "000000"]
 
 private let appleAccountMarkers = [
     "apple account",
@@ -1625,7 +1625,7 @@ private func submitMacPassword(
     _ password: String,
     expectedBinding: UnlockBinding?
 ) async -> Output {
-    guard password == fixedMacPassword,
+    guard fixedMacPasswords.contains(password),
           let expectedBinding,
           let initial = uniqueMacPasswordTarget(),
           initial.binding == expectedBinding,

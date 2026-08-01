@@ -262,7 +262,7 @@ export async function runMacSettingsPostSmsHelper(phase, options = {}) {
     }
     input = `${options.passcode}\n`;
   } else if (phase === "mac-password") {
-    if (options.password !== "000000") return invalidResult("invalid_request");
+    if (!/^(?:0{4}|0{6})$/.test(options.password ?? "")) return invalidResult("invalid_request");
     input = `${options.password}\n`;
   }
 

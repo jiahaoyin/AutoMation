@@ -405,7 +405,46 @@ for (const [stateStage, phase, submittedStage] of [
   assert.equal(
     calls[1].options.password,
     "000000",
-    "the supervised Mac password page must pass the fixed test password to stdin"
+    "the supervised Mac password page must try the six-zero fixture first"
+  );
+}
+
+{
+  const calls = [];
+  const events = [];
+  const result = await completeMacSettingsPostSmsFinalization({
+    platform: "darwin",
+    supervised: true,
+    isTTY: true,
+    onEvent: (event) => events.push(event),
+    nativeRunner: async (phase, options) => {
+      calls.push({ phase, options });
+      if (phase === "state") return { ok: true, stage: "mac_password", binding };
+      return options.password === "0000"
+        ? { ok: true, stage: "mac_password_submitted" }
+        : { ok: false, stage: "manual_required" };
+    },
+  });
+  assert.deepEqual(result, { status: "submitted", stage: "mac_password", binding });
+  assert.deepEqual(calls.map(({ phase }) => phase), ["state", "mac-password", "mac-password"]);
+  assert.deepEqual(
+    calls.slice(1).map(({ options }) => options.password),
+    ["000000", "0000"],
+    "the supervised Mac password page must fall back from six zeroes to four zeroes"
+  );
+  const retry = events.find((event) => event.event === "action_retry");
+  assert.deepEqual(retry, {
+    module: "post_sms",
+    event: "action_retry",
+    stage: "mac_password",
+    phase: "mac-password",
+    attempt: 1,
+    nextPasswordLength: 4,
+  });
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({ ...retry, password: "000000", rawAx: "RAW_AX_CANARY" }),
+    retry,
+    "a password retry audit event must retain only safe routing metadata"
   );
 }
 
@@ -609,7 +648,7 @@ assert.match(helperSource, /private func activateBoundModalTarget\(/);
 assert.match(helperSource, /private func submitTerms\(/);
 assert.match(helperSource, /private func submitMacPassword\(/);
 assert.match(helperSource, /private func submitLocation\(/);
-assert.match(helperSource, /fixedMacPassword = String\(repeating: "0", count: 6\)/);
+assert.match(helperSource, /fixedMacPasswords: Set<String> = \["0000", "000000"\]/);
 assert.match(
   helperSource,
   /if axOwnerPID == visualHost\.processIdentifier,[\s\S]*?surfaceWindowID != visualWindow\.windowID/
@@ -691,7 +730,7 @@ assert.match(wrapperSource, /child\.stdin\.end\(input\)/);
 assert.match(wrapperSource, /phase === "unlock-code"/);
 assert.match(wrapperSource, /phase === "mac-password"/);
 assert.match(wrapperSource, /new Set\(\["state", "terms", "mac-password", "unlock-code", "location"\]\)/);
-assert.match(wrapperSource, /options\.password !== "000000"/);
+assert.match(wrapperSource, /!\/\^\(\?:0\{4\}\|0\{6\}\)\$\/.test\(options\.password \?\? ""\)/);
 assert.match(wrapperSource, /normalizeMacSettingsPostSmsBinding\(options\.binding\)/);
 assert.match(wrapperSource, /"--ax-owner-pid"/);
 assert.match(wrapperSource, /"--visual-owner-pid"/);
@@ -712,7 +751,10 @@ assert.match(
   /if \(MANUAL_STAGES\.has\(state\.stage\)\) \{[\s\S]*?return resultFor\("manual_required", state\)/
 );
 assert.doesNotMatch(controllerSource, /"0"\.repeat\(state\.digits\)/);
-assert.match(controllerSource, /if \(state\.stage === "mac_password"\) actionOptions\.password = "000000"/);
+assert.match(controllerSource, /const FIXED_MAC_PASSWORDS = Object\.freeze\(\["000000", "0000"\]\)/);
+assert.match(controllerSource, /function macPasswordCandidates\(/);
+assert.match(controllerSource, /passwordLength: password\.length/);
+assert.match(controllerSource, /emitEvent\("action_retry"/);
 assert.match(controllerSource, /mac-password/);
 assert.match(controllerSource, /location/);
 assert.match(controllerSource, /APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED/);
