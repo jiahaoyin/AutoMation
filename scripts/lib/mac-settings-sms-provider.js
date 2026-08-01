@@ -3,6 +3,15 @@ import { stdin as input, stdout as output } from "node:process";
 
 const SIX_DIGIT_CODE_RE = /(?<!\d)(\d{6})(?!\d)/g;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const MAX_PROVIDER_REDIRECTS = 3;
+const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 20_000;
+const DEFAULT_SMS_PROVIDER_HEADERS = Object.freeze({
+  accept: "application/json, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1",
+  "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+  "cache-control": "no-cache",
+  pragma: "no-cache",
+  "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0",
+});
 const FIXED_INCOMPLETE_CONFIG_NOTICE =
   "[Mac 设置][短信] 手机号码与短信服务地址必须同时填写，请重新输入。";
 const FIXED_INVALID_CONFIG_NOTICE =
@@ -212,6 +221,112 @@ function primitiveText(value) {
   return null;
 }
 
+function timestampFromScalar(value) {
+  const text = primitiveText(value)?.trim() ?? "";
+  if (!text) return null;
+  if (/^\d{10,13}$/.test(text)) {
+    const numeric = Number(text);
+    if (Number.isFinite(numeric)) return text.length === 10 ? numeric * 1_000 : numeric;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function timestampFromText(value) {
+  const text = String(value ?? "");
+  let newest = null;
+  const candidates = [
+    ...text.matchAll(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:\s*(?:Z|[+-]\d{2}:?\d{2})?)?)?\b/g),
+    ...text.matchAll(/\b1\d{9,12}\b/g),
+  ];
+  for (const match of candidates) {
+    const parsed = timestampFromScalar(match[0]);
+    if (parsed !== null && (newest === null || parsed > newest)) newest = parsed;
+  }
+  return newest;
+}
+
+function isTimestampFieldName(key) {
+  return /(?:^|[_-])(?:time|timestamp|date|created|updated|received|sent|arrival|issued)(?:$|[_-])|(?:time|timestamp|date|created|updated|received|sent|arrival|issued)(?:at|time)?$/i.test(
+    key
+  );
+}
+
+function htmlEntityCodePoint(raw, radix) {
+  const numeric = Number.parseInt(raw, radix);
+  if (!Number.isSafeInteger(numeric) || numeric < 0 || numeric > 0x10ffff) return "";
+  try {
+    return String.fromCodePoint(numeric);
+  } catch {
+    return "";
+  }
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? "")
+    .replace(/&#x([0-9a-f]+);?/gi, (_match, code) => htmlEntityCodePoint(code, 16))
+    .replace(/&#(\d+);?/g, (_match, code) => htmlEntityCodePoint(code, 10))
+    .replace(/&(nbsp|amp|lt|gt|quot|apos);/gi, (_match, name) => ({
+      nbsp: " ",
+      amp: "&",
+      lt: "<",
+      gt: ">",
+      quot: '"',
+      apos: "'",
+    })[name.toLowerCase()]);
+}
+
+function isSmsRecordHtmlAttribute(key) {
+  return /^(?:value|aria-label|title|data-(?:message|sms|code|phone|mobile|number|time|timestamp|date|created(?:-at)?|updated(?:-at)?|received(?:-at)?|sent(?:-at)?))$/i.test(
+    key
+  );
+}
+
+function smsRecordHtmlAttributeText(tag) {
+  const values = [];
+  const attributes = tag.matchAll(/\b([:\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g);
+  for (const attribute of attributes) {
+    const key = attribute[1];
+    if (!isSmsRecordHtmlAttribute(key)) continue;
+    const value = attribute[2] ?? attribute[3] ?? attribute[4] ?? "";
+    if (value) values.push(`${key}: ${decodeHtmlEntities(value)}`);
+  }
+  return values.length > 0 ? ` ${values.join(" ")} ` : "";
+}
+
+function recordsFromHtml(value) {
+  const html = String(value ?? "");
+  const rows = decodeHtmlEntities(
+    html
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "\n")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "\n")
+      .replace(/<[^>]+>/g, (tag) => `${tag}${smsRecordHtmlAttributeText(tag)}`)
+      .replace(/<\/?(?:tr|li|article|section|p|h[1-6])\b[^>]*>/gi, "\n")
+      .replace(/<\/?(?:td|th|br|div)\b[^>]*>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .split(/\r?\n+/)
+    .map((row) => row.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  return rows.flatMap((row) => collectSmsMessageRecords(row));
+}
+
+function recordsFromEmbeddedJson(value) {
+  const records = [];
+  const html = String(value ?? "");
+  const scripts = html.matchAll(
+    /<script\b[^>]*\btype\s*=\s*["']application\/json["'][^>]*>([\s\S]*?)<\/script\s*>/gi
+  );
+  for (const script of scripts) {
+    try {
+      records.push(...collectSmsMessageRecords(JSON.parse(decodeHtmlEntities(script[1]))));
+    } catch {
+      // A malformed script block is ignored; plain rendered rows remain usable.
+    }
+  }
+  return records;
+}
+
 function providerMessageSuffixes(text) {
   const result = new Set();
   const expression =
@@ -230,15 +345,24 @@ function isPhoneFieldName(key) {
   return /(?:phone|mobile|number|tel|\u624b\u673a|\u53f7\u7801)/i.test(key);
 }
 
-function collectSmsMessageRecords(value) {
+function collectSmsMessageRecords(value, inheritedTimestamp = null) {
   const scalar = primitiveText(value);
-  if (scalar !== null) return [{ text: scalar, suffixes: providerMessageSuffixes(scalar) }];
-  if (Array.isArray(value)) return value.flatMap(collectSmsMessageRecords);
+  if (scalar !== null) {
+    return [{
+      text: scalar,
+      suffixes: providerMessageSuffixes(scalar),
+      timestamp: timestampFromText(scalar) ?? inheritedTimestamp,
+    }];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectSmsMessageRecords(item, inheritedTimestamp));
+  }
   if (!value || typeof value !== "object") return [];
 
   const directParts = [];
   const directSuffixes = new Set();
   const nestedRecords = [];
+  let timestamp = inheritedTimestamp;
   for (const [key, item] of Object.entries(value)) {
     const itemText = primitiveText(item);
     if (itemText !== null) {
@@ -248,12 +372,25 @@ function collectSmsMessageRecords(value) {
         const digits = itemText.replace(/\D/g, "");
         if (digits.length >= 2) directSuffixes.add(digits.slice(-2));
       }
+      if (isTimestampFieldName(key)) {
+        const parsed = timestampFromScalar(itemText) ?? timestampFromText(itemText);
+        if (parsed !== null && (timestamp === null || parsed > timestamp)) timestamp = parsed;
+      }
       continue;
     }
-    nestedRecords.push(...collectSmsMessageRecords(item));
+  }
+  for (const item of Object.values(value)) {
+    if (primitiveText(item) === null) {
+      nestedRecords.push(...collectSmsMessageRecords(item, timestamp));
+    }
   }
   if (directParts.length > 0) {
-    return [{ text: directParts.join("\n"), suffixes: directSuffixes }, ...nestedRecords];
+    const text = directParts.join("\n");
+    return [{
+      text,
+      suffixes: directSuffixes,
+      timestamp: timestampFromText(text) ?? timestamp,
+    }, ...nestedRecords];
   }
   return nestedRecords;
 }
@@ -264,34 +401,62 @@ export function extractSmsVerificationCode(body, suffix) {
     try {
       return collectSmsMessageRecords(JSON.parse(text));
     } catch {
-      return collectSmsMessageRecords(text);
+      const embeddedJson = recordsFromEmbeddedJson(text);
+      const renderedRows = recordsFromHtml(text);
+      return embeddedJson.length > 0 || renderedRows.length > 0
+        ? [...embeddedJson, ...renderedRows]
+        : collectSmsMessageRecords(text);
     }
   })();
-  const codes = new Set(
-    records.flatMap(({ text: recordText }) =>
-      [...recordText.matchAll(SIX_DIGIT_CODE_RE)].map((match) => match[1])
-    )
-  );
-  if (codes.size !== 1) return null;
+  const candidates = [];
+  const otherPhoneCodes = new Set();
+  for (const [index, record] of records.entries()) {
+    const codes = [...new Set([...record.text.matchAll(SIX_DIGIT_CODE_RE)].map((match) => match[1]))];
+    if (codes.length !== 1) continue;
+    const association = record.suffixes.size === 0
+      ? "unassociated"
+      : record.suffixes.size === 1 && record.suffixes.has(suffix)
+        ? "target"
+        : "other";
+    if (association === "other") {
+      otherPhoneCodes.add(codes[0]);
+      continue;
+    }
+    candidates.push({
+      code: codes[0],
+      association,
+      timestamp: Number.isFinite(record.timestamp) ? record.timestamp : null,
+      index,
+    });
+  }
 
-  const [code] = codes;
-  let associatedWithTarget = false;
-  let unassociated = false;
-  for (const record of records) {
-    if (![...record.text.matchAll(SIX_DIGIT_CODE_RE)].some((match) => match[1] === code)) {
-      continue;
-    }
-    if (record.suffixes.size === 0) {
-      unassociated = true;
-      continue;
-    }
-    if (record.suffixes.size === 1 && record.suffixes.has(suffix)) {
-      associatedWithTarget = true;
-      continue;
-    }
+  const targetCandidates = candidates.filter((candidate) => candidate.association === "target");
+  const eligible = targetCandidates.length > 0
+    ? targetCandidates
+    : candidates.filter((candidate) => candidate.association === "unassociated");
+  if (eligible.length === 0) return null;
+  if (
+    targetCandidates.length === 0 &&
+    [...otherPhoneCodes].some((code) => !eligible.some((candidate) => candidate.code === code))
+  ) {
+    // A page with another explicitly-labelled phone record plus a bare code
+    // cannot safely associate that bare code with the configured number.
     return null;
   }
-  return associatedWithTarget || unassociated ? code : null;
+  if (new Set(eligible.map((candidate) => candidate.code)).size === 1) return eligible[0].code;
+
+  const timestamped = eligible
+    .filter((candidate) => candidate.timestamp !== null)
+    .sort((left, right) => right.timestamp - left.timestamp || right.index - left.index);
+  if (timestamped.length === 0) return null;
+  if (
+    timestamped.length > 1 &&
+    timestamped[0].timestamp === timestamped[1].timestamp &&
+    timestamped[0].code !== timestamped[1].code
+  ) {
+    return null;
+  }
+  return timestamped[0].code;
 }
 
 async function readBoundedBody(response, signal) {
@@ -319,26 +484,123 @@ async function readBoundedBody(response, signal) {
   }
 }
 
+function splitSetCookieHeader(value) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  // `Expires=Wed, ...` contains a comma. Only split where the following token
+  // is another cookie name rather than an attribute date fragment.
+  return value.split(/,(?=[^;,=\s]+=[^;,\s]+)/g).map((item) => item.trim()).filter(Boolean);
+}
+
+function responseSetCookies(headers) {
+  if (!headers) return [];
+  if (typeof headers.getSetCookie === "function") {
+    try {
+      return headers.getSetCookie().filter((item) => typeof item === "string" && item.trim());
+    } catch {
+      // The standard Headers implementation on older Node releases can throw
+      // for a forbidden response header. Fall through to its raw value.
+    }
+  }
+  return splitSetCookieHeader(headers.get?.("set-cookie"));
+}
+
+function updateProviderCookieJar(cookieJar, headers) {
+  for (const line of responseSetCookies(headers)) {
+    const [pair, ...attributes] = line.split(";");
+    const divider = pair.indexOf("=");
+    if (divider <= 0) continue;
+    const name = pair.slice(0, divider).trim();
+    const value = pair.slice(divider + 1).trim();
+    if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name) || /[\r\n;]/.test(value)) continue;
+    const expired = attributes.some((attribute) => /^\s*max-age\s*=\s*0\s*$/i.test(attribute));
+    if (expired || !value) cookieJar.delete(name);
+    else cookieJar.set(name, value);
+  }
+}
+
+function providerRequestHeaders(origin, cookieJar) {
+  const headers = {
+    ...DEFAULT_SMS_PROVIDER_HEADERS,
+    referer: `${origin}/`,
+  };
+  if (cookieJar.size > 0) {
+    headers.cookie = [...cookieJar.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
+  }
+  return headers;
+}
+
+function safeProviderRedirect(location, currentUrl, origin) {
+  if (typeof location !== "string" || !location.trim()) return null;
+  try {
+    const next = new URL(location, currentUrl);
+    return next.protocol === "https:" && next.origin === origin ? next : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRedirectStatus(response) {
+  return response?.status === 301 || response?.status === 302 || response?.status === 303 ||
+    response?.status === 307 || response?.status === 308;
+}
+
+async function requestProviderResponse({ request, state, origin, cookieJar, signal }) {
+  let requestUrl = state.url;
+  for (let redirectCount = 0; redirectCount <= MAX_PROVIDER_REDIRECTS; redirectCount += 1) {
+    const response = await request(requestUrl, {
+      method: "GET",
+      redirect: "manual",
+      cache: "no-store",
+      keepalive: true,
+      credentials: "include",
+      signal,
+      headers: providerRequestHeaders(origin, cookieJar),
+    });
+    updateProviderCookieJar(cookieJar, response?.headers);
+    if (!isRedirectStatus(response)) {
+      state.url = requestUrl;
+      return response;
+    }
+    const next = safeProviderRedirect(response.headers?.get?.("location"), requestUrl, origin);
+    if (!next) return null;
+    requestUrl = next.toString();
+    state.url = requestUrl;
+  }
+  return null;
+}
+
 export function createSmsProviderCodePoller(config, options = {}) {
   const providerUrl = validateSmsProviderUrl(config?.apiUrl).toString();
+  const providerOrigin = new URL(providerUrl).origin;
   const suffix = validateSmsProviderPhone(config?.phoneNumber).replace(/\D/g, "").slice(-2);
   const request = options.fetch ?? globalThis.fetch;
   const pause = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now ?? Date.now;
   const pollIntervalMs = Math.max(250, Math.trunc(options.pollIntervalMs ?? 3_000));
+  const configuredRequestTimeoutMs = Number.isFinite(options.requestTimeoutMs)
+    ? Math.trunc(options.requestTimeoutMs)
+    : DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS;
+  const requestTimeoutMs = Math.max(1_000, Math.min(30_000, configuredRequestTimeoutMs));
   if (typeof request !== "function") throw failure("MAC_SETTINGS_SMS_PROVIDER_UNAVAILABLE");
   return async ({ signal, timeoutMs }) => {
     const deadline = now() + timeoutMs;
+    const cookieJar = new Map();
+    const requestState = { url: providerUrl };
     while (!signal?.aborted && now() < deadline) {
       const controller = new AbortController();
       const onAbort = () => controller.abort();
       signal?.addEventListener("abort", onAbort, { once: true });
       try {
         const remainingMs = Math.max(1, deadline - now());
-        const timer = setTimeout(() => controller.abort(), Math.min(15_000, remainingMs));
-        let response;
+        const timer = setTimeout(() => controller.abort(), Math.min(requestTimeoutMs, remainingMs));
         try {
-          response = await request(providerUrl, { method: "GET", redirect: "error", signal: controller.signal, headers: { accept: "application/json, text/plain, text/html" } });
+          const response = await requestProviderResponse({
+            request,
+            state: requestState,
+            origin: providerOrigin,
+            cookieJar,
+            signal: controller.signal,
+          });
           if (response?.ok) {
             const code = extractSmsVerificationCode(await readBoundedBody(response, controller.signal), suffix);
             if (code) return code;
