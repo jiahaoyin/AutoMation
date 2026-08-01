@@ -393,18 +393,19 @@ for (const [stateStage, phase, submittedStage] of [
     platform: "darwin",
     supervised: true,
     isTTY: true,
-    nativeRunner: async (phase) => {
-      calls.push(phase);
+    nativeRunner: async (phase, options) => {
+      calls.push({ phase, options });
       return phase === "state"
         ? { ok: true, stage: "mac_password", binding }
         : { ok: true, stage: "mac_password_submitted" };
     },
   });
-  assert.deepEqual(result, { status: "manual_required", stage: "mac_password", binding });
-  assert.deepEqual(
-    calls,
-    ["state"],
-    "a local Mac password page must stay manual and receive no placeholder input"
+  assert.deepEqual(result, { status: "submitted", stage: "mac_password", binding });
+  assert.deepEqual(calls.map(({ phase }) => phase), ["state", "mac-password"]);
+  assert.equal(
+    calls[1].options.password,
+    "000000",
+    "the supervised Mac password page must pass the fixed test password to stdin"
   );
 }
 
@@ -558,9 +559,23 @@ assert.match(helperSource, /request\.maximumAspectRatio = 1\.0/);
 assert.doesNotMatch(helperSource, /request\.maximumAspectRatio = 1\.35/);
 assert.match(helperSource, /guard !windows\.isEmpty else \{ continue \}/);
 assert.match(helperSource, /axRole\(candidateRoot\) == kAXWindowRole as String/);
-assert.match(helperSource, /return textContainsAny\(directTexts\(element\), passwordMarkers\)/);
+assert.match(helperSource, /if textContainsAny\(directTexts\(element\), passwordMarkers\)/);
 assert.match(helperSource, /private func hasMacPasswordEvidence\(/);
 assert.match(helperSource, /hasMacPasswordEvidence\(passwordText\)/);
+assert.match(helperSource, /private func hasPasswordFieldEvidence\(/);
+assert.match(helperSource, /hasMacPasswordEvidence\(passwordText\) \|\| hasPasswordFieldEvidence\(fields\[0\]\)/);
+assert.match(helperSource, /private func isMacPasswordField\(/);
+assert.match(helperSource, /private func nearestButton\(/);
+assert.match(helperSource, /excludingIdentifiers: Set<String> = \[\]/);
+assert.match(helperSource, /excludingIdentifiers: \["LOGIN_BUTTON"\]/);
+assert.match(helperSource, /elements: \[fields\[0\], cancelButtons\[0\], continueButton\]/);
+assert.doesNotMatch(
+  helperSource.slice(
+    helperSource.indexOf("private func isMacPasswordField"),
+    helperSource.indexOf("private func checkboxIsSelected")
+  ),
+  /axChildren\(element\)\.isEmpty/
+);
 assert.match(helperSource, /private func hasTermsEvidence\(/);
 assert.match(helperSource, /private func hasLocationEvidence\(/);
 assert.match(helperSource, /find my mac/);
@@ -691,13 +706,13 @@ const controllerSource = fs.readFileSync(
   "utf8"
 );
 assert.doesNotMatch(controllerSource, /promptForHiddenDevicePasscode/);
-assert.match(controllerSource, /const MANUAL_STAGES = new Set\(\["mac_password", "iphone_unlock"\]\)/);
+assert.match(controllerSource, /const MANUAL_STAGES = new Set\(\["iphone_unlock"\]\)/);
 assert.match(
   controllerSource,
   /if \(MANUAL_STAGES\.has\(state\.stage\)\) \{[\s\S]*?return resultFor\("manual_required", state\)/
 );
 assert.doesNotMatch(controllerSource, /"0"\.repeat\(state\.digits\)/);
-assert.doesNotMatch(controllerSource, /actionOptions\.password = "000000"/);
+assert.match(controllerSource, /if \(state\.stage === "mac_password"\) actionOptions\.password = "000000"/);
 assert.match(controllerSource, /mac-password/);
 assert.match(controllerSource, /location/);
 assert.match(controllerSource, /APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED/);

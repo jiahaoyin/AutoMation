@@ -474,15 +474,33 @@ private func isTextInput(_ element: AXUIElement) -> Bool {
     return role == kAXTextFieldRole as String || role == "AXSecureTextField"
 }
 
+private func hasPasswordFieldEvidence(_ element: AXUIElement) -> Bool {
+    if textContainsAny(directTexts(element), passwordMarkers) {
+        return true
+    }
+    let identifier = normalized(axIdentifier(element))
+    if passwordMarkers.contains(where: { identifier.contains(normalized($0)) }) {
+        return true
+    }
+    var parent = axParent(element)
+    for _ in 0..<4 {
+        guard let node = parent else { break }
+        if textContainsAny(directTexts(node), passwordMarkers) {
+            return true
+        }
+        parent = axParent(node)
+    }
+    return false
+}
+
 private func isMacPasswordField(_ element: AXUIElement) -> Bool {
     guard isTextInput(element),
           isVisible(element),
           isEnabled(element),
-          axChildren(element).isEmpty,
           axFrame(element) != nil else {
         return false
     }
-    return textContainsAny(directTexts(element), passwordMarkers)
+    return hasPasswordFieldEvidence(element)
 }
 
 private func checkboxIsSelected(_ element: AXUIElement) -> Bool {
@@ -493,11 +511,13 @@ private func checkboxIsSelected(_ element: AXUIElement) -> Bool {
 private func nearestButton(
     to element: AXUIElement,
     in nodes: [AXUIElement],
-    labels: Set<String>
+    labels: Set<String>,
+    excludingIdentifiers: Set<String> = []
 ) -> AXUIElement? {
     guard let sourceFrame = axFrame(element) else { return nil }
     let candidates = nodes.compactMap { candidate -> (AXUIElement, CGFloat)? in
-        guard buttonMatches(candidate, labels: labels, requireEnabled: false),
+        guard !excludingIdentifiers.contains(axIdentifier(candidate)),
+              buttonMatches(candidate, labels: labels, requireEnabled: false),
               let frame = axFrame(candidate) else {
             return nil
         }
@@ -723,18 +743,23 @@ private func uniqueMacPasswordTarget() -> ModalTarget? {
     let targets = trustedSurfaceCandidates().compactMap { candidate -> ModalTarget? in
         let passwordText = textBlob(candidate.nodes)
         let fields = candidate.nodes.filter(isMacPasswordField)
-        guard hasMacPasswordEvidence(passwordText),
-              fields.count == 1,
+        let cancelButtons = candidate.nodes.filter {
+            buttonMatches($0, labels: cancelLabels, requireEnabled: false)
+        }
+        guard fields.count == 1,
+              cancelButtons.count == 1,
+              (hasMacPasswordEvidence(passwordText) || hasPasswordFieldEvidence(fields[0])),
               let continueButton = nearestButton(
                   to: fields[0],
                   in: candidate.nodes,
-                  labels: continueLabels
+                  labels: continueLabels,
+                  excludingIdentifiers: ["LOGIN_BUTTON"]
               ),
               let binding = bindingForSurfaceElements(
                   axOwnerPID: candidate.axOwnerPID,
                   surface: candidate.surface,
                   surfaceFrame: axFrame(candidate.surface),
-                  elements: [fields[0], continueButton]
+                  elements: [fields[0], cancelButtons[0], continueButton]
               ) else {
             return nil
         }
@@ -743,12 +768,44 @@ private func uniqueMacPasswordTarget() -> ModalTarget? {
             binding: binding,
             surface: candidate.surface,
             primaryButton: continueButton,
-            secondaryButton: nil,
+            secondaryButton: cancelButtons[0],
             checkbox: nil,
             passwordField: fields[0]
         )
     }
-    return targets.count == 1 ? targets[0] : nil
+    var unique: [ModalTarget] = []
+    for target in targets {
+        guard let fieldFrame = target.passwordField.flatMap(axFrame),
+              let primaryFrame = axFrame(target.primaryButton),
+              let secondaryFrame = target.secondaryButton.flatMap(axFrame) else {
+            continue
+        }
+        let signature = [
+            String(target.binding.visualOwnerPid),
+            String(target.binding.windowId),
+            String(format: "%.1f,%.1f,%.1f,%.1f", fieldFrame.minX, fieldFrame.minY, fieldFrame.width, fieldFrame.height),
+            String(format: "%.1f,%.1f,%.1f,%.1f", primaryFrame.minX, primaryFrame.minY, primaryFrame.width, primaryFrame.height),
+            String(format: "%.1f,%.1f,%.1f,%.1f", secondaryFrame.minX, secondaryFrame.minY, secondaryFrame.width, secondaryFrame.height),
+        ].joined(separator: ":")
+        if !unique.contains(where: { existing in
+            guard let existingField = existing.passwordField.flatMap(axFrame),
+                  let existingPrimary = axFrame(existing.primaryButton),
+                  let existingSecondary = existing.secondaryButton.flatMap(axFrame) else {
+                return false
+            }
+            let existingSignature = [
+                String(existing.binding.visualOwnerPid),
+                String(existing.binding.windowId),
+                String(format: "%.1f,%.1f,%.1f,%.1f", existingField.minX, existingField.minY, existingField.width, existingField.height),
+                String(format: "%.1f,%.1f,%.1f,%.1f", existingPrimary.minX, existingPrimary.minY, existingPrimary.width, existingPrimary.height),
+                String(format: "%.1f,%.1f,%.1f,%.1f", existingSecondary.minX, existingSecondary.minY, existingSecondary.width, existingSecondary.height),
+            ].joined(separator: ":")
+            return existingSignature == signature
+        }) {
+            unique.append(target)
+        }
+    }
+    return unique.count == 1 ? unique[0] : nil
 }
 
 private func uniqueLocationTarget() -> ModalTarget? {

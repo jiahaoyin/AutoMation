@@ -17,11 +17,10 @@ const TERMINAL_STAGE_LABELS = Object.freeze({
   iphone_unlock: "iPhone 解锁码确认",
   location: "定位/查找 Mac 确认",
 });
-// These two screens require a device-local secret that is intentionally not
-// kept in the automation runtime. Detect them accurately, retain the bound
-// Settings page, and hand them to the supervised operator instead of entering
-// placeholder values or repeatedly submitting a wrong secret.
-const MANUAL_STAGES = new Set(["mac_password", "iphone_unlock"]);
+// iPhone unlock still requires a device-local secret that is intentionally not
+// kept in the automation runtime. The Mac password prompt is a fixed supervised
+// test surface and is submitted through the native helper over stdin.
+const MANUAL_STAGES = new Set(["iphone_unlock"]);
 
 function terminalStageLabel(stage) {
   return TERMINAL_STAGE_LABELS[stage] ?? "后置确认页面";
@@ -161,6 +160,7 @@ export async function completeMacSettingsPostSmsFinalization(options = {}) {
     binding: state.binding,
     timeoutMs: actionTimeoutMs,
   };
+  if (state.stage === "mac_password") actionOptions.password = "000000";
   let submitted;
   try {
     emitEvent("action_started", { stage: state.stage, phase, timeoutMs: actionTimeoutMs });
