@@ -120,6 +120,52 @@ function providerResponse(body, { status = 200, headers = {}, setCookies = [] } 
   assert.match(calls[2].options.headers.cookie, /sms_session=ready/);
 }
 
+{
+  const calls = [];
+  const poller = createSmsProviderCodePoller(
+    {
+      phoneNumber: "+8613800130051",
+      apiUrl: "https://lixsms.com/?code=private&view=latest#fragment",
+    },
+    {
+      pollIntervalMs: 1,
+      sleep: async () => {},
+      fetch: async (url) => {
+        calls.push(url);
+        return providerResponse("Apple code 123456 sent to **51");
+      },
+    }
+  );
+  const code = await poller({ signal: new AbortController().signal, timeoutMs: 2_000 });
+  assert.equal(code, "123456");
+  assert.equal(calls[0], "https://lixsms.com/message?code=private&view=latest#fragment");
+}
+
+{
+  const cases = [
+    ["https://lixsms.com/message?code=private", "https://lixsms.com/message?code=private"],
+    ["https://lixsms.com/api?code=private", "https://lixsms.com/api?code=private"],
+    ["https://example.test/?code=private", "https://example.test/?code=private"],
+  ];
+  for (const [apiUrl, expectedUrl] of cases) {
+    const calls = [];
+    const poller = createSmsProviderCodePoller(
+      { phoneNumber: "+8613800130051", apiUrl },
+      {
+        pollIntervalMs: 1,
+        sleep: async () => {},
+        fetch: async (url) => {
+          calls.push(url);
+          return providerResponse("Apple code 123456 sent to **51");
+        },
+      }
+    );
+    const code = await poller({ signal: new AbortController().signal, timeoutMs: 2_000 });
+    assert.equal(code, "123456");
+    assert.equal(calls[0], expectedUrl);
+  }
+}
+
 const providerSource = fs.readFileSync(new URL("./lib/mac-settings-sms-provider.js", import.meta.url), "utf8");
 assert.match(providerSource, /response\.body\.getReader/);
 assert.match(providerSource, /bytes > MAX_RESPONSE_BYTES/);

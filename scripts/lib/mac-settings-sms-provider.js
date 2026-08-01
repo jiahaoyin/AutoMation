@@ -65,6 +65,13 @@ export function validateSmsProviderUrl(value) {
   return url;
 }
 
+function normalizeLixSmsProviderRequestUrl(url) {
+  if (url.hostname === "lixsms.com" && url.pathname === "/" && url.search) {
+    url.pathname = "/message";
+  }
+  return url;
+}
+
 export function validateSmsProviderPhone(value) {
   const phone = fixedString(value);
   if (!/^\+?[0-9()\s.-]+$/.test(phone) || phone.replace(/\D/g, "").length < 4) {
@@ -570,7 +577,9 @@ async function requestProviderResponse({ request, state, origin, cookieJar, sign
 }
 
 export function createSmsProviderCodePoller(config, options = {}) {
-  const providerUrl = validateSmsProviderUrl(config?.apiUrl).toString();
+  const providerUrl = normalizeLixSmsProviderRequestUrl(
+    validateSmsProviderUrl(config?.apiUrl)
+  ).toString();
   const providerOrigin = new URL(providerUrl).origin;
   const suffix = validateSmsProviderPhone(config?.phoneNumber).replace(/\D/g, "").slice(-2);
   const request = options.fetch ?? globalThis.fetch;
