@@ -1751,6 +1751,73 @@ async function runDeveloperTrustPromptStatusSanitizationTest() {
   );
 }
 
+async function runDeveloperMembershipProbeSanitizationTest() {
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  const probe = {
+    event: "status",
+    status: "developer_membership_probe",
+    routeMatched: true,
+    authBlocked: false,
+    detailsPage: true,
+    appleDeveloperProgram: true,
+    renewalDate: true,
+    registrationIdentity: true,
+    teamId: true,
+    membershipFieldCount: 99,
+    stableCount: 99,
+    rawMembershipDetails: SECRET_FIXTURE,
+    renewalValue: SECRET_FIXTURE,
+    registrationIdentityValue: SECRET_FIXTURE,
+    teamIdentifier: SECRET_FIXTURE,
+  };
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent(probe);
+      return successfulResult();
+    },
+    { terminalDebug: true }
+  );
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+    });
+  });
+
+  const auditProbe = entries.find(
+    (entry) =>
+      entry.source === "ruyipage" &&
+      entry.event === "status" &&
+      entry.details.status === "developer_membership_probe"
+  );
+  assert.deepEqual(auditProbe?.details, {
+    status: "developer_membership_probe",
+    routeMatched: true,
+    authBlocked: false,
+    detailsPage: true,
+    appleDeveloperProgram: true,
+    renewalDate: true,
+    registrationIdentity: true,
+    teamId: true,
+    membershipFieldCount: 5,
+    stableCount: 2,
+  });
+  assert.equal(
+    logs.filter((line) => line.includes("MembershipDetailsCard")).length,
+    1
+  );
+  assert.ok(
+    logs.some((line) => line.startsWith("[ruyipage] membership:route:1:"))
+  );
+  assert.deepEqual(warnings, []);
+  assert.equal(
+    JSON.stringify({ entries, logs, warnings, result }).includes(SECRET_FIXTURE),
+    false
+  );
+}
+
 async function runUnauthenticatedDeveloperFailureStopsAccountModuleTest() {
   const storedMemberships = [];
   const { entries, flowAudit } = createDeveloperMembershipAudit();
@@ -3957,6 +4024,7 @@ const focusedTests = {
     await runDeveloperMembershipPersistenceTest();
     await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
     await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+    await runDeveloperMembershipProbeSanitizationTest();
     await runDeveloperTrustPromptStatusSanitizationTest();
     await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();
     await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();
@@ -4031,6 +4099,7 @@ await runProfilePersistenceAndAuditRedactionTest();
 await runDeveloperMembershipPersistenceTest();
 await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
 await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+await runDeveloperMembershipProbeSanitizationTest();
 await runDeveloperTrustPromptStatusSanitizationTest();
 await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();
 await runDeveloperMembershipEventPersistenceFailureIsNonfatalTest();

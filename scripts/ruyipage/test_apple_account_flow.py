@@ -1233,6 +1233,11 @@ class DeveloperFakePage(FakePage):
             "joinProgram": False,
             "membershipNavigation": False,
         }
+        self.membership_details_sequence = (
+            list(membership_details)
+            if isinstance(membership_details, (list, tuple))
+            else None
+        )
         self.membership_details = membership_details or {
             "detailsPage": False,
             "appleDeveloperProgram": False,
@@ -1245,7 +1250,15 @@ class DeveloperFakePage(FakePage):
             return json.dumps(self.account_snapshot)
         if "ruyipage-developer-membership-details" in script:
             self.developer_scripts.append(script)
-            return json.dumps(self.membership_details)
+            if self.membership_details_sequence is not None:
+                result = (
+                    self.membership_details_sequence.pop(0)
+                    if len(self.membership_details_sequence) > 1
+                    else self.membership_details_sequence[0]
+                )
+            else:
+                result = self.membership_details
+            return json.dumps(result)
         return super().run_js(script)
 
 
@@ -4049,7 +4062,10 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
             side_effect=complete_developer,
         ), patch("apple_account_flow.human_pause", return_value=None), patch(
             "apple_account_flow.emit"
-        ):
+        ), patch(
+            "apple_account_flow.confirm_active_developer_membership",
+            return_value=False,
+        ) as confirm_active:
             result, returned_page, _screenshot = account_flow.collect_developer_account_membership(
                 page,
                 "person@example.com",
@@ -4064,6 +4080,7 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(page.get_calls, [account_flow.DEVELOPER_ACCOUNT_URL])
         self.assertEqual(contexts, [context])
+        confirm_active.assert_called_once_with(page)
 
     def test_account_tab_failure_keeps_developer_membership_screenshot(self):
         class FakeFirefoxOptions:
@@ -9213,6 +9230,135 @@ class TrustBrowserTests(unittest.TestCase):
         ]
         self.assertEqual(phases, ["trust_prompt_detected", "trust_click_sent"])
 
+    def test_developer_session_probe_waits_past_transient_account_manage_state(self):
+        page = FakePage(
+            state={
+                "href": "https://account.apple.com/account/manage",
+                "twofa": False,
+                "trustPrompt": False,
+                "error": False,
+                "password": False,
+                "email": False,
+            }
+        )
+        page.states = FakeStates(alive=True)
+        probe_states = iter(
+            (
+                None,
+                {
+                    "href": "https://developer.apple.com/account",
+                    "developerAccountShell": True,
+                    "trusted": True,
+                    "error": False,
+                },
+            )
+        )
+        generic_account_state = {
+            "href": "https://account.apple.com/account/manage",
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "rootError": False,
+        }
+
+        with patch(
+            "apple_account_flow.confirmed_account_manage_state",
+            return_value=generic_account_state,
+        ) as generic_probe, patch(
+            "apple_account_flow.human_pause", lambda *_: None
+        ):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                session_probe=lambda _page: next(probe_states),
+            )
+
+        self.assertTrue(state["developerAccountShell"])
+        generic_probe.assert_not_called()
+
+    def test_developer_session_probe_waits_past_generic_trusted_state(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/account/manage"}
+        )
+        page.states = FakeStates(alive=True)
+        probe_states = iter(
+            (
+                None,
+                {
+                    "href": "https://developer.apple.com/account",
+                    "developerAccountShell": True,
+                    "trusted": True,
+                    "error": False,
+                },
+            )
+        )
+        transient_account_state = {
+            "href": "https://account.apple.com/account/manage",
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "rootError": False,
+            "twofa": False,
+            "trustPrompt": False,
+            "error": False,
+        }
+
+        with patch(
+            "apple_account_flow.confirmed_account_manage_state", return_value=None
+        ), patch(
+            "apple_account_flow.detect_login_state",
+            return_value=transient_account_state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            state = wait_for_signed_in(
+                page,
+                timeout_s=0.05,
+                submitted=True,
+                otp_generation=1,
+                submission_method="automatic",
+                session_probe=lambda _page: next(probe_states),
+            )
+
+        self.assertTrue(state["developerAccountShell"])
+
+    def test_developer_pre_otp_probe_waits_past_generic_account_session(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/account/manage"}
+        )
+        page.states = FakeStates(alive=True)
+        probe_states = iter(
+            (
+                None,
+                {
+                    "href": "https://developer.apple.com/account",
+                    "developerAccountShell": True,
+                    "trusted": True,
+                    "error": False,
+                },
+            )
+        )
+        transient_account_state = {
+            "href": "https://account.apple.com/account/manage",
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "rootError": False,
+            "twofa": False,
+            "trustPrompt": False,
+            "error": False,
+        }
+
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=transient_account_state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None):
+            state = account_flow.wait_for_2fa_or_session(
+                page,
+                timeout_s=0.05,
+                session_probe=lambda _page: next(probe_states),
+            )
+
+        self.assertTrue(state["developerAccountShell"])
+
     def test_shadow_trust_cannot_be_clicked_again_after_deadline_when_state_omits_prompt(self):
         initial_state = {
             "href": "https://idmsa.apple.com/appleauth/auth/verify",
@@ -10291,6 +10437,99 @@ class DeveloperAccountTests(unittest.TestCase):
         page.states = FakeStates(alive=True)
         return page
 
+    def evaluate_membership_details_query(
+        self,
+        text="",
+        hash_value="#MembershipDetailsCard",
+        *,
+        main_text=None,
+        body_text=None,
+        shadow_texts=(),
+        membership_card_text=None,
+    ):
+        page = DeveloperFakePage(state={"href": account_flow.DEVELOPER_ACCOUNT_URL})
+        account_flow.developer_membership_details_snapshot(page)
+        query = page.developer_scripts[-1]
+        runner = r"""
+const payload = JSON.parse(process.argv[1]);
+const makeElement = (text, { id = '', className = '', shadowRoot = null } = {}) => ({
+  innerText: text,
+  textContent: text,
+  children: [],
+  shadowRoot,
+  tagName: 'SPAN',
+  id,
+  className,
+  getAttribute() { return null; },
+  getBoundingClientRect() { return { width: 100, height: 20 }; }
+});
+const elementsFor = (text) => String(text || '')
+  .split(/\r?\n/)
+  .filter(Boolean)
+  .map((value) => makeElement(value));
+const shadowRoots = (payload.shadowTexts || []).map((text) => {
+  const elements = elementsFor(text);
+  return {
+    querySelectorAll(selector) {
+      if (selector.includes('[id], [class], [data-testid]')) return [];
+      if (selector.includes('h1, h2, h3, h4')) return [];
+      return elements;
+    }
+  };
+});
+const membershipCards = payload.membershipCardText
+  ? [makeElement(payload.membershipCardText, { id: 'MembershipDetailsCard' })]
+  : [];
+const elements = [
+  ...elementsFor(payload.text),
+  ...shadowRoots.map((root) => makeElement('', { shadowRoot: root })),
+  ...membershipCards,
+];
+const main = { innerText: String(payload.mainText || '') };
+const body = { innerText: String(payload.bodyText || '') };
+globalThis.document = {
+  body,
+  querySelector(selector) { return selector === 'main' ? main : null; },
+  querySelectorAll(selector) {
+    if (selector.includes('[id], [class], [data-testid]')) return membershipCards;
+    if (selector.includes('h1, h2, h3, h4')) return [];
+    return elements;
+  }
+};
+globalThis.location = { hash: payload.hash, pathname: '/account' };
+globalThis.window = {
+  getComputedStyle() { return { display: 'block', visibility: 'visible' }; }
+};
+const prefix = 'return JSON.stringify(';
+const query = String(payload.query || '').trim();
+if (!query.startsWith(prefix)) throw new Error('unexpected query prefix');
+const expression = query.slice(prefix.length).replace(/\)\s*$/, '');
+process.stdout.write(JSON.stringify(eval(expression)));
+"""
+        completed = subprocess.run(
+            [
+                "node",
+                "-e",
+                runner,
+                json.dumps(
+                    {
+                        "query": query,
+                        "text": text,
+                        "mainText": text if main_text is None else main_text,
+                        "bodyText": text if body_text is None else body_text,
+                        "shadowTexts": list(shadow_texts),
+                        "membershipCardText": membership_card_text,
+                        "hash": hash_value,
+                    },
+                    ensure_ascii=False,
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(completed.stdout)
+
     def test_developer_account_url_is_exact_https_origin(self):
         for url in (
             "https://developer.apple.com/account",
@@ -10608,14 +10847,33 @@ class DeveloperAccountTests(unittest.TestCase):
                 "joinProgram": False,
                 "membershipNavigation": True,
             },
-            membership_details={
-                "detailsPage": True,
-                "appleDeveloperProgram": True,
-            },
+            membership_details=[
+                {
+                    "detailsPage": False,
+                    "appleDeveloperProgram": False,
+                    "renewalDate": False,
+                    "registrationIdentity": False,
+                    "membershipFieldCount": 0,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
         )
         page.states = FakeStates(alive=True)
 
-        with patch("apple_account_flow.time.monotonic", side_effect=[0.0, 0.1, 0.2]), patch(
+        with patch("apple_account_flow.time.monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]), patch(
             "apple_account_flow.human_pause", lambda *_: None
         ):
             active = account_flow.confirm_active_developer_membership(
@@ -10630,7 +10888,7 @@ class DeveloperAccountTests(unittest.TestCase):
             for script in page.developer_scripts
             if "ruyipage-developer-membership-details" in script
         ]
-        self.assertEqual(len(details_queries), 2)
+        self.assertEqual(len(details_queries), 3)
 
     def test_plain_list_item_can_open_membership_details(self):
         membership_item = FakeElement(
@@ -10645,9 +10903,174 @@ class DeveloperAccountTests(unittest.TestCase):
         page = DeveloperFakePage(
             {"css:main li": [membership_item]},
             state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+            membership_details=[
+                {
+                    "detailsPage": False,
+                    "appleDeveloperProgram": False,
+                    "renewalDate": False,
+                    "registrationIdentity": False,
+                    "membershipFieldCount": 0,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertIn(("human_click", membership_item), page.actions.calls)
+
+    def test_hash_routed_membership_details_bypass_navigation_and_wait_for_hydration(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": False,
+                    "renewalDate": False,
+                    "registrationIdentity": False,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertEqual(page.actions.calls, [])
+        self.assertEqual(
+            len(
+                [
+                    script
+                    for script in page.developer_scripts
+                    if "ruyipage-developer-membership-details" in script
+                ]
+            ),
+            3,
+        )
+
+    def test_canonical_account_url_confirms_visible_membership_details_without_navigation(self):
+        page = DeveloperFakePage(
+            state={"href": "https://developer.apple.com/account"},
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "teamId": True,
+                    "membershipFieldCount": 3,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "teamId": True,
+                    "membershipFieldCount": 3,
+                },
+            ],
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3],
+        ), patch("apple_account_flow.emit"):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertEqual(page.actions.calls, [])
+
+    def test_membership_details_require_renewal_and_registration_evidence(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
             membership_details={
                 "detailsPage": True,
                 "appleDeveloperProgram": True,
+                "renewalDate": False,
+                "registrationIdentity": False,
+                "membershipFieldCount": 0,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 1.1],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=1.0,
+                pause=lambda *_: None,
+            )
+
+        self.assertFalse(active)
+
+    def test_membership_details_with_live_auth_controls_fails_closed(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard",
+                "email": True,
+                "password": True,
+                "error": True,
+                "assertiveAuthenticationError": True,
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+                "renewalDate": True,
+                "registrationIdentity": True,
+                "membershipFieldCount": 2,
             },
         )
         page.states = FakeStates(alive=True)
@@ -10661,8 +11084,218 @@ class DeveloperAccountTests(unittest.TestCase):
                 pause=lambda *_: None,
             )
 
-        self.assertTrue(active)
-        self.assertIn(("human_click", membership_item), page.actions.calls)
+        self.assertFalse(active)
+
+    def test_membership_details_with_root_text_only_error_fails_closed(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard",
+                "error": True,
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+                "renewalDate": True,
+                "registrationIdentity": True,
+                "membershipFieldCount": 2,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertFalse(active)
+
+    def test_membership_details_query_reads_hash_and_generic_card_fields(self):
+        page = DeveloperFakePage(
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+        )
+
+        account_flow.developer_membership_details_snapshot(page)
+
+        query = page.developer_scripts[-1]
+        self.assertIn("location.hash", query)
+        self.assertIn("openShadowRoots", query)
+        self.assertIn("queryRoots", query)
+        self.assertIn("renewalDate", query)
+        self.assertIn("registrationIdentity", query)
+
+    def test_membership_details_query_classifies_chinese_and_english_dom_text(self):
+        fixtures = (
+            (
+                "会员资格详细信息\n团队 ID\nTEAM-TEST-001\n计划\nApple Developer Program\n"
+                "注册身份\n个人\n续订日期\n2030年1月2日",
+                "#MembershipDetailsCard",
+            ),
+            (
+                "Membership details\nTeam ID\nTEAM-TEST-001\nPlan\nApple Developer Program\n"
+                "Registration identity\nIndividual\nRenewal date\nJanuary 2, 2030",
+                "#MembershipDetailsCard",
+            ),
+            (
+                "Membership details Team ID TEAM-TEST-001 Plan Apple Developer Program "
+                "Registration identity Individual Phone 5550100 Street address Example Street "
+                "Renewal date January 2, 2030 Annual fee TEST-AMOUNT Device reset date January 2, 2030",
+                "#MembershipDetailsCard",
+            ),
+            (
+                "会员资格详细信息 团队 ID TEAM-TEST-001 计划 Apple Developer Program "
+                "注册身份 个人 电话 5550100 街道地址 示例街道 续订日期 2030年1月2日 "
+                "年费 TEST-AMOUNT 设备重置日期 2030年1月2日",
+                "#MembershipDetailsCard",
+            ),
+        )
+        for text, hash_value in fixtures:
+            with self.subTest(text=text):
+                snapshot = self.evaluate_membership_details_query(text, hash_value)
+                self.assertTrue(snapshot["detailsPage"])
+                self.assertTrue(snapshot["appleDeveloperProgram"])
+                self.assertTrue(snapshot["renewalDate"])
+                self.assertTrue(snapshot["registrationIdentity"])
+                self.assertTrue(
+                    account_flow.developer_membership_snapshot_is_active(snapshot)
+                )
+
+    def test_membership_details_query_merges_shell_body_and_open_shadow_card_text(self):
+        snapshot = self.evaluate_membership_details_query(
+            "",
+            "#MembershipDetailsCard",
+            main_text="Account",
+            body_text="Account",
+            shadow_texts=(
+                "会员资格详细信息 团队 ID TESTTEAM01 计划 Apple Developer Program "
+                "注册身份 个人 电话 5550100 街道地址 Example Street 续订日期 2030年1月2日 "
+                "年费 TEST-AMOUNT 设备重置日期 2030年1月2日",
+            ),
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertTrue(snapshot["renewalDate"])
+        self.assertTrue(snapshot["registrationIdentity"])
+        self.assertTrue(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
+    def test_membership_details_query_rejects_hash_and_title_without_field_values(self):
+        snapshot = self.evaluate_membership_details_query(
+            "会员资格详细信息\nApple Developer Program"
+        )
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertFalse(snapshot["renewalDate"])
+        self.assertFalse(snapshot["registrationIdentity"])
+
+    def test_membership_navigation_label_is_not_a_membership_details_page(self):
+        snapshot = self.evaluate_membership_details_query(
+            "Membership details",
+            "",
+        )
+
+        self.assertFalse(snapshot["detailsPage"])
+        self.assertFalse(snapshot["appleDeveloperProgram"])
+        self.assertFalse(snapshot["renewalDate"])
+        self.assertFalse(snapshot["registrationIdentity"])
+
+    def test_membership_details_query_does_not_cross_text_source_boundaries(self):
+        membership_labels_without_values = (
+            "Membership details\nPlan\nApple Developer Program\n"
+            "Registration identity\nRenewal date"
+        )
+        snapshot = self.evaluate_membership_details_query(
+            "",
+            "#MembershipDetailsCard",
+            main_text=membership_labels_without_values,
+            body_text="Account\n" + membership_labels_without_values,
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertFalse(snapshot["renewalDate"])
+        self.assertFalse(snapshot["registrationIdentity"])
+        self.assertFalse(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
+    def test_membership_details_query_does_not_skip_over_the_next_field_label(self):
+        snapshot = self.evaluate_membership_details_query(
+            "Membership details\nPlan\nApple Developer Program\n"
+            "Renewal date\nRegistration identity\nIndividual"
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertFalse(snapshot["renewalDate"])
+        self.assertTrue(snapshot["registrationIdentity"])
+        self.assertFalse(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
+    def test_membership_details_card_is_primary_evidence_scope(self):
+        snapshot = self.evaluate_membership_details_query(
+            "",
+            "",
+            main_text="Account",
+            body_text="Account",
+            membership_card_text=(
+                "Membership details Team ID TEAM-TEST-001 Plan Apple Developer Program "
+                "Registration identity Individual Renewal date January 2, 2030"
+            ),
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertTrue(snapshot["renewalDate"])
+        self.assertTrue(snapshot["registrationIdentity"])
+        self.assertTrue(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
+    def test_membership_details_card_does_not_borrow_surrounding_page_values(self):
+        snapshot = self.evaluate_membership_details_query(
+            "",
+            "",
+            main_text="Account",
+            body_text=(
+                "Membership details Plan Apple Developer Program Registration identity "
+                "Individual Renewal date January 2, 2030"
+            ),
+            membership_card_text=(
+                "Membership details Plan Apple Developer Program Registration identity "
+                "Renewal date"
+            ),
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertFalse(snapshot["renewalDate"])
+        self.assertFalse(snapshot["registrationIdentity"])
+        self.assertFalse(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
+    def test_membership_details_query_rejects_empty_renewal_placeholders(self):
+        for placeholder in ("-", "—", "N/A", "未提供"):
+            with self.subTest(placeholder=placeholder):
+                snapshot = self.evaluate_membership_details_query(
+                    "Membership details\nPlan\nApple Developer Program\n"
+                    f"Renewal date\n{placeholder}\nRegistration identity\nIndividual"
+                )
+
+                self.assertTrue(snapshot["detailsPage"])
+                self.assertTrue(snapshot["appleDeveloperProgram"])
+                self.assertFalse(snapshot["renewalDate"])
+                self.assertTrue(snapshot["registrationIdentity"])
+                self.assertFalse(
+                    account_flow.developer_membership_snapshot_is_active(snapshot)
+                )
 
     def test_selector_priority_avoids_counting_nested_wrappers_twice(self):
         membership_item = FakeElement(
@@ -10864,6 +11497,90 @@ class DeveloperAccountTests(unittest.TestCase):
             full_page=False,
         )
 
+    def test_collects_active_membership_after_late_hash_hydration_without_nav_snapshot(self):
+        developer_page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": False,
+                    "renewalDate": False,
+                    "registrationIdentity": False,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        developer_page.states = FakeStates(alive=True)
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class RootPage:
+            def new_tab(self, _url):
+                return developer_page
+
+        screenshot_path = Path("03-developer-membership.png")
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "developerAccountShell": True,
+                    "joinProgram": False,
+                    "membershipNavigation": False,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ), patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=str(screenshot_path),
+        ) as screenshot, patch(
+            "apple_account_flow.human_pause",
+            lambda *_: None,
+        ), patch("apple_account_flow.emit"):
+            result, returned_page, captured = (
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    {"twofaPrepared": True, "nextGeneration": 2},
+                    screenshot_path,
+                )
+            )
+
+        self.assertEqual(result["membershipStatus"], "active")
+        self.assertIs(returned_page, developer_page)
+        self.assertEqual(captured, str(screenshot_path))
+        screenshot.assert_called_once_with(
+            developer_page,
+            screenshot_path,
+            checkpoint="developer_membership",
+            full_page=False,
+        )
+
     def test_membership_markers_cannot_be_classified_without_confirmed_account_shell(self):
         developer_page = self.authenticated_page()
         developer_page.wait = type(
@@ -10991,6 +11708,55 @@ class DeveloperAccountTests(unittest.TestCase):
             )
 
         self.assertIs(result, confirmed)
+        self.assertEqual(session_probe.call_count, 2)
+
+    def test_complete_developer_authentication_waits_past_initial_generic_session(self):
+        page = FakePage(
+            state={"href": "https://account.apple.com/account/manage"}
+        )
+        page.states = FakeStates(alive=True)
+        generic_account_state = {
+            "href": "https://account.apple.com/account/manage",
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "rootError": False,
+            "twofa": False,
+            "trustPrompt": False,
+            "error": False,
+        }
+        confirmed = {
+            "href": account_flow.DEVELOPER_ACCOUNT_URL,
+            "trusted": True,
+            "rootSessionTrusted": True,
+            "developerAccount": True,
+            "developerAccountShell": True,
+            "joinProgram": False,
+            "membershipNavigation": False,
+        }
+        session_probe = Mock(side_effect=[None, confirmed])
+
+        with patch(
+            "apple_account_flow.detect_login_state",
+            return_value=generic_account_state,
+        ), patch(
+            "apple_account_flow.settle_trust_state",
+            side_effect=lambda _page, state, **_kwargs: state,
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit_browser_observation"
+        ):
+            result = account_flow.complete_account_authentication(
+                page,
+                "person@example.com",
+                "secret",
+                FakeKeys,
+                account_home_confirmed=False,
+                authentication_context={"twofaPrepared": True, "nextGeneration": 2},
+                session_probe=session_probe,
+            )
+
+        self.assertIs(result["confirmedState"], confirmed)
+        self.assertTrue(result["skippedLogin"])
+        self.assertTrue(result["skipped2FA"])
         self.assertEqual(session_probe.call_count, 2)
 
     def test_developer_top_level_target_waits_past_retiring_child_error(self):

@@ -125,6 +125,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "developer_account_tab_created",
   "developer_account_authentication_started",
   "developer_account_authenticated",
+  "developer_membership_probe",
   "developer_membership_checked",
   "developer_account_completed",
   "developer_account_failed",
@@ -960,6 +961,26 @@ function sanitizeDeveloperMembershipStatus(value) {
   return DEVELOPER_MEMBERSHIP_STATUSES.has(value) ? value : "unknown";
 }
 
+function sanitizeDeveloperMembershipProbe(event) {
+  const fieldCount = Number.isInteger(event?.membershipFieldCount)
+    ? Math.min(5, Math.max(0, event.membershipFieldCount))
+    : 0;
+  const stableCount = Number.isInteger(event?.stableCount)
+    ? Math.min(2, Math.max(0, event.stableCount))
+    : 0;
+  return {
+    routeMatched: event?.routeMatched === true,
+    authBlocked: event?.authBlocked === true,
+    detailsPage: event?.detailsPage === true,
+    appleDeveloperProgram: event?.appleDeveloperProgram === true,
+    renewalDate: event?.renewalDate === true,
+    registrationIdentity: event?.registrationIdentity === true,
+    teamId: event?.teamId === true,
+    membershipFieldCount: fieldCount,
+    stableCount,
+  };
+}
+
 function sanitizeDeveloperAccountFailureClass(value) {
   return DEVELOPER_ACCOUNT_FAILURE_CLASSES.has(value) ? value : "unknown";
 }
@@ -1273,6 +1294,9 @@ function auditRuyiPageEvent(flowAudit, event) {
       details.membershipStatus = sanitizeDeveloperMembershipStatus(
         event.membershipStatus
       );
+    }
+    if (event.status === "developer_membership_probe") {
+      Object.assign(details, sanitizeDeveloperMembershipProbe(event));
     }
     if (event.status === "developer_account_failed") {
       details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
@@ -1641,6 +1665,33 @@ export async function runAccountBrowserPhase(
           event.status === "developer_account_authenticated"
         ) {
           console.log("[✓] Apple Developer 登录成功，正在检查会员资格");
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_membership_probe"
+        ) {
+          const probe = sanitizeDeveloperMembershipProbe(event);
+          if (showTerminalDebug) {
+            console.log(
+              `[ruyipage] membership:route:${probe.routeMatched ? 1 : 0}:auth_blocked:${probe.authBlocked ? 1 : 0}:details:${probe.detailsPage ? 1 : 0}:program:${probe.appleDeveloperProgram ? 1 : 0}:renewal:${probe.renewalDate ? 1 : 0}:identity:${probe.registrationIdentity ? 1 : 0}:team:${probe.teamId ? 1 : 0}:fields:${probe.membershipFieldCount}:stable:${probe.stableCount}`
+            );
+          }
+          if (probe.routeMatched) {
+            reportTerminalProgress(
+              "developer-membership:details",
+              "[→] 已到达会员资格详细信息，正在核验计划、续订日期和注册身份"
+            );
+          }
+          if (
+            probe.detailsPage &&
+            probe.appleDeveloperProgram &&
+            probe.renewalDate &&
+            probe.registrationIdentity
+          ) {
+            reportTerminalProgress(
+              "developer-membership:evidence",
+              "[✓] MembershipDetailsCard 已读取，正在确认会员资格"
+            );
+          }
         } else if (
           event.event === "status" &&
           event.status === "developer_account_failed" &&

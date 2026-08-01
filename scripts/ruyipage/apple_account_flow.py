@@ -4138,9 +4138,16 @@ def resolve_developer_membership_navigation(page: Any) -> tuple[Any, Any] | None
     return None
 
 
-def developer_membership_details_snapshot(page: Any) -> dict[str, bool]:
+def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
     if not is_developer_account_url(scope_location_url(page)):
-        return {"detailsPage": False, "appleDeveloperProgram": False}
+        return {
+            "detailsPage": False,
+            "appleDeveloperProgram": False,
+            "renewalDate": False,
+            "registrationIdentity": False,
+            "teamId": False,
+            "membershipFieldCount": 0,
+        }
     raw = page.run_js(
         r"""
         return JSON.stringify((() => {
@@ -4157,6 +4164,49 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool]:
             .replace(/\s+/g, ' ')
             .trim()
             .toLocaleLowerCase();
+          const main = document.querySelector('main');
+          const openShadowRoots = [];
+          const seenShadowRoots = new Set();
+          const collectOpenShadowRoots = (root) => {
+            if (!root || seenShadowRoots.has(root)) return;
+            seenShadowRoots.add(root);
+            for (const element of [...root.querySelectorAll('*')]) {
+              if (!element.shadowRoot) continue;
+              openShadowRoots.push(element.shadowRoot);
+              collectOpenShadowRoots(element.shadowRoot);
+            }
+          };
+          collectOpenShadowRoots(document);
+          const queryRoots = [document, ...openShadowRoots];
+          const sourceTexts = new Set();
+          const appendTextSource = (value) => {
+            const text = String(value || '').trim();
+            if (text) sourceTexts.add(text);
+          };
+          const textGroup = (value) => {
+            const lines = String(value || '').split(/\r?\n/)
+              .map(normalize)
+              .filter(Boolean);
+            return { lines, flatText: lines.join(' ') };
+          };
+          const textFromRoot = (root) => [...root.querySelectorAll('*')]
+            .filter(visible)
+            .filter((element) => !element.children || element.children.length === 0)
+            .map((element) => String(element.innerText || element.textContent || '').trim())
+            .filter(Boolean)
+            .join('\n');
+          // Keep each readable document/shadow-root source isolated.  Joining
+          // sources before parsing lets a field label from the card borrow an
+          // unrelated account-shell heading as its value at a source boundary.
+          // Card-field evidence must have its label and value in the same source.
+          appendTextSource(main && main.innerText);
+          appendTextSource(document.body && document.body.innerText);
+          for (const root of openShadowRoots) {
+            appendTextSource(textFromRoot(root));
+          }
+          const sourceTextGroups = [...sourceTexts].map(textGroup);
+          const lines = sourceTextGroups.flatMap((group) => group.lines);
+          const hash = String(location.hash || '').toLocaleLowerCase();
           const detailsLabels = new Set([
             'membership details',
             '\u4f1a\u5458\u8d44\u683c\u8be6\u7ec6\u4fe1\u606f',
@@ -4164,20 +4214,185 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool]:
             '\u6703\u54e1\u8cc7\u683c\u8a73\u7d30\u8cc7\u8a0a',
             '\u6703\u54e1\u8cc7\u683c\u8a73\u60c5'
           ]);
-          const candidates = [...document.querySelectorAll(
-            'main h1, main h2, main h3, main h4, main [role="heading"], ' +
-            'main [aria-current="page"], main [aria-selected="true"], main dt, main dd, main strong'
-          )].filter(visible);
-          const labels = candidates.map((el) => normalize(
+          const detailPageCandidates = queryRoots.flatMap((root) => [...root.querySelectorAll(
+            'h1, h2, h3, h4, [role="heading"], [aria-current="page"], [aria-selected="true"]'
+          )]).filter(visible);
+          const detailPageLabels = detailPageCandidates.map((el) => normalize(
             el.getAttribute('aria-label') || el.innerText || el.textContent || ''
           )).filter(Boolean);
-          const path = String(location.pathname || '').toLocaleLowerCase();
+          const membershipCards = queryRoots.flatMap((root) =>
+            [...root.querySelectorAll('[id], [class], [data-testid]')]
+          ).filter(visible).filter((el) => [
+            el.id,
+            typeof el.className === 'string' ? el.className : '',
+            el.getAttribute('data-testid') || ''
+          ].join(' ').toLocaleLowerCase().includes('membershipdetailscard'));
+          const cardTexts = new Set();
+          for (const card of membershipCards) {
+            const text = String(card.innerText || card.textContent || '').trim();
+            if (text) cardTexts.add(text);
+            if (card.shadowRoot) cardTexts.add(textFromRoot(card.shadowRoot));
+          }
+          const cardTextGroups = [...cardTexts]
+            .filter(Boolean)
+            .map(textGroup)
+            .filter((group) => group.lines.length > 0);
+          // An explicit MembershipDetailsCard is the strongest scope: field
+          // evidence comes from it alone, not from surrounding account chrome.
+          const evidenceTextGroups = cardTextGroups.length > 0
+            ? cardTextGroups
+            : sourceTextGroups;
+          const evidenceLines = evidenceTextGroups.flatMap((group) => group.lines);
+          const evidenceFlatText = evidenceTextGroups
+            .map((group) => group.flatText)
+            .filter(Boolean)
+            .join(' ');
+          const cardMarker = membershipCards.length > 0;
+          const detailsPage = hash.includes('membershipdetailscard') ||
+            hash.includes('membershipdetails') ||
+            cardMarker ||
+            detailPageLabels.some((label) => detailsLabels.has(label));
+          const planPattern = /(?:^|\s)(?:plan|\u8ba1\u5212|\u65b9\u6848)\s*[:\uff1a]?\s*apple developer program(?:$|\s)/;
+          const appleDeveloperProgram = evidenceLines.some((line) =>
+            line === 'apple developer program' || planPattern.test(line)
+          ) || planPattern.test(evidenceFlatText);
+          const fieldLabels = {
+            renewalDate: [
+              /renewal date/,
+              /renewed through/,
+              /membership expiration/,
+              /\u7eed\u8ba2\u65e5\u671f/,
+              /\u7e8c\u8a02\u65e5\u671f/,
+              /\u7eed\u671f\u65e5\u671f/,
+              /\u7e8c\u671f\u65e5\u671f/
+            ],
+            registrationIdentity: [
+              /registration identity/,
+              /registered as/,
+              /enrollment type/,
+              /\u6ce8\u518c\u8eab\u4efd/,
+              /\u8a3b\u518a\u8eab\u5206/,
+              /\u6ce8\u518c\u7c7b\u578b/,
+              /\u8a3b\u518a\u985e\u578b/
+            ],
+            teamId: [
+              /team id/,
+              /\u56e2\u961f\s*id/,
+              /\u5718\u968a\s*id/
+            ]
+          };
+          const allFieldLabels = [
+            /plan/,
+            /\u8ba1\u5212/,
+            /\u65b9\u6848/,
+            ...fieldLabels.renewalDate,
+            ...fieldLabels.registrationIdentity,
+            ...fieldLabels.teamId,
+            /phone/,
+            /\u7535\u8bdd/,
+            /\u96fb\u8a71/,
+            /street address/,
+            /\u8857\u9053\u5730\u5740/,
+            /annual fee/,
+            /\u5e74\u8d39/,
+            /\u5e74\u8cbb/,
+            /device reset date/,
+            /\u8bbe\u5907\u91cd\u7f6e\u65e5\u671f/,
+            /\u8a2d\u5099\u91cd\u7f6e\u65e5\u671f/
+          ];
+          const placeholderValues = new Set([
+            '-',
+            '--',
+            '–',
+            '—',
+            'n/a',
+            'na',
+            'none',
+            'unavailable',
+            '\u672a\u63d0\u4f9b',
+            '\u65e0'
+          ]);
+          const normalizeMeaningfulValue = (value) => {
+            const normalized = String(value || '')
+              .replace(/^[\s:：\-–—]+|[\s:：\-–—]+$/g, '')
+              .trim()
+              .toLocaleLowerCase();
+            return normalized && !placeholderValues.has(normalized)
+              ? normalized
+              : '';
+          };
+          const hasLabeledValue = (patterns, { requireNumeric = false } = {}) => {
+            const validValue = (value) => {
+              const normalized = normalizeMeaningfulValue(value);
+              return normalized && (!requireNumeric || /\d/.test(normalized));
+            };
+            for (const group of evidenceTextGroups) {
+              for (let index = 0; index < group.lines.length; index += 1) {
+                const line = group.lines[index];
+                if (!patterns.some((pattern) => pattern.test(line))) continue;
+                const remainder = patterns.reduce(
+                  (value, pattern) => value.replace(pattern, ''),
+                  line
+                ).replace(/^[\s:：-]+|[\s:：-]+$/g, '').trim();
+                if (validValue(remainder) && !allFieldLabels.some((pattern) => pattern.test(remainder))) {
+                  return true;
+                }
+                // A following field label closes this field.  Do not skip over
+                // it looking for a later unrelated shell heading.
+                const candidate = group.lines[index + 1];
+                if (validValue(candidate) && !allFieldLabels.some((pattern) => pattern.test(candidate))) {
+                  return true;
+                }
+              }
+              // The Developer Account card is a responsive grid.  On narrower
+              // Firefox layouts its visible text can be flattened into one long
+              // line instead of one label/value pair per line.  In that form the
+              // old remainder check always contained subsequent field labels and
+              // rejected an otherwise valid value.  Bound the value by the next
+              // known field label, within this same DOM-text source.
+              for (const pattern of patterns) {
+                let cursor = 0;
+                while (cursor < group.flatText.length) {
+                  const match = pattern.exec(group.flatText.slice(cursor));
+                  if (!match) break;
+                  const matchStart = cursor + match.index;
+                  const valueStart = matchStart + match[0].length;
+                  const remaining = group.flatText.slice(valueStart)
+                    .replace(/^[\s:：-]+/, '');
+                  const boundaries = allFieldLabels
+                    .map((fieldPattern) => {
+                      const boundary = fieldPattern.exec(remaining);
+                      return boundary ? boundary.index : -1;
+                    })
+                    .filter((index) => index >= 0);
+                  const value = normalizeMeaningfulValue(remaining.slice(
+                    0,
+                    boundaries.length ? Math.min(...boundaries) : remaining.length
+                  ));
+                  if (value && (!requireNumeric || /\d/.test(value))) return true;
+                  cursor = valueStart;
+                }
+              }
+            }
+            return false;
+          };
+          const renewalDate = hasLabeledValue(fieldLabels.renewalDate, { requireNumeric: true });
+          const registrationIdentity = hasLabeledValue(fieldLabels.registrationIdentity);
+          const teamId = hasLabeledValue(fieldLabels.teamId);
+          const membershipFieldCount = [
+            renewalDate,
+            registrationIdentity,
+            teamId,
+            /annual fee|\u5e74\u8d39|\u5e74\u8cbb/.test(evidenceFlatText),
+            /device reset date|\u8bbe\u5907\u91cd\u7f6e\u65e5\u671f|\u8a2d\u5099\u91cd\u7f6e\u65e5\u671f/.test(evidenceFlatText)
+          ].filter(Boolean).length;
           return {
-            detailsPage: labels.some((label) => detailsLabels.has(label)) ||
-              path.includes('membership'),
-            appleDeveloperProgram: labels.some((label) =>
-              label === 'apple developer program'
-            )
+            detailsPage,
+            appleDeveloperProgram,
+            renewalDate,
+            registrationIdentity,
+            teamId,
+            membershipFieldCount
           };
         })())
         """
@@ -4191,7 +4406,63 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool]:
     return {
         "detailsPage": result.get("detailsPage") is True,
         "appleDeveloperProgram": result.get("appleDeveloperProgram") is True,
+        "renewalDate": result.get("renewalDate") is True,
+        "registrationIdentity": result.get("registrationIdentity") is True,
+        "teamId": result.get("teamId") is True,
+        "membershipFieldCount": normalize_membership_field_count(
+            result.get("membershipFieldCount")
+        ),
     }
+
+
+def normalize_membership_field_count(value: Any) -> int:
+    return min(5, max(0, value if type(value) is int else 0))
+
+
+def developer_membership_snapshot_is_active(snapshot: dict[str, Any]) -> bool:
+    """Require the loaded membership card, plan, renewal and identity evidence."""
+    return bool(
+        snapshot.get("detailsPage") is True
+        and snapshot.get("appleDeveloperProgram") is True
+        and snapshot.get("renewalDate") is True
+        and snapshot.get("registrationIdentity") is True
+    )
+
+
+def emit_developer_membership_probe(
+    snapshot: dict[str, Any],
+    *,
+    route_matched: bool,
+    auth_blocked: bool,
+    stable_count: int,
+) -> None:
+    """Record a de-identified membership-readiness observation for diagnosis."""
+    emit(
+        {
+            "event": "status",
+            "status": "developer_membership_probe",
+            "routeMatched": route_matched is True,
+            "authBlocked": auth_blocked is True,
+            "detailsPage": snapshot.get("detailsPage") is True,
+            "appleDeveloperProgram": snapshot.get("appleDeveloperProgram") is True,
+            "renewalDate": snapshot.get("renewalDate") is True,
+            "registrationIdentity": snapshot.get("registrationIdentity") is True,
+            "teamId": snapshot.get("teamId") is True,
+            "membershipFieldCount": normalize_membership_field_count(
+                snapshot.get("membershipFieldCount")
+            ),
+            "stableCount": min(2, max(0, stable_count)),
+        }
+    )
+
+
+def developer_membership_details_route(url: str) -> bool:
+    normalized = str(url or "").casefold()
+    return bool(
+        "#membershipdetailscard" in normalized
+        or "#membershipdetails" in normalized
+        or "/membership" in normalized
+    )
 
 
 def confirm_active_developer_membership(
@@ -4200,23 +4471,84 @@ def confirm_active_developer_membership(
     timeout_s: float = 20.0,
     pause: Callable[[int, int], None] = human_pause,
 ) -> bool:
-    navigation = resolve_developer_membership_navigation(page)
-    if navigation is None:
-        return False
-    scope, element = navigation
-    human_click(scope, element, pause=pause)
     deadline = time.monotonic() + max(0.0, timeout_s)
-    stable_count = 0
-    while time.monotonic() < deadline:
-        if not browser_connection_is_alive(page):
-            raise RuntimeError("developer browser connection was lost")
-        snapshot = developer_membership_details_snapshot(page)
-        if snapshot["detailsPage"] and snapshot["appleDeveloperProgram"]:
-            stable_count += 1
+
+    def wait_for_loaded_details(
+        initial_snapshot: dict[str, Any] | None = None,
+    ) -> bool:
+        stable_count = 0
+        last_probe: tuple[bool | int, ...] | None = None
+        pending_snapshot = initial_snapshot
+        while time.monotonic() < deadline:
+            if not browser_connection_is_alive(page):
+                raise RuntimeError("developer browser connection was lost")
+            if pending_snapshot is None:
+                snapshot = developer_membership_details_snapshot(page)
+            else:
+                snapshot = pending_snapshot
+                pending_snapshot = None
+            try:
+                auth_blocked = developer_scope_has_auth_blocker(
+                    page,
+                    # Membership confirmation must fail closed on any root
+                    # authentication/error marker, even when stale page text
+                    # is the only remaining signal.
+                    allow_root_text_only_error=False,
+                    allow_retiring_child_text_only_error=True,
+                )
+            except Exception:
+                auth_blocked = True
+            if not auth_blocked and developer_membership_snapshot_is_active(snapshot):
+                stable_count += 1
+            else:
+                stable_count = 0
+            route_matched = developer_membership_details_route(scope_location_url(page))
+            probe = (
+                route_matched,
+                auth_blocked,
+                snapshot.get("detailsPage") is True,
+                snapshot.get("appleDeveloperProgram") is True,
+                snapshot.get("renewalDate") is True,
+                snapshot.get("registrationIdentity") is True,
+                snapshot.get("teamId") is True,
+                normalize_membership_field_count(snapshot.get("membershipFieldCount")),
+                min(2, stable_count),
+            )
+            if probe != last_probe:
+                emit_developer_membership_probe(
+                    snapshot,
+                    route_matched=route_matched,
+                    auth_blocked=auth_blocked,
+                    stable_count=stable_count,
+                )
+                last_probe = probe
+            if auth_blocked:
+                return False
             if stable_count >= 2:
                 return True
-        else:
-            stable_count = 0
+            pause(250, 500)
+        return False
+
+    # Apple can land on the hash-routed details card before the nav items are
+    # rendered. Keep polling the current page so a late hash/nav hydration is
+    # not frozen into the initial ``membershipNavigation`` snapshot.  Its SPA
+    # can also canonicalize the URL back to ``/account`` while retaining the
+    # visible details card, so the live snapshot is an independent route cue.
+    while time.monotonic() < deadline:
+        current_url = scope_location_url(page)
+        if developer_membership_details_route(current_url):
+            return wait_for_loaded_details()
+        try:
+            snapshot = developer_membership_details_snapshot(page)
+        except Exception:
+            snapshot = None
+        if isinstance(snapshot, dict) and snapshot.get("detailsPage") is True:
+            return wait_for_loaded_details(initial_snapshot=snapshot)
+        navigation = resolve_developer_membership_navigation(page)
+        if navigation is not None:
+            scope, element = navigation
+            human_click(scope, element, pause=pause)
+            return wait_for_loaded_details()
         pause(250, 500)
     return False
 
@@ -4317,7 +4649,7 @@ def wait_for_2fa_or_session(
             max(0, int((time.monotonic() - started) * 1000)),
             max(0, int(timeout_s * 1000)),
         )
-        if has_confirmed_account_session(last_state):
+        if has_confirmed_account_session(last_state) and session_probe is None:
             last_state["trusted"] = True
             last_state["elapsedMs"] = elapsed_ms
             return last_state
@@ -4396,13 +4728,18 @@ def wait_for_signed_in(
             if direct_target_state is not None:
                 observe_transition(direct_target_state)
                 return direct_target_state
-        direct_session_state = confirmed_account_manage_state(
-            page,
-            allow_retiring_child_errors=allow_retiring_child_errors,
-        )
-        if direct_session_state is not None:
-            observe_transition(direct_session_state)
-            return direct_session_state
+        # A Developer-targeted flow must not complete on the transient generic
+        # account.apple.com session that Apple can expose between the trust
+        # click and the Developer account shell hydration.  In probe mode the
+        # target probe is the only terminal success condition.
+        if session_probe is None:
+            direct_session_state = confirmed_account_manage_state(
+                page,
+                allow_retiring_child_errors=allow_retiring_child_errors,
+            )
+            if direct_session_state is not None:
+                observe_transition(direct_session_state)
+                return direct_session_state
         try:
             last_state = detect_login_state(page)
             if allow_post_otp_clicks:
@@ -4456,7 +4793,7 @@ def wait_for_signed_in(
             str(last_state.get("href") or "")
         ):
             raise RuntimeError("2FA state left the verified Apple HTTPS origin")
-        if has_confirmed_account_session(last_state):
+        if has_confirmed_account_session(last_state) and session_probe is None:
             # A retiring idmsa frame can still expose generic error text after
             # the top-level account shell has already established the session.
             # A root-page error remains terminal; only retired child-frame
@@ -6107,7 +6444,8 @@ def complete_account_authentication(
     authentication_context: dict[str, Any],
     session_probe: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
-    initial_state = session_probe(page) if session_probe is not None else None
+    initial_target_state = session_probe(page) if session_probe is not None else None
+    initial_state = initial_target_state
     if initial_state is None:
         initial_state = detect_login_state(page)
         initial_state = settle_trust_state(
@@ -6134,6 +6472,19 @@ def complete_account_authentication(
             "twofa": False,
             "twofaVisible": False,
         }
+    if (
+        session_probe is not None
+        and initial_target_state is None
+        and has_confirmed_account_session(initial_state)
+    ):
+        # The target tab can temporarily visit account.apple.com/manage after
+        # its session is restored.  Keep waiting for the caller's target-shell
+        # probe instead of treating that generic session as a completed
+        # Developer login.
+        initial_state = wait_for_2fa_or_session(
+            page,
+            session_probe=session_probe,
+        )
     set_browser_startup_stage("login_state_detected")
     skipped_login = has_confirmed_account_session(initial_state)
     confirmed_login_state = initial_state
@@ -6522,7 +6873,9 @@ def collect_developer_account_membership(
     screenshot: str | None = None
     if confirmed_state.get("joinProgram") is True:
         membership_status = "not_enrolled"
-    elif confirmed_state.get("membershipNavigation") is True:
+    else:
+        # The account shell snapshot can race the hash-routed membership card.
+        # Re-read the live page instead of freezing the initial nav boolean.
         if confirm_active_developer_membership(developer_page):
             membership_status = "active"
             screenshot = take_screenshot(
