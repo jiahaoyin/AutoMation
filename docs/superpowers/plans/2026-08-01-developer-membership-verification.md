@@ -33,4 +33,4 @@
 - 两个只读 review 子代理均已完成修改—复审循环并通过：membership_contract_review=PASS、membership_logic_review=PASS。
 - Python 全量：394 tests OK；DeveloperAccountTests：47 tests OK。
 - Node test:account-browser-flow, test:flow-audit, py_compile, and git diff --check all passed.
-- Mac 精确 SHA 验证暂未执行：须先在 Windows 提交并推送精确 SHA；真实 Apple/2FA 流程还须使用显式受监督的 Mac 会话。
+- Windows 已提交并推送会员判定修复；Mac 精确 SHA 验证于 2026-08-01T18:33:06Z 尝试启动，但 macOS 验证主机的 SSH/SCP 连接超时，未产生 Mac 侧验证产物。主机恢复可达后需重试；真实 Apple/2FA 流程仍须使用显式受监督的 Mac 会话。
