@@ -1117,11 +1117,54 @@ private func hitTestMatchesBoundSurface(
             return false
         }
     }
+    // A System Settings host and its AppleIDSettings ExtensionKit process can
+    // both answer the same hit-test point, but their AX trees are separate.
+    // Accept either trusted owner when the hit element (or one of its trusted
+    // ancestors) resolves to the exact CGWindow already bound to this modal.
+    if elementOrAncestorHasWindowID(
+        hit,
+        target.binding.windowID,
+        ownerPIDs: Set([target.binding.axOwnerPID, target.binding.visualOwnerPID])
+    ) {
+        return true
+    }
     return isTrustedDescendant(
         hit,
         of: target.surface,
         ownerPIDs: Set([target.binding.axOwnerPID, target.binding.visualOwnerPID])
     )
+}
+
+private func elementOrAncestorHasWindowID(
+    _ element: AXUIElement,
+    _ windowID: CGWindowID,
+    ownerPIDs: Set<pid_t>
+) -> Bool {
+    var current: AXUIElement? = element
+    for _ in 0..<32 {
+        guard let node = current,
+              let nodePID = elementPID(node),
+              ownerPIDs.contains(nodePID) else {
+            return false
+        }
+        if elementWindowID(node) == windowID {
+            return true
+        }
+        current = axParent(node)
+    }
+    return false
+}
+
+private func surfaceFrameMatchesBoundWindow(
+    _ surfaceFrame: CGRect,
+    windowFrame: CGRect,
+    tolerance: CGFloat = 4
+) -> Bool {
+    // A broad AXWindow (for example 446) can own a separately composited
+    // modal CGWindow (for example 608).  The bound controls are checked below
+    // against the modal window, so accept either containment direction here.
+    frame(surfaceFrame, isWithin: windowFrame, tolerance: tolerance) ||
+        frame(windowFrame, isWithin: surfaceFrame, tolerance: tolerance)
 }
 
 private func modalTargetIsReady(
@@ -1131,10 +1174,10 @@ private func modalTargetIsReady(
 ) -> Bool {
     guard window.binding == target.binding,
           let surfaceFrame = axFrame(target.surface),
-          frame(surfaceFrame, isWithin: window.frame),
+          surfaceFrameMatchesBoundWindow(surfaceFrame, windowFrame: window.frame),
           modalElements(target).allSatisfy({ element in
               guard let elementFrame = axFrame(element) else { return false }
-              return frame(elementFrame, isWithin: window.frame)
+              return frame(elementFrame, isWithin: window.frame, tolerance: 4)
           }),
           targetWindowIsTopmostAtPoint(window, point: point),
           hitTestMatchesBoundSurface(target, window: window, point: point) else {

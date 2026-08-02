@@ -683,6 +683,35 @@ assert.match(helperSource, /frame\(visualWindowFrame, isWithin: surfaceFrame, to
 assert.match(helperSource, /resolveOnScreenWindowID\(\r?\n\s+pid: visualOwnerPID,/);
 assert.match(helperSource, /private func onScreenWindowFrame\(/);
 assert.doesNotMatch(helperSource, /surfaceWindowID != visualWindow\.windowID/);
+assert.match(helperSource, /private func elementOrAncestorHasWindowID\(/);
+assert.match(
+  helperSource,
+  /elementOrAncestorHasWindowID\([\s\S]*?hit,[\s\S]*?target\.binding\.windowID,[\s\S]*?ownerPIDs: Set\(\[target\.binding\.axOwnerPID, target\.binding\.visualOwnerPID\]\)/
+);
+const ancestorWindowBody = helperSource.slice(
+  helperSource.indexOf("private func elementOrAncestorHasWindowID"),
+  helperSource.indexOf("private func surfaceFrameMatchesBoundWindow")
+);
+assert.match(ancestorWindowBody, /ownerPIDs\.contains\(nodePID\)/);
+assert.match(ancestorWindowBody, /elementWindowID\(node\) == windowID/);
+const modalReadyBody = helperSource.slice(
+  helperSource.indexOf("private func modalTargetIsReady"),
+  helperSource.indexOf("private func activateBoundModalTarget")
+);
+assert.match(helperSource, /private func surfaceFrameMatchesBoundWindow\(/);
+assert.match(
+  modalReadyBody,
+  /surfaceFrameMatchesBoundWindow\(surfaceFrame, windowFrame: window\.frame\)/
+);
+assert.match(modalReadyBody, /frame\(elementFrame, isWithin: window\.frame, tolerance: 4\)/);
+assert.match(helperSource, /frame\(windowFrame, isWithin: surfaceFrame, tolerance: tolerance\)/);
+const surfaceHitBody = helperSource.slice(
+  helperSource.indexOf("private func hitTestMatchesBoundSurface"),
+  helperSource.indexOf("private func elementOrAncestorHasWindowID")
+);
+assert.match(surfaceHitBody, /hitPID == target\.binding\.visualOwnerPID/);
+assert.match(surfaceHitBody, /hitPID == target\.binding\.axOwnerPID/);
+assert.match(surfaceHitBody, /ownerPIDs: Set\(\[target\.binding\.axOwnerPID, target\.binding\.visualOwnerPID\]\)/);
 const hitTestBody = helperSource.slice(
   helperSource.indexOf("private func hitTestMatchesBoundTarget"),
   helperSource.indexOf("private func activateBoundSettingsWindow")
