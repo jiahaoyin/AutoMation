@@ -999,6 +999,7 @@ class FakeElement:
         self.rendered_text = rendered_text
         self.scroll = FakeScroll(on_scroll)
         self.prompt_semantics = prompt_semantics
+        self._default_profile_modal_close = None
         self.password_target_identity = (
             self.attrs.get("passwordTargetIdentity") or f"test-password:{id(self)}"
         )
@@ -1029,6 +1030,30 @@ class FakeElement:
 
     def attr(self, name):
         return self.attrs.get(name)
+
+    def eles(self, selector, timeout=None):
+        elements_by_selector = self.attrs.get("elementsBySelector", {})
+        if selector in elements_by_selector:
+            elements = elements_by_selector.get(selector, [])
+            for element in elements:
+                element.scope = self.scope
+            return elements
+        if selector in account_flow.PROFILE_MODAL_CLOSE_SELECTORS and "profileModal" in self.attrs:
+            if self._default_profile_modal_close is None:
+                self._default_profile_modal_close = FakeElement(
+                    text="关闭",
+                    on_click=lambda: setattr(self.states, "is_displayed", False),
+                    attrs={
+                        "profileModalClose": {
+                            "visible": True,
+                            "label": "关闭",
+                            "className": "modal-close",
+                        }
+                    },
+                )
+            self._default_profile_modal_close.scope = self.scope
+            return [self._default_profile_modal_close]
+        return []
 
     def run_js(self, script):
         if not str(script).lstrip().startswith("function"):
@@ -1068,6 +1093,7 @@ class FakeElement:
                     },
                 )
             )
+            summary["visible"] = summary.get("visible") is True and self.states.is_displayed
             summary.setdefault(
                 "orderedParts",
                 [
@@ -1077,6 +1103,17 @@ class FakeElement:
                 ],
             )
             return json.dumps(summary)
+        if "ruyipage-profile-modal-close" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "profileModalClose",
+                    {
+                        "visible": self.states.is_displayed,
+                        "label": self.text,
+                        "className": self.attrs.get("className", ""),
+                    },
+                )
+            )
         if "ruyipage-profile-navigation-link-summary" in script:
             return json.dumps(
                 self.attrs.get(
@@ -1088,6 +1125,73 @@ class FakeElement:
                     },
                 )
             )
+        if "ruyipage-account-password-card" in script:
+            summary = dict(
+                self.attrs.get(
+                    "accountPasswordCard",
+                    {
+                        "visible": self.states.is_displayed,
+                        "passwordCard": "密码" in self.text or "password" in self.text.lower(),
+                        "lastUpdated": "上次更新" in self.text or "last updated" in self.text.lower(),
+                    },
+                )
+            )
+            summary.setdefault("domIdentity", f"password-card:{self.attrs.get('id') or id(self)}")
+            return json.dumps(summary)
+        if "ruyipage-account-password-change-field" in script:
+            summary = dict(
+                self.attrs.get(
+                    "passwordChangeField",
+                    {
+                        "visible": self.states.is_displayed,
+                        "editable": self.states.is_enabled,
+                        "inputType": str(self.attrs.get("type") or "password").lower(),
+                        "signals": [],
+                    },
+                )
+            )
+            summary.setdefault("domIdentity", f"password-field:{self.attrs.get('id') or id(self)}")
+            return json.dumps(summary)
+        if "ruyipage-account-password-submit" in script:
+            return json.dumps(
+                self.attrs.get(
+                    "accountPasswordSubmit",
+                    {
+                        "visible": self.states.is_displayed,
+                        "enabled": self.states.is_enabled,
+                        "label": self.text,
+                    },
+                )
+            )
+        if "ruyipage-small-business-control-summary" in script:
+            summary = dict(
+                self.attrs.get(
+                    "smallBusinessControl",
+                    {
+                        "visible": self.states.is_displayed,
+                        "enabled": self.states.is_enabled,
+                        "tagName": self.attrs.get("tagName", "label"),
+                        "inputType": self.attrs.get("type", "radio"),
+                        "checked": self.states.is_checked,
+                        "label": self.text,
+                        "text": self.text,
+                        "groupText": self.attrs.get("groupText", ""),
+                        "sectionId": self.attrs.get("sectionId", ""),
+                        "className": self.attrs.get("className", ""),
+                        "id": self.attrs.get("id", ""),
+                        "name": self.attrs.get("name", ""),
+                        "value": self.attrs.get("value", ""),
+                    },
+                )
+            )
+            summary.setdefault("checked", self.states.is_checked)
+            summary.setdefault("domIdentity", f"small-business:{self.attrs.get('id') or id(self)}")
+            summary.setdefault(
+                "controlIdentity",
+                f"small-business-control:{self.attrs.get('id') or id(self)}",
+            )
+            summary.setdefault("domOrder", int(self.attrs.get("domOrder") or 0))
+            return json.dumps(summary)
         if "ruyipage-developer-membership-navigation" in script:
             return json.dumps(
                 self.attrs.get(
@@ -1202,6 +1306,35 @@ class FakePage:
     def run_js(self, _script):
         if "location.href" in _script and "JSON.stringify" not in _script:
             return self.state.get("href", "https://idmsa.apple.com/appleauth/auth/signin")
+        if "ruyipage-account-security-page-snapshot" in _script:
+            return json.dumps(
+                {
+                    "securityPage": bool(
+                        self.state.get("securityPage")
+                        or self.state.get("href") == account_flow.ACCOUNT_SECURITY_URL
+                    ),
+                    "passwordCard": bool(self.state.get("passwordCard")),
+                    "passwordForm": bool(self.state.get("passwordForm")),
+                    "passwordFieldCount": int(self.state.get("passwordFieldCount") or 0),
+                    "passwordChanged": bool(self.state.get("passwordChanged")),
+                }
+            )
+        if "ruyipage-small-business-enrollment-snapshot" in _script:
+            return json.dumps(
+                {
+                    "enrollPage": bool(
+                        self.state.get("smallBusinessEnrollPage")
+                        or self.state.get("href")
+                        == account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL
+                    ),
+                    "thankYou": bool(self.state.get("smallBusinessThankYou")),
+                    "formReady": bool(self.state.get("smallBusinessFormReady")),
+                    "paidAgreementYes": bool(self.state.get("smallBusinessPaidAgreementYes")),
+                    "associatedNoCount": int(self.state.get("smallBusinessNoCount") or 0),
+                    "revenueCertification": bool(self.state.get("smallBusinessRevenueCertification")),
+                    "submitAvailable": bool(self.state.get("smallBusinessSubmitAvailable")),
+                }
+            )
         if "strongTwoFactorText" in _script and "const shadowRoot = this" in _script:
             if not str(_script).lstrip().startswith("function"):
                 raise RuntimeError("FirefoxElement.run_js requires a function declaration")
@@ -3178,6 +3311,9 @@ class BrowserFlowTests(unittest.TestCase):
             ), patch(
                 "apple_account_flow.try_attach_existing_browser_for_flow",
                 return_value=(None, "new_browser"),
+            ), patch.object(account_flow.sys, "platform", "darwin"), patch(
+                "apple_account_flow.macos_firefox_process_uses_profile",
+                return_value=True,
             ), patch(
                 "apple_account_flow.construct_firefox_page",
             ) as construct_page, patch("apple_account_flow.emit") as emit_event:
@@ -4212,11 +4348,35 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         event_sink=None,
         wait_ready_side_effect=None,
         collect_side_effect=None,
+        password_change_result=None,
+        small_business_result=None,
     ):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
                 return lambda *_args, **_kwargs: None
 
+        password_change_result = password_change_result or {
+            "success": True,
+            "attempted": True,
+            "passwordStored": True,
+            "passwordLength": 16,
+            "newPassword": "RotatedA2!fixtrX",
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": True,
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+        small_business_result = small_business_result or {
+            "success": True,
+            "attempted": True,
+            "submitted": True,
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": True,
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
         args = parse_args(["--report-dir", str(report_dir)])
         with patch.dict(
             os.environ,
@@ -4237,6 +4397,12 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         ), patch(
             "apple_account_flow.collect_personal_info",
             side_effect=collect_side_effect or (lambda _page: personal_info),
+        ), patch(
+            "apple_account_flow.change_account_password",
+            return_value=password_change_result,
+        ), patch(
+            "apple_account_flow.apply_small_business_program",
+            return_value=(small_business_result, None, None),
         ), patch(
             "apple_account_flow.human_pause",
             return_value=None,
@@ -13834,6 +14000,540 @@ process.stdout.write(query.call(modal));
             {"trusted": True},
             {"name": "Test Given Test Family", "birthday": "2000-01-02"},
         )
+
+    def test_account_security_url_requires_exact_trusted_security_route(self):
+        self.assertTrue(
+            account_flow.is_account_security_url(account_flow.ACCOUNT_SECURITY_URL)
+        )
+        for url in (
+            "http://account.apple.com/account/manage/section/security",
+            "https://account.apple.com/account/manage/section/security/extra",
+            "https://account.apple.com.evil.example/account/manage/section/security",
+            "https://account.apple.com/account/manage/section/information",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(account_flow.is_account_security_url(url))
+
+    def test_generated_account_password_matches_the_fixed_policy(self):
+        confusing = set("0O1Il")
+        for _ in range(50):
+            password = account_flow.generate_account_password()
+            self.assertEqual(len(password), 16)
+            self.assertTrue(any(ch in account_flow.ACCOUNT_PASSWORD_UPPERCASE for ch in password))
+            self.assertTrue(any(ch in account_flow.ACCOUNT_PASSWORD_LOWERCASE for ch in password))
+            self.assertTrue(any(ch in account_flow.ACCOUNT_PASSWORD_DIGITS for ch in password))
+            self.assertTrue(
+                any(ch in account_flow.ACCOUNT_PASSWORD_SPECIAL_CHARACTERS for ch in password)
+            )
+            self.assertTrue(confusing.isdisjoint(password))
+
+    def test_password_change_fields_use_semantics_then_dom_order_fallback(self):
+        current = FakeElement(
+            attrs={
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["current-password"],
+                },
+            }
+        )
+        new = FakeElement(
+            attrs={
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["新密码"],
+                },
+            }
+        )
+        confirm = FakeElement(
+            attrs={
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["确认新密码"],
+                },
+            }
+        )
+        page = FakePage(
+            {"css:input[type='password']": [new, confirm, current]},
+            state={
+                "href": account_flow.ACCOUNT_SECURITY_URL,
+                "securityPage": True,
+            },
+        )
+
+        fields = account_flow.resolve_account_password_change_fields(page)
+
+        self.assertIs(fields["current"][1], current)
+        self.assertIs(fields["new"][1], new)
+        self.assertIs(fields["confirm"][1], confirm)
+
+        ordered = [
+            FakeElement(attrs={"type": "password"}),
+            FakeElement(attrs={"type": "password"}),
+            FakeElement(attrs={"type": "password"}),
+        ]
+        fallback_page = FakePage(
+            {"css:input[type='password']": ordered},
+            state={
+                "href": account_flow.ACCOUNT_SECURITY_URL,
+                "securityPage": True,
+            },
+        )
+
+        fallback = account_flow.resolve_account_password_change_fields(fallback_page)
+
+        self.assertIs(fallback["current"][1], ordered[0])
+        self.assertIs(fallback["new"][1], ordered[1])
+        self.assertIs(fallback["confirm"][1], ordered[2])
+
+    def test_password_change_submit_requires_one_interactable_change_button(self):
+        submit = FakeElement(
+            text="更改密码",
+            attrs={
+                "id": "change-password-submit",
+                "accountPasswordSubmit": {
+                    "visible": True,
+                    "enabled": True,
+                    "label": "更改密码",
+                }
+            },
+        )
+        disabled_duplicate = FakeElement(
+            text="更改密码",
+            enabled=False,
+            attrs={
+                "id": "change-password-disabled",
+                "accountPasswordSubmit": {
+                    "visible": True,
+                    "enabled": False,
+                    "label": "更改密码",
+                }
+            },
+        )
+        page = FakePage(
+            buttons=[submit, disabled_duplicate],
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        self.assertEqual(
+            account_flow.resolve_account_password_change_submit(page),
+            (page, submit),
+        )
+
+        duplicate = FakeElement(
+            text="更改密码",
+            attrs={
+                "id": "change-password-duplicate",
+                "accountPasswordSubmit": {
+                    "visible": True,
+                    "enabled": True,
+                    "label": "更改密码",
+                }
+            },
+        )
+        ambiguous_page = FakePage(
+            buttons=[submit, duplicate],
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        self.assertIsNone(
+            account_flow.resolve_account_password_change_submit(ambiguous_page)
+        )
+
+    def test_change_account_password_runs_security_card_form_submit_and_success(self):
+        events = []
+        typed: list[tuple[str, str]] = []
+        new_password = "Aa2!Bb3@Cc4#Dd5$"
+        link = FakeElement(
+            text="登录与安全性",
+            attrs={
+                "href": account_flow.ACCOUNT_SECURITY_URL,
+                "profileNavigationLink": {
+                    "visible": True,
+                    "href": account_flow.ACCOUNT_SECURITY_URL,
+                    "label": "登录与安全性",
+                },
+            },
+        )
+        card = FakeElement(
+            text="密码 上次更新：2026年7月30日",
+            attrs={
+                "id": "password-card",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                },
+            },
+        )
+        current = FakeElement(
+            attrs={
+                "id": "current-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["当前密码"],
+                },
+            }
+        )
+        new = FakeElement(
+            attrs={
+                "id": "new-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["新密码"],
+                },
+            }
+        )
+        confirm = FakeElement(
+            attrs={
+                "id": "confirm-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["确认新密码"],
+                },
+            }
+        )
+        submit = FakeElement(
+            text="更改密码",
+            attrs={
+                "accountPasswordSubmit": {
+                    "visible": True,
+                    "enabled": True,
+                    "label": "更改密码",
+                }
+            },
+        )
+
+        class SecurityPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    {
+                        "css:a[href]": [link],
+                        "css:button.button.button-bare": [card],
+                        "css:input[type='password']": [current, new, confirm],
+                    },
+                    buttons=[submit],
+                    state={
+                        "href": account_flow.ACCOUNT_INFORMATION_URL,
+                        "securityPage": False,
+                        "passwordCard": False,
+                        "passwordForm": False,
+                        "passwordFieldCount": 3,
+                        "passwordChanged": False,
+                    },
+                )
+                link.on_click = self.open_security
+                card.on_click = self.open_password_form
+                submit.on_click = self.complete_password_change
+
+            def open_security(self):
+                self.state["href"] = account_flow.ACCOUNT_SECURITY_URL
+                self.state["securityPage"] = True
+                self.state["passwordCard"] = True
+
+            def open_password_form(self):
+                self.state["passwordForm"] = True
+
+            def complete_password_change(self):
+                self.state["passwordChanged"] = True
+
+        page = SecurityPage()
+
+        def fake_input(scope, field, value, label, keys, **kwargs):
+            self.assertIs(scope, page)
+            self.assertEqual(label, "password")
+            typed.append((field.attrs["id"], value))
+
+        with patch("apple_account_flow.emit", side_effect=events.append), patch(
+            "apple_account_flow.human_click",
+            side_effect=lambda scope, element, pause=None: scope.actions.human_click(element).perform(),
+        ), patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.generate_account_password",
+            return_value=new_password,
+        ), patch("apple_account_flow.input_and_verify", side_effect=fake_input), patch(
+            "apple_account_flow.human_pause", lambda *_: None
+        ):
+            result = account_flow.change_account_password(
+                page,
+                "OldPass123!",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(
+            typed,
+            [
+                ("current-password", "OldPass123!"),
+                ("new-password", new_password),
+                ("confirm-password", new_password),
+            ],
+        )
+        self.assertTrue(page.state["passwordChanged"])
+        self.assertEqual(result["success"], True)
+        self.assertEqual(result["attempted"], True)
+        self.assertEqual(result["newPassword"], new_password)
+        self.assertEqual(result["passwordLength"], 16)
+        statuses = [event["status"] for event in events if event.get("event") == "status"]
+        self.assertLess(
+            statuses.index("account_security_navigation_started"),
+            statuses.index("account_security_navigation_sidebar_click_sent"),
+        )
+        self.assertLess(
+            statuses.index("password_change_form_ready"),
+            statuses.index("password_change_submitted"),
+        )
+        self.assertIn("password_change_completed", statuses)
+        non_terminal_statuses = [
+            event
+            for event in events
+            if event.get("event") == "status"
+            and event.get("status") != "password_change_completed"
+        ]
+        self.assertNotIn(new_password, json.dumps(non_terminal_statuses))
+
+
+class SmallBusinessApplicationTests(unittest.TestCase):
+    def small_business_control(
+        self,
+        label,
+        *,
+        input_type="radio",
+        group_text="",
+        element_id="",
+        dom_order=0,
+        on_click=None,
+    ):
+        return FakeElement(
+            text=label,
+            on_click=on_click,
+            attrs={
+                "id": element_id,
+                "smallBusinessControl": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "label",
+                    "inputType": input_type,
+                    "checked": False,
+                    "label": label,
+                    "text": label,
+                    "groupText": group_text,
+                    "sectionId": "",
+                    "className": "",
+                    "id": element_id,
+                    "name": element_id,
+                    "value": label,
+                    "domIdentity": f"dom:{element_id}",
+                    "controlIdentity": f"control:{element_id}",
+                    "domOrder": dom_order,
+                },
+            },
+        )
+
+    def small_business_page(self, *, chinese=False):
+        if chinese:
+            paid = self.small_business_control(
+                "是，我已接受",
+                group_text="付费应用程序协议",
+                element_id="paid-yes",
+                dom_order=1,
+            )
+            no_label = "否"
+            checkbox = self.small_business_control(
+                "据你所知，你和关联开发者账户收入不超过 1,000,000 美元",
+                input_type="checkbox",
+                group_text="据你所知 关联开发者账户 收入 美元",
+                element_id="revenue-certification",
+                dom_order=10,
+            )
+            submit_label = "提交"
+        else:
+            paid = self.small_business_control(
+                "Yes, I have accepted.",
+                group_text="Paid Applications Agreement",
+                element_id="paid-yes",
+                dom_order=1,
+            )
+            no_label = "No"
+            checkbox = self.small_business_control(
+                "To the best of your knowledge, you and your Associated Developer Accounts earned no more than 1,000,000 USD.",
+                input_type="checkbox",
+                group_text="Associated Developer Accounts earned no more than 1,000,000 USD",
+                element_id="revenue-certification",
+                dom_order=10,
+            )
+            submit_label = "Submit"
+        nos = [
+            self.small_business_control(
+                no_label,
+                group_text="Associated Developer Accounts",
+                element_id=f"associated-no-{index}",
+                dom_order=2 + index,
+            )
+            for index in range(4)
+        ]
+        submit = self.small_business_control(
+            submit_label,
+            input_type="submit",
+            group_text="",
+            element_id="submit",
+            dom_order=11,
+        )
+        page = FakePage(
+            {
+                "css:fieldset label": [paid, *nos, checkbox],
+                "css:input#submit": [submit],
+            },
+            state={
+                "href": account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL,
+                "smallBusinessEnrollPage": True,
+                "smallBusinessFormReady": True,
+                "smallBusinessPaidAgreementYes": True,
+                "smallBusinessNoCount": 4,
+                "smallBusinessRevenueCertification": True,
+                "smallBusinessSubmitAvailable": True,
+            },
+        )
+        return page, paid, nos, checkbox, submit
+
+    def test_small_business_url_requires_exact_developer_enroll_route(self):
+        self.assertTrue(
+            account_flow.is_small_business_program_enroll_url(
+                account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL
+            )
+        )
+        for url in (
+            "http://developer.apple.com/app-store/small-business-program/enroll/",
+            "https://developer.apple.com.evil.example/app-store/small-business-program/enroll/",
+            "https://developer.apple.com/app-store/small-business-program/enroll/extra",
+            "https://developer.apple.com/account",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(
+                    account_flow.is_small_business_program_enroll_url(url)
+                )
+
+    def test_small_business_form_controls_resolve_in_english_and_chinese(self):
+        for chinese in (False, True):
+            with self.subTest(chinese=chinese):
+                page, paid, nos, checkbox, submit = self.small_business_page(
+                    chinese=chinese
+                )
+
+                self.assertEqual(
+                    account_flow.resolve_small_business_paid_agreement_yes(page),
+                    (page, paid, account_flow.small_business_control_summary(paid)),
+                )
+                resolved_nos = account_flow.resolve_small_business_associated_no_options(page)
+                self.assertEqual([item[1] for item in resolved_nos], nos)
+                self.assertEqual(
+                    account_flow.resolve_small_business_revenue_certification(page)[1],
+                    checkbox,
+                )
+                self.assertEqual(
+                    account_flow.resolve_small_business_submit(page)[1],
+                    submit,
+                )
+
+    def test_apply_small_business_program_clicks_choices_submits_and_confirms(self):
+        page, paid, nos, checkbox, submit = self.small_business_page()
+        clicked = []
+
+        def mark_clicked(element):
+            def inner():
+                clicked.append(element.attrs["id"])
+                element.states.is_checked = True
+                control = element.attrs["smallBusinessControl"]
+                control["checked"] = True
+                if element is submit:
+                    page.state["smallBusinessThankYou"] = True
+
+            return inner
+
+        for element in [paid, *nos, checkbox, submit]:
+            element.on_click = mark_clicked(element)
+
+        account_page = FakePage()
+        account_page.states = FakeStates(alive=True)
+        page.states = FakeStates(alive=True)
+        opened = {}
+
+        def new_tab(url):
+            opened["url"] = url
+            return page
+
+        account_page.new_tab = new_tab
+        page.wait = type("Wait", (), {"doc_loaded": lambda *_args, **_kwargs: None})()
+        events = []
+
+        with patch("apple_account_flow.emit", side_effect=events.append), patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "smallBusinessApplication": True,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.take_screenshot",
+            return_value="04-small-business-application.png",
+        ):
+            result, returned_page, screenshot = account_flow.apply_small_business_program(
+                account_page,
+                "person@example.com",
+                "RotatedPass2!",
+                FakeKeys,
+                {"twofaPrepared": False, "nextGeneration": 1},
+                Path("04-small-business-application.png"),
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(opened["url"], account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL)
+        self.assertEqual(
+            clicked,
+            [
+                "paid-yes",
+                "associated-no-0",
+                "associated-no-1",
+                "associated-no-2",
+                "associated-no-3",
+                "revenue-certification",
+                "submit",
+            ],
+        )
+        self.assertIs(returned_page, page)
+        self.assertEqual(screenshot, "04-small-business-application.png")
+        self.assertTrue(result["success"])
+        self.assertTrue(result["submitted"])
+        statuses = [event["status"] for event in events if event.get("event") == "status"]
+        self.assertLess(
+            statuses.index("small_business_paid_agreement_accepted"),
+            statuses.index("small_business_associated_accounts_answered"),
+        )
+        self.assertLess(
+            statuses.index("small_business_revenue_certification_checked"),
+            statuses.index("small_business_application_submitted"),
+        )
+        self.assertIn("small_business_application_completed", statuses)
 
 
 if __name__ == "__main__":

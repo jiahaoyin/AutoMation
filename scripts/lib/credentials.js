@@ -182,6 +182,37 @@ export function saveCredentialsToEnv({ appleId, password }) {
   return envPath;
 }
 
+function normalizeSecretEnvValue(value, label, maxLength) {
+  if (typeof value !== "string") {
+    throw new Error(`${label} is invalid`);
+  }
+  if (!value || value.length > maxLength || /[\r\n\u0000]/.test(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
+/**
+ * Persist the newly rotated Apple password. The caller must keep the raw value
+ * out of terminal output, reports, and audit records.
+ */
+export function saveApplePasswordToEnv(password) {
+  const safePassword = normalizeSecretEnvValue(
+    password,
+    "apple password",
+    1024
+  );
+  const envPath = resolveEnvPath();
+  const { lines, lineEnding } = fs.existsSync(envPath)
+    ? readEnvDocument(envPath)
+    : { lines: [], lineEnding: "\n" };
+  const updated = upsertEnvLines(lines, {
+    APPLE_PASSWORD: safePassword,
+  });
+  writePrivateEnvFile(envPath, updated, lineEnding);
+  return envPath;
+}
+
 /**
  * 保存系统设置短信服务配置。验证码本身永远不写入 .env。
  */

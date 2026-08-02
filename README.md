@@ -1,6 +1,6 @@
 # Apple-AutoMation（macOS）
 
-> 先核验 Apple Developer 会员状态，再进入 Apple Account 个人信息采集的 macOS 自动化流程。
+> 先核验 Apple Developer 会员状态，再进入 Apple Account 个人信息、改密与小开发者申请的 macOS 自动化流程。
 
 项目把浏览器动作统一交给 **Python ruyiPage**：Firefox 启动、标签页、导航、页面读取、BiDi 输入、2FA 网页交接和截图都没有第二套浏览器后端。Node 只负责流程编排、脱敏 JSONL 审计、报告与 macOS 2FA provider 生命周期。
 
@@ -23,6 +23,11 @@ flowchart TD
     K --> L[个人信息页 /section/information]
     L --> M[保存 02-account-information.png]
     M --> N[私有 .env 写入 name、birthday]
+    N --> O[登录与安全性：修改 Apple 账户密码]
+    O --> P[私有 .env 更新 APPLE_PASSWORD]
+    P --> Q[新建小开发者申请标签页]
+    Q --> R[提交 Small Business Program 申请]
+    R --> S[保存 04-small-business-application.png]
 ~~~
 
 ## 快速开始
@@ -31,7 +36,7 @@ flowchart TD
 # 首次或 native helper 更新后执行
 ./install.sh
 
-# 完整流程：系统设置 + Developer-first 浏览器模块
+# 完整流程：系统设置 + Developer-first / Account / 小开发者浏览器模块
 ./run.sh
 
 # 常用浏览器验证：跳过 macOS 系统设置阶段
@@ -52,7 +57,7 @@ flowchart TD
 | --- | --- | --- |
 | 默认测试 | **DEVELOPER_MEMBERSHIP_GATE=0** | 无论 Developer 为 **active**、**not_enrolled**、**unknown**，或 Developer 模块给出固定 partial，都会继续 Account。 |
 | 业务 gate | **DEVELOPER_MEMBERSHIP_GATE=1** | 只有 **active** 才新建 Account 标签页；其余结果作为成功的 gate stop 结束。 |
-| 浏览器单独验证 | **./run.sh --skip-mac** | 不进入 macOS 系统设置；仍执行 Developer-first 与 Account 模块。 |
+| 浏览器单独验证 | **./run.sh --skip-mac** | 不进入 macOS 系统设置；仍执行 Developer-first、Account 改密与小开发者申请模块。 |
 | 系统设置单独验证 | **./run.sh --skip-browser** | 不启动 Firefox / ruyiPage。 |
 | 终端诊断镜像 | **APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac** | 终端额外显示脱敏固定状态；该开关只接受 shell/export，不从 .env 读取。 |
 
@@ -79,6 +84,20 @@ screenshots/02-account-information.png
 ~~~
 
 **name**、**birthday**、**developer_membership** 与 **developer_registration_identity** 只写入本机私有 .env；报告与 JSONL 只保留固定状态、布尔值、分类和截图文件名，不保存账号、密码、验证码、Cookie、原始页面文本或个人资料值。
+
+个人信息采集完成后，Account 模块会继续进入「登录与安全性」修改密码：新密码为 16 位、包含英文大小写、数字和常见特殊字符，且避开易混淆字符。网页确认 “密码已更改” 后，Node 会立刻把新密码写回私有 `.env` 的 `APPLE_PASSWORD`；终端只显示“已写入且隐藏”，不会打印明文。
+
+改密成功后，会新建标签页打开：
+
+~~~text
+https://developer.apple.com/app-store/small-business-program/enroll/
+~~~
+
+小开发者申请模块按页面语言自动匹配英文/中文选项，选择已接受付费应用协议、四个关联开发者账户问题的 No/否、勾选收益声明，然后点击 Submit/提交。出现 “Thank you for your submission.” 或中文等价成功提示后保存：
+
+~~~text
+screenshots/04-small-business-application.png
+~~~
 
 ## 2FA 运行原则
 
@@ -146,7 +165,8 @@ data/reports/apple-id-flow-<timestamp>/
 ├── launcher-audit.jsonl
 └── screenshots/
     ├── 03-developer-membership.png  # 仅 active
-    └── 02-account-information.png   # 仅个人信息页稳定后
+    ├── 02-account-information.png   # 仅个人信息页稳定后
+    └── 04-small-business-application.png # 仅小开发者申请提交确认后
 ~~~
 
 | 现象 | 首选证据 | 首先确认什么 |
@@ -155,6 +175,7 @@ data/reports/apple-id-flow-<timestamp>/
 | 被 gate 正常停止 | **flow-audit.jsonl** + **report.json** 固定字段 | **developer_membership_gate_blocked**、**accountModule.skipped=true**。 |
 | Account 没有新标签页 | **flow-audit.jsonl** | **account_module_started**、**account_module_tab_created**。 |
 | 登录成功但资料采集 partial | **flow-audit.jsonl** | **account_home_confirmed** 后的 **profile_capture_*** 固定阶段。 |
+| 改密或小开发者申请 partial | **flow-audit.jsonl** + **report.json** | **password_change_***、**small_business_application_*** 固定阶段；密码明文只核对本机 .env。 |
 | 未生成个人信息截图 | **flow-audit.jsonl** | 先检查个人信息页是否真正 ready，勿把认证页当截图目标。 |
 | 2FA 取到码但网页未确认 | **2fa-audit.jsonl** + **flow-audit.jsonl** | **target_resolved → input_completed → submit_sent → transition_confirmed**。 |
 
@@ -165,8 +186,8 @@ data/reports/apple-id-flow-<timestamp>/
 | 命令 | 用途 |
 | --- | --- |
 | **./install.sh** | 安装/更新项目运行环境与 native helper。 |
-| **./run.sh** | 完整系统设置 + Developer-first + Account 流程。 |
-| **./run.sh --skip-mac** | 跳过 macOS 系统设置，执行浏览器两个模块。 |
+| **./run.sh** | 完整系统设置 + Developer-first + Account 改密 + 小开发者申请流程。 |
+| **./run.sh --skip-mac** | 跳过 macOS 系统设置，执行浏览器模块。 |
 | **npm run check** | 环境自检。 |
 | **npm run test:account-browser-flow** | Node 浏览器编排、会员持久化、gate 与报告契约。 |
 | **npm run test:ruyipage-protocol** | JSONL 协议契约。 |

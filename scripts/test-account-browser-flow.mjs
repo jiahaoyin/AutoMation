@@ -25,6 +25,7 @@ import {
   parseEnvValue,
   saveMacSettingsSmsProviderConfig,
   saveCredentialsToEnv,
+  saveApplePasswordToEnv,
   saveAppleProfileToEnv,
   saveDeveloperMembershipToEnv,
   shouldAutoConfirmAppleCredentials,
@@ -82,6 +83,9 @@ function createRuntime(runBackend, options = {}) {
     saveAppleProfileToEnv(profile) {
       return options.saveAppleProfileToEnv?.(profile) ?? "/tmp/test-profile.env";
     },
+    saveApplePasswordToEnv(password) {
+      return options.saveApplePasswordToEnv?.(password) ?? "/tmp/test-password.env";
+    },
     saveDeveloperMembershipToEnv(status, registrationIdentityValue) {
       return options.saveDeveloperMembershipToEnv?.(status, registrationIdentityValue) ??
         "/tmp/test-developer-membership.env";
@@ -132,6 +136,27 @@ function successfulResult() {
       success: true,
       failureStage: "unknown",
       failureClass: "unknown",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: false,
+    },
+    postLoginPasswordChange: {
+      success: false,
+      attempted: false,
+      passwordStored: false,
+      passwordLength: 0,
+      failureStage: "password_change",
+      failureClass: "password_change_not_attempted",
+      browserAlive: true,
+      browserPreserved: true,
+      browserPreservationRequested: false,
+    },
+    postLoginSmallBusinessApplication: {
+      success: false,
+      attempted: false,
+      submitted: false,
+      failureStage: "small_business_application",
+      failureClass: "small_business_not_attempted",
       browserAlive: true,
       browserPreserved: true,
       browserPreservationRequested: false,
@@ -1220,6 +1245,15 @@ function runAccountBrowserCompletionSummaryTest() {
     accountHomeConfirmed: false,
     accountModuleSkipped: false,
     profileCaptureState: "skipped",
+    passwordChangeState: "skipped",
+    passwordStored: null,
+    passwordLength: null,
+    passwordChangeFailureStage: null,
+    passwordChangeFailureClass: null,
+    smallBusinessApplicationState: "skipped",
+    smallBusinessApplicationSubmitted: null,
+    smallBusinessApplicationFailureStage: null,
+    smallBusinessApplicationFailureClass: null,
     postLoginFinalizationState: "skipped",
     backendCleanupCompleted: null,
     collectorDisposed: null,
@@ -1237,6 +1271,15 @@ function runAccountBrowserCompletionSummaryTest() {
       accountHomeConfirmed: true,
       accountModuleSkipped: false,
       profileCaptureState: "succeeded",
+      passwordChangeState: "unknown",
+      passwordStored: null,
+      passwordLength: null,
+      passwordChangeFailureStage: null,
+      passwordChangeFailureClass: null,
+      smallBusinessApplicationState: "skipped",
+      smallBusinessApplicationSubmitted: null,
+      smallBusinessApplicationFailureStage: null,
+      smallBusinessApplicationFailureClass: null,
       postLoginFinalizationState: "unknown",
       backendCleanupCompleted: null,
       collectorDisposed: null,
@@ -1263,6 +1306,15 @@ function runAccountBrowserCompletionSummaryTest() {
       accountHomeConfirmed: true,
       accountModuleSkipped: false,
       profileCaptureState: "partial",
+      passwordChangeState: "skipped",
+      passwordStored: null,
+      passwordLength: null,
+      passwordChangeFailureStage: null,
+      passwordChangeFailureClass: null,
+      smallBusinessApplicationState: "skipped",
+      smallBusinessApplicationSubmitted: null,
+      smallBusinessApplicationFailureStage: null,
+      smallBusinessApplicationFailureClass: null,
       postLoginFinalizationState: "partial",
       backendCleanupCompleted: false,
       collectorDisposed: true,
@@ -1276,6 +1328,12 @@ function runAccountBrowserCompletionSummaryTest() {
     summarizeAccountBrowserCompletion({
       browserLogin: { accountHomeConfirmed: true },
       postLoginProfileCapture: { success: true },
+	    postLoginPasswordChange: {
+	      success: true,
+	      attempted: true,
+	      passwordStored: true,
+        passwordLength: 16,
+      },
       postLoginFinalization: {
         backendCleanupCompleted: true,
         collectorDisposed: true,
@@ -1288,6 +1346,15 @@ function runAccountBrowserCompletionSummaryTest() {
       accountHomeConfirmed: true,
       accountModuleSkipped: false,
       profileCaptureState: "succeeded",
+      passwordChangeState: "succeeded",
+      passwordStored: true,
+      passwordLength: 16,
+      passwordChangeFailureStage: null,
+      passwordChangeFailureClass: null,
+      smallBusinessApplicationState: "unknown",
+      smallBusinessApplicationSubmitted: null,
+      smallBusinessApplicationFailureStage: null,
+      smallBusinessApplicationFailureClass: null,
       postLoginFinalizationState: "completed",
       backendCleanupCompleted: true,
       collectorDisposed: true,
@@ -1397,6 +1464,308 @@ async function runProfilePersistenceAndAuditRedactionTest() {
     if (fs.existsSync(reportFile)) fs.unlinkSync(reportFile);
     fs.rmdirSync(reportDir);
   }
+}
+
+async function runPasswordChangePersistenceAndRedactionTest() {
+  const rotatedPassword = "Aa2!Bb3@Cc4#Dd5$";
+  const backendPasswordChange = {
+    success: true,
+    attempted: true,
+    passwordStored: false,
+    passwordLength: 16,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: false,
+    browserPreservationRequested: false,
+    newPassword: SECRET_FIXTURE,
+  };
+  const createFlowAudit = () => {
+    const entries = [];
+    const secrets = [];
+    return {
+      entries,
+      secrets,
+      audit: {
+        addSecrets(values) {
+          secrets.push(...values);
+        },
+        write(source, event, details = {}) {
+          entries.push({ source, event, details });
+        },
+        writeError(source, event, _error, details = {}) {
+          entries.push({ source, event, details });
+        },
+      },
+    };
+  };
+
+  const storedPasswords = [];
+  const successAudit = createFlowAudit();
+  const successHarness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_completed",
+      newPassword: rotatedPassword,
+      passwordLength: 16,
+      rawPassword: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: backendPasswordChange,
+    };
+  }, {
+    saveApplePasswordToEnv(value) {
+      storedPasswords.push(value);
+      return "/tmp/test-password.env";
+    },
+  });
+
+  let successResult;
+  const successLogs = await captureConsole("log", async () => {
+    successResult = await runAccountBrowserPhase(
+      { ...params, flowAudit: successAudit.audit },
+      successHarness.runtime
+    );
+  });
+
+  assert.deepEqual(storedPasswords, [rotatedPassword]);
+  assert.deepEqual(successResult.postLoginPasswordChange, {
+    success: true,
+    attempted: true,
+    passwordStored: true,
+    passwordLength: 16,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: false,
+    browserPreservationRequested: false,
+  });
+  assert.ok(successLogs.includes("[✓] Apple 账户密码已更改"));
+  assert.ok(successLogs.includes("[✓] 新密码已写入 .env（16 位，已隐藏）"));
+  assert.deepEqual(successAudit.secrets, [
+    rotatedPassword,
+    "Test Given Test Family",
+    "2000-01-02",
+  ]);
+  assert.ok(
+    successAudit.entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "password_change_completed" &&
+        entry.details.passwordLength === 16 &&
+        !("newPassword" in entry.details)
+    )
+  );
+  assert.ok(
+    successAudit.entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_completed" &&
+        entry.details.passwordStored === true
+    )
+  );
+  assert.equal(JSON.stringify(successResult).includes(rotatedPassword), false);
+  assert.equal(JSON.stringify(successAudit.entries).includes(rotatedPassword), false);
+  assert.equal(successLogs.join("\n").includes(rotatedPassword), false);
+
+  const failureAudit = createFlowAudit();
+  const failureHarness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_completed",
+      newPassword: rotatedPassword,
+      passwordLength: 16,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: backendPasswordChange,
+    };
+  }, {
+    saveApplePasswordToEnv() {
+      throw new Error("password persistence failed");
+    },
+  });
+
+  let failureResult;
+  let failureLogs;
+  const failureWarnings = await captureConsole("warn", async () => {
+    failureLogs = await captureConsole("log", async () => {
+      failureResult = await runAccountBrowserPhase(
+        { ...params, flowAudit: failureAudit.audit },
+        failureHarness.runtime
+      );
+    });
+  });
+
+  assert.deepEqual(failureResult.postLoginPasswordChange, {
+    success: false,
+    attempted: true,
+    passwordStored: false,
+    passwordLength: 16,
+    failureStage: "password_change",
+    failureClass: "password_persistence_failed",
+    browserAlive: true,
+    browserPreserved: false,
+    browserPreservationRequested: false,
+  });
+  assert.ok(
+    failureWarnings.includes(
+      "[!] 新密码已在网页确认，但写入 .env 失败，详情已写入日志"
+    )
+  );
+  assert.ok(
+    failureAudit.entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_partial" &&
+        entry.details.failureClass === "password_persistence_failed"
+    )
+  );
+  assert.equal(JSON.stringify(failureResult).includes(rotatedPassword), false);
+  assert.equal(JSON.stringify(failureAudit.entries).includes(rotatedPassword), false);
+  assert.equal(failureLogs.join("\n").includes(rotatedPassword), false);
+  assert.equal(failureWarnings.join("\n").includes(rotatedPassword), false);
+}
+
+async function runSmallBusinessApplicationSanitizationTest() {
+  const rotatedPassword = "Aa2!Bb3@Cc4#Dd5$";
+  const entries = [];
+  const secrets = [];
+  const flowAudit = {
+    addSecrets(values) {
+      secrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const storedPasswords = [];
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_completed",
+      newPassword: rotatedPassword,
+      passwordLength: 16,
+    });
+    for (const status of [
+      "small_business_application_started",
+      "small_business_application_tab_created",
+      "small_business_application_authenticated",
+      "small_business_enrollment_page_ready",
+      "small_business_paid_agreement_accepted",
+    ]) {
+      await options.onEvent({ event: "status", status, rawText: SECRET_FIXTURE });
+    }
+    await options.onEvent({
+      event: "status",
+      status: "small_business_associated_accounts_answered",
+      answerCount: 4,
+      rawText: SECRET_FIXTURE,
+    });
+    for (const status of [
+      "small_business_revenue_certification_checked",
+      "small_business_application_submitted",
+      "small_business_application_completed",
+    ]) {
+      await options.onEvent({ event: "status", status, rawText: SECRET_FIXTURE });
+    }
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: {
+        success: true,
+        attempted: true,
+        passwordStored: false,
+        passwordLength: 16,
+        failureStage: "unknown",
+        failureClass: "unknown",
+        browserAlive: true,
+        browserPreserved: false,
+        browserPreservationRequested: false,
+      },
+      postLoginSmallBusinessApplication: {
+        success: true,
+        attempted: true,
+        submitted: true,
+        failureStage: SECRET_FIXTURE,
+        failureClass: SECRET_FIXTURE,
+        browserAlive: true,
+        browserPreserved: false,
+        browserPreservationRequested: false,
+        rawSubmissionText: SECRET_FIXTURE,
+      },
+      screenshots: {
+        smallBusinessApplication:
+          "/private/run/04-small-business-application.png",
+        extra: SECRET_FIXTURE,
+      },
+    };
+  }, {
+    saveApplePasswordToEnv(value) {
+      storedPasswords.push(value);
+      return "/tmp/test-password.env";
+    },
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase(
+        { ...params, flowAudit },
+        harness.runtime
+      );
+    });
+  });
+
+  assert.deepEqual(storedPasswords, [rotatedPassword]);
+  assert.deepEqual(result.postLoginSmallBusinessApplication, {
+    success: true,
+    attempted: true,
+    submitted: true,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: false,
+    browserPreservationRequested: false,
+  });
+  assert.deepEqual(result.screenshots, {
+    smallBusinessApplication: "04-small-business-application.png",
+  });
+  assert.equal(
+    summarizeAccountBrowserCompletion(result).smallBusinessApplicationState,
+    "succeeded"
+  );
+  assert.ok(logs.includes("[✓] 小开发者申请已提交成功"));
+  assert.deepEqual(warnings, []);
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "small_business_associated_accounts_answered" &&
+        entry.details.answerCount === 4
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "small_business_application_completed" &&
+        entry.details.submitted === true
+    )
+  );
+  assert.deepEqual(secrets, [
+    rotatedPassword,
+    "Test Given Test Family",
+    "2000-01-02",
+  ]);
+  assert.equal(JSON.stringify({ result, entries, logs, warnings }).includes(SECRET_FIXTURE), false);
+  assert.equal(JSON.stringify({ result, entries, logs, warnings }).includes(rotatedPassword), false);
 }
 
 async function runDeveloperMembershipPersistenceTest() {
@@ -2124,6 +2493,15 @@ async function runDeveloperMembershipGateStopTest() {
       accountHomeConfirmed: false,
       accountModuleSkipped: true,
       profileCaptureState: "skipped",
+      passwordChangeState: "skipped",
+      passwordStored: null,
+      passwordLength: null,
+      passwordChangeFailureStage: null,
+      passwordChangeFailureClass: null,
+      smallBusinessApplicationState: "skipped",
+      smallBusinessApplicationSubmitted: null,
+      smallBusinessApplicationFailureStage: null,
+      smallBusinessApplicationFailureClass: null,
       postLoginFinalizationState: fixture.finalizationState,
       backendCleanupCompleted: true,
       collectorDisposed: true,
@@ -2185,7 +2563,16 @@ async function runDeveloperMembershipGateStopTest() {
 
 async function runBrowserResultMetadataAllowlistTest() {
   const profile = { name: "Test Given Test Family", birthday: "2000-01-02" };
-  const harness = createRuntime(async () => ({
+  const rotatedPassword = "Aa2!Bb3@Cc4#Dd5$";
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_completed",
+      newPassword: rotatedPassword,
+      passwordLength: 16,
+      secret: SECRET_FIXTURE,
+    });
+    return {
     success: true,
     browserLogin: {
       success: true,
@@ -2224,8 +2611,31 @@ async function runBrowserResultMetadataAllowlistTest() {
       browserPreservationRequested: true,
       rawMembershipDetails: SECRET_FIXTURE,
     },
-    accountModule: {
+    postLoginPasswordChange: {
+      success: true,
       attempted: true,
+      passwordStored: true,
+      passwordLength: 16,
+      failureStage: SECRET_FIXTURE,
+      failureClass: SECRET_FIXTURE,
+      browserAlive: true,
+      browserPreserved: true,
+	      browserPreservationRequested: true,
+	      newPassword: SECRET_FIXTURE,
+	    },
+	    postLoginSmallBusinessApplication: {
+	      success: true,
+	      attempted: true,
+	      submitted: true,
+	      failureStage: SECRET_FIXTURE,
+	      failureClass: SECRET_FIXTURE,
+	      browserAlive: true,
+	      browserPreserved: true,
+	      browserPreservationRequested: true,
+	      rawApplicationText: SECRET_FIXTURE,
+	    },
+	    accountModule: {
+	      attempted: true,
       skipped: false,
       skipReason: "unknown",
       membershipGateEnabled: false,
@@ -2234,12 +2644,14 @@ async function runBrowserResultMetadataAllowlistTest() {
     },
     personalInfo: profile,
     screenshots: {
-      afterLogin: "/private/run/02-ruyipage-after-login.png",
-      personalInformation: "/private/run/02-account-information.png",
-      extra: SECRET_FIXTURE,
-    },
+	      afterLogin: "/private/run/02-ruyipage-after-login.png",
+	      personalInformation: "/private/run/02-account-information.png",
+	      smallBusinessApplication: "/private/run/04-small-business-application.png",
+	      extra: SECRET_FIXTURE,
+	    },
     unexpected: SECRET_FIXTURE,
-  }));
+    };
+  });
 
   const result = await runAccountBrowserPhase(params, harness.runtime);
 
@@ -2252,9 +2664,10 @@ async function runBrowserResultMetadataAllowlistTest() {
     sessionReused: true,
     rememberAccount: false,
   });
-  assert.deepEqual(result.screenshots, {
-    personalInformation: "02-account-information.png",
-  });
+	  assert.deepEqual(result.screenshots, {
+	    personalInformation: "02-account-information.png",
+	    smallBusinessApplication: "04-small-business-application.png",
+	  });
   assert.deepEqual(result.postLoginProfileCapture, {
     success: true,
     failureStage: "unknown",
@@ -2263,6 +2676,27 @@ async function runBrowserResultMetadataAllowlistTest() {
     browserPreserved: true,
     browserPreservationRequested: true,
   });
+	  assert.deepEqual(result.postLoginPasswordChange, {
+	    success: true,
+    attempted: true,
+    passwordStored: true,
+    passwordLength: 16,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: true,
+	    browserPreservationRequested: true,
+	  });
+	  assert.deepEqual(result.postLoginSmallBusinessApplication, {
+	    success: true,
+	    attempted: true,
+	    submitted: true,
+	    failureStage: "unknown",
+	    failureClass: "unknown",
+	    browserAlive: true,
+	    browserPreserved: true,
+	    browserPreservationRequested: true,
+	  });
   assert.deepEqual(result.postLoginFinalization, {
     success: true,
     backendCleanupCompleted: true,
@@ -3087,6 +3521,15 @@ async function runMissingPostLoginFinalizationRemainsUnknownTest() {
     accountHomeConfirmed: true,
     accountModuleSkipped: false,
     profileCaptureState: "succeeded",
+    passwordChangeState: "unknown",
+    passwordStored: null,
+    passwordLength: null,
+    passwordChangeFailureStage: null,
+    passwordChangeFailureClass: null,
+    smallBusinessApplicationState: "skipped",
+    smallBusinessApplicationSubmitted: null,
+    smallBusinessApplicationFailureStage: null,
+    smallBusinessApplicationFailureClass: null,
     postLoginFinalizationState: "unknown",
     backendCleanupCompleted: null,
     collectorDisposed: null,
@@ -3431,7 +3874,9 @@ function runEnvDataParsingTest() {
   assert.equal(parseEnvValue('" leading # $ value "'), " leading # $ value ");
   assert.equal(parseEnvValue("plain#value$HOME"), "plain#value$HOME");
 
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "apple-env-data-"));
+  const tempDir = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "apple-env-data-"))
+  );
   const envPath = path.join(tempDir, ".env");
   const originalCwd = process.cwd();
   const externalKey = "APPLE_AUTOMATION_TEST_EXTERNAL";
@@ -3475,6 +3920,7 @@ function runEnvDataParsingTest() {
       saveCredentialsToEnv({ appleId: "person@example.com", password: "secret" }),
       envPath
     );
+    assert.equal(saveApplePasswordToEnv("Nw2!SafePass_2026"), envPath);
     assert.equal(
       saveAppleProfileToEnv({
         name: "Test Given Test Family",
@@ -3516,6 +3962,8 @@ function runEnvDataParsingTest() {
       envPath
     );
     const saved = fs.readFileSync(envPath, "utf8");
+    assert.match(saved, /^APPLE_PASSWORD=Nw2!SafePass_2026$/m);
+    assert.equal((saved.match(/^APPLE_PASSWORD=/gm) ?? []).length, 1);
     assert.match(saved, /^name="Test Given Test Family"$/m);
     assert.match(saved, /^birthday=2000-01-02$/m);
     assert.match(saved, /^developer_membership=未确认$/m);
@@ -3544,6 +3992,18 @@ function runEnvDataParsingTest() {
     assert.throws(
       () => saveAppleProfileToEnv({ name: "line\nbreak", birthday: "2000-01-02" }),
       /profile name/
+    );
+    assert.throws(
+      () => saveApplePasswordToEnv(""),
+      /apple password/
+    );
+    assert.throws(
+      () => saveApplePasswordToEnv("line\nbreak"),
+      /apple password/
+    );
+    assert.throws(
+      () => saveApplePasswordToEnv("nul\u0000byte"),
+      /apple password/
     );
     assert.throws(
       () => saveDeveloperMembershipToEnv("paid"),
@@ -4075,6 +4535,7 @@ const focusedTests = {
     runAcceptanceMarkerFailureIsNonfatalTest();
   },
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
+  "password-change": runPasswordChangePersistenceAndRedactionTest,
   "developer-membership": async () => {
     await runDeveloperMembershipPersistenceTest();
     await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
@@ -4089,6 +4550,7 @@ const focusedTests = {
   },
   "developer-trust": runDeveloperTrustPromptStatusSanitizationTest,
   "developer-membership-gate": runDeveloperMembershipGateStopTest,
+  "small-business": runSmallBusinessApplicationSanitizationTest,
   "profile-persistence-partial": runProfilePersistenceFailureReturnsPartialTest,
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
@@ -4152,6 +4614,8 @@ await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
 await runProfilePersistenceAndAuditRedactionTest();
+await runPasswordChangePersistenceAndRedactionTest();
+await runSmallBusinessApplicationSanitizationTest();
 await runDeveloperMembershipPersistenceTest();
 await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
 await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();

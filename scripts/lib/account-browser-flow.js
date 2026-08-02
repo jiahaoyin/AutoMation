@@ -7,6 +7,7 @@
 
 import { isAccessibilityGranted } from "./accessibility.js";
 import {
+  saveApplePasswordToEnv,
   saveAppleProfileToEnv,
   saveDeveloperMembershipToEnv,
 } from "./credentials.js";
@@ -109,6 +110,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "profile_screenshot_saved",
   "profile_birthday_collected",
   "profile_name_collected",
+  "profile_name_modal_closed",
   "profile_name_modal_query_failed",
   "profile_navigation_started",
   "profile_navigation_sidebar_link_resolved",
@@ -132,6 +134,29 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "developer_membership_gate_blocked",
   "account_module_started",
   "account_module_tab_created",
+  "account_security_navigation_started",
+  "account_security_navigation_link_resolved",
+  "account_security_navigation_sidebar_click_sent",
+  "account_security_navigation_direct_fallback",
+  "account_security_navigation_arrived",
+  "account_security_navigation_sign_in_redirect",
+  "account_security_navigation_unconfirmed",
+  "password_change_started",
+  "password_change_page_ready",
+  "password_change_form_ready",
+  "password_change_submitted",
+  "password_change_completed",
+  "password_change_failed",
+  "small_business_application_started",
+  "small_business_application_tab_created",
+  "small_business_application_authenticated",
+  "small_business_enrollment_page_ready",
+  "small_business_paid_agreement_accepted",
+  "small_business_associated_accounts_answered",
+  "small_business_revenue_certification_checked",
+  "small_business_application_submitted",
+  "small_business_application_completed",
+  "small_business_application_failed",
   "input_progress",
   "remember_progress",
   "twofa_progress",
@@ -186,12 +211,32 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   profile_page_ready: "[✓] 个人信息页面已就绪",
   profile_birthday_collected: "[✓] 已读取出生日期",
   profile_name_collected: "[✓] 已读取姓名",
+  profile_name_modal_closed: "[✓] 姓名弹窗已关闭",
   developer_account_started: "[→] 正在打开 Apple Developer 账户页面",
   developer_account_authentication_started:
     "[→] Apple Developer 页面需要登录，正在继续认证",
   developer_account_authenticated: "[✓] 已确认 Apple Developer 账户登录成功",
   developer_account_completed: "[✓] Apple Developer 会员状态检查完成",
   account_module_started: "[→] 正在打开 Apple 账户页面",
+  account_security_navigation_started: "[→] 正在打开登录与安全性页面",
+  account_security_navigation_sidebar_click_sent:
+    "[→] 正在通过账户侧栏打开登录与安全性",
+  account_security_navigation_direct_fallback:
+    "[→] 正在使用登录与安全性网址继续打开",
+  account_security_navigation_arrived: "[✓] 登录与安全性页面已打开",
+  password_change_started: "[→] 正在准备修改 Apple 账户密码",
+  password_change_page_ready: "[✓] 登录与安全性页面已就绪",
+  password_change_form_ready: "[→] 正在填写当前密码和新密码",
+  password_change_submitted: "[→] 已提交密码更改请求",
+  small_business_application_started: "[→] 正在打开小开发者申请页面",
+  small_business_application_tab_created: "[→] 已新建小开发者申请标签页",
+  small_business_application_authenticated: "[✓] 小开发者申请页登录已确认",
+  small_business_enrollment_page_ready: "[✓] 小开发者申请表单已就绪",
+  small_business_paid_agreement_accepted: "[✓] 已选择付费应用协议确认项",
+  small_business_associated_accounts_answered: "[✓] 已填写关联开发者账户问题",
+  small_business_revenue_certification_checked: "[✓] 已勾选收益声明",
+  small_business_application_submitted: "[→] 已提交小开发者申请",
+  small_business_application_completed: "[✓] 小开发者申请已提交成功",
   browser_session_preserved: "[✓] 已保留 Firefox 窗口和账户标签页",
 });
 const RUYIPAGE_TWO_FACTOR_PROGRESS_MESSAGES = Object.freeze({
@@ -232,6 +277,7 @@ const RUYIPAGE_SCREENSHOT_CHECKPOINTS = new Set([
   "account_home",
   "account_information",
   "developer_membership",
+  "small_business_application",
 ]);
 const RUYIPAGE_PAGE_KINDS = new Set([
   "sign_in",
@@ -270,6 +316,29 @@ const PROFILE_CAPTURE_READINESS_OUTCOMES = new Set([
   "card_ambiguous",
   "card_identity_collision",
   "card_query_failed",
+]);
+const PASSWORD_CHANGE_FAILURE_CLASSES = new Set([
+  "password_change_not_attempted",
+  "password_change_navigation_failed",
+  "password_change_form_unready",
+  "password_change_submit_unconfirmed",
+  "password_change_confirmation_missing",
+  "password_change_failed",
+  "password_persistence_failed",
+  "password_persistence_missing",
+  "runner_post_login_failed",
+  "unknown",
+]);
+const SMALL_BUSINESS_APPLICATION_FAILURE_CLASSES = new Set([
+  "small_business_not_attempted",
+  "small_business_navigation_failed",
+  "small_business_login_unconfirmed",
+  "small_business_form_unready",
+  "small_business_submission_unconfirmed",
+  "small_business_application_failed",
+  "small_business_result_missing",
+  "runner_post_login_failed",
+  "unknown",
 ]);
 const POST_LOGIN_FINALIZATION_CLASSES = new Set([
   "completed",
@@ -361,6 +430,11 @@ const RUYIPAGE_FAILURE_STAGES = new Set([
   "developer_login",
   "developer_membership",
   "account_navigation",
+  "account_security",
+  "password_change",
+  "small_business_application",
+  "small_business_login",
+  "small_business_enrollment",
   "post_login_finalization",
   "result_emitting",
   "result_emitted",
@@ -478,6 +552,22 @@ function sanitizeBrowserPageKind(value) {
 
 function sanitizeProfileCaptureFailureClass(value) {
   return PROFILE_CAPTURE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizePasswordChangeFailureClass(value) {
+  return PASSWORD_CHANGE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizeSmallBusinessApplicationFailureClass(value) {
+  return SMALL_BUSINESS_APPLICATION_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizePasswordLength(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 1024 ? value : 0;
+}
+
+function sanitizeSmallBusinessAnswerCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 4 ? value : 0;
 }
 
 function sanitizeProfileCaptureReadiness(event) {
@@ -889,6 +979,36 @@ function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile)
   return { collected: true, nameStored: true, birthdayStored: true };
 }
 
+function normalizeRotatedApplePassword(value) {
+  if (typeof value !== "string") {
+    throw new Error("rotated apple password is invalid");
+  }
+  if (!value || value.length > 1024 || /[\r\n\u0000]/.test(value)) {
+    throw new Error("rotated apple password is invalid");
+  }
+  return value;
+}
+
+function saveRotatedApplePassword(event, flowAudit, savePassword) {
+  const newPassword = normalizeRotatedApplePassword(event?.newPassword);
+  const passwordLength = sanitizePasswordLength(event?.passwordLength);
+  if (passwordLength !== newPassword.length) {
+    throw new Error("rotated apple password length is invalid");
+  }
+  flowAudit?.addSecrets?.([newPassword]);
+  savePassword(newPassword);
+  writeFlowAudit(flowAudit, "account_browser", "password_persisted", {
+    passwordLength,
+    passwordStored: true,
+  });
+  console.log(`[✓] 新密码已写入 .env（${passwordLength} 位，已隐藏）`);
+  return {
+    attempted: true,
+    passwordStored: true,
+    passwordLength,
+  };
+}
+
 function saveDeveloperMembership(
   membershipStatus,
   registrationIdentityValue,
@@ -934,6 +1054,7 @@ function sanitizeScreenshotMetadata(screenshots) {
   const expectedFiles = {
     personalInformation: "02-account-information.png",
     developerMembership: "03-developer-membership.png",
+    smallBusinessApplication: "04-small-business-application.png",
   };
   for (const [key, expectedFile] of Object.entries(expectedFiles)) {
     const value = source[key];
@@ -976,6 +1097,57 @@ function sanitizePostLoginProfileCapture(profileCapture) {
       : isPresent
         ? sanitizeProfileCaptureFailureClass(source.failureClass)
         : "profile_result_missing",
+    browserAlive: source.browserAlive === true,
+    browserPreserved: source.browserPreserved === true,
+    browserPreservationRequested: source.browserPreservationRequested === true,
+  };
+}
+
+function sanitizePostLoginPasswordChange(passwordChange) {
+  const isPresent = passwordChange && typeof passwordChange === "object";
+  const source = isPresent ? passwordChange : {};
+  const attempted = source.attempted === true;
+  const success = source.success === true;
+  return {
+    success,
+    attempted,
+    passwordStored: source.passwordStored === true,
+    passwordLength: sanitizePasswordLength(source.passwordLength),
+    failureStage: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeBrowserFailureStage(source.failureStage)
+        : "password_change",
+    failureClass: success
+      ? "unknown"
+      : isPresent
+        ? sanitizePasswordChangeFailureClass(source.failureClass)
+        : "password_change_not_attempted",
+    browserAlive: source.browserAlive === true,
+    browserPreserved: source.browserPreserved === true,
+    browserPreservationRequested: source.browserPreservationRequested === true,
+  };
+}
+
+function sanitizePostLoginSmallBusinessApplication(application) {
+  const isPresent = application && typeof application === "object";
+  const source = isPresent ? application : {};
+  const attempted = source.attempted === true;
+  const success = source.success === true;
+  return {
+    success,
+    attempted,
+    submitted: source.submitted === true,
+    failureStage: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeBrowserFailureStage(source.failureStage)
+        : "small_business_application",
+    failureClass: success
+      ? "unknown"
+      : isPresent
+        ? sanitizeSmallBusinessApplicationFailureClass(source.failureClass)
+        : "small_business_not_attempted",
     browserAlive: source.browserAlive === true,
     browserPreserved: source.browserPreserved === true,
     browserPreservationRequested: source.browserPreservationRequested === true,
@@ -1185,6 +1357,27 @@ function createPostLoginRunnerPartialResult(failureCode, failureStage, runnerCon
       browserPreserved,
       browserPreservationRequested,
     },
+    postLoginPasswordChange: {
+      success: false,
+      attempted: false,
+      passwordStored: false,
+      passwordLength: 0,
+      failureStage,
+      failureClass: "runner_post_login_failed",
+      browserAlive: false,
+      browserPreserved,
+      browserPreservationRequested,
+    },
+    postLoginSmallBusinessApplication: {
+      success: false,
+      attempted: false,
+      submitted: false,
+      failureStage,
+      failureClass: "runner_post_login_failed",
+      browserAlive: false,
+      browserPreserved,
+      browserPreservationRequested,
+    },
     postLoginFinalization: {
       backendCleanupCompleted:
         runnerContext.cleanupFailed !== true && failureCode !== "backend_cleanup",
@@ -1212,6 +1405,12 @@ function sanitizeAccountBrowserBackendResult(result) {
     ),
     postLoginDeveloperAccount: sanitizePostLoginDeveloperAccount(
       source.postLoginDeveloperAccount
+    ),
+    postLoginPasswordChange: sanitizePostLoginPasswordChange(
+      source.postLoginPasswordChange
+    ),
+    postLoginSmallBusinessApplication: sanitizePostLoginSmallBusinessApplication(
+      source.postLoginSmallBusinessApplication
     ),
     postLoginFinalization: sanitizePostLoginFinalization(
       source.postLoginFinalization
@@ -1315,6 +1514,26 @@ function auditRuyiPageEvent(flowAudit, event) {
       details.browserPreservationRequested =
         event.browserPreservationRequested === true;
     }
+    if (event.status === "password_change_form_ready") {
+      details.fieldCount = event.fieldCount === 3 ? 3 : 0;
+    }
+    if (event.status === "password_change_completed") {
+      details.passwordLength = sanitizePasswordLength(event.passwordLength);
+    }
+    if (event.status === "password_change_failed") {
+      details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
+      details.failureClass = sanitizePasswordChangeFailureClass(event.failureClass);
+    }
+    if (event.status === "small_business_associated_accounts_answered") {
+      details.answerCount = sanitizeSmallBusinessAnswerCount(event.answerCount);
+    }
+    if (event.status === "small_business_application_failed") {
+      details.failureStage = sanitizeBrowserFailureStage(event.failureStage);
+      details.failureClass = sanitizeSmallBusinessApplicationFailureClass(
+        event.failureClass
+      );
+      details.submitted = event.submitted === true;
+    }
     if (event.status === "developer_membership_checked") {
       details.membershipStatus = sanitizeDeveloperMembershipStatus(
         event.membershipStatus
@@ -1342,7 +1561,8 @@ function auditRuyiPageEvent(flowAudit, event) {
     }
     if (
       event.status.startsWith("profile_navigation_") ||
-      event.status.startsWith("profile_reauthentication_")
+      event.status.startsWith("profile_reauthentication_") ||
+      event.status.startsWith("account_security_navigation_")
     ) {
       details.attempt = event.attempt === 1 || event.attempt === 2 ? event.attempt : 0;
       if (Object.hasOwn(event, "route")) {
@@ -1388,12 +1608,23 @@ function auditRuyiPageEvent(flowAudit, event) {
   }
   if (event.event === "result") {
     const accountModule = sanitizeAccountModule(event.accountModule);
+    const passwordChange = sanitizePostLoginPasswordChange(
+      event.postLoginPasswordChange
+    );
+    const smallBusinessApplication = sanitizePostLoginSmallBusinessApplication(
+      event.postLoginSmallBusinessApplication
+    );
     writeFlowAudit(flowAudit, "ruyipage", "result", {
       success: event.success === true,
       failureStage: sanitizeBrowserFailureStage(event.failureStage),
       accountHomeConfirmed:
         event.browserLogin?.accountHomeConfirmed === true,
       profileCaptureSuccess: event.postLoginProfileCapture?.success === true,
+      passwordChangeSuccess: passwordChange.success,
+      passwordStored: passwordChange.passwordStored,
+      passwordLength: passwordChange.passwordLength,
+      smallBusinessApplicationSuccess: smallBusinessApplication.success,
+      smallBusinessApplicationSubmitted: smallBusinessApplication.submitted,
       developerAccountSuccess:
         event.postLoginDeveloperAccount?.success === true,
       developerMembershipStatus: sanitizeDeveloperMembershipStatus(
@@ -1486,6 +1717,7 @@ export async function runAccountBrowserPhase(
     runtime.createRuyiPageBackendRunner ?? createRuyiPageBackendRunner;
   const createCollector = runtime.createMac2FACollector ?? createMac2FACollector;
   const saveProfile = runtime.saveAppleProfileToEnv ?? saveAppleProfileToEnv;
+  const savePassword = runtime.saveApplePasswordToEnv ?? saveApplePasswordToEnv;
   const saveMembership =
     runtime.saveDeveloperMembershipToEnv ?? saveDeveloperMembershipToEnv;
   const shouldPrintProfile = runtime.shouldPrintCapturedProfile ?? shouldPrintCapturedProfile;
@@ -1556,6 +1788,12 @@ export async function runAccountBrowserPhase(
   let reportedFinalizationPartial = false;
   let reportedDeveloperMembershipGateStop = false;
   let developerMembershipPersistenceAttempted = false;
+  let passwordChangePersistence = {
+    attempted: false,
+    passwordStored: false,
+    passwordLength: 0,
+    failureClass: "password_change_not_attempted",
+  };
   let developerAccount = {
     checked: false,
     membershipStatus: "unknown",
@@ -1657,6 +1895,43 @@ export async function runAccountBrowserPhase(
           event.authenticated === true
         ) {
           persistDeveloperMembership("unknown", false);
+        }
+        if (
+          event.event === "status" &&
+          event.status === "password_change_completed" &&
+          passwordChangePersistence.passwordStored !== true
+        ) {
+          reportTerminalProgress(
+            "password-change:completed",
+            "[✓] Apple 账户密码已更改"
+          );
+          try {
+            passwordChangePersistence = {
+              ...passwordChangePersistence,
+              ...saveRotatedApplePassword(event, flowAudit, savePassword),
+              failureClass: "unknown",
+            };
+          } catch (error) {
+            passwordChangePersistence = {
+              attempted: true,
+              passwordStored: false,
+              passwordLength: sanitizePasswordLength(event.passwordLength),
+              failureClass: "password_persistence_failed",
+            };
+            writeFlowAuditError(
+              flowAudit,
+              "account_browser",
+              "password_persistence_failed",
+              error,
+              {
+                passwordLength: passwordChangePersistence.passwordLength,
+                passwordStored: false,
+              }
+            );
+            console.warn(
+              "[!] 新密码已在网页确认，但写入 .env 失败，详情已写入日志"
+            );
+          }
         }
         if (event.event === "ready") {
           console.log("[✓] Firefox 浏览器已就绪");
@@ -1794,6 +2069,25 @@ export async function runAccountBrowserPhase(
           console.warn(
             `[!] 个人资料采集未完成（阶段：${stage}，原因：${failureClass}），详情已写入日志`
           );
+        } else if (
+          event.event === "status" &&
+          event.status === "password_change_failed"
+        ) {
+          const stage = sanitizeBrowserFailureStage(event.failureStage);
+          const failureClass = sanitizePasswordChangeFailureClass(event.failureClass);
+          console.warn(
+            `[!] Apple 账户密码修改未完成（阶段：${stage}，原因：${failureClass}），详情已写入日志`
+          );
+        } else if (
+          event.event === "status" &&
+          event.status === "account_security_navigation_sign_in_redirect"
+        ) {
+          console.warn("[!] 登录与安全性页面要求重新登录，密码修改未继续");
+        } else if (
+          event.event === "status" &&
+          event.status === "account_security_navigation_unconfirmed"
+        ) {
+          console.warn("[!] 登录与安全性页面未确认，密码修改未继续");
         } else if (event.event === "status" && event.status === "browser_finalization_started") {
           if (showTerminalDebug) {
             console.log(
@@ -2015,6 +2309,78 @@ export async function runAccountBrowserPhase(
   let postLoginProfileCapture = sanitizePostLoginProfileCapture(
     result.postLoginProfileCapture
   );
+  let postLoginPasswordChange = sanitizePostLoginPasswordChange(
+    result.postLoginPasswordChange
+  );
+  let postLoginSmallBusinessApplication =
+    sanitizePostLoginSmallBusinessApplication(
+      result.postLoginSmallBusinessApplication
+    );
+  if (postLoginPasswordChange.success) {
+    if (passwordChangePersistence.passwordStored === true) {
+      postLoginPasswordChange = {
+        ...postLoginPasswordChange,
+        passwordStored: true,
+        passwordLength:
+          passwordChangePersistence.passwordLength ||
+          postLoginPasswordChange.passwordLength,
+      };
+      writeFlowAudit(flowAudit, "account_browser", "password_change_completed", {
+        passwordLength: postLoginPasswordChange.passwordLength,
+        passwordStored: true,
+      });
+    } else {
+      const failureClass =
+        passwordChangePersistence.failureClass === "password_persistence_failed"
+          ? "password_persistence_failed"
+          : "password_persistence_missing";
+      postLoginPasswordChange = {
+        ...postLoginPasswordChange,
+        success: false,
+        attempted: true,
+        passwordStored: false,
+        passwordLength:
+          passwordChangePersistence.passwordLength ||
+          postLoginPasswordChange.passwordLength,
+        failureStage: "password_change",
+        failureClass,
+      };
+      writeFlowAudit(flowAudit, "account_browser", "password_change_partial", {
+        passwordLength: postLoginPasswordChange.passwordLength,
+        passwordStored: false,
+        failureStage: postLoginPasswordChange.failureStage,
+        failureClass: postLoginPasswordChange.failureClass,
+      });
+      if (failureClass === "password_persistence_missing") {
+        console.warn(
+          "[!] 新密码网页确认事件未完成本地持久化，详情已写入日志"
+        );
+      }
+    }
+  } else if (postLoginPasswordChange.attempted) {
+    writeFlowAudit(flowAudit, "account_browser", "password_change_partial", {
+      passwordLength: postLoginPasswordChange.passwordLength,
+      passwordStored: postLoginPasswordChange.passwordStored,
+      failureStage: postLoginPasswordChange.failureStage,
+      failureClass: postLoginPasswordChange.failureClass,
+    });
+  }
+  if (postLoginSmallBusinessApplication.success) {
+    writeFlowAudit(flowAudit, "account_browser", "small_business_application_completed", {
+      submitted: postLoginSmallBusinessApplication.submitted === true,
+    });
+  } else if (postLoginSmallBusinessApplication.attempted) {
+    writeFlowAudit(flowAudit, "account_browser", "small_business_application_partial", {
+      submitted: postLoginSmallBusinessApplication.submitted === true,
+      failureStage: postLoginSmallBusinessApplication.failureStage,
+      failureClass: postLoginSmallBusinessApplication.failureClass,
+      browserAlive: postLoginSmallBusinessApplication.browserAlive,
+      browserPreserved: postLoginSmallBusinessApplication.browserPreserved,
+    });
+    console.warn(
+      `[!] 小开发者申请未完成（阶段：${postLoginSmallBusinessApplication.failureStage}，原因：${postLoginSmallBusinessApplication.failureClass}），详情已写入日志`
+    );
+  }
   let postLoginFinalization = sanitizePostLoginFinalization(
     result.postLoginFinalization
   );
@@ -2046,6 +2412,8 @@ export async function runAccountBrowserPhase(
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
     postLoginDeveloperAccount,
+    postLoginPasswordChange,
+    postLoginSmallBusinessApplication,
     postLoginFinalization,
     accountModule,
     personalInfo: {
@@ -2128,6 +2496,8 @@ export async function runAccountBrowserPhase(
     antiAutomation: { backend: "ruyipage", delegated: true },
     postLoginProfileCapture,
     postLoginDeveloperAccount,
+    postLoginPasswordChange,
+    postLoginSmallBusinessApplication,
     postLoginFinalization,
     accountModule,
     personalInfo,
