@@ -864,6 +864,19 @@ function normalizeCapturedProfile(personalInfo) {
   return { name, birthday };
 }
 
+function sanitizeDeveloperRegistrationIdentityValue(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (
+    !normalized ||
+    normalized.length > 64 ||
+    /[\r\n\u0000]/.test(value)
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
 function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile) {
   const { name, birthday } = normalizeCapturedProfile(personalInfo);
   flowAudit?.addSecrets?.([name, birthday]);
@@ -878,12 +891,20 @@ function saveCapturedProfile(personalInfo, flowAudit, saveProfile, printProfile)
 
 function saveDeveloperMembership(
   membershipStatus,
+  registrationIdentityValue,
   flowAudit,
   saveMembership,
   printResult
 ) {
   const normalized = sanitizeDeveloperMembershipStatus(membershipStatus);
-  saveMembership(normalized);
+  const safeRegistrationIdentity =
+    normalized === "active"
+      ? sanitizeDeveloperRegistrationIdentityValue(registrationIdentityValue)
+      : null;
+  if (safeRegistrationIdentity !== null) {
+    flowAudit?.addSecrets?.([safeRegistrationIdentity]);
+  }
+  saveMembership(normalized, safeRegistrationIdentity);
   if (printResult === true) {
     const labels = {
       active: "已加入",
@@ -892,6 +913,10 @@ function saveDeveloperMembership(
     };
     console.log("[✓] 已写入 .env：developer_membership");
     console.log(`[✓] Apple Developer Program：${labels[normalized]}`);
+    if (safeRegistrationIdentity !== null) {
+      console.log("[✓] 已写入 .env：developer_registration_identity");
+      console.log(`[✓] 注册身份：${safeRegistrationIdentity}`);
+    }
   }
   writeFlowAudit(flowAudit, "developer_account", "membership_persisted", {
     membershipStatus: normalized,
@@ -1536,7 +1561,11 @@ export async function runAccountBrowserPhase(
     membershipStatus: "unknown",
     membershipStored: false,
   };
-  const persistDeveloperMembership = (membershipStatus, checked) => {
+  const persistDeveloperMembership = (
+    membershipStatus,
+    checked,
+    registrationIdentityValue = null
+  ) => {
     if (developerMembershipPersistenceAttempted) return developerAccount;
 
     developerMembershipPersistenceAttempted = true;
@@ -1550,6 +1579,7 @@ export async function runAccountBrowserPhase(
       developerAccount = {
         ...saveDeveloperMembership(
           normalizedMembershipStatus,
+          registrationIdentityValue,
           flowAudit,
           saveMembership,
           shouldPrintProfile()
@@ -1616,7 +1646,11 @@ export async function runAccountBrowserPhase(
         }
         auditRuyiPageEvent(flowAudit, event);
         if (event.event === "status" && event.status === "developer_membership_checked") {
-          persistDeveloperMembership(event.membershipStatus, true);
+          persistDeveloperMembership(
+            event.membershipStatus,
+            true,
+            event.registrationIdentityValue
+          );
         } else if (
           event.event === "status" &&
           event.status === "developer_account_failed" &&

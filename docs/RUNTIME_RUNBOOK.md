@@ -131,7 +131,7 @@ Enter 不代表成功，只是让扫描器重新读取状态。最终仍以 sign
 
 | 内部状态 | .env 写入 | 用户可见终端 | 详情截图 |
 | --- | --- | --- | --- |
-| active | developer_membership=已加入 | 已加入会员的固定提示 | 03-developer-membership.png，且仅在会员详情导航成功、详情内容确认后保存。 |
+| active | developer_membership=已加入；developer_registration_identity=详情卡注册身份 | 已加入会员的固定提示 | 03-developer-membership.png，且仅在会员详情导航成功、详情内容确认后保存。 |
 | not_enrolled | developer_membership=未加入 | 未加入的固定提示 | 不保存。 |
 | unknown | developer_membership=未确认 | 未确认的固定提示 | 不保存。 |
 

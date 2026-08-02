@@ -107,7 +107,7 @@ recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=tru
 | APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED | 1（未设置） | SMS 后置动态接续；`1` 开启，`0` 关闭，与 SMS provider 配置独立。 |
 | APPLE_AUTOMATION_SMS_RECONFIGURE | 0 | 号码与短信服务地址重新录入；`1` 开启重新配置，`0` 关闭并沿用已有配置。 |
 
-.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、name、birthday。它不进入命令行、audit、report 或 Git。
+.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、developer_registration_identity、name、birthday。它不进入命令行、audit、report 或 Git。
 
 ## 6. System Settings 状态机与审计
 

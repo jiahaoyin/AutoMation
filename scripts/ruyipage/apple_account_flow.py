@@ -4138,13 +4138,14 @@ def resolve_developer_membership_navigation(page: Any) -> tuple[Any, Any] | None
     return None
 
 
-def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
+def developer_membership_details_snapshot(page: Any) -> dict[str, Any]:
     if not is_developer_account_url(scope_location_url(page)):
         return {
             "detailsPage": False,
             "appleDeveloperProgram": False,
             "renewalDate": False,
             "registrationIdentity": False,
+            "registrationIdentityValue": None,
             "teamId": False,
             "membershipFieldCount": 0,
         }
@@ -4321,10 +4322,12 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
               ? normalized
               : '';
           };
-          const hasLabeledValue = (patterns, { requireNumeric = false } = {}) => {
+          const findLabeledValue = (patterns, { requireNumeric = false } = {}) => {
             const validValue = (value) => {
               const normalized = normalizeMeaningfulValue(value);
-              return normalized && (!requireNumeric || /\d/.test(normalized));
+              return normalized && (!requireNumeric || /\d/.test(normalized))
+                ? normalized
+                : '';
             };
             for (const group of evidenceTextGroups) {
               for (let index = 0; index < group.lines.length; index += 1) {
@@ -4334,14 +4337,16 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
                   (value, pattern) => value.replace(pattern, ''),
                   line
                 ).replace(/^[\s:：-]+|[\s:：-]+$/g, '').trim();
-                if (validValue(remainder) && !allFieldLabels.some((pattern) => pattern.test(remainder))) {
-                  return true;
+                const inlineValue = validValue(remainder);
+                if (inlineValue && !allFieldLabels.some((pattern) => pattern.test(remainder))) {
+                  return inlineValue;
                 }
                 // A following field label closes this field.  Do not skip over
                 // it looking for a later unrelated shell heading.
                 const candidate = group.lines[index + 1];
-                if (validValue(candidate) && !allFieldLabels.some((pattern) => pattern.test(candidate))) {
-                  return true;
+                const followingValue = validValue(candidate);
+                if (followingValue && !allFieldLabels.some((pattern) => pattern.test(candidate))) {
+                  return followingValue;
                 }
               }
               // The Developer Account card is a responsive grid.  On narrower
@@ -4369,16 +4374,19 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
                     0,
                     boundaries.length ? Math.min(...boundaries) : remaining.length
                   ));
-                  if (value && (!requireNumeric || /\d/.test(value))) return true;
+                  if (value && (!requireNumeric || /\d/.test(value))) return value;
                   cursor = valueStart;
                 }
               }
             }
-            return false;
+            return '';
           };
-          const renewalDate = hasLabeledValue(fieldLabels.renewalDate, { requireNumeric: true });
-          const registrationIdentity = hasLabeledValue(fieldLabels.registrationIdentity);
-          const teamId = hasLabeledValue(fieldLabels.teamId);
+          const renewalDateValue = findLabeledValue(fieldLabels.renewalDate, { requireNumeric: true });
+          const registrationIdentityValue = findLabeledValue(fieldLabels.registrationIdentity);
+          const teamIdValue = findLabeledValue(fieldLabels.teamId);
+          const renewalDate = Boolean(renewalDateValue);
+          const registrationIdentity = Boolean(registrationIdentityValue);
+          const teamId = Boolean(teamIdValue);
           const membershipFieldCount = [
             renewalDate,
             registrationIdentity,
@@ -4391,6 +4399,7 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
             appleDeveloperProgram,
             renewalDate,
             registrationIdentity,
+            registrationIdentityValue: registrationIdentityValue || null,
             teamId,
             membershipFieldCount
           };
@@ -4408,6 +4417,9 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
         "appleDeveloperProgram": result.get("appleDeveloperProgram") is True,
         "renewalDate": result.get("renewalDate") is True,
         "registrationIdentity": result.get("registrationIdentity") is True,
+        "registrationIdentityValue": normalize_developer_registration_identity(
+            result.get("registrationIdentityValue")
+        ),
         "teamId": result.get("teamId") is True,
         "membershipFieldCount": normalize_membership_field_count(
             result.get("membershipFieldCount")
@@ -4417,6 +4429,17 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
 
 def normalize_membership_field_count(value: Any) -> int:
     return min(5, max(0, value if type(value) is int else 0))
+
+
+def normalize_developer_registration_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split()).strip()
+    if not normalized or len(normalized) > 64 or any(
+        character in normalized for character in ("\r", "\n", "\x00")
+    ):
+        return None
+    return normalized
 
 
 def developer_membership_snapshot_is_active(snapshot: dict[str, Any]) -> bool:
@@ -4470,6 +4493,7 @@ def confirm_active_developer_membership(
     *,
     timeout_s: float = 20.0,
     pause: Callable[[int, int], None] = human_pause,
+    registration_identity_holder: dict[str, str | None] | None = None,
 ) -> bool:
     deadline = time.monotonic() + max(0.0, timeout_s)
 
@@ -4525,6 +4549,12 @@ def confirm_active_developer_membership(
             if auth_blocked:
                 return False
             if stable_count >= 2:
+                if registration_identity_holder is not None:
+                    registration_identity_holder["value"] = (
+                        normalize_developer_registration_identity(
+                            snapshot.get("registrationIdentityValue")
+                        )
+                    )
                 return True
             pause(250, 500)
         return False
@@ -6870,6 +6900,7 @@ def collect_developer_account_membership(
 
     set_browser_startup_stage("developer_membership")
     membership_status = "unknown"
+    registration_identity_value: str | None = None
     screenshot: str | None = None
     if confirmed_state.get("joinProgram") is True:
         membership_status = "not_enrolled"
@@ -6878,6 +6909,14 @@ def collect_developer_account_membership(
         # Re-read the live page instead of freezing the initial nav boolean.
         if confirm_active_developer_membership(developer_page):
             membership_status = "active"
+            try:
+                registration_identity_value = normalize_developer_registration_identity(
+                    developer_membership_details_snapshot(developer_page).get(
+                        "registrationIdentityValue"
+                    )
+                )
+            except Exception:
+                registration_identity_value = None
             screenshot = take_screenshot(
                 developer_page,
                 screenshot_path,
@@ -6889,6 +6928,7 @@ def collect_developer_account_membership(
             "event": "status",
             "status": "developer_membership_checked",
             "membershipStatus": membership_status,
+            "registrationIdentityValue": registration_identity_value,
         }
     )
     emit({"event": "status", "status": "developer_account_completed"})
@@ -6897,6 +6937,7 @@ def collect_developer_account_membership(
             "success": True,
             "authenticated": True,
             "membershipStatus": membership_status,
+            "registrationIdentityValue": registration_identity_value,
             "failureStage": "unknown",
             "failureClass": "unknown",
             "browserAlive": browser_connection_is_alive(developer_page),
@@ -7021,6 +7062,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             "success": False,
             "authenticated": False,
             "membershipStatus": "unknown",
+            "registrationIdentityValue": None,
             "failureStage": "developer_account",
             "failureClass": "developer_result_missing",
             "browserAlive": browser_connection_is_alive(page),
@@ -7055,6 +7097,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 "success": False,
                 "authenticated": failure_stage == "developer_membership",
                 "membershipStatus": "unknown",
+                "registrationIdentityValue": None,
                 "failureStage": failure_stage,
                 "failureClass": failure_class,
                 "browserAlive": browser_alive,

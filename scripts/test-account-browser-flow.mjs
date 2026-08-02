@@ -82,8 +82,8 @@ function createRuntime(runBackend, options = {}) {
     saveAppleProfileToEnv(profile) {
       return options.saveAppleProfileToEnv?.(profile) ?? "/tmp/test-profile.env";
     },
-    saveDeveloperMembershipToEnv(status) {
-      return options.saveDeveloperMembershipToEnv?.(status) ??
+    saveDeveloperMembershipToEnv(status, registrationIdentityValue) {
+      return options.saveDeveloperMembershipToEnv?.(status, registrationIdentityValue) ??
         "/tmp/test-developer-membership.env";
     },
     shouldPrintCapturedProfile() {
@@ -1624,6 +1624,42 @@ async function runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest(
   });
   assert.equal(membershipPersistenceEntries(entries).length, 1);
   assert.equal(JSON.stringify({ result, entries }).includes(SECRET_FIXTURE), false);
+}
+
+async function runDeveloperRegistrationIdentityPersistenceTest() {
+  const saved = [];
+  const secrets = [];
+  const { entries, flowAudit } = createDeveloperMembershipAudit();
+  flowAudit.addSecrets = (values) => secrets.push(...values);
+  const harness = createRuntime(
+    async (options) => {
+      await options.onEvent({
+        event: "status",
+        status: "developer_membership_checked",
+        membershipStatus: "active",
+        registrationIdentityValue: "个人",
+      });
+      return successfulResult();
+    },
+    {
+      saveDeveloperMembershipToEnv(status, registrationIdentityValue) {
+        saved.push({ status, registrationIdentityValue });
+        return "/tmp/test-developer-membership.env";
+      },
+    }
+  );
+
+  const result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  assert.deepEqual(saved, [
+    { status: "active", registrationIdentityValue: "个人" },
+  ]);
+  assert.equal(secrets.filter((value) => value === "个人").length, 1);
+  assert.deepEqual(result.developerAccount, {
+    checked: true,
+    membershipStatus: "active",
+    membershipStored: true,
+  });
+  assert.equal(JSON.stringify(entries).includes("个人"), false);
 }
 
 async function runDeveloperTrustPromptStatusSanitizationTest() {
@@ -3446,17 +3482,32 @@ function runEnvDataParsingTest() {
       }),
       envPath
     );
-    assert.equal(saveDeveloperMembershipToEnv("active"), envPath);
+    assert.equal(saveDeveloperMembershipToEnv("active", "个人"), envPath);
     assert.match(
       fs.readFileSync(envPath, "utf8"),
       /^developer_membership=已加入$/m
+    );
+    assert.match(
+      fs.readFileSync(envPath, "utf8"),
+      /^developer_registration_identity=个人$/m
     );
     assert.equal(saveDeveloperMembershipToEnv("not_enrolled"), envPath);
     assert.match(
       fs.readFileSync(envPath, "utf8"),
       /^developer_membership=未加入$/m
     );
+    assert.equal(saveDeveloperMembershipToEnv("not_enrolled", "组织"), envPath);
+    assert.equal(
+      (fs.readFileSync(envPath, "utf8").match(/^developer_registration_identity=/gm) ?? [])
+        .length,
+      0
+    );
     assert.equal(saveDeveloperMembershipToEnv("unknown"), envPath);
+    assert.equal(
+      (fs.readFileSync(envPath, "utf8").match(/^developer_registration_identity=/gm) ?? [])
+        .length,
+      0
+    );
     assert.equal(
       saveMacSettingsSmsProviderConfig({
         phoneNumber: "+8613800130052",
@@ -3497,6 +3548,10 @@ function runEnvDataParsingTest() {
     assert.throws(
       () => saveDeveloperMembershipToEnv("paid"),
       /developer membership status/
+    );
+    assert.throws(
+      () => saveDeveloperMembershipToEnv("active", "line\nbreak"),
+      /developer registration identity/
     );
   } finally {
     process.chdir(originalCwd);
@@ -4024,6 +4079,7 @@ const focusedTests = {
     await runDeveloperMembershipPersistenceTest();
     await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
     await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+    await runDeveloperRegistrationIdentityPersistenceTest();
     await runDeveloperMembershipProbeSanitizationTest();
     await runDeveloperTrustPromptStatusSanitizationTest();
     await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();
@@ -4099,6 +4155,7 @@ await runProfilePersistenceAndAuditRedactionTest();
 await runDeveloperMembershipPersistenceTest();
 await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
 await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
+await runDeveloperRegistrationIdentityPersistenceTest();
 await runDeveloperMembershipProbeSanitizationTest();
 await runDeveloperTrustPromptStatusSanitizationTest();
 await runUnauthenticatedDeveloperFailureStopsAccountModuleTest();

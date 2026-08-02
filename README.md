@@ -78,7 +78,7 @@ https://account.apple.com/account/manage/section/information
 screenshots/02-account-information.png
 ~~~
 
-**name**、**birthday** 与 **developer_membership** 只写入本机私有 .env；报告与 JSONL 只保留固定状态、布尔值、分类和截图文件名，不保存账号、密码、验证码、Cookie、原始页面文本或个人资料值。
+**name**、**birthday**、**developer_membership** 与 **developer_registration_identity** 只写入本机私有 .env；报告与 JSONL 只保留固定状态、布尔值、分类和截图文件名，不保存账号、密码、验证码、Cookie、原始页面文本或个人资料值。
 
 ## 2FA 运行原则
 

@@ -11159,6 +11159,10 @@ process.stdout.write(JSON.stringify(eval(expression)));
                 self.assertTrue(snapshot["appleDeveloperProgram"])
                 self.assertTrue(snapshot["renewalDate"])
                 self.assertTrue(snapshot["registrationIdentity"])
+                self.assertEqual(
+                    snapshot["registrationIdentityValue"],
+                    "个人" if "注册身份" in text else "individual",
+                )
                 self.assertTrue(
                     account_flow.developer_membership_snapshot_is_active(snapshot)
                 )
@@ -11192,6 +11196,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertTrue(snapshot["appleDeveloperProgram"])
         self.assertFalse(snapshot["renewalDate"])
         self.assertFalse(snapshot["registrationIdentity"])
+        self.assertIsNone(snapshot["registrationIdentityValue"])
 
     def test_membership_navigation_label_is_not_a_membership_details_page(self):
         snapshot = self.evaluate_membership_details_query(
@@ -11203,6 +11208,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertFalse(snapshot["appleDeveloperProgram"])
         self.assertFalse(snapshot["renewalDate"])
         self.assertFalse(snapshot["registrationIdentity"])
+        self.assertIsNone(snapshot["registrationIdentityValue"])
 
     def test_membership_details_query_does_not_cross_text_source_boundaries(self):
         membership_labels_without_values = (
@@ -11220,6 +11226,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertTrue(snapshot["appleDeveloperProgram"])
         self.assertFalse(snapshot["renewalDate"])
         self.assertFalse(snapshot["registrationIdentity"])
+        self.assertIsNone(snapshot["registrationIdentityValue"])
         self.assertFalse(
             account_flow.developer_membership_snapshot_is_active(snapshot)
         )
@@ -11440,6 +11447,14 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
     def test_collects_active_membership_and_returns_fixed_screenshot(self):
         developer_page = self.authenticated_page(membership_navigation=True)
+        developer_page.membership_details = {
+            "detailsPage": True,
+            "appleDeveloperProgram": True,
+            "renewalDate": True,
+            "registrationIdentity": True,
+            "registrationIdentityValue": "个人",
+            "membershipFieldCount": 2,
+        }
         developer_page.wait = type(
             "FakeWait",
             (),
@@ -11451,6 +11466,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
                 return developer_page
 
         screenshot_path = Path("03-developer-membership.png")
+        events = []
         with patch(
             "apple_account_flow.complete_account_authentication",
             return_value={
@@ -11473,7 +11489,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
         ) as screenshot, patch(
             "apple_account_flow.human_pause",
             lambda *_: None,
-        ), patch("apple_account_flow.emit"):
+        ), patch("apple_account_flow.emit", side_effect=events.append):
             result, returned_page, captured = (
                 account_flow.collect_developer_account_membership(
                     RootPage(),
@@ -11488,6 +11504,16 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertTrue(result["success"])
         self.assertTrue(result["authenticated"])
         self.assertEqual(result["membershipStatus"], "active")
+        self.assertEqual(result["registrationIdentityValue"], "个人")
+        self.assertIn(
+            {
+                "event": "status",
+                "status": "developer_membership_checked",
+                "membershipStatus": "active",
+                "registrationIdentityValue": "个人",
+            },
+            events,
+        )
         self.assertIs(returned_page, developer_page)
         self.assertEqual(captured, str(screenshot_path))
         screenshot.assert_called_once_with(
@@ -11514,6 +11540,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
                     "appleDeveloperProgram": True,
                     "renewalDate": True,
                     "registrationIdentity": True,
+                    "registrationIdentityValue": "个人",
                     "membershipFieldCount": 2,
                 },
                 {
@@ -11521,6 +11548,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
                     "appleDeveloperProgram": True,
                     "renewalDate": True,
                     "registrationIdentity": True,
+                    "registrationIdentityValue": "个人",
                     "membershipFieldCount": 2,
                 },
             ],
@@ -11572,6 +11600,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
             )
 
         self.assertEqual(result["membershipStatus"], "active")
+        self.assertEqual(result["registrationIdentityValue"], "个人")
         self.assertIs(returned_page, developer_page)
         self.assertEqual(captured, str(screenshot_path))
         screenshot.assert_called_once_with(

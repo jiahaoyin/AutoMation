@@ -248,17 +248,50 @@ const DEVELOPER_MEMBERSHIP_VALUES = new Map([
   ["unknown", "未确认"],
 ]);
 
-export function saveDeveloperMembershipToEnv(membershipStatus) {
+function normalizeDeveloperRegistrationIdentity(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") {
+    throw new Error("developer registration identity is invalid");
+  }
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (
+    !normalized ||
+    normalized.length > 64 ||
+    /[\r\n\u0000]/.test(value)
+  ) {
+    throw new Error("developer registration identity is invalid");
+  }
+  return normalized;
+}
+
+/**
+ * Persist the fixed membership result and, for an active member, the
+ * registration identity read from the membership details card. The identity
+ * is private .env data and is intentionally absent from reports and audits.
+ */
+export function saveDeveloperMembershipToEnv(
+  membershipStatus,
+  registrationIdentityValue = null
+) {
   const envValue = DEVELOPER_MEMBERSHIP_VALUES.get(membershipStatus);
   if (envValue === undefined) {
     throw new Error("developer membership status is invalid");
   }
+  const safeRegistrationIdentity =
+    membershipStatus === "active"
+      ? normalizeDeveloperRegistrationIdentity(registrationIdentityValue)
+      : null;
   const envPath = resolveEnvPath();
   const { lines, lineEnding } = fs.existsSync(envPath)
     ? readEnvDocument(envPath)
     : { lines: [], lineEnding: "\n" };
-  const updated = upsertEnvLines(lines, {
+  const identityKey = "developer_registration_identity";
+  const withoutPreviousIdentity = removeEnvLines(lines, new Set([identityKey]));
+  const updated = upsertEnvLines(withoutPreviousIdentity, {
     developer_membership: envValue,
+    ...(safeRegistrationIdentity === null
+      ? {}
+      : { [identityKey]: safeRegistrationIdentity }),
   });
   writePrivateEnvFile(envPath, updated, lineEnding);
   return envPath;
