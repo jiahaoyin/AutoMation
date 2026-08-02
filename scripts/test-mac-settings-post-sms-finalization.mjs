@@ -607,6 +607,13 @@ assert.match(helperSource, /hasMacPasswordEvidence\(passwordText\)/);
 assert.match(helperSource, /private func hasPasswordFieldEvidence\(/);
 assert.match(helperSource, /hasMacPasswordEvidence\(passwordText\) \|\| hasPasswordFieldEvidence\(fields\[0\]\)/);
 assert.match(helperSource, /private func isMacPasswordField\(/);
+assert.match(
+  helperSource.slice(
+    helperSource.indexOf("private func isMacPasswordField"),
+    helperSource.indexOf("private func checkboxIsSelected")
+  ),
+  /isNotExplicitlyDisabled\(element\)/
+);
 assert.match(helperSource, /private func nearestButton\(/);
 assert.match(helperSource, /excludingIdentifiers: Set<String> = \[\]/);
 assert.match(helperSource, /excludingIdentifiers: \["LOGIN_BUTTON"\]/);
@@ -650,6 +657,13 @@ assert.match(helperSource, /private func hitTestMatchesBoundSurface\(/);
 assert.match(helperSource, /private func activateBoundModalTarget\(/);
 assert.match(helperSource, /private func submitTerms\(/);
 assert.match(helperSource, /private func submitMacPassword\(/);
+assert.match(
+  helperSource.slice(
+    helperSource.indexOf("private func submitMacPassword"),
+    helperSource.indexOf("private func submitLocation")
+  ),
+  /isNotExplicitlyDisabled\(refreshed\.primaryButton\)/
+);
 assert.match(helperSource, /private func submitLocation\(/);
 assert.match(helperSource, /fixedMacPasswords: Set<String> = \["0000", "000000"\]/);
 assert.match(helperSource, /private func isNotExplicitlyDisabled\(/);
@@ -661,7 +675,7 @@ assert.match(
   helperSource,
   /private func bindingForSurfaceElements\([\s\S]*?directWindowID = elementWindowID\(surface\)\.flatMap/
 );
-assert.match(helperSource, /resolveOnScreenWindowID\(\n\s+pid: visualOwnerPID,/);
+assert.match(helperSource, /resolveOnScreenWindowID\(\r?\n\s+pid: visualOwnerPID,/);
 assert.match(helperSource, /private func onScreenWindowFrame\(/);
 assert.doesNotMatch(helperSource, /surfaceWindowID != visualWindow\.windowID/);
 const hitTestBody = helperSource.slice(
