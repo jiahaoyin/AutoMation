@@ -282,6 +282,14 @@ private func belongsTo(_ element: AXUIElement, pid: pid_t) -> Bool {
     elementPID(element) == pid
 }
 
+private func belongsToTrustedOwners(
+    _ element: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> Bool {
+    guard let pid = elementPID(element) else { return false }
+    return allowedPIDs.contains(pid)
+}
+
 private func axElementsEqual(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
     CFEqual(lhs, rhs)
 }
@@ -292,6 +300,14 @@ private func isVisible(_ element: AXUIElement) -> Bool {
 
 private func isEnabled(_ element: AXUIElement) -> Bool {
     axBool(element, kAXEnabledAttribute as String) == true
+}
+
+// The macOS password sheet is SwiftUI-backed on some Sequoia builds and omits
+// AXEnabled even though the secure field and Continue button are actionable.
+// Keep the strict gate for every other surface; only an explicit false means
+// disabled on this one scoped path.
+private func isNotExplicitlyDisabled(_ element: AXUIElement) -> Bool {
+    axBool(element, kAXEnabledAttribute as String) != false
 }
 
 private func supportsPress(_ element: AXUIElement) -> Bool {
@@ -386,15 +402,68 @@ private func windowsForApp(_ appElement: AXUIElement) -> [AXUIElement] {
     return windows
 }
 
-private func activeSurfaceRoot(_ root: AXUIElement, pid: pid_t) -> AXUIElement? {
-    guard belongsTo(root, pid: pid), isVisible(root) else { return nil }
-    let sheets = axSheets(root).filter { belongsTo($0, pid: pid) && isVisible($0) }
-    guard sheets.count <= 1 else { return nil }
-    guard let sheet = sheets.first else { return root }
-    return activeSurfaceRoot(sheet, pid: pid)
+private func isSurfaceRole(_ element: AXUIElement) -> Bool {
+    let role = axRole(element)
+    return role == kAXWindowRole as String || role == "AXDialog" || role == "AXSheet"
 }
 
-private func visibleNodes(_ root: AXUIElement, pid: pid_t, limit: Int = 1_200) -> [AXUIElement] {
+// Most System Settings prompts are AXWindow/AXSheet descendants, but the
+// AppleIDSettings extension can expose a modal as a top-level AXDialog or
+// AXSheet. Enumerate only those trusted surface roles and their descendants;
+// arbitrary application-root controls never become a recovery surface.
+private func surfaceRoots(
+    for appElement: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> [AXUIElement] {
+    var roots = windowsForApp(appElement)
+    var queue = axChildren(appElement) + axSheets(appElement)
+    if let focused: AXUIElement = axCopy(appElement, kAXFocusedUIElementAttribute as String) {
+        queue.append(focused)
+    }
+    var seen: [AXUIElement] = []
+    while !queue.isEmpty && seen.count < 1_024 {
+        let current = queue.removeFirst()
+        if seen.contains(where: { axElementsEqual($0, current) }) { continue }
+        seen.append(current)
+        guard belongsToTrustedOwners(current, allowedPIDs: allowedPIDs), isVisible(current) else {
+            continue
+        }
+        if isSurfaceRole(current) && !roots.contains(where: { axElementsEqual($0, current) }) {
+            roots.append(current)
+        }
+        // Walk only trusted surface containers. This discovers a dialog/sheet
+        // nested below an AXWindow without flooding the tree with every text
+        // field and button in the page.
+        if isSurfaceRole(current) {
+            queue.append(contentsOf: axChildren(current))
+            queue.append(contentsOf: axSheets(current))
+        }
+    }
+    return roots
+}
+
+private func activeSurfaceRoot(
+    _ root: AXUIElement,
+    allowedPIDs: Set<pid_t>
+) -> AXUIElement? {
+    guard isSurfaceRole(root),
+          belongsToTrustedOwners(root, allowedPIDs: allowedPIDs),
+          isVisible(root) else {
+        return nil
+    }
+    let sheets = axSheets(root).filter {
+        belongsToTrustedOwners($0, allowedPIDs: allowedPIDs) && isVisible($0)
+    }
+    guard sheets.count <= 1 else { return nil }
+    guard let sheet = sheets.first else { return root }
+    return activeSurfaceRoot(sheet, allowedPIDs: allowedPIDs)
+}
+
+private func visibleNodes(
+    _ root: AXUIElement,
+    allowedPIDs: Set<pid_t>,
+    limit: Int = 1_200
+) -> [AXUIElement] {
     var queue: [AXUIElement] = [root]
     var seen: [AXUIElement] = []
     var nodes: [AXUIElement] = []
@@ -402,7 +471,9 @@ private func visibleNodes(_ root: AXUIElement, pid: pid_t, limit: Int = 1_200) -
         let current = queue.removeFirst()
         if seen.contains(where: { $0 == current }) { continue }
         seen.append(current)
-        guard belongsTo(current, pid: pid), isVisible(current) else { continue }
+        guard belongsToTrustedOwners(current, allowedPIDs: allowedPIDs), isVisible(current) else {
+            continue
+        }
         nodes.append(current)
         queue.append(contentsOf: axChildren(current))
         queue.append(contentsOf: axSheets(current))
@@ -496,7 +567,7 @@ private func hasPasswordFieldEvidence(_ element: AXUIElement) -> Bool {
 private func isMacPasswordField(_ element: AXUIElement) -> Bool {
     guard isTextInput(element),
           isVisible(element),
-          isEnabled(element),
+          isNotExplicitlyDisabled(element),
           axFrame(element) != nil else {
         return false
     }
@@ -575,37 +646,98 @@ private func resolveOnScreenWindowID(pid: pid_t, near frame: CGRect) -> CGWindow
     return best.id
 }
 
+private func onScreenWindowFrame(
+    pid: pid_t,
+    windowID: CGWindowID,
+    near surfaceFrame: CGRect? = nil
+) -> CGRect? {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+    for info in windows {
+        guard let owner = info[kCGWindowOwnerPID as String] as? NSNumber,
+              pid_t(owner.int32Value) == pid,
+              let number = info[kCGWindowNumber as String] as? NSNumber,
+              CGWindowID(number.uint32Value) == windowID,
+              let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+              let candidateFrame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+              candidateFrame.width > 80,
+              candidateFrame.height > 60,
+              let alpha = info[kCGWindowAlpha as String] as? NSNumber,
+              alpha.doubleValue > 0 else {
+            continue
+        }
+        if let surfaceFrame,
+           !frame(surfaceFrame, isWithin: candidateFrame, tolerance: 4),
+           surfaceFrame.intersection(candidateFrame).isNull {
+            continue
+        }
+        return candidateFrame
+    }
+    return nil
+}
+
+private func trustedOwnerPID(
+    for elements: [AXUIElement],
+    fallback: pid_t
+) -> pid_t? {
+    guard !elements.isEmpty else {
+        return trustedSettingsVisualOwner(fallback) == nil ? nil : fallback
+    }
+    let owners = elements.compactMap(elementPID)
+    guard owners.count == elements.count,
+          let first = owners.first,
+          owners.allSatisfy({ $0 == first }),
+          trustedSettingsVisualOwner(first) != nil else {
+        return nil
+    }
+    return first
+}
+
 private func bindingForSurfaceElements(
     axOwnerPID: pid_t,
     surface: AXUIElement,
     surfaceFrame: CGRect?,
     elements: [AXUIElement]
 ) -> UnlockBinding? {
-    guard let visualHost = visualHostForAXOwner(axOwnerPID),
-          let visualWindow = focusedWindowForTrustedSettingsHost(visualHost.processIdentifier) else {
+    guard let resolvedAXOwnerPID = trustedOwnerPID(for: elements, fallback: axOwnerPID),
+          let visualHost = visualHostForAXOwner(resolvedAXOwnerPID),
+          let surfaceFrame = surfaceFrame else {
         return nil
     }
-    if let surfaceFrame, !frame(surfaceFrame, isWithin: visualWindow.frame) {
+    let visualOwnerPID = visualHost.processIdentifier
+    let directWindowID = elementWindowID(surface).flatMap { candidateID in
+        onScreenWindowFrame(
+            pid: visualOwnerPID,
+            windowID: candidateID,
+            near: surfaceFrame
+        ) == nil ? nil : candidateID
+    }
+    let resolvedWindowID = directWindowID ?? resolveOnScreenWindowID(
+        pid: visualOwnerPID,
+        near: surfaceFrame
+    )
+    guard let windowID = resolvedWindowID,
+          let visualWindowFrame = onScreenWindowFrame(
+              pid: visualOwnerPID,
+              windowID: windowID,
+              near: surfaceFrame
+          ),
+          frame(surfaceFrame, isWithin: visualWindowFrame, tolerance: 4) else {
         return nil
     }
     guard elements.allSatisfy({ element in
         guard isDescendant(element, of: surface),
-              let elementFrame = axFrame(element) else {
+               let elementFrame = axFrame(element) else {
             return false
         }
-        return frame(elementFrame, isWithin: visualWindow.frame)
+        return frame(elementFrame, isWithin: visualWindowFrame, tolerance: 4)
     }) else {
         return nil
     }
-    if axOwnerPID == visualHost.processIdentifier,
-       let surfaceWindowID = elementWindowID(surface),
-       surfaceWindowID != visualWindow.windowID {
-        return nil
-    }
     return UnlockBinding(
-        axOwnerPid: Int32(axOwnerPID),
-        visualOwnerPid: Int32(visualHost.processIdentifier),
-        windowId: UInt32(visualWindow.windowID)
+        axOwnerPid: Int32(resolvedAXOwnerPID),
+        visualOwnerPid: Int32(visualOwnerPID),
+        windowId: UInt32(windowID)
     )
 }
 
@@ -613,6 +745,23 @@ private func isDescendant(_ element: AXUIElement, of ancestor: AXUIElement) -> B
     var current: AXUIElement? = element
     for _ in 0..<32 {
         guard let node = current else { return false }
+        if axElementsEqual(node, ancestor) { return true }
+        current = axParent(node)
+    }
+    return false
+}
+
+private func isTrustedDescendant(
+    _ element: AXUIElement,
+    of ancestor: AXUIElement,
+    ownerPIDs: Set<pid_t>
+) -> Bool {
+    var current: AXUIElement? = element
+    for _ in 0..<32 {
+        guard let node = current,
+              belongsToTrustedOwners(node, allowedPIDs: ownerPIDs) else {
+            return false
+        }
         if axElementsEqual(node, ancestor) { return true }
         current = axParent(node)
     }
@@ -642,32 +791,45 @@ private func trustedSurfaceCandidates() -> [(
 )] {
     var candidates: [(surface: AXUIElement, nodes: [AXUIElement], axOwnerPID: pid_t, binding: UnlockBinding)] = []
     var seen = Set<String>()
+    let allowedPIDs = Set(
+        NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
+            trustedSettingsVisualOwner(app.processIdentifier) == nil
+                ? nil
+                : app.processIdentifier
+        }
+    )
+    guard !allowedPIDs.isEmpty else { return [] }
 
     for app in NSWorkspace.shared.runningApplications {
-        guard trustedSettingsVisualOwner(app.processIdentifier) != nil else { continue }
+        guard allowedPIDs.contains(app.processIdentifier) else { continue }
         let axOwnerPID = app.processIdentifier
         let appElement = AXUIElementCreateApplication(axOwnerPID)
-        let windows = windowsForApp(appElement)
+        let windows = surfaceRoots(for: appElement, allowedPIDs: allowedPIDs)
         // ExtensionKit may expose an application AX root without a concrete
         // on-screen window. That root is not a safe recovery surface: reject
         // it instead of allowing same-process unrelated UI through hit-test.
         guard !windows.isEmpty else { continue }
         for candidateRoot in windows {
-            guard axRole(candidateRoot) == kAXWindowRole as String,
-                  let surface = activeSurfaceRoot(candidateRoot, pid: axOwnerPID),
+            guard isSurfaceRole(candidateRoot),
+                  let surface = activeSurfaceRoot(candidateRoot, allowedPIDs: allowedPIDs),
+                  let surfaceOwnerPID = elementPID(surface),
+                  allowedPIDs.contains(surfaceOwnerPID),
                   let binding = bindingForSurfaceElements(
-                      axOwnerPID: axOwnerPID,
+                      axOwnerPID: surfaceOwnerPID,
                       surface: surface,
                       surfaceFrame: axFrame(surface),
                       elements: []
                   ) else {
                 continue
             }
-            let key = "\(binding.axOwnerPid):\(binding.visualOwnerPid):\(binding.windowId)"
+            // The host and ExtensionKit can expose the same on-screen window as
+            // two AX roots. Keep one candidate per visual window; its node scan
+            // already admits both trusted owners.
+            let key = "\(binding.visualOwnerPid):\(binding.windowId)"
             guard seen.insert(key).inserted else { continue }
-            let nodes = visibleNodes(surface, pid: axOwnerPID)
+            let nodes = visibleNodes(surface, allowedPIDs: allowedPIDs)
             guard !nodes.isEmpty else { continue }
-            candidates.append((surface: surface, nodes: nodes, axOwnerPID: axOwnerPID, binding: binding))
+            candidates.append((surface: surface, nodes: nodes, axOwnerPID: surfaceOwnerPID, binding: binding))
         }
     }
     return candidates
@@ -920,36 +1082,22 @@ private func hitTestMatchesBoundSurface(
         return false
     }
 
-    if hitPID == target.binding.visualOwnerPID {
-        var current: AXUIElement? = hit
-        for _ in 0..<24 {
-            guard let node = current,
-                  belongsTo(node, pid: target.binding.visualOwnerPID) else {
-                return false
-            }
-            if axElementsEqual(node, target.surface) { return true }
-            current = axParent(node)
-        }
+    guard hitPID == target.binding.visualOwnerPID ||
+          hitPID == target.binding.axOwnerPID else {
         return false
     }
-
-    guard hitPID == target.binding.axOwnerPID,
-          target.binding.axOwnerPID != target.binding.visualOwnerPID,
-          let axOwner = trustedSettingsVisualOwner(target.binding.axOwnerPID),
-          isTrustedAppleIDSettingsExtension(axOwner),
-          uniqueTrustedSettingsHost()?.processIdentifier == target.binding.visualOwnerPID else {
-        return false
-    }
-    var current: AXUIElement? = hit
-    for _ in 0..<24 {
-        guard let node = current,
-              belongsTo(node, pid: target.binding.axOwnerPID) else {
+    if target.binding.axOwnerPID != target.binding.visualOwnerPID {
+        guard let axOwner = trustedSettingsVisualOwner(target.binding.axOwnerPID),
+              isTrustedAppleIDSettingsExtension(axOwner),
+              uniqueTrustedSettingsHost()?.processIdentifier == target.binding.visualOwnerPID else {
             return false
         }
-        if axElementsEqual(node, target.surface) { return true }
-        current = axParent(node)
     }
-    return false
+    return isTrustedDescendant(
+        hit,
+        of: target.surface,
+        ownerPIDs: Set([target.binding.axOwnerPID, target.binding.visualOwnerPID])
+    )
 }
 
 private func modalTargetIsReady(
@@ -983,7 +1131,10 @@ private func activateBoundModalTarget(
     }
 
     visualHost.activate(options: [.activateIgnoringOtherApps])
-    if let visualWindow = focusedWindowForTrustedSettingsHost(target.binding.visualOwnerPID)?.element {
+    let raisedSurface = isSurfaceRole(target.surface) &&
+        AXUIElementPerformAction(target.surface, kAXRaiseAction as CFString) == .success
+    if !raisedSurface,
+       let visualWindow = focusedWindowForTrustedSettingsHost(target.binding.visualOwnerPID)?.element {
         _ = AXUIElementPerformAction(visualWindow, kAXRaiseAction as CFString)
     }
 
@@ -1131,36 +1282,28 @@ private func hitTestMatchesBoundTarget(
         return false
     }
 
-    if hitPID == target.binding.visualOwnerPID {
-        var current: AXUIElement? = hit
-        for _ in 0..<12 {
-            guard let node = current, belongsTo(node, pid: target.binding.visualOwnerPID) else {
-                return false
-            }
-            if elementWindowID(node) == target.binding.windowID { return true }
-            current = axParent(node)
-        }
+    guard hitPID == target.binding.visualOwnerPID ||
+          hitPID == target.binding.axOwnerPID else {
         return false
     }
-
-    // ExtensionKit can expose the point through its own AX subtree although
-    // the on-screen window is owned by the verified System Settings host.
-    guard hitPID == target.binding.axOwnerPID,
-          target.binding.axOwnerPID != target.binding.visualOwnerPID,
-          let axOwner = trustedSettingsVisualOwner(target.binding.axOwnerPID),
-          isTrustedAppleIDSettingsExtension(axOwner),
-          uniqueTrustedSettingsHost()?.processIdentifier == target.binding.visualOwnerPID else {
-        return false
-    }
-    var current: AXUIElement? = hit
-    for _ in 0..<16 {
-        guard let node = current, belongsTo(node, pid: target.binding.axOwnerPID) else {
+    if target.binding.axOwnerPID != target.binding.visualOwnerPID {
+        // ExtensionKit can expose the point through its own AX subtree although
+        // the on-screen window is owned by the verified System Settings host.
+        guard let axOwner = trustedSettingsVisualOwner(target.binding.axOwnerPID),
+              isTrustedAppleIDSettingsExtension(axOwner),
+              uniqueTrustedSettingsHost()?.processIdentifier == target.binding.visualOwnerPID else {
             return false
         }
-        if axElementsEqual(node, target.window) { return true }
-        current = axParent(node)
     }
-    return false
+    if hitPID == target.binding.visualOwnerPID,
+       elementWindowID(hit) == target.binding.windowID {
+        return true
+    }
+    return isTrustedDescendant(
+        hit,
+        of: target.window,
+        ownerPIDs: Set([target.binding.axOwnerPID, target.binding.visualOwnerPID])
+    )
 }
 
 // The hidden terminal prompt necessarily takes foreground focus. Restore only
@@ -1660,7 +1803,7 @@ private func submitMacPassword(
     for _ in 0..<20 {
         guard let refreshed = uniqueMacPasswordTarget(),
               refreshed.binding == expectedBinding,
-              isEnabled(refreshed.primaryButton),
+              isNotExplicitlyDisabled(refreshed.primaryButton),
               supportsPress(refreshed.primaryButton),
               let refreshedWindow = boundOnScreenSettingsWindow(expectedBinding),
               let point = modalPoint(refreshed),

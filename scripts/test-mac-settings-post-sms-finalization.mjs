@@ -597,7 +597,10 @@ assert.match(helperSource, /VNDetectRectanglesRequest/);
 assert.match(helperSource, /request\.maximumAspectRatio = 1\.0/);
 assert.doesNotMatch(helperSource, /request\.maximumAspectRatio = 1\.35/);
 assert.match(helperSource, /guard !windows\.isEmpty else \{ continue \}/);
-assert.match(helperSource, /axRole\(candidateRoot\) == kAXWindowRole as String/);
+assert.match(helperSource, /private func isSurfaceRole\(/);
+assert.match(helperSource, /role == kAXWindowRole as String \|\| role == "AXDialog" \|\| role == "AXSheet"/);
+assert.match(helperSource, /private func surfaceRoots\(/);
+assert.match(helperSource, /surfaceRoots\(for: appElement, allowedPIDs: allowedPIDs\)/);
 assert.match(helperSource, /if textContainsAny\(directTexts\(element\), passwordMarkers\)/);
 assert.match(helperSource, /private func hasMacPasswordEvidence\(/);
 assert.match(helperSource, /hasMacPasswordEvidence\(passwordText\)/);
@@ -649,15 +652,24 @@ assert.match(helperSource, /private func submitTerms\(/);
 assert.match(helperSource, /private func submitMacPassword\(/);
 assert.match(helperSource, /private func submitLocation\(/);
 assert.match(helperSource, /fixedMacPasswords: Set<String> = \["0000", "000000"\]/);
+assert.match(helperSource, /private func isNotExplicitlyDisabled\(/);
 assert.match(
   helperSource,
-  /if axOwnerPID == visualHost\.processIdentifier,[\s\S]*?surfaceWindowID != visualWindow\.windowID/
+  /private func isEnabled\([\s\S]*?axBool\(element, kAXEnabledAttribute as String\) == true/
 );
+assert.match(
+  helperSource,
+  /private func bindingForSurfaceElements\([\s\S]*?directWindowID = elementWindowID\(surface\)\.flatMap/
+);
+assert.match(helperSource, /resolveOnScreenWindowID\(\n\s+pid: visualOwnerPID,/);
+assert.match(helperSource, /private func onScreenWindowFrame\(/);
+assert.doesNotMatch(helperSource, /surfaceWindowID != visualWindow\.windowID/);
 const hitTestBody = helperSource.slice(
   helperSource.indexOf("private func hitTestMatchesBoundTarget"),
   helperSource.indexOf("private func activateBoundSettingsWindow")
 );
-assert.match(hitTestBody, /if axElementsEqual\(node, target\.window\) \{ return true \}/);
+assert.match(hitTestBody, /if hitPID == target\.binding\.visualOwnerPID/);
+assert.match(hitTestBody, /isTrustedDescendant\(/);
 assert.doesNotMatch(hitTestBody, /isTrustedAppleIDSettingsExtension\(axOwner\)[\s\S]*?return true\s*\n\}/);
 assert.match(helperSource, /private func activateBoundSettingsWindow\(/);
 assert.match(helperSource, /visualHost\.activate\(options: \[\.activateIgnoringOtherApps\]\)/);

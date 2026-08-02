@@ -145,6 +145,7 @@ function providerResponse(body, { status = 200, headers = {}, setCookies = [] } 
   const cases = [
     ["https://lixsms.com/message?code=private", "https://lixsms.com/message?code=private"],
     ["https://lixsms.com/api?code=private", "https://lixsms.com/api?code=private"],
+    ["https://lixsms.com/?view=latest", "https://lixsms.com/?view=latest"],
     ["https://example.test/?code=private", "https://example.test/?code=private"],
   ];
   for (const [apiUrl, expectedUrl] of cases) {

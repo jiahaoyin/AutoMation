@@ -66,7 +66,8 @@ export function validateSmsProviderUrl(value) {
 }
 
 function normalizeLixSmsProviderRequestUrl(url) {
-  if (url.hostname === "lixsms.com" && url.pathname === "/" && url.search) {
+  const code = url.searchParams.get("code");
+  if (url.hostname === "lixsms.com" && url.pathname === "/" && code?.trim()) {
     url.pathname = "/message";
   }
   return url;
