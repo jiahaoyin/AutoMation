@@ -262,7 +262,7 @@ twofa_code_delivery_started
 
 ## 9. Windows 开发与 Mac 验证
 
-Windows 修改、测试、提交、推送；Mac 只验证**已推送的精确 SHA**。真实 Apple 登录、人工 2FA 与 GUI 会话仅在用户明确监督的 Mac 验证中执行。常规 Windows 回归不跑真实登录：
+Windows and Mac are full development hosts. Mac `verify` validates the pushed exact SHA; Mac `implementation` has full writer-lock authority for source, tests, macOS optimization, ruyiPage browser work, native GUI, runtime, network, credentials required by the task, and Git commit/push when required. Returned artifacts remain sanitized.
 
 ~~~powershell
 npm.cmd run -s test:account-browser-flow
@@ -273,10 +273,16 @@ npm.cmd run -s test:release-copy-paths
 git diff --check
 ~~~
 
-Mac 同步、只读 sandbox、受监督 GUI、回传证据与重测规则见 [Windows → Mac 调度手册](WINDOWS_MAC_CODEX.md) 和 [Mac 交接](MAC_CODEX_HANDOFF.md)。
+Mac 同步、双模式 sandbox、受监督 GUI、实现回传与重测规则见 [Windows → Mac 调度手册](WINDOWS_MAC_CODEX.md) 和 [Mac 交接](MAC_CODEX_HANDOFF.md)。
 
 ## 10. 维护规则
 
 - 先改拥有该状态的最小模块，再加定点测试；不要为了一个状态缺口换浏览器框架。
 - 每次新增/改名固定状态，都要同步 flow-audit.jsonl、report.json sanitization、README/本手册及静态文档合同测试。
 - 当前执行顺序是 Developer-first。旧的“Account 完成后再跑 Developer”仅是历史计划，不是可运行行为。
+# Current Mac execution policy (2026-08-02)
+
+Mac supports two orchestrated modes: `verify` (default, read-only exact-SHA validation) and
+`implementation` (full-permission exclusive writer for all macOS-specific implementation, runtime, GUI, network, and ruyiPage annotation work).
+Implementation results are returned as sanitized diff/untracked/annotation artifacts; the full project-development contract remains active.
+separate and verification-only.

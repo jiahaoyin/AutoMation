@@ -42,6 +42,8 @@
     "mac:codex": "node scripts/mac-codex-orchestrator.mjs",
     "test:mac-codex": "node scripts/test-mac-codex-orchestrator.mjs && node scripts/test-supervised-browser-broker.mjs",
     "test:firefox-profile": "node scripts/test-firefox-profile-mode.mjs",
-    "test:release-copy-paths": "node scripts/test-release-copy-paths.mjs"
+    "test:release-copy-paths": "node scripts/test-release-copy-paths.mjs",
+    "test:browser-annotations": "node scripts/test-browser-annotation-sanitizer.mjs && node scripts/test-browser-annotation-writer.mjs",
+    "test:mac-codex-artifacts": "node scripts/test-mac-codex-artifact-sanitizer.mjs"
   }
 }

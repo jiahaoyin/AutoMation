@@ -87,7 +87,7 @@
       }
     },
     "executionMode": {
-      "enum": ["noninteractive", "supervised_gui"]
+      "enum": ["noninteractive", "supervised_gui", "mac_implementation"]
     },
     "supervisedGuiStatus": {
       "enum": ["not_requested", "passed", "failed", "skipped"]
