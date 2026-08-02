@@ -705,7 +705,22 @@ private func bindingForSurfaceElements(
         return nil
     }
     let visualOwnerPID = visualHost.processIdentifier
-    let directWindowID = elementWindowID(surface).flatMap { candidateID in
+    let elementWindowIDs = elements.compactMap(elementWindowID)
+    guard elementWindowIDs.count != elements.count || Set(elementWindowIDs).count == 1 else {
+        return nil
+    }
+    let controlsWindowID: CGWindowID? = {
+        guard !elementWindowIDs.isEmpty else { return nil }
+        let uniqueWindowIDs = Set(elementWindowIDs)
+        return uniqueWindowIDs.count == 1 ? uniqueWindowIDs.first : nil
+    }()
+    let directWindowID = controlsWindowID.flatMap { candidateID in
+        onScreenWindowFrame(
+            pid: visualOwnerPID,
+            windowID: candidateID,
+            near: elements.compactMap(axFrame).first ?? surfaceFrame
+        ) == nil ? nil : candidateID
+    } ?? elementWindowID(surface).flatMap { candidateID in
         onScreenWindowFrame(
             pid: visualOwnerPID,
             windowID: candidateID,
@@ -721,9 +736,18 @@ private func bindingForSurfaceElements(
               pid: visualOwnerPID,
               windowID: windowID,
               near: surfaceFrame
-          ),
-          frame(surfaceFrame, isWithin: visualWindowFrame, tolerance: 4) else {
+          ) else {
         return nil
+    }
+    if !frame(surfaceFrame, isWithin: visualWindowFrame, tolerance: 4) {
+        // A broad AXWindow can contain an independently composited modal. Once
+        // every target control resolves to the same trusted CGWindow, accepting
+        // the inverse containment binds the modal (for example 608) instead of
+        // its host window (for example 446).
+        guard !elements.isEmpty,
+              frame(visualWindowFrame, isWithin: surfaceFrame, tolerance: 4) else {
+            return nil
+        }
     }
     guard elements.allSatisfy({ element in
         guard isDescendant(element, of: surface),

@@ -673,8 +673,13 @@ assert.match(
 );
 assert.match(
   helperSource,
-  /private func bindingForSurfaceElements\([\s\S]*?directWindowID = elementWindowID\(surface\)\.flatMap/
+  /private func bindingForSurfaceElements\([\s\S]*?elementWindowIDs = elements\.compactMap\(elementWindowID\)[\s\S]*?controlsWindowID[\s\S]*?directWindowID = controlsWindowID\.flatMap/
 );
+assert.match(helperSource, /let elementWindowIDs = elements\.compactMap\(elementWindowID\)/);
+assert.match(helperSource, /let controlsWindowID: CGWindowID\?/);
+assert.match(helperSource, /directWindowID = controlsWindowID\.flatMap[\s\S]*?\?\? elementWindowID\(surface\)\.flatMap/);
+assert.match(helperSource, /if !frame\(surfaceFrame, isWithin: visualWindowFrame, tolerance: 4\)/);
+assert.match(helperSource, /frame\(visualWindowFrame, isWithin: surfaceFrame, tolerance: 4\)/);
 assert.match(helperSource, /resolveOnScreenWindowID\(\r?\n\s+pid: visualOwnerPID,/);
 assert.match(helperSource, /private func onScreenWindowFrame\(/);
 assert.doesNotMatch(helperSource, /surfaceWindowID != visualWindow\.windowID/);
