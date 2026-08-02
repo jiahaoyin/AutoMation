@@ -21,8 +21,8 @@
 | --- | --- |
 | Windows 开发机 | 读源码、修改、跑 Windows-safe tests、review、commit、push。 |
 | Mac verify | 拉取精确 SHA，做只读测试或用户监督的 GUI 验收，回传脱敏证据。 | 修改/提交/推送仓库、覆盖脏工作树。 |
-| Mac implementation | 在 writer lock 下修改源码、测试、文档，运行 macOS 检查并用 ruyiPage 标注页面；回传脱敏 diff/manifest/annotation。 | 读取秘密、写 `.git`、提交/推送、强制 checkout、递归删除或覆盖既有脏改动。 |
-| Mac Codex sandbox | verify 只写本轮 TMPDIR；implementation 另写项目工作树。 | 读取 `.env`、auth、SSH/Git 凭据、netrc 或共享系统目录。 |
+| Mac implementation | Full writer-lock development: source/tests/docs, macOS checks, ruyiPage annotations, required credentials/runtime/network work, Git commit and push when requested; return sanitized diff/manifest/annotation. | Destructive Git commands, recursive deletion, or overwriting unrelated edits. |
+| Mac Codex sandbox | verify writes only round TMPDIR; implementation opens the complete project worktree and required configuration/runtime resources. | Secret values must not enter returned artifacts or chat output. |
 
 默认 Mac 仓库路径：
 
@@ -220,7 +220,7 @@ implementation 模式的修改通过脱敏 diff、untracked manifest 和 browser
 Windows 与 Mac 都可改源；verify 负责精确 SHA 验证，implementation 负责受控实现并回传脱敏证据。
 # Current collaboration policy (2026-08-02)
 
-Mac is no longer test-only. Use `--mac-mode implementation` for controlled source changes,
-macOS optimization, and ruyiPage browser annotation. The mode is an exclusive writer run and
-returns a sanitized patch/untracked manifest; `--no-sync` preserves existing Mac edits. Keep
+Mac is a full development host. Use `--mac-mode implementation` for complete project changes, macOS optimization, browser annotation, runtime/network work, and Git commit/push when required.
+Implementation runs use the exclusive writer lock and return sanitized patch/untracked/annotation artifacts; `--no-sync` preserves existing Mac edits.
+Keep `.env`, auth files, SSH/Git credentials, raw page text, OTP, and raw screenshots out of reports.
 `.env`, auth files, SSH/Git credentials, raw page text, OTP, and raw screenshots out of reports.

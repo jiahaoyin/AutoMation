@@ -116,18 +116,15 @@ export function createMacVerificationPermissionProfile(runTmpDir, repository) {
   return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}/.env" = "deny", "~/.codex/auth.json" = "deny", "~/.ssh" = "deny", "~/.git-credentials" = "deny", "~/.netrc" = "deny", "~/.config/gh" = "deny" } }`;
 }
 
-// Implementation mode grants the complete project worktree for normal macOS
-// development. Repository control, credentials, and the bundled runtime stay
-// outside that writable boundary.
-// Credential stores remain explicitly denied because Mac Codex may edit code
-// and browser annotation fixtures without gaining access to account secrets.
+// Implementation mode is the full project development profile. Artifact
+// sanitizers still enforce that secrets and personal data do not leave the Mac.
 export function createMacImplementationPermissionProfile(runTmpDir, repository) {
   const writable = String(runTmpDir ?? "");
   const repo = String(repository ?? "");
   for (const value of [writable, repo]) {
     assertMacPermissionPath(value, "Mac implementation permission path is invalid");
   }
-  return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}" = "write", "${repo}/.runtime" = "deny", "${repo}/.git" = "deny", "${repo}/.env" = "deny", "${repo}/.env.*" = "deny", "~/.codex/auth.json" = "deny", "~/.ssh" = "deny", "~/.git-credentials" = "deny", "~/.netrc" = "deny", "~/.config/gh" = "deny" }, network = { enabled = true, domains = {} } }`;
+  return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}" = "write" }, network = { enabled = true, domains = {} } }`;
 }
 
 function assertMacPermissionPath(value, message) {

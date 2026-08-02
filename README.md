@@ -215,6 +215,7 @@ APPLE_AUTOMATION_SMS_RECONFIGURE=0 # 1=重新录入号码与服务地址；0=沿
 - 发布分发包使用 **npm run package**；其他 Mac 使用 **./install.sh && ./run.sh**。
 # Mac collaboration note (2026-08-02)
 
-Mac is supported for controlled implementation and browser annotation through
-`npm.cmd run -s mac:codex -- --mac-mode implementation ...`; the default mode remains read-only
-verification for compatibility.
+Mac is a full development host when `--mac-mode implementation` is selected: it may modify
+the complete project worktree, use task-required configuration/runtime/Git/browser/network
+resources, and commit or push when the task requires it. `verify` remains the default exact-SHA
+read-only validation mode.

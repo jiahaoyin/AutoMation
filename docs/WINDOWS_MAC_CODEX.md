@@ -1,11 +1,12 @@
 # Current policy (2026-08-02)
 
-Windows and Mac are both development hosts. `verify` is the default exact-SHA validation mode;
-`implementation` is the controlled Mac writer mode for macOS-specific code, tests, optimization,
-and detailed ruyiPage browser annotations. Implementation runs take the exclusive writer lock,
-default to `--no-sync`, preserve existing Mac edits, deny secrets and `.git`, and return a
-sanitized `git-diff.patch`, `git-untracked.txt`, and `browser-annotations.jsonl`. Browser actions
-remain ruyiPage-only; Playwright, Puppeteer, Selenium, destructive Git commands, and automatic commit/push are not allowed.
+Windows and Mac are both full development hosts. `verify` is the default exact-SHA validation
+mode; `implementation` is the full-permission Mac development mode for macOS code, tests,
+optimization, native GUI, runtime, network work, and detailed ruyiPage annotations. It takes
+the exclusive writer lock, defaults to `--no-sync`, preserves existing Mac edits, opens the
+complete worktree including `.git`, `.runtime`, `.env`, and task-required local credentials,
+and returns sanitized `git-diff.patch`, `git-untracked.txt`, and `browser-annotations.jsonl`.
+Browser actions remain ruyiPage-only; destructive Git commands remain forbidden.
 
 # Windows 调度 Mac 手册
 
@@ -17,8 +18,8 @@ Windows 与 Mac 都是开发主机；verify 模式负责精确 SHA 验证，impl
 | --- | --- | --- |
 | Windows 开发机 | 修改源码、运行 Windows-safe tests、review、commit、push、发起 Mac 调度。 | 以 Windows 结果替代 macOS TCC / Swift / GUI 验收。 |
 | Mac verify | 拉取精确 SHA、运行非交互检查、在明确监督下执行 GUI 验收、回传证据。 | 修改仓库、提交/推送、覆盖脏工作树。 |
-| Mac implementation | 修改源码/测试/文档、macOS 优化、使用 ruyiPage 做页面标注并回传脱敏产物。 | 读取秘密、写 `.git`、提交/推送、强制 checkout、递归删除或覆盖既有脏改动。 |
-| Mac Codex sandbox | verify 只写本轮 TMPDIR；implementation 另写项目工作树。 | 读取 `.env`、auth、SSH/Git 凭据、netrc 或共享系统目录。 |
+| Mac implementation | Full project development, macOS optimization, ruyiPage browser annotation, required credentials/runtime/network work, Git commit and push when requested. | Destructive Git commands, recursive deletion, and overwriting unrelated edits. |
+| Mac Codex sandbox | verify writes only the round TMPDIR; implementation writes the complete project worktree and required runtime/configuration resources. | Secret values may not be copied into reports, logs, annotations, patches, or chat output. |
 
 浏览器一律 ruyiPage-only。不要添加 Playwright、Puppeteer、Selenium、AppleScript browser control 或 Node browser driver。
 
@@ -89,7 +90,7 @@ npm.cmd run -s mac:codex -- --no-sync --task "只读审查当前提交的 Develo
 
 --no-sync 的 reader lock 不得与同步 writer 并发。出现 Mac repository is busy 时，等待现有任务结束后重试。
 
-verify 模式的权限 profile 继承 read-only，唯一可写位置是本轮 TMPDIR；implementation 模式额外允许项目源码/测试/文档写入，仍拒绝秘密与 `.git`：
+`verify` inherits the read-only profile and only writes the round TMPDIR; `implementation` opens the complete worktree, including `.git`, `.runtime`, `.env`, and task-required credentials, with network enabled.
 
 ~~~text
 /Users/admin/.codex-orchestrator/runs/<runId>/mac/round-XX/tmp
@@ -101,7 +102,7 @@ verify 模式的权限 profile 继承 read-only，唯一可写位置是本轮 TM
 /usr/bin/xcrun swiftc -module-cache-path "$TMPDIR/apple-automation-swift-module-cache" -typecheck <file>
 ~~~
 
-implementation 可用 ruyiPage 接管**已登录**的 Firefox 页面完成注释；不读取 `.env`，也不跑登录或
+`implementation` may use ruyiPage for the task-required browser flow, including credential/2FA steps and page annotations. Sanitizers still remove secrets, personal data, raw page text, screenshots, and raw AX/OCR from returned artifacts.
 2FA。元素确认后只能写入脱敏元数据：
 
 ~~~zsh
@@ -111,35 +112,25 @@ node scripts/write-browser-annotation.mjs '{"phase":"developer","selectorKind":"
 该命令固定写到 `$APPLE_AUTOMATION_REPORT_ROOT/browser-annotations.jsonl`。收集器会再次校验并脱敏；
 URL、页面文本、截图、账户字段和原始 AX/OCR 均会被拒绝。
 
-## 5. 受监督 GUI 验收
+## 5. Supervised GUI and full Mac implementation
 
-真实 Apple 登录、2FA 或需要图形界面确认的测试默认不执行。只有用户明确正在监督该 Mac 会话时，才使用同步独占模式：
+Real Apple login, 2FA, or interactive GUI confirmation may use the synchronized supervised
+verify bridge with `--allow-supervised-gui`. Mac implementation does not downgrade to that
+helper contract: `--mac-mode implementation` keeps full project, browser, runtime, native GUI,
+network, credential, and Git authority; `--allow-supervised-gui` is accepted as an explicit
+operator signal without replacing the implementation contract.
 
-~~~powershell
-npm.cmd run -s mac:codex -- --task-file .mac-supervised-task.txt --round 2 --allow-supervised-gui
-~~~
+```powershell
+npm.cmd run -s mac:codex -- --mac-mode implementation --task-file .mac-implementation-task.txt
+```
 
-该开关只适用于受监督的 `verify`，不放宽：
+Every browser action remains ruyiPage-only. Reports, screenshots, 2FA audit files, browser
+profiles, patches, annotations, and chat output must redact secrets and personal data.
+The fixed production helper command remains:
 
-- Mac verify 仓库 read-only；
-- TMPDIR 唯一可写边界；
-- .env 与凭据脱敏；
-- 浏览器 ruyiPage-only；
-- 精确 SHA 与 clean worktree；
-- 报告、截图、2FA audit、Firefox profile 必须位于本轮 TMPDIR。
-
-生产 GUI 命令固定为：
-
-~~~text
+```text
 ./run.sh --skip-mac
-~~~
-
-Mac Codex 不能通过 open、launchctl、AppleScript 或自定义 GUI 启动器绕开受控 bridge。bridge 只处理带随机 nonce 的一次性 trigger，并把原始生产输出限制为固定阶段/失败类别；任何密钥、OTP、原始页面文本和完整截图都不进入 events、final 或固定证据清单。
-
-兼容性记录保留：真实 Apple ID 的手动验收仍只在受监督 verify 中进行；profile 继续以
-`sandbox_mode = "read-only"`、`umask 077`、30 秒与 30 天的既有时限约束为准。
-每轮仍产生 `codex-exit.txt`、`git-before.txt` 和 `git-after.txt`；手工 `test:2fa-allow`
-仍仅允许在受监督 verify 中执行。
+```
 
 ## 6. Developer-first 验收合同
 

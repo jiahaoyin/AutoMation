@@ -573,19 +573,16 @@ for (const contract of [projectInstructions, operationsGuide]) {
   assert.match(contract, /final\.json/);
   assert.match(contract, /events\.jsonl/);
 }
-assert.match(projectInstructions, /Windows and Mac are both development hosts/);
-assert.match(projectInstructions, /controlled implementation host/);
+assert.match(projectInstructions, /Windows and Mac are both full development hosts/);
+assert.match(projectInstructions, /full-permission implementation host/);
+assert.match(projectInstructions, /including `\.git`, `\.runtime`, `\.env`/);
 assert.match(projectInstructions, /fast-forward/);
 assert.match(projectInstructions, /-module-cache-path/);
-assert.match(operationsGuide, /codex-exit\.txt/);
-assert.match(operationsGuide, /git-before\.txt/);
-assert.match(operationsGuide, /git-after\.txt/);
-assert.match(operationsGuide, /test:2fa-allow/);
-assert.match(operationsGuide, /真实 Apple ID/);
-assert.match(operationsGuide, /-module-cache-path/);
-assert.match(operationsGuide, /sandbox_mode = "read-only"/);
-assert.match(operationsGuide, /umask 077/);
-assert.match(operationsGuide, /30 天/);
+assert.match(operationsGuide, /full-permission Mac development mode/);
+assert.match(operationsGuide, /complete worktree/);
+assert.match(operationsGuide, /`--allow-supervised-gui`/);
+assert.match(operationsGuide, /Git authority/);
+assert.match(operationsGuide, /Browser actions remain ruyiPage-only/);
 
 function removeTreeOneFileAtATime(directory) {
   if (!fs.existsSync(directory)) return;
@@ -1689,17 +1686,17 @@ assert.throws(
   () => parseArgs(["--task", "x", "--mac-mode", "unknown"]),
   /invalid Mac mode/i
 );
-assert.throws(
-  () =>
-    parseArgs([
-      "--task",
-      "x",
-      "--mac-mode",
-      "implementation",
-      "--allow-supervised-gui",
-    ]),
-  /requires --mac-mode verify/i
-);
+const supervisedImplementationArgs = parseArgs([
+  "--task",
+  "Mac implementation with explicit GUI authorization",
+  "--mac-mode",
+  "implementation",
+  "--allow-supervised-gui",
+]);
+assert.equal(supervisedImplementationArgs.macMode, "implementation");
+assert.equal(supervisedImplementationArgs.supervisedGui, true);
+assert.equal(supervisedImplementationArgs.sync, false);
+
 const settingsSmokeArgs = parseArgs([
   "--task",
   "settings smoke acceptance",
@@ -1742,28 +1739,26 @@ assert.throws(
   /timeout of at least 120000ms/i
 );
 
-const prompt = buildAgentPrompt({ task: "检查中文任务与登录流程" });
+const prompt = buildAgentPrompt({ task: "Inspect login and account flow" });
 for (const requiredText of [
-  "检查中文任务与登录流程",
+  "Inspect login and account flow",
   "ruyiPage",
   ".env",
   "auth.json",
   "API Key",
   "GitHub PAT",
-  "不读取",
-  "不修改",
-  "不提交",
-  "不推送",
-  "非交互",
-  "2FA",
-  "退出码",
-  "JSON Schema",
+  "Do not read",
+  "Do not modify",
+  "commit, or push",
   "noninteractive",
+  "2FA",
+  "exit code",
+  "JSON Schema",
 ]) {
   assert.match(prompt, new RegExp(requiredText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 }
-assert.match(prompt, /不执行人工 2FA/);
-assert.doesNotMatch(prompt, /用户明确监督并授权 GUI 验收/);
+assert.match(prompt, /Do not run manual 2FA/);
+assert.doesNotMatch(prompt, /trusted helper command/);
 
 const supervisedPrompt = buildAgentPrompt({
   task: "执行真实 Apple Account 登录验收",
@@ -1774,8 +1769,8 @@ for (const requiredText of [
   "Execute exactly one trusted helper command",
   SUPERVISED_HELPER_COMMAND,
   SUPERVISED_SUCCESS_MARKER,
-  "生产脚本在进程内部加载凭据",
-  "完整 Apple ID",
+  "Production helpers may load credentials internally",
+  "full Apple IDs",
   "raw AX/OCR",
   "supervised_gui",
   "Do not run open, launchctl, AppleScript, run.sh",
@@ -1848,8 +1843,10 @@ const implementationPrompt = buildAgentPrompt({
   macMode: "implementation",
 });
 assert.match(implementationPrompt, /mac_implementation/);
-assert.match(implementationPrompt, /允许在项目仓库内修改/);
+assert.match(implementationPrompt, /full-permission Mac implementation run/);
+assert.match(implementationPrompt, /Full project development, Git operations, browser\/native GUI/);
 assert.match(implementationPrompt, /ruyiPage/);
+
 const implementationOptions = {
   ...remoteOptions,
   sync: false,
@@ -1861,9 +1858,9 @@ const implementationProfile = createMacImplementationPermissionProfile(
 );
 assert.match(implementationProfile, /:read-only/);
 assert.match(implementationProfile, /Apple-AutoMation" = "write"/);
-assert.match(implementationProfile, /Apple-AutoMation\/\.env" = "deny"/);
-assert.match(implementationProfile, /Apple-AutoMation\/\.git" = "deny"/);
-assert.match(implementationProfile, /Apple-AutoMation\/\.runtime" = "deny"/);
+assert.doesNotMatch(implementationProfile, /Apple-AutoMation\/\.env" = "deny"/);
+assert.doesNotMatch(implementationProfile, /Apple-AutoMation\/\.git" = "deny"/);
+assert.doesNotMatch(implementationProfile, /Apple-AutoMation\/\.runtime" = "deny"/);
 assert.match(implementationProfile, /network = \{ enabled = true, domains = \{\} \}/);
 const implementationScript = buildRemoteScript(implementationOptions);
 assert.match(implementationScript, /LOCK_MODE='writer'/);
@@ -1884,6 +1881,20 @@ assert.doesNotMatch(
 );
 assert.match(implementationScript, /path resolves through a symlink/);
 assert.doesNotMatch(implementationScript, /cp -p .*browser-annotations\.jsonl/);
+const supervisedImplementationPrompt = buildAgentPrompt({
+  task: "Implement with explicit GUI authorization",
+  macMode: "implementation",
+  supervisedGui: true,
+});
+assert.match(supervisedImplementationPrompt, /mac_implementation/);
+assert.match(supervisedImplementationPrompt, /full-permission Mac implementation run/);
+assert.doesNotMatch(supervisedImplementationPrompt, /Execute exactly one trusted helper command/);
+const supervisedImplementationScript = buildRemoteScript({
+  ...implementationOptions,
+  supervisedGui: true,
+});
+assert.match(supervisedImplementationScript, /SUPERVISED_GUI='0'/);
+assert.doesNotMatch(supervisedImplementationScript, /terminal-bridge\.command/);
 const implementationScp = buildScpArgs({
   sshAlias: "mac-codex",
   remoteRoundDir: implementationOptions.remoteRoundDir,
