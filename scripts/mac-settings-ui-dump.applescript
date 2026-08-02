@@ -1,4 +1,4 @@
--- 诊断：打印 System Settings 登录页 AX 树（调试填表失败时用）
+-- 诊断：输出 System Settings 登录页的脱敏 AX 结构摘要（调试填表失败时用）
 -- v1.0.26：禁止 entire contents（含 repeat with e in entire contents，macOS 会隐式 item i 索引导致 -1700）
 -- 改用 BFS + UI element ci of parent 逐层遍历
 -- 用法: osascript scripts/mac-settings-ui-dump.applescript
@@ -15,7 +15,7 @@ tell application "System Events"
 			delay 0.25
 			set report to report & "windows=" & (count of windows) & linefeed
 		on error errMsg number errNum
-			return "AUTOMATION_DENIED:" & errNum & " " & errMsg & linefeed & "→ 请在 系统设置 → 隐私与安全性 → 自动化 中勾选 Terminal/Cursor 控制「系统设置」"
+			return "AUTOMATION_DENIED:" & errNum & linefeed
 		end try
 
 		if (count of windows) is 0 then
@@ -49,12 +49,7 @@ tell application "System Events"
 				set report to report & "WARNING: class empty — Accessibility 可能已开，但 Automation 未授予 Terminal→系统设置" & linefeed
 			end if
 		on error errMsg number errNum
-			return report & "READ_DENIED:" & errNum & " " & errMsg & linefeed & "→ 打开 隐私与安全性 → 自动化，勾选控制「系统设置」"
-		end try
-		try
-			set report to report & "window1.name=" & (name of targetW) & linefeed
-		on error errMsg number errNum
-			set report to report & "window1.name ERR:" & errNum & linefeed
+			return report & "READ_DENIED:" & errNum & linefeed
 		end try
 
 		set report to report & "login window found" & linefeed
@@ -74,32 +69,13 @@ tell application "System Events"
 					set childEl to UI element ci of parentRef
 					set n to n + 1
 					set c to ""
-					set roleDesc to ""
-					set desc to ""
 					try
 						set c to class of childEl as text
 					on error errMsg number errNum
 						set c to "ERR:" & errNum
 					end try
-					try
-						set roleDesc to value of attribute "AXRoleDescription" of childEl
-					end try
-					try
-						set desc to description of childEl
-					end try
-					if desc is "" then
-						try
-							set desc to name of childEl
-						end try
-					end if
-					if n is less than or equal to 30 then
-						set report to report & "#" & n & " class=" & c & " role=" & roleDesc & " desc=" & desc & linefeed
-					end if
 					if c is in {"text field", "text area", "combo box"} then
 						set nDeep to nDeep + 1
-						if nDeep is less than or equal to 10 then
-							set report to report & "  [input deep#" & nDeep & "] " & desc & linefeed
-						end if
 					end if
 					if c is in {"group", "scroll area", "split group", "tab group", "splitter group"} then
 						set end of queue to childEl
@@ -113,16 +89,6 @@ tell application "System Events"
 		try
 			repeat with tf in every text field of targetW
 				set nShallow to nShallow + 1
-				set shallowDesc to ""
-				try
-					set shallowDesc to description of tf
-				end try
-				if shallowDesc is "" then
-					try
-						set shallowDesc to name of tf
-					end try
-				end if
-				set report to report & "shallow#" & nShallow & ": " & shallowDesc & linefeed
 			end repeat
 		on error errMsg number errNum
 			set report to report & "shallow ERR:" & errNum & linefeed

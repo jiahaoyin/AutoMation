@@ -11,17 +11,36 @@ import { checkEnvironment, ensureEnvironment } from "./lib/env-setup.js";
 const checkOnly = process.argv.includes("--check-only");
 const quiet = process.argv.includes("--quiet");
 const skipFirefox = process.argv.includes("--skip-firefox");
+const skipRuyiPage = process.argv.includes("--skip-ruyipage");
 const skipAccessibility = process.argv.includes("--skip-accessibility");
 const skipAutomation = process.argv.includes("--skip-automation");
+const installRuyiPage = process.argv.includes("--install-ruyipage");
 
 async function main() {
   if (checkOnly) {
-    const result = await checkEnvironment({ quiet });
+    const result = await checkEnvironment({
+      quiet,
+      skipFirefox,
+      skipRuyiPage,
+      skipAutomation,
+    });
     process.exit(result.ok ? 0 : 1);
   }
 
-  await ensureEnvironment({ quiet, skipFirefox, skipAccessibility, skipAutomation });
-  const result = await checkEnvironment({ quiet });
+  await ensureEnvironment({
+    quiet,
+    skipFirefox,
+    skipRuyiPage,
+    skipAccessibility,
+    skipAutomation,
+    installRuyiPage,
+  });
+  const result = await checkEnvironment({
+    quiet,
+    skipFirefox,
+    skipRuyiPage,
+    skipAutomation,
+  });
   if (!result.ok && result.issues.some((i) => !i.includes(".env"))) {
     console.warn("警告: 仍有未解决项:", result.issues.join("; "));
   }

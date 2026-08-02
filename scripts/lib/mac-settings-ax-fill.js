@@ -8,12 +8,53 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sleep } from "./prompt.js";
+import { resolveNativeHelperPath } from "./native-helper-path.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SWIFT_SRC = path.resolve(__dirname, "../swift/mac-settings-ax-fill.swift");
-const AX_BIN = path.resolve(__dirname, "../bin/mac-settings-ax-fill");
+const AX_BIN = resolveNativeHelperPath(
+  path.resolve(__dirname, "../bin"),
+  "mac-settings-ax-fill"
+);
+const SMS_RUNTIME_SECRET_ENV_KEYS = [
+  "APPLE_AUTOMATION_SMS_PHONE",
+  "APPLE_AUTOMATION_SMS_API_URL",
+  "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+];
+const AX_FILL_PHASES = new Set(["dump", "email", "continue", "password", "state"]);
+const AX_FILL_REASONS = new Set([
+  "ok",
+  "target_unavailable_before_write",
+  "target_focus_unavailable",
+  "target_changed_before_write",
+  "ax_value_unconfirmed",
+  "keyboard_fallback_unsafe",
+  "keyboard_target_changed",
+  "keyboard_unconfirmed",
+  "login_state_unknown",
+  "login_window_not_found",
+  "exact_username_field_not_found",
+  "exact_password_field_not_found",
+  "enabled_login_button_not_found",
+  "enabled_login_button_not_found_after_password",
+  "missing_email_value",
+  "missing_password_value",
+  "settings_process_not_found",
+  "helper_invalid_output",
+  "helper_exit",
+  "helper_unavailable",
+  "compile_failed",
+]);
+const AX_FILL_LOGIN_STATES = new Set(["email", "password", "unknown"]);
+const AX_FILL_INPUT_ROUTES = new Set(["ax_value", "keyboard", "existing_value", "unknown"]);
+const MAX_AX_TEXT_FIELD_COUNT = 32;
+
+export function sanitizedAxFillChildEnv(env = process.env) {
+  const childEnv = { ...env };
+  for (const key of SMS_RUNTIME_SECRET_ENV_KEYS) delete childEnv[key];
+  return childEnv;
+}
 
 /** 编译 Swift helper（install.sh 也会调用） */
 export function compileAxFillHelper(options = {}) {
@@ -25,11 +66,11 @@ export function compileAxFillHelper(options = {}) {
   const r = spawnSync(
     "swiftc",
     ["-O", "-o", AX_BIN, SWIFT_SRC, "-framework", "ApplicationServices", "-framework", "AppKit"],
-    { encoding: "utf-8" }
+    { encoding: "utf-8", env: sanitizedAxFillChildEnv() }
   );
   if (r.status !== 0) {
-    if (!quiet) console.warn("[Mac 设置] Swift AX helper 编译失败:", r.stderr?.trim() || r.error);
-    return { ok: false, reason: r.stderr?.trim() || String(r.error) };
+    if (!quiet) console.warn("[Mac 设置] Swift AX helper 编译失败（详情已隐藏）");
+    return { ok: false, reason: "compile_failed" };
   }
   try {
     fs.chmodSync(AX_BIN, 0o755);
@@ -48,93 +89,198 @@ export function isAxFillAvailable() {
   return process.platform === "darwin" && fs.existsSync(AX_BIN) && fs.statSync(AX_BIN).isFile();
 }
 
+function emitSafeAxHelperProgress(stderr, verbose) {
+  if (verbose === false || typeof stderr !== "string") return;
+  for (const line of stderr.split("\n")) {
+    const match = /^\[step\s+(\d+)\]/.exec(line.trim());
+    if (match) console.log("[Mac 设置] Swift AX step " + match[1] + " complete");
+  }
+}
+
+function safeAxFillPhase(value, fallback = "state") {
+  return AX_FILL_PHASES.has(value) ? value : fallback;
+}
+
+function safeAxFillReason(value, fallback = "unknown") {
+  if (typeof value !== "string") return fallback;
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return AX_FILL_REASONS.has(normalized) ? normalized : fallback;
+}
+
+function safeAxFillLoginState(value) {
+  return AX_FILL_LOGIN_STATES.has(value) ? value : "unknown";
+}
+
+function safeAxFillInputRoute(value) {
+  return AX_FILL_INPUT_ROUTES.has(value) ? value : "unknown";
+}
+
+function safeAxFillTextFieldCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_AX_TEXT_FIELD_COUNT
+    ? value
+    : null;
+}
+
+export function normalizeAxFillResult(stdout, phase, options = {}) {
+  const normalizedPhase = safeAxFillPhase(phase);
+  const fallbackReason = options.reason ?? "helper_invalid_output";
+  try {
+    const parsed = JSON.parse(String(stdout ?? "").trim());
+    const ok = parsed?.ok === true;
+    return {
+      ok,
+      route: "swift_ax",
+      phase: safeAxFillPhase(parsed?.phase, normalizedPhase),
+      reason: ok ? "ok" : safeAxFillReason(parsed?.message),
+      loginState: safeAxFillLoginState(parsed?.loginState),
+      inputRoute: safeAxFillInputRoute(parsed?.inputRoute),
+      textFieldCount: safeAxFillTextFieldCount(parsed?.textFieldCount),
+    };
+  } catch {
+    return {
+      ok: false,
+      route: "swift_ax",
+      phase: normalizedPhase,
+      reason: safeAxFillReason(fallbackReason, "helper_invalid_output"),
+      loginState: "unknown",
+      inputRoute: "unknown",
+      textFieldCount: null,
+    };
+  }
+}
+
+function emitAxFillStatus(onStatus, status) {
+  if (typeof onStatus !== "function") return;
+  try {
+    onStatus({
+      route: "swift_ax",
+      phase: safeAxFillPhase(status?.phase),
+      outcome:
+        status?.outcome === "started" ||
+        status?.outcome === "succeeded" ||
+        status?.outcome === "fallback"
+          ? status.outcome
+          : "failed",
+      reason: safeAxFillReason(status?.reason, "unknown"),
+      loginState: safeAxFillLoginState(status?.loginState),
+      inputRoute: safeAxFillInputRoute(status?.inputRoute),
+      textFieldCount: safeAxFillTextFieldCount(status?.textFieldCount),
+    });
+  } catch {
+    /* Observability must not change the login result. */
+  }
+}
+
+function createAxFillError(result) {
+  const error = new Error("MAC_SETTINGS_AX_FILL_FAILED");
+  error.code = "MAC_SETTINGS_AX_FILL_FAILED";
+  error.macSettingsStatus = { ...result, outcome: "failed" };
+  return error;
+}
+
 /**
  * @param {string} phase email | continue | password | dump | all
  * @param {object} [opts]
- * @param {string} [opts.value]
  * @param {Record<string,string>} [opts.env]
  * @param {boolean} [opts.verbose]
+ * @param {(status: object) => void} [opts.onStatus]
  */
 export async function runAxFill(phase, opts = {}) {
+  const normalizedPhase = safeAxFillPhase(phase);
+  emitAxFillStatus(opts.onStatus, { phase: normalizedPhase, outcome: "started", reason: "ok" });
   if (!isAxFillAvailable()) {
     const built = compileAxFillHelper({ quiet: true });
     if (!built.ok) {
-      throw new Error(`Swift AX helper unavailable: ${built.reason}`);
+      const unavailable = {
+        ok: false,
+        route: "swift_ax",
+        phase: normalizedPhase,
+        reason: built.reason === "compile_failed" ? "compile_failed" : "helper_unavailable",
+        loginState: "unknown",
+        inputRoute: "unknown",
+        textFieldCount: null,
+      };
+      emitAxFillStatus(opts.onStatus, { ...unavailable, outcome: "failed" });
+      return unavailable;
     }
   }
 
   const args = ["--phase", phase];
-  if (opts.value) args.push("--value", opts.value);
-
-  const { stdout, stderr } = await execFileAsync(AX_BIN, args, {
-    timeout: 120_000,
-    env: { ...process.env, ...(opts.env ?? {}) },
-    maxBuffer: 2 * 1024 * 1024,
-  });
-
-  if (opts.verbose !== false && stderr?.trim()) {
-    for (const line of stderr.trim().split("\n")) {
-      console.log(`[Mac 设置] ${line}`);
-    }
-  }
-
-  let parsed = { ok: false, message: stdout?.trim() || "empty" };
+  let stdout = "";
+  let stderr = "";
+  let helperExited = false;
   try {
-    parsed = JSON.parse(stdout.trim());
-  } catch {
-    parsed = { ok: false, message: stdout?.trim() || "invalid json" };
+    ({ stdout, stderr } = await execFileAsync(AX_BIN, args, {
+      timeout: 120_000,
+      env: sanitizedAxFillChildEnv({ ...process.env, ...(opts.env ?? {}) }),
+      maxBuffer: 2 * 1024 * 1024,
+    }));
+  } catch (error) {
+    helperExited = true;
+    stdout = typeof error?.stdout === "string" ? error.stdout : "";
+    stderr = typeof error?.stderr === "string" ? error.stderr : "";
   }
-  return { ...parsed, stderr: stderr?.trim() ?? "" };
+  emitSafeAxHelperProgress(stderr, opts.verbose);
+  const result = normalizeAxFillResult(stdout, normalizedPhase, {
+    reason: helperExited ? "helper_exit" : "helper_invalid_output",
+  });
+  emitAxFillStatus(opts.onStatus, { ...result, outcome: result.ok ? "succeeded" : "failed" });
+  return result;
 }
 
 /**
  * 两阶段登录：邮箱 → 继续 → 密码
  * @param {{ appleId: string, password: string }} creds
  */
-export async function fillViaSwiftAx(creds) {
+export async function fillViaSwiftAx(creds, options = {}) {
   console.log("[Mac 设置] 使用 Swift AX API 填表（主路径）…");
 
-  const dump = await runAxFill("dump");
+  const dump = await runAxFill("dump", { onStatus: options.onStatus });
   if (!dump.ok) {
-    throw new Error(`Swift AX 预检失败: ${dump.message}`);
+    throw createAxFillError(dump);
   }
-  console.log(
-    `[Mac 设置] 登录窗口「${dump.windowTitle ?? "?"}」发现 ${dump.textFieldCount ?? 0} 个输入框`
-  );
+  console.log("[Mac 设置] 登录窗口已就绪，发现 " + (dump.textFieldCount ?? 0) + " 个输入框");
 
-  const email = await runAxFill("email", {
-    value: creds.appleId,
-    env: {
-      APPLE_SCRIPT_APPLE_ID: creds.appleId,
-      APPLE_SCRIPT_PASSWORD: creds.password,
-    },
-  });
-  if (!email.ok) {
-    throw new Error(`Swift AX 填邮箱失败: ${email.message}`);
-  }
-  console.log("[Mac 设置] ✓ 邮箱已填入");
+  if (dump.loginState === "email") {
+    const email = await runAxFill("email", {
+      env: {
+        APPLE_SCRIPT_APPLE_ID: creds.appleId,
+      },
+      onStatus: options.onStatus,
+    });
+    if (!email.ok) {
+      throw createAxFillError(email);
+    }
+    console.log("[Mac 设置] ✓ 邮箱已填入");
 
-  await sleep(600);
-  const cont = await runAxFill("continue");
-  if (cont.ok) {
+    const cont = await runAxFill("continue", { onStatus: options.onStatus });
+    if (!cont.ok) {
+      throw createAxFillError(cont);
+    }
     console.log("[Mac 设置] ✓ 已点击「继续」");
-  } else {
-    console.warn("[Mac 设置] 「继续」按钮未找到或未启用，尝试直接填密码…");
+  } else if (dump.loginState !== "password") {
+    throw createAxFillError({
+      ...dump,
+      ok: false,
+      phase: "state",
+      reason: "login_state_unknown",
+    });
   }
 
-  await sleep(2500);
   const pwd = await runAxFill("password", {
-    value: creds.password,
     env: {
-      APPLE_SCRIPT_APPLE_ID: creds.appleId,
       APPLE_SCRIPT_PASSWORD: creds.password,
     },
+    onStatus: options.onStatus,
   });
   if (!pwd.ok) {
-    console.warn(`[Mac 设置] Swift AX 填密码: ${pwd.message}（可能需人工完成密码步）`);
-  } else {
-    console.log("[Mac 设置] ✓ 密码已填入并提交");
+    throw createAxFillError(pwd);
   }
+  console.log("[Mac 设置] ✓ 密码已填入并提交");
 
-  return { emailOk: true, passwordOk: pwd.ok };
+  return { emailOk: true, continueOk: true, passwordOk: true };
 }

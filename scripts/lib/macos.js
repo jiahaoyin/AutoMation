@@ -17,10 +17,13 @@ export const APPLE_ACCOUNT_URL_FALLBACKS = [
   "x-apple.systempreferences:com.apple.AccountSettings.AccountsSettingsExtension",
 ];
 
-export function openAppleAccountSettings() {
+export function openAppleAccountSettings(options = {}) {
   if (process.platform !== "darwin") return false;
   for (const url of APPLE_ACCOUNT_URL_FALLBACKS) {
-    const r = spawnSync("open", [url], { encoding: "utf-8" });
+    const r = spawnSync("open", [url], {
+      encoding: "utf-8",
+      env: options.env ?? process.env,
+    });
     if (r.status === 0) return true;
   }
   return false;
@@ -29,13 +32,14 @@ export function openAppleAccountSettings() {
 /**
  * @returns {{ major: number, minor: number, patch: number, productVersion: string }}
  */
-export function getMacOSVersion() {
+export function getMacOSVersion(options = {}) {
   if (process.platform !== "darwin") {
     return { major: 0, minor: 0, patch: 0, productVersion: "non-darwin" };
   }
   try {
     const productVersion = execSync("sw_vers -productVersion", {
       encoding: "utf-8",
+      env: options.env ?? process.env,
     }).trim();
     const [major, minor = "0", patch = "0"] = productVersion.split(".");
     return {
@@ -55,7 +59,7 @@ export function getMacOSVersion() {
  */
 export function ensureMacOS15(options = {}) {
   const { strict = false } = options;
-  const v = getMacOSVersion();
+  const v = getMacOSVersion({ env: options.env });
 
   if (process.platform !== "darwin") {
     throw new Error("此脚本仅支持 macOS");

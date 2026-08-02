@@ -1,9 +1,9 @@
 #!/usr/bin/env swift
 // mac-settings-ax-fill — 直接 AX API 填 System Settings 登录框
 // 用法:
-//   mac-settings-ax-fill --phase email --value "user@example.com"
+//   mac-settings-ax-fill --phase email
 //   mac-settings-ax-fill --phase continue
-//   mac-settings-ax-fill --phase password --value "secret"
+//   mac-settings-ax-fill --phase password
 //   mac-settings-ax-fill --phase dump
 // JSON → stdout；[step N] → stderr
 
@@ -16,11 +16,35 @@ struct Output: Codable {
     let phase: String
     let message: String
     let textFieldCount: Int?
-    let windowTitle: String?
-    let fieldDescriptions: [String]?
+    let loginState: String?
+    let inputRoute: String?
+
+    init(
+        ok: Bool,
+        phase: String,
+        message: String,
+        textFieldCount: Int?,
+        loginState: String? = nil,
+        inputRoute: String? = nil
+    ) {
+        self.ok = ok
+        self.phase = phase
+        self.message = message
+        self.textFieldCount = textFieldCount
+        self.loginState = loginState
+        self.inputRoute = inputRoute
+    }
 }
 
 let settingsBundleIds = ["com.apple.systempreferences", "com.apple.SystemSettings"]
+
+// These AX identifiers are stable across the English and Chinese System
+// Settings login surfaces observed on macOS 15. Field position is not: the
+// sidebar search field and retained username field pollute ordinal scans after
+// the login UI rehydrates.
+let usernameFieldIdentifier = "USERNAME_TEXT_FIELD"
+let passwordFieldIdentifier = "PASSWORD_TEXT_FIELD"
+let loginButtonIdentifier = "LOGIN_BUTTON"
 
 let loginWindowMarkers = [
     "一个账户", "尽享 Apple", "电子邮件或电话号码",
@@ -67,9 +91,18 @@ func axDescription(_ element: AXUIElement) -> String {
         .joined(separator: " | ")
 }
 
+func axIdentifier(_ element: AXUIElement) -> String {
+    axString(element, kAXIdentifierAttribute as String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+}
+
 func isTextInput(_ element: AXUIElement) -> Bool {
     let role = axRole(element)
-    return role == kAXTextFieldRole as String || role == kAXTextAreaRole as String || role == kAXComboBoxRole as String
+    return role == kAXTextFieldRole as String || role == "AXSecureTextField"
+}
+
+func isVisible(_ element: AXUIElement) -> Bool {
+    axBool(element, kAXHiddenAttribute as String) != true
 }
 
 func isSearchField(_ element: AXUIElement) -> Bool {
@@ -85,7 +118,205 @@ func isContainerRole(_ role: String) -> Bool {
 
 struct FieldHit {
     let element: AXUIElement
-    let description: String
+}
+
+enum LoginState: String {
+    case email
+    case password
+}
+
+struct LoginControlHit {
+    let window: AXUIElement
+    let element: AXUIElement
+}
+
+func axElementsEqual(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
+    CFEqual(lhs, rhs)
+}
+
+func bfsElements(root: AXUIElement, maxNodes: Int = 600) -> [AXUIElement] {
+    var queue: [AXUIElement] = [root]
+    var elements: [AXUIElement] = []
+    var visited = 0
+
+    while !queue.isEmpty && visited < maxNodes {
+        let node = queue.removeFirst()
+        visited += 1
+        elements.append(node)
+        queue.append(contentsOf: axChildren(node))
+    }
+    return elements
+}
+
+func matchingLoginControls(
+    in window: AXUIElement,
+    identifier: String,
+    matches: (AXUIElement) -> Bool
+) -> [AXUIElement] {
+    bfsElements(root: window).filter {
+        isVisible($0) && axIdentifier($0) == identifier && matches($0)
+    }
+}
+
+func windowMatchesLoginState(_ window: AXUIElement, state: LoginState) -> Bool {
+    guard isVisible(window), axBool(window, kAXMinimizedAttribute as String) != true else {
+        return false
+    }
+
+    let username = matchingLoginControls(
+        in: window,
+        identifier: usernameFieldIdentifier,
+        matches: isTextInput
+    )
+    let password = matchingLoginControls(
+        in: window,
+        identifier: passwordFieldIdentifier,
+        matches: isTextInput
+    )
+    let loginButtons = matchingLoginControls(
+        in: window,
+        identifier: loginButtonIdentifier,
+        matches: { axRole($0) == kAXButtonRole as String }
+    )
+
+    guard loginButtons.count == 1 else { return false }
+    switch state {
+    case .email:
+        return username.count == 1 && password.isEmpty
+    case .password:
+        // macOS 15.6 can remove USERNAME_TEXT_FIELD after Continue. The
+        // password field and submit button remain the unique state anchors.
+        return username.count <= 1 && password.count == 1
+    }
+}
+
+func loginWindows(appElement: AXUIElement, state: LoginState) -> [AXUIElement] {
+    var windows: [AXUIElement] = axCopy(appElement, kAXWindowsAttribute as String) ?? []
+    let focused: AXUIElement? = axCopy(appElement, kAXFocusedWindowAttribute as String)
+    let main: AXUIElement? = axCopy(appElement, kAXMainWindowAttribute as String)
+    for candidate in [focused, main].compactMap({ $0 }) where !windows.contains(where: { axElementsEqual($0, candidate) }) {
+        windows.append(candidate)
+    }
+    return windows.filter { windowMatchesLoginState($0, state: state) }
+}
+
+func findLoginWindow(appElement: AXUIElement, state: LoginState) -> AXUIElement? {
+    guard activeSettingsApp(for: appElement) != nil,
+          let focusedWindow: AXUIElement = axCopy(appElement, kAXFocusedWindowAttribute as String) else {
+        return nil
+    }
+    let candidates = loginWindows(appElement: appElement, state: state)
+    guard candidates.count == 1, axElementsEqual(candidates[0], focusedWindow) else { return nil }
+    return candidates[0]
+}
+
+func waitForLoginWindow(
+    appElement: AXUIElement,
+    state: LoginState,
+    timeoutMs: UInt32 = 12_000
+) -> AXUIElement? {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+    while true {
+        if let window = findLoginWindow(appElement: appElement, state: state) {
+            return window
+        }
+        if Date() >= deadline { return nil }
+        usleep(120_000)
+    }
+}
+
+func currentLoginState(appElement: AXUIElement) -> LoginState? {
+    let emailWindow = findLoginWindow(appElement: appElement, state: .email)
+    let passwordWindow = findLoginWindow(appElement: appElement, state: .password)
+    if emailWindow != nil && passwordWindow == nil { return .email }
+    if passwordWindow != nil && emailWindow == nil { return .password }
+    return nil
+}
+
+func waitForAnyLoginState(
+    appElement: AXUIElement,
+    timeoutMs: UInt32 = 12_000
+) -> LoginState? {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+    while true {
+        if let state = currentLoginState(appElement: appElement) {
+            return state
+        }
+        if Date() >= deadline { return nil }
+        usleep(120_000)
+    }
+}
+
+func findLoginControl(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    matches: (AXUIElement) -> Bool
+) -> LoginControlHit? {
+    guard let window = findLoginWindow(appElement: appElement, state: state) else { return nil }
+    let controls = matchingLoginControls(in: window, identifier: identifier, matches: matches)
+    guard controls.count == 1 else { return nil }
+    return LoginControlHit(window: window, element: controls[0])
+}
+
+func waitForLoginControl(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    timeoutMs: UInt32 = 12_000,
+    requireEnabled: Bool = false,
+    matches: (AXUIElement) -> Bool
+) -> LoginControlHit? {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+    while true {
+        if let hit = findLoginControl(
+            appElement: appElement,
+            state: state,
+            identifier: identifier,
+            matches: matches
+        ) {
+            if !requireEnabled || axBool(hit.element, kAXEnabledAttribute as String) == true {
+                return hit
+            }
+        }
+        if Date() >= deadline { return nil }
+        usleep(120_000)
+    }
+}
+
+func waitForLoginTextField(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String
+) -> LoginControlHit? {
+    waitForLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        requireEnabled: true,
+        matches: isTextInput
+    )
+}
+
+func pressLoginButton(appElement: AXUIElement, state: LoginState) -> Bool {
+    guard waitForLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: loginButtonIdentifier,
+        requireEnabled: true,
+        matches: { axRole($0) == kAXButtonRole as String }
+    ) != nil else {
+        return false
+    }
+    guard let liveHit = findLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: loginButtonIdentifier,
+        matches: { axRole($0) == kAXButtonRole as String }
+    ), axBool(liveHit.element, kAXEnabledAttribute as String) == true else {
+        return false
+    }
+    return AXUIElementPerformAction(liveHit.element, kAXPressAction as CFString) == .success
 }
 
 func bfsTextFields(root: AXUIElement, maxNodes: Int = 500) -> [FieldHit] {
@@ -96,7 +327,7 @@ func bfsTextFields(root: AXUIElement, maxNodes: Int = 500) -> [FieldHit] {
         let node = queue.removeFirst()
         visited += 1
         if isTextInput(node), !isSearchField(node) {
-            hits.append(FieldHit(element: node, description: axDescription(node)))
+            hits.append(FieldHit(element: node))
         }
         if isContainerRole(axRole(node)) || visited == 1 {
             queue.append(contentsOf: axChildren(node))
@@ -115,79 +346,440 @@ func findSettingsApp() -> NSRunningApplication? {
     }
 }
 
-func findLoginWindow(appElement: AXUIElement) -> AXUIElement? {
-    guard let windows: [AXUIElement] = axCopy(appElement, kAXWindowsAttribute as String) else { return nil }
-    for w in windows {
-        let title = axString(w, kAXTitleAttribute as String) ?? ""
-        if loginWindowMarkers.contains(where: { title.contains($0) }) { return w }
+func isEnabledAndFocused(_ field: AXUIElement) -> Bool {
+    axBool(field, kAXEnabledAttribute as String) == true &&
+        axBool(field, kAXFocusedAttribute as String) == true
+}
+
+func activeSettingsApp(for appElement: AXUIElement) -> NSRunningApplication? {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(appElement, &pid) == .success,
+          let app = NSRunningApplication(processIdentifier: pid),
+          let bundleID = app.bundleIdentifier,
+          settingsBundleIds.contains(bundleID),
+          app.isActive else {
+        return nil
     }
-    return windows.first
+    return app
 }
 
-func postCmdV() {
-    let src = CGEventSource(stateID: .combinedSessionState)
-    let vDown = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)!
-    vDown.flags = .maskCommand
-    let vUp = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)!
-    vUp.flags = .maskCommand
-    vDown.post(tap: .cghidEventTap)
-    vUp.post(tap: .cghidEventTap)
+func activeFocusedLoginControl(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    matches: (AXUIElement) -> Bool
+) -> LoginControlHit? {
+    guard activeSettingsApp(for: appElement) != nil,
+          let hit = findLoginControl(
+              appElement: appElement,
+              state: state,
+              identifier: identifier,
+              matches: matches
+          ),
+          let focusedWindow: AXUIElement = axCopy(appElement, kAXFocusedWindowAttribute as String),
+          axElementsEqual(focusedWindow, hit.window) else {
+        return nil
+    }
+    return hit
 }
 
-func focusField(_ field: AXUIElement) {
-    AXUIElementPerformAction(field, kAXRaiseAction as CFString)
+func resolveFocusedLoginTextField(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String
+) -> LoginControlHit? {
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: state,
+        identifier: identifier
+    ) != nil else {
+        return nil
+    }
+    guard let liveHit = activeFocusedLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        matches: isTextInput
+    ), axBool(liveHit.element, kAXEnabledAttribute as String) == true else {
+        return nil
+    }
+    _ = AXUIElementPerformAction(liveHit.element, kAXRaiseAction as CFString)
     usleep(120_000)
-    AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+
+    guard let readyHit = activeFocusedLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        matches: isTextInput
+    ), axBool(readyHit.element, kAXEnabledAttribute as String) == true else {
+        return nil
+    }
+    guard AXUIElementSetAttributeValue(
+        readyHit.element,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    ) == .success else {
+        return nil
+    }
     usleep(80_000)
+
+    guard let focusedHit = activeFocusedLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        matches: isTextInput
+    ), isEnabledAndFocused(focusedHit.element) else {
+        return nil
+    }
+    return focusedHit
 }
 
-func focusAndSetValue(_ field: AXUIElement, _ text: String, isEmail: Bool) -> Bool {
-    focusField(field)
+func valueMatchesRequest(_ field: AXUIElement, _ text: String, isEmail: Bool) -> Bool {
+    guard let value = axString(field, kAXValueAttribute as String) else { return false }
+    if isEmail {
+        return value.trimmingCharacters(in: .whitespacesAndNewlines) == text
+    }
+    return value.count >= min(4, text.count)
+}
 
-    if AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, text as CFString) == .success {
-        usleep(250_000)
-        if let val = axString(field, kAXValueAttribute as String) {
-            if isEmail { return val.contains("@") }
-            return val.count >= min(4, text.count)
+func postUnicodeText(_ text: String) -> Bool {
+    guard !text.isEmpty,
+          let source = CGEventSource(stateID: .hidSystemState) else {
+        return false
+    }
+
+    for character in text {
+        let codeUnits = Array(String(character).utf16)
+        guard let down = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: 0,
+                  keyDown: true
+              ),
+              let up = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: 0,
+                  keyDown: false
+              ) else {
+            return false
         }
+        codeUnits.withUnsafeBufferPointer { buffer in
+            down.keyboardSetUnicodeString(
+                stringLength: codeUnits.count,
+                unicodeString: buffer.baseAddress
+            )
+            up.keyboardSetUnicodeString(
+                stringLength: codeUnits.count,
+                unicodeString: buffer.baseAddress
+            )
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        usleep(8_000)
     }
-
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(text, forType: .string)
-    usleep(100_000)
-    focusField(field)
-    AXUIElementPerformAction(field, kAXPressAction as CFString)
-    usleep(100_000)
-    postCmdV()
-    usleep(350_000)
-
-    if let val = axString(field, kAXValueAttribute as String) {
-        if isEmail { return val.contains("@") }
-        return val.count >= min(4, text.count)
-    }
-    return false
+    return true
 }
 
-func clickButton(in root: AXUIElement, names: [String]) -> Bool {
-    var queue: [AXUIElement] = [root]
-    var visited = 0
-    while !queue.isEmpty && visited < 400 {
-        let node = queue.removeFirst()
-        visited += 1
-        if axRole(node) == kAXButtonRole as String {
-            let title = axString(node, kAXTitleAttribute as String) ?? axDescription(node)
-            for name in names where title == name || title.contains(name) {
-                if axBool(node, kAXEnabledAttribute as String) != false {
-                    AXUIElementPerformAction(node, kAXPressAction as CFString)
-                    return true
+struct LoginValueInputResult {
+    let ok: Bool
+    let route: String?
+    let reason: String
+}
+
+func waitForLoginValueMatch(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    text: String,
+    isEmail: Bool,
+    previousValue: String? = nil,
+    requireValueChange: Bool = false,
+    timeoutMs: UInt32 = 1_500
+) -> Bool {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+    while true {
+        if let hit = activeFocusedLoginControl(
+            appElement: appElement,
+            state: state,
+            identifier: identifier,
+            matches: isTextInput
+        ), valueMatchesRequest(hit.element, text, isEmail: isEmail) {
+            if !requireValueChange ||
+               axString(hit.element, kAXValueAttribute as String) != previousValue {
+                return true
+            }
+        }
+        if Date() >= deadline { return false }
+        usleep(120_000)
+    }
+}
+
+func waitForExactLoginValue(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    expectedValue: String,
+    timeoutMs: UInt32 = 1_000
+) -> Bool {
+    let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+    while true {
+        if let hit = activeFocusedLoginControl(
+            appElement: appElement,
+            state: state,
+            identifier: identifier,
+            matches: isTextInput
+        ), axString(hit.element, kAXValueAttribute as String) == expectedValue {
+            return true
+        }
+        if Date() >= deadline { return false }
+        usleep(120_000)
+    }
+}
+
+func focusAndSetLoginValue(
+    appElement: AXUIElement,
+    state: LoginState,
+    identifier: String,
+    text: String,
+    isEmail: Bool
+) -> LoginValueInputResult {
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: state,
+        identifier: identifier
+    ) != nil,
+          let liveHit = activeFocusedLoginControl(
+              appElement: appElement,
+              state: state,
+              identifier: identifier,
+              matches: isTextInput
+          ),
+          axBool(liveHit.element, kAXEnabledAttribute as String) == true else {
+        return LoginValueInputResult(
+            ok: false,
+            route: nil,
+            reason: "target_unavailable_before_write"
+        )
+    }
+
+    // An exact email value can be reused. A secure field only exposes a masked
+    // length, so an existing password value can never prove it is this run's
+    // credential and must not be submitted as-is.
+    if isEmail && valueMatchesRequest(liveHit.element, text, isEmail: true) {
+        return LoginValueInputResult(
+            ok: true,
+            route: "existing_value",
+            reason: "verified"
+        )
+    }
+
+    // System Settings enables Continue only after real keystrokes reach the
+    // email field. Do not use Command+A here: the SwiftUI login surface can
+    // intercept that global shortcut and render the pane blank. Clear via AX
+    // first, then use the HID path for the actual email text.
+    if isEmail {
+        let originalEmailValue = axString(liveHit.element, kAXValueAttribute as String)
+        if let keyboardHit = resolveFocusedLoginTextField(
+            appElement: appElement,
+            state: state,
+            identifier: identifier
+        ), isEnabledAndFocused(keyboardHit.element) {
+            let beforeClear = axString(keyboardHit.element, kAXValueAttribute as String)
+            let keyboardTargetIsCleared: Bool
+            if let beforeClear {
+                if beforeClear.isEmpty {
+                    keyboardTargetIsCleared = true
+                } else {
+                    let cleared = AXUIElementSetAttributeValue(
+                        keyboardHit.element,
+                        kAXValueAttribute as CFString,
+                        "" as CFString
+                    ) == .success
+                    keyboardTargetIsCleared = cleared && waitForExactLoginValue(
+                        appElement: appElement,
+                        state: state,
+                        identifier: identifier,
+                        expectedValue: ""
+                    )
+                }
+            } else {
+                // An unreadable value cannot prove that keyboard typing will
+                // replace rather than append. Keep the HID route bounded to
+                // a confirmed-empty email control.
+                keyboardTargetIsCleared = false
+            }
+
+            if keyboardTargetIsCleared {
+                usleep(60_000)
+                if let beforeTypeHit = activeFocusedLoginControl(
+                    appElement: appElement,
+                    state: state,
+                    identifier: identifier,
+                    matches: isTextInput
+                ), isEnabledAndFocused(beforeTypeHit.element),
+                   postUnicodeText(text),
+                   waitForLoginValueMatch(
+                       appElement: appElement,
+                       state: state,
+                       identifier: identifier,
+                       text: text,
+                       isEmail: true,
+                       previousValue: originalEmailValue,
+                       requireValueChange: false
+                   ) {
+                    return LoginValueInputResult(
+                        ok: true,
+                        route: "keyboard",
+                        reason: "verified"
+                    )
                 }
             }
         }
-        if isContainerRole(axRole(node)) {
-            queue.append(contentsOf: axChildren(node))
+
+        // Some macOS builds do not expose a focused field long enough for the
+        // keyboard route. Retain an AX value fallback for manual recovery.
+        let beforeAxFallback = originalEmailValue ?? ""
+        let axResult = AXUIElementSetAttributeValue(
+            liveHit.element,
+            kAXValueAttribute as CFString,
+            text as CFString
+        )
+        if axResult == .success,
+           waitForLoginValueMatch(
+               appElement: appElement,
+               state: state,
+               identifier: identifier,
+               text: text,
+               isEmail: true,
+               previousValue: beforeAxFallback,
+               requireValueChange: false
+           ) {
+            return LoginValueInputResult(
+                ok: true,
+                route: "ax_value",
+                reason: "verified"
+            )
         }
+        return LoginValueInputResult(
+            ok: false,
+            route: axResult == .success ? "ax_value" : nil,
+            reason: axResult == .success
+                ? "ax_value_unconfirmed"
+                : "keyboard_unconfirmed"
+        )
     }
-    return false
+
+    // Password path: AX first, then keyboard fallback if the AX value did
+    // not become visible on the same focused secure field.
+    let originalValue = axString(liveHit.element, kAXValueAttribute as String)
+    var valueBeforeWrite = originalValue
+    if let originalValue, !originalValue.isEmpty {
+        let clearResult = AXUIElementSetAttributeValue(
+            liveHit.element,
+            kAXValueAttribute as CFString,
+            "" as CFString
+        )
+        guard clearResult == .success,
+              waitForExactLoginValue(
+                  appElement: appElement,
+                  state: state,
+                  identifier: identifier,
+                  expectedValue: ""
+              ) else {
+            return LoginValueInputResult(
+                ok: false,
+                route: clearResult == .success ? "ax_value" : nil,
+                reason: clearResult == .success
+                    ? "ax_value_unconfirmed"
+                    : "keyboard_fallback_unsafe"
+            )
+        }
+        valueBeforeWrite = ""
+    }
+
+    let axWriteResult = AXUIElementSetAttributeValue(
+        liveHit.element,
+        kAXValueAttribute as CFString,
+        text as CFString
+    )
+    if axWriteResult == .success,
+       waitForLoginValueMatch(
+           appElement: appElement,
+           state: state,
+           identifier: identifier,
+           text: text,
+           isEmail: false,
+           previousValue: valueBeforeWrite,
+           requireValueChange: true
+       ) {
+        return LoginValueInputResult(
+            ok: true,
+            route: "ax_value",
+            reason: "verified"
+        )
+    }
+
+    guard let currentHit = activeFocusedLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        matches: isTextInput
+    ), let valueBeforeWrite,
+       let currentValue = axString(
+           currentHit.element,
+           kAXValueAttribute as String
+       ), currentValue == valueBeforeWrite,
+       let keyboardHit = resolveFocusedLoginTextField(
+           appElement: appElement,
+           state: state,
+           identifier: identifier
+       ),
+       axString(keyboardHit.element, kAXValueAttribute as String) == valueBeforeWrite else {
+        return LoginValueInputResult(
+            ok: false,
+            route: axWriteResult == .success ? "ax_value" : nil,
+            reason: axWriteResult == .success
+                ? "ax_value_unconfirmed"
+                : "keyboard_fallback_unsafe"
+        )
+    }
+
+    // The password field was cleared above, so selecting all is unnecessary.
+    usleep(100_000)
+    guard let beforeTypeHit = activeFocusedLoginControl(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        matches: isTextInput
+    ), isEnabledAndFocused(beforeTypeHit.element),
+       axString(beforeTypeHit.element, kAXValueAttribute as String) == valueBeforeWrite,
+       postUnicodeText(text) else {
+        return LoginValueInputResult(
+            ok: false,
+            route: "keyboard",
+            reason: "keyboard_target_changed"
+        )
+    }
+
+    if waitForLoginValueMatch(
+        appElement: appElement,
+        state: state,
+        identifier: identifier,
+        text: text,
+        isEmail: false,
+        previousValue: valueBeforeWrite,
+        requireValueChange: true
+    ) {
+        return LoginValueInputResult(
+            ok: true,
+            route: "keyboard",
+            reason: "verified"
+        )
+    }
+    return LoginValueInputResult(
+        ok: false,
+        route: "keyboard",
+        reason: "keyboard_unconfirmed"
+    )
 }
 
 func emit(_ output: Output) -> Never {
@@ -201,12 +793,10 @@ func emit(_ output: Output) -> Never {
 }
 
 var phase = "all"
-var value = ""
 var i = 1
 let args = CommandLine.arguments
 while i < args.count {
     if args[i] == "--phase", i + 1 < args.count { phase = args[i + 1]; i += 2; continue }
-    if args[i] == "--value", i + 1 < args.count { value = args[i + 1]; i += 2; continue }
     i += 1
 }
 
@@ -220,7 +810,7 @@ _ = NSWorkspace.shared.launchApplication(
 usleep(900_000)
 
 guard let app = findSettingsApp() else {
-    emit(Output(ok: false, phase: phase, message: "System Settings process not found", textFieldCount: nil, windowTitle: nil, fieldDescriptions: nil))
+    emit(Output(ok: false, phase: phase, message: "System Settings process not found", textFieldCount: nil))
 }
 
 app.activate(options: [.activateIgnoringOtherApps])
@@ -229,90 +819,251 @@ usleep(700_000)
 let appElement = AXUIElementCreateApplication(app.processIdentifier)
 logStep(2, "found System Settings pid=\(app.processIdentifier)")
 
-guard let window = findLoginWindow(appElement: appElement) else {
-    emit(Output(ok: false, phase: phase, message: "login window not found", textFieldCount: nil, windowTitle: nil, fieldDescriptions: nil))
+if phase == "state" || phase == "dump" {
+    guard let state = waitForAnyLoginState(appElement: appElement) else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: "login_state_unknown",
+                textFieldCount: nil,
+                loginState: "unknown"
+            )
+        )
+    }
+    guard let stateWindow = findLoginWindow(appElement: appElement, state: state) else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: "login_state_unknown",
+                textFieldCount: nil,
+                loginState: "unknown"
+            )
+        )
+    }
+    emit(
+        Output(
+            ok: true,
+            phase: phase,
+            message: "ok",
+            textFieldCount: bfsTextFields(root: stateWindow).count,
+            loginState: state.rawValue
+        )
+    )
 }
 
-let winTitle = axString(window, kAXTitleAttribute as String) ?? ""
-logStep(3, "found window title=\(winTitle)")
-
-var fields = bfsTextFields(root: window)
-let descs = fields.map(\.description)
-logStep(4, "BFS found \(fields.count) non-search text fields: \(descs.joined(separator: "; "))")
-
-if phase == "dump" {
-    emit(Output(ok: true, phase: "dump", message: "ok", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+let initialState: LoginState = phase == "password" ? .password : .email
+guard let window = waitForLoginWindow(appElement: appElement, state: initialState) else {
+    emit(Output(ok: false, phase: phase, message: "login window not found", textFieldCount: nil))
 }
+
+logStep(3, "found login window")
+
+let fields = bfsTextFields(root: window)
+logStep(4, "BFS found \(fields.count) non-search text fields")
 
 switch phase {
 case "email":
-    guard !value.isEmpty else {
-        emit(Output(ok: false, phase: phase, message: "missing --value", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    let email = ProcessInfo.processInfo.environment["APPLE_SCRIPT_APPLE_ID"] ?? ""
+    guard !email.isEmpty else {
+        emit(Output(ok: false, phase: phase, message: "missing email value", textFieldCount: fields.count))
     }
-    guard let f = fields.first else {
-        emit(Output(ok: false, phase: phase, message: "no email field", textFieldCount: 0, windowTitle: winTitle, fieldDescriptions: descs))
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: .email,
+        identifier: usernameFieldIdentifier
+    ) != nil else {
+        emit(Output(ok: false, phase: phase, message: "exact username field not found", textFieldCount: fields.count))
     }
     logStep(5, "filling email")
-    guard focusAndSetValue(f.element, value, isEmail: true) else {
-        emit(Output(ok: false, phase: phase, message: "email verification failed", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    let emailResult = focusAndSetLoginValue(
+        appElement: appElement,
+        state: .email,
+        identifier: usernameFieldIdentifier,
+        text: email,
+        isEmail: true
+    )
+    guard emailResult.ok else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: emailResult.reason,
+                textFieldCount: fields.count,
+                loginState: LoginState.email.rawValue,
+                inputRoute: emailResult.route
+            )
+        )
     }
     logStep(6, "email ok")
-    emit(Output(ok: true, phase: phase, message: "ok", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    emit(
+        Output(
+            ok: true,
+            phase: phase,
+            message: "ok",
+            textFieldCount: fields.count,
+            loginState: LoginState.email.rawValue,
+            inputRoute: emailResult.route
+        )
+    )
 
 case "continue":
     logStep(7, "clicking continue")
-    guard clickButton(in: window, names: ["Continue", "继续", "Next", "下一步"]) else {
-        emit(Output(ok: false, phase: phase, message: "continue button not found", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    guard pressLoginButton(appElement: appElement, state: .email) else {
+        emit(Output(ok: false, phase: phase, message: "enabled login button not found", textFieldCount: fields.count))
     }
     logStep(8, "continue ok")
-    emit(Output(ok: true, phase: phase, message: "ok", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    emit(Output(ok: true, phase: phase, message: "ok", textFieldCount: fields.count))
 
 case "password":
-    guard !value.isEmpty else {
-        emit(Output(ok: false, phase: phase, message: "missing --value", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    let password = ProcessInfo.processInfo.environment["APPLE_SCRIPT_PASSWORD"] ?? ""
+    guard !password.isEmpty else {
+        emit(Output(ok: false, phase: phase, message: "missing password value", textFieldCount: fields.count))
     }
-    fields = bfsTextFields(root: window)
-    let pwdHit = fields.count >= 2 ? fields[1] : fields.last
-    guard let pf = pwdHit else {
-        emit(Output(ok: false, phase: phase, message: "password field not found", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: fields.map(\.description)))
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: .password,
+        identifier: passwordFieldIdentifier
+    ) != nil else {
+        emit(Output(ok: false, phase: phase, message: "exact password field not found", textFieldCount: fields.count))
     }
     logStep(9, "filling password")
-    guard focusAndSetValue(pf.element, value, isEmail: false) else {
-        emit(Output(ok: false, phase: phase, message: "password fill failed", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: fields.map(\.description)))
+    let passwordResult = focusAndSetLoginValue(
+        appElement: appElement,
+        state: .password,
+        identifier: passwordFieldIdentifier,
+        text: password,
+        isEmail: false
+    )
+    guard passwordResult.ok else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: passwordResult.reason,
+                textFieldCount: fields.count,
+                loginState: LoginState.password.rawValue,
+                inputRoute: passwordResult.route
+            )
+        )
     }
     logStep(10, "password ok")
-    _ = clickButton(in: window, names: ["Sign In", "Sign in", "登录", "登入", "Continue", "继续"])
+    guard pressLoginButton(appElement: appElement, state: .password) else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: "enabled login button not found after password",
+                textFieldCount: fields.count,
+                loginState: LoginState.password.rawValue,
+                inputRoute: passwordResult.route
+            )
+        )
+    }
     logStep(11, "submit clicked")
-    emit(Output(ok: true, phase: phase, message: "ok", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: fields.map(\.description)))
+    emit(
+        Output(
+            ok: true,
+            phase: phase,
+            message: "ok",
+            textFieldCount: fields.count,
+            loginState: LoginState.password.rawValue,
+            inputRoute: passwordResult.route
+        )
+    )
 
 case "all":
-    let appleId = value.isEmpty ? (ProcessInfo.processInfo.environment["APPLE_SCRIPT_APPLE_ID"] ?? "") : value
+    let appleId = ProcessInfo.processInfo.environment["APPLE_SCRIPT_APPLE_ID"] ?? ""
     let password = ProcessInfo.processInfo.environment["APPLE_SCRIPT_PASSWORD"] ?? ""
     guard !appleId.isEmpty else {
-        emit(Output(ok: false, phase: phase, message: "missing apple id", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+        emit(Output(ok: false, phase: phase, message: "missing apple id", textFieldCount: fields.count))
     }
-    guard let emailHit = fields.first else {
-        emit(Output(ok: false, phase: phase, message: "no email field", textFieldCount: 0, windowTitle: winTitle, fieldDescriptions: descs))
+    guard !password.isEmpty else {
+        emit(Output(ok: false, phase: phase, message: "missing password value", textFieldCount: fields.count))
+    }
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: .email,
+        identifier: usernameFieldIdentifier
+    ) != nil else {
+        emit(Output(ok: false, phase: phase, message: "exact username field not found", textFieldCount: fields.count))
     }
     logStep(5, "filling email (all phase)")
-    guard focusAndSetValue(emailHit.element, appleId, isEmail: true) else {
-        emit(Output(ok: false, phase: phase, message: "email failed", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: descs))
+    let emailResult = focusAndSetLoginValue(
+        appElement: appElement,
+        state: .email,
+        identifier: usernameFieldIdentifier,
+        text: appleId,
+        isEmail: true
+    )
+    guard emailResult.ok else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: emailResult.reason,
+                textFieldCount: fields.count,
+                loginState: LoginState.email.rawValue,
+                inputRoute: emailResult.route
+            )
+        )
     }
     logStep(6, "email ok — clicking continue")
-    _ = clickButton(in: window, names: ["Continue", "继续", "Next", "下一步"])
-    usleep(2_000_000)
-    fields = bfsTextFields(root: window)
-    if !password.isEmpty, fields.count >= 2 {
-        logStep(9, "filling password (all phase)")
-        if focusAndSetValue(fields[1].element, password, isEmail: false) {
-            logStep(10, "password ok")
-            _ = clickButton(in: window, names: ["Sign In", "Sign in", "登录", "登入"])
-        }
-    } else if !password.isEmpty, fields.count == 1 {
-        logStep(9, "password field not visible yet — email-only step done")
+    guard pressLoginButton(appElement: appElement, state: .email) else {
+        emit(Output(ok: false, phase: phase, message: "enabled login button not found", textFieldCount: fields.count))
     }
-    emit(Output(ok: true, phase: phase, message: "ok", textFieldCount: fields.count, windowTitle: winTitle, fieldDescriptions: fields.map(\.description)))
+    guard waitForLoginTextField(
+        appElement: appElement,
+        state: .password,
+        identifier: passwordFieldIdentifier
+    ) != nil else {
+        emit(Output(ok: false, phase: phase, message: "exact password field not found", textFieldCount: fields.count))
+    }
+    logStep(9, "filling password (all phase)")
+    let passwordResult = focusAndSetLoginValue(
+        appElement: appElement,
+        state: .password,
+        identifier: passwordFieldIdentifier,
+        text: password,
+        isEmail: false
+    )
+    guard passwordResult.ok else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: passwordResult.reason,
+                textFieldCount: fields.count,
+                loginState: LoginState.password.rawValue,
+                inputRoute: passwordResult.route
+            )
+        )
+    }
+    logStep(10, "password ok")
+    guard pressLoginButton(appElement: appElement, state: .password) else {
+        emit(
+            Output(
+                ok: false,
+                phase: phase,
+                message: "enabled login button not found after password",
+                textFieldCount: fields.count,
+                loginState: LoginState.password.rawValue,
+                inputRoute: passwordResult.route
+            )
+        )
+    }
+    emit(
+        Output(
+            ok: true,
+            phase: phase,
+            message: "ok",
+            textFieldCount: fields.count,
+            loginState: LoginState.password.rawValue,
+            inputRoute: passwordResult.route
+        )
+    )
 
 default:
-    emit(Output(ok: false, phase: phase, message: "unknown phase: \(phase)", textFieldCount: nil, windowTitle: winTitle, fieldDescriptions: descs))
+    emit(Output(ok: false, phase: phase, message: "unknown phase: \(phase)", textFieldCount: nil))
 }

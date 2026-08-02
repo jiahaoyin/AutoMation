@@ -8,30 +8,24 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  checkNativeAccessibilityCapability,
+  promptNativeAccessibilityPermission,
+} from "./mac-2fa-popup.js";
 import { sleep } from "./prompt.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CHECK_SCPT = path.resolve(__dirname, "../accessibility-check.applescript");
 const AUTOMATION_CHECK_SCPT = path.resolve(
   __dirname,
   "../automation-check.applescript"
 );
-const TWO_FA_AUTOMATION_CHECK_SCPT = path.resolve(
-  __dirname,
-  "../2fa-automation-check.applescript"
-);
-
-const ACCESSIBILITY_URLS = [
-  "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
-  "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-  "x-apple.systempreferences:com.apple.settings.PrivacySecurity",
-];
 
 const AUTOMATION_URLS = [
   "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation",
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
 ];
+const NATIVE_HELPER_ACCESSIBILITY_CLIENT = "macOS 原生提示中列出的 2FA helper";
 
 function psField(pid, field) {
   const r = spawnSync("ps", ["-p", String(pid), "-o", `${field}=`], {
@@ -42,25 +36,46 @@ function psField(pid, field) {
 }
 
 /**
- * 推断需要在「辅助功能」中勾选的宿主 App（运行脚本的终端）
+ * 推断需要在「辅助功能」中勾选的宿主 App。
+ *
+ * A supervised production run is launched from Terminal but executes through
+ * the Codex sandbox. Treating its inherited TERM_PROGRAM as the TCC client
+ * sends the user to the wrong Privacy entry, so inspect the real parent chain
+ * before falling back to the terminal label.
  * @returns {{ name: string }}
  */
-export function getAccessibilityHostApp() {
-  const term = process.env.TERM_PROGRAM?.trim();
-  if (term === "Apple_Terminal") return { name: "Terminal" };
-  if (term === "iTerm.app") return { name: "iTerm" };
-  if (term && /vscode|Visual Studio Code/i.test(term)) {
+export function getAccessibilityHostApp(options = {}) {
+  const env = options.env ?? process.env;
+  const readPsField = options.psField ?? psField;
+  const supervised =
+    options.supervised ?? env.APPLE_AUTOMATION_SUPERVISED_GUI === "1";
+  const term = env.TERM_PROGRAM?.trim();
+
+  if (options.nativeHelper === true) {
+    return { name: NATIVE_HELPER_ACCESSIBILITY_CLIENT };
+  }
+
+  if (!supervised && term === "Apple_Terminal") return { name: "Terminal" };
+  if (!supervised && term === "iTerm.app") return { name: "iTerm" };
+  if (!supervised && term && /vscode|Visual Studio Code/i.test(term)) {
     return { name: "Visual Studio Code" };
   }
-  if (term && /cursor/i.test(term)) return { name: "Cursor" };
-  if (process.env.CURSOR_TRACE_ID || process.env.CURSOR_SESSION) {
+  if (!supervised && term && /cursor/i.test(term)) return { name: "Cursor" };
+  if (!supervised && (env.CURSOR_TRACE_ID || env.CURSOR_SESSION)) {
     return { name: "Cursor" };
   }
 
-  let pid = process.pid;
+  let pid = options.pid ?? process.pid;
   for (let i = 0; i < 20; i++) {
-    const comm = psField(pid, "comm");
-    const args = psField(pid, "command") || comm;
+    const comm = readPsField(pid, "comm");
+    const args = readPsField(pid, "command") || comm;
+
+    if (
+      /(?:^|[\\/\s])codex(?:\s|$)/i.test(comm) ||
+      /(?:^|[\\/\s])codex(?:\s|$)/i.test(args)
+    ) {
+      return { name: "Codex" };
+    }
 
     if (/Terminal/i.test(comm) || /Terminal\.app/i.test(args)) {
       return { name: "Terminal" };
@@ -75,12 +90,12 @@ export function getAccessibilityHostApp() {
       return { name: "Visual Studio Code" };
     }
 
-    const ppid = parseInt(psField(pid, "ppid"), 10);
+    const ppid = parseInt(readPsField(pid, "ppid"), 10);
     if (!ppid || ppid <= 1) break;
     pid = ppid;
   }
 
-  return { name: "Terminal" };
+  return { name: supervised ? "Codex" : "Terminal" };
 }
 
 /** 是否为 macOS 自动化未授权错误（-1743 等） */
@@ -99,46 +114,61 @@ export function isAutomationDeniedError(err) {
 /** 是否为 macOS 辅助功能未授权错误（-25211 等） */
 export function isAccessibilityDeniedError(err) {
   const parts = [
+    err?.code ?? "",
     err instanceof Error ? err.message : "",
     err?.stderr ?? "",
     err?.stdout ?? "",
     String(err),
   ];
-  return /-25211|assistive access|辅助访问|不允许辅助|not allowed assist/i.test(
+  return /-25211|ACCESSIBILITY_DENIED|requires Accessibility permission|assistive access|辅助访问|不允许辅助|not allowed assist/i.test(
     parts.join("\n")
   );
 }
 
-/** 是否已获得辅助功能权限（通过 System Events 探测） */
-export async function isAccessibilityGranted() {
-  if (process.platform !== "darwin") return true;
-  if (!fs.existsSync(CHECK_SCPT)) return false;
+function resolveAccessibilityRuntime(options = {}) {
+  return {
+    platform: options.runtime?.platform ?? process.platform,
+    checkCapability:
+      options.runtime?.checkCapability ?? checkNativeAccessibilityCapability,
+    promptPermission:
+      options.runtime?.promptPermission ?? promptNativeAccessibilityPermission,
+    sleep: options.runtime?.sleep ?? sleep,
+  };
+}
 
-  try {
-    const { stdout } = await execFileAsync("osascript", [CHECK_SCPT], {
-      timeout: 10_000,
-    });
-    return stdout.trim().toLowerCase() === "yes";
-  } catch {
-    return false;
+/** 是否已获得辅助功能权限（通过原生 AX API 探测） */
+export async function isAccessibilityGranted(options = {}) {
+  const runtime = resolveAccessibilityRuntime(options);
+  if (runtime.platform !== "darwin") return true;
+  const result = await runtime.checkCapability({
+    signal: options.signal,
+    // Runtime permission checks must use the helper prepared by setup.
+    compileIfNeeded: false,
+  });
+  if (result.capability === "unavailable") {
+    const error = new Error("Accessibility capability probe is unavailable");
+    error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
+    throw error;
   }
+  return result.capability === "available";
 }
 
 /** 尝试触发系统辅助功能授权弹窗 */
-export async function triggerAccessibilityPrompt() {
-  if (process.platform !== "darwin") return;
-  try {
-    await execFileAsync(
-      "osascript",
-      [
-        "-e",
-        'tell application "System Events" to get name of first application process',
-      ],
-      { timeout: 10_000 }
-    );
-  } catch {
-    /* 预期可能失败，用于唤起系统授权提示 */
+export async function triggerAccessibilityPrompt(options = {}) {
+  const runtime = resolveAccessibilityRuntime(options);
+  if (runtime.platform !== "darwin") return { capability: "available" };
+  const result = await runtime.promptPermission({
+    signal: options.signal,
+    waitTimeoutMs: options.waitTimeoutMs,
+    // The native prompt is still a runtime operation, never a build step.
+    compileIfNeeded: false,
+  });
+  if (result.capability === "unavailable") {
+    const error = new Error("Accessibility permission prompt is unavailable");
+    error.code = "2FA_ACCESSIBILITY_UNAVAILABLE";
+    throw error;
   }
+  return result;
 }
 
 /**
@@ -282,66 +312,79 @@ export async function ensureAutomation(options = {}) {
   );
 }
 
-/** 打开系统设置 → 隐私与安全性 → 辅助功能 */
-export function openAccessibilitySettings() {
-  if (process.platform !== "darwin") return false;
-
-  for (const url of ACCESSIBILITY_URLS) {
-    const r = spawnSync("open", [url], { encoding: "utf-8" });
-    if (r.status === 0) return true;
-  }
-  return false;
-}
-
 function log(msg, quiet) {
   if (!quiet) console.log(msg);
 }
 
+function throwIfAccessibilityCancelled(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error("Accessibility authorization was cancelled");
+  error.code = "2FA_ACCESSIBILITY_CANCELLED";
+  throw error;
+}
+
 /**
- * 检测辅助功能；未授权时打开系统设置并等待用户勾选
+ * 检测辅助功能；未授权时触发系统原生提示并等待用户授权
  * @param {object} [options]
  * @param {boolean} [options.quiet]
  * @param {number} [options.timeoutMs]
  * @param {number} [options.pollMs]
  */
 export async function ensureAccessibility(options = {}) {
-  const { quiet = false, timeoutMs = 180_000, pollMs = 2000 } = options;
+  const { quiet = false, timeoutMs = 180_000, pollMs = 2000, signal } = options;
+  const runtime = resolveAccessibilityRuntime(options);
 
-  if (process.platform !== "darwin") {
+  throwIfAccessibilityCancelled(signal);
+  if (runtime.platform !== "darwin") {
     return { granted: true, skipped: true };
   }
 
-  const host = getAccessibilityHostApp();
+  const host = getAccessibilityHostApp({ nativeHelper: true });
 
-  if (await isAccessibilityGranted()) {
+  if (await isAccessibilityGranted({ runtime, signal, compileIfNeeded: false })) {
+    throwIfAccessibilityCancelled(signal);
     log(`✓ 辅助功能已授权（${host.name}）`, quiet);
     return { granted: true, host: host.name };
   }
+  throwIfAccessibilityCancelled(signal);
 
   log(">>> 辅助功能未授权，正在引导开启…", quiet);
-  log(`    需要允许「${host.name}」控制此电脑（AppleScript 填表依赖此项）`, quiet);
-
-  await triggerAccessibilityPrompt();
-  const opened = openAccessibilitySettings();
-  if (opened) {
-    log("    已打开：系统设置 → 隐私与安全性 → 辅助功能", quiet);
-  } else {
-    log("    请手动打开：系统设置 → 隐私与安全性 → 辅助功能", quiet);
-  }
-  log(`    请勾选「${host.name}」并确认（等待授权中…）`, quiet);
+  log(`    需要允许「${host.name}」控制此电脑（原生 AX 操作依赖此项）`, quiet);
 
   const deadline = Date.now() + timeoutMs;
+  const promptResult = await triggerAccessibilityPrompt({
+    runtime,
+    signal,
+    compileIfNeeded: false,
+    // Keep the same native helper alive while macOS displays the prompt. This
+    // avoids a one-shot child disappearing before TCC records the decision.
+    waitTimeoutMs: Math.min(timeoutMs, 30_000),
+  });
+  throwIfAccessibilityCancelled(signal);
+  if (promptResult.capability === "available") {
+    log(`✓ 辅助功能已授权（${host.name}）`, quiet);
+    return { granted: true, host: host.name };
+  }
+  log(`    请按 macOS 原生提示授权「${host.name}」（等待授权中…）`, quiet);
+  console.log(
+    `    若未出现提示，请立即打开：系统设置 → 隐私与安全性 → 辅助功能，并勾选「${host.name}」`,
+  );
+
   while (Date.now() < deadline) {
-    await sleep(pollMs);
-    if (await isAccessibilityGranted()) {
+    await runtime.sleep(pollMs);
+    throwIfAccessibilityCancelled(signal);
+    if (await isAccessibilityGranted({ runtime, signal, compileIfNeeded: false })) {
+      throwIfAccessibilityCancelled(signal);
       log(`✓ 辅助功能已授权（${host.name}）`, quiet);
       return { granted: true, host: host.name };
     }
   }
 
-  throw new Error(
+  const error = new Error(
     `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完成后重新运行 ./run.sh`
   );
+  error.code = "2FA_ACCESSIBILITY_DENIED";
+  throw error;
 }
 
 /**
@@ -356,7 +399,7 @@ export async function withAccessibilityRetry(fn, options = {}) {
   const { maxAttempts = 3, label = "操作" } = options;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await ensureAccessibility({ quiet: false });
+    await ensureAccessibility({ quiet: false, compileIfNeeded: false });
     await sleep(500);
 
     try {
@@ -368,7 +411,11 @@ export async function withAccessibilityRetry(fn, options = {}) {
       console.warn(
         `[辅助功能] ${label} 失败（尝试 ${attempt}/${maxAttempts}），请在系统设置中勾选后脚本将自动重试…`
       );
-      await ensureAccessibility({ quiet: false, timeoutMs: 180_000 });
+      await ensureAccessibility({
+        quiet: false,
+        timeoutMs: 180_000,
+        compileIfNeeded: false,
+      });
       await sleep(1000);
     }
   }
@@ -377,202 +424,47 @@ export async function withAccessibilityRetry(fn, options = {}) {
 }
 
 /**
- * 检测 Terminal/Cursor 对 System Events / 2FA 弹窗进程的自动化权限
- * @returns {Promise<{ granted: boolean, reason?: string, code?: string, mode?: string, kind?: 'accessibility'|'automation'|'partial' }>}
- */
-export async function check2FAAutomationGranted() {
-  if (process.platform !== "darwin") return { granted: true, mode: "non-darwin" };
-  if (!fs.existsSync(TWO_FA_AUTOMATION_CHECK_SCPT)) {
-    return { granted: false, reason: "missing 2fa-automation-check script" };
-  }
-
-  const host = getAccessibilityHostApp();
-  const axOk = await isAccessibilityGranted();
-  if (!axOk) {
-    return {
-      granted: false,
-      code: "-25211",
-      kind: "accessibility",
-      reason:
-        `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」（与「自动化」是两项独立权限，仅开 System Events 不够）`,
-    };
-  }
-
-  try {
-    const { stdout } = await execFileAsync("osascript", [TWO_FA_AUTOMATION_CHECK_SCPT], {
-      timeout: 20_000,
-    });
-    const line = stdout.trim();
-    if (line === "yes" || line.startsWith("yes:")) {
-      return { granted: true, mode: line.split(":")[1] || "yes" };
-    }
-    if (line.startsWith("no:partial:")) {
-      return {
-        granted: false,
-        code: "partial",
-        kind: "partial",
-        reason:
-          "自动化已部分生效但读 UI 失败：请取消勾选后重新勾选 Terminal → System Events，并完全退出终端后重开",
-      };
-    }
-    const m = line.match(/^no:(-?\d+):(.*)$/);
-    if (m) {
-      const code = m[1];
-      const detail = m[2]?.trim() || line;
-      if (code === "-1743") {
-        return {
-          granted: false,
-          code,
-          kind: "automation",
-          reason: `自动化未授权（-1743）：请在 自动化 中展开「${host.name}」并勾选「System Events」`,
-        };
-      }
-      if (code === "-25211") {
-        if (axOk) {
-          return {
-            granted: true,
-            mode: "idle",
-            warn: `个别系统进程不可读（${detail}），核心探测已通过`,
-          };
-        }
-        return {
-          granted: false,
-          code,
-          kind: "accessibility",
-          reason: `辅助功能未授权（-25211）：请在 辅助功能 中勾选「${host.name}」`,
-        };
-      }
-      return { granted: false, code, reason: detail };
-    }
-    return { granted: false, reason: line || "unknown" };
-  } catch (err) {
-    return {
-      granted: false,
-      reason: String(err?.stderr ?? err?.message ?? err),
-    };
-  }
-}
-
-/**
- * 引导开启 2FA 相关自动化（System Events）
- * @param {object} [options]
- */
-export async function ensure2FAAutomation(options = {}) {
-  const { quiet = false, timeoutMs = 180_000, pollMs = 2000 } = options;
-
-  if (process.platform !== "darwin") {
-    return { granted: true, skipped: true };
-  }
-
-  const host = getAccessibilityHostApp();
-
-  await ensureAccessibility({ quiet, timeoutMs: Math.min(timeoutMs, 60_000) });
-
-  const first = await check2FAAutomationGranted();
-  if (first.granted) {
-    log(`✓ 2FA 自动化已授权（${host.name} → System Events）`, quiet);
-    return { granted: true, host: host.name, mode: first.mode };
-  }
-
-  log(">>> 2FA 权限探测未通过，正在引导开启…", quiet);
-  if (first.reason) log(`    原因: ${first.reason}`, quiet);
-
-  if (first.kind === "accessibility" || first.code === "-25211") {
-    log(
-      `    「自动化」与「辅助功能」是两项独立权限；您截图中的 System Events 属于自动化，还需勾选辅助功能`,
-      quiet
-    );
-    await triggerAccessibilityPrompt();
-    const opened = openAccessibilitySettings();
-    if (opened) {
-      log("    已打开：系统设置 → 隐私与安全性 → 辅助功能", quiet);
-    }
-    log(`    请勾选「${host.name}」，完成后完全退出终端并重新打开`, quiet);
-  } else {
-    log(
-      `    需要允许「${host.name}」控制「System Events」（点击 2FA「允许」弹窗依赖此项）`,
-      quiet
-    );
-    if (first.code === "partial") {
-      log(
-        "    检测到「已勾选但仍失效」：请取消勾选后重新勾选 System Events，并重启终端",
-        quiet
-      );
-    }
-
-    try {
-      await execFileAsync(
-        "osascript",
-        [
-          "-e",
-          'tell application "System Events" to get name of first application process whose background only is false',
-        ],
-        { timeout: 10_000 }
-      );
-    } catch {
-      /* 触发授权弹窗 */
-    }
-
-    const opened = openAutomationSettings();
-    if (opened) {
-      log("    已打开：系统设置 → 隐私与安全性 → 自动化", quiet);
-    }
-    log(
-      `    请展开「${host.name}」并勾选「System Events」（若出现 FollowUpUI 也一并勾选）`,
-      quiet
-    );
-  }
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await sleep(pollMs);
-    const check = await check2FAAutomationGranted();
-    if (check.granted) {
-      log(`✓ 2FA 自动化已授权（${host.name} → System Events）`, quiet);
-      return { granted: true, host: host.name, mode: check.mode };
-    }
-  }
-
-  if (first.kind === "accessibility" || first.code === "-25211") {
-    throw new Error(
-      `辅助功能未授权：请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选「${host.name}」，完全退出终端后重新运行 ./run.sh`
-    );
-  }
-
-  throw new Error(
-    `2FA 自动化未授权：请在 系统设置 → 隐私与安全性 → 自动化 中展开「${host.name}」并勾选「System Events」，完成后重新运行 ./run.sh`
-  );
-}
-
-/**
- * 组合预检：辅助功能 + 系统设置自动化 + 2FA 自动化
+ * 浏览器 2FA 原生 sidecar 只需要辅助功能权限。
  * @param {object} [options]
  */
 export async function run2FAPermissionPreflight(options = {}) {
-  const { quiet = false, timeoutMs = 120_000 } = options;
+  const { quiet = false, timeoutMs = 120_000, pollMs = 2000 } = options;
+  const runtime = resolveAccessibilityRuntime(options);
 
-  if (process.platform !== "darwin") {
+  if (runtime.platform !== "darwin") {
     return { ok: true, skipped: true };
   }
 
-  const host = getAccessibilityHostApp();
+  const host = getAccessibilityHostApp({ nativeHelper: true });
   if (!quiet) {
     console.log("==> 2FA 权限预检");
   }
 
-  await ensureAccessibility({ quiet, timeoutMs });
-  await ensureAutomation({ quiet, timeoutMs });
-  const twoFa = await ensure2FAAutomation({ quiet, timeoutMs });
+  try {
+    await ensureAccessibility({
+      quiet,
+      timeoutMs,
+      pollMs,
+      runtime,
+      compileIfNeeded: false,
+    });
+  } catch (error) {
+    if (error?.code === "2FA_ACCESSIBILITY_UNAVAILABLE") {
+      return {
+        ok: false,
+        host: host.name,
+        capability: "unavailable",
+      };
+    }
+    throw error;
+  }
 
   if (!quiet) {
-    console.log(
-      `==> 2FA 权限就绪（${host.name}：辅助功能 + 系统设置 + System Events）`
-    );
+    console.log(`==> 2FA 权限就绪（${host.name}：辅助功能）`);
   }
 
   return {
     ok: true,
     host: host.name,
-    twoFaMode: twoFa.mode,
   };
 }

@@ -1,201 +1,188 @@
-# Apple ID Automation — 项目上下文文档
+# Apple-AutoMation 项目参考
 
-> **用途**：新开会话 / 新协作者快速了解本项目。  
-> **仓库**：独立项目，与 `ChromeTest`（浏览器指纹探针）分离维护。  
-> **本地路径**：`/Users/yu/Apple-AutoMation`  
-> **目标系统**：macOS 15 Sequoia
+> 当前可运行方案：**Developer-first 会员判定 → Account 个人信息采集**。操作入口见 [运行手册](RUNTIME_RUNBOOK.md)。
 
----
+## 1. 目标与非目标
 
-## 1. 项目目标
+| 能力 | 当前契约 |
+| --- | --- |
+| macOS 系统设置阶段 | 可选的 Apple Account 登录与短信后置流程；--skip-mac 时完全跳过。 |
+| Firefox 浏览器阶段 | ruyiPage-only；初始 tab 先跑 Developer，再为 Account 新建 tab。 |
+| Apple 认证 | email、password、remember-account、OTP 和 trust 提示复用同一可信认证链。 |
+| Developer 判定 | active、not_enrolled、unknown 三态；仅 active 保存会员详情截图。 |
+| Account 采集 | 稳定个人信息页后读取 birthday 与 name，并私有持久化。 |
+| 诊断 | 完整脱敏 JSONL + 简洁终端进度；不把秘密/页面正文混入报告。 |
 
-自动化完成以下流程（测试/运维场景）：
+浏览器生命周期不使用 Playwright、Puppeteer、Selenium、Node BiDi 或 DOM synthetic input 回退。ruyiPage 对敏感输入使用 BiDi-native 行为；JavaScript 仅做无副作用的状态/文本查询。
 
-| 阶段 | 方式 | 人工介入 |
-|------|------|----------|
-| Mac 系统设置登录 Apple ID | AppleScript GUI | **手机 SMS 验证码** |
-| 等待 Mac 登录完成 | 轮询 + 可选 Enter 确认 | 验证码输入后等待 |
-| Firefox 打开 account.apple.com | WebDriver BiDi + 拟人输入 | — |
-| 浏览器 2FA | macOS `FollowUpUI` 弹窗读码 | 需 Mac 已登录同账号 |
-| 采集个人信息 | 页面解析 | — |
+## 2. 模块架构
 
-**未实现 / 后续**：`developer.apple.com`、`appstoreconnect.apple.com` 多标签流程。
+~~~mermaid
+flowchart LR
+    Launcher[run.sh] --> Main[scripts/apple-id-full-flow.mjs]
+    Main --> Browser[scripts/lib/account-browser-flow.js]
+    Browser --> Runner[scripts/lib/ruyipage-backend-runner.js]
+    Runner <--> Python[scripts/ruyipage/apple_account_flow.py]
+    Browser --> TwoFA[scripts/lib/two-fa-sidecar.js]
+    Browser --> Audit[flow-audit.jsonl]
+    Main --> Report[report.json]
+    Python --> Firefox[Firefox via ruyiPage]
+    Python --> Dev[developer.apple.com/account]
+    Python --> Account[account.apple.com/account/manage/section/information]
+~~~
 
----
+| 文件 | 所有权 |
+| --- | --- |
+| scripts/apple-id-full-flow.mjs | 总流程、报告目录、最终 acceptance marker、用户可见结束摘要。 |
+| scripts/lib/account-browser-flow.js | Python runner、2FA collector、状态 sanitization、终端进度、私有结果持久化。 |
+| scripts/lib/ruyipage-backend-runner.js | JSONL framing、超时、子进程组与 bounded cleanup。 |
+| scripts/ruyipage/apple_account_flow.py | 唯一浏览器实现；Developer、Account、截图、profile、tab 和可信页面状态。 |
+| scripts/lib/two-fa-sidecar.js | popup → Settings → TTY 严格串行取码。 |
+| scripts/lib/mac-settings-login.js | System Settings 登录、动态 SMS/post-SMS 协调、人工接续和固定审计事件。 |
+| scripts/lib/mac-settings-sms-verification.js | 可选号码选择、稳定六码页检测、provider 轮询、写码与转场确认。 |
+| scripts/lib/mac-settings-post-sms-finalization.js | 单个可信后置页面的探测；条款/定位自动动作，Mac 密码/iPhone 解锁人工交接。 |
+| scripts/lib/flow-audit.js / scripts/lib/2fa-audit.js | 版本化、脱敏、runId 关联 audit。 |
+| scripts/build-release.mjs | 分发包和独立 README/.env.example；同时打包当前文档。 |
 
-## 2. 技术选型（为何不用 Chrome/Playwright）
+## 3. Browser 状态机
 
-| 层级 | 选型 | 原因 |
-|------|------|------|
-| Mac 2FA 弹窗 | `scripts/apple-2fa-wait.scpt` | 读 `FollowUpUI` 六位码 |
-| 系统设置填表 | AppleScript + System Events | 必须控制原生 UI |
-| 浏览器 | **Firefox** 独立 Profile | BiDi + `input.performActions` 拟人输入 |
-| 协议 | WebDriver BiDi（`ws://127.0.0.1:PORT/session`） | 非 CDP，降低检测面 |
-| Node 依赖 | 无 npm 第三方包 | 原生 WebSocket、`child_process` |
-| 安装 | **不用 Homebrew** | Node 用 nodejs.org 官方包；Firefox 手动安装 |
+~~~text
+browser_ready
+  -> developer_account
+  -> developer_login
+  -> [Developer auth failure] browser failure / preserve policy
+  -> developer_membership
+  -> developer_membership_checked
+  -> [gate=1 && non-active] developer_membership_gate_blocked -> finalization
+  -> [otherwise] account_navigation
+  -> account authentication / shared 2FA
+  -> account_home_confirmed
+  -> account_information
+  -> profile capture / finalization
+~~~
 
----
+### Developer-first 与 gate
 
-## 3. 目录结构
+**DEVELOPER_MEMBERSHIP_GATE=0** 是测试默认。Developer 登录已确认后，它允许 active、not_enrolled、unknown 继续 Account，便于同一次浏览器运行覆盖双模块。Developer 登录失败、仍可见 Apple 登录控件或 2FA 未完成时，绝不创建 Account tab。
 
-```
-Apple-AutoMation/
-├── install.sh              # 环境安装（Node + 辅助功能）
-├── run.sh                  # 主入口
-├── package.json            # 版本号 = 发布版本
-├── .env.example
-├── docs/
-│   └── PROJECT.md          # 本文件
-├── scripts/
-│   ├── apple-id-full-flow.mjs      # 主编排
-│   ├── setup-environment.mjs
-│   ├── check-environment.mjs
-│   ├── bootstrap-macos.sh          # Node 官方包引导
-│   ├── build-release.mjs           # 打 zip 并可选上传 GitHub Releases
-│   ├── fetch-latest.sh             # 从 Releases 下载最新 zip
-│   ├── bump-patch-version.mjs
-│   ├── apple-2fa-wait.scpt
-│   ├── mac-settings-apple-login.applescript
-│   ├── mac-settings-signed-in.applescript
-│   ├── accessibility-check.applescript
-│   └── lib/
-│       ├── credentials.js          # 终端输入 → 备份 .env
-│       ├── accessibility.js        # 辅助功能检测/引导
-│       ├── mac-settings-login.js
-│       ├── account-browser-flow.js
-│       ├── bidi-client.js
-│       ├── human-input-bidi.js
-│       ├── two-fa-sidecar.js
-│       ├── env-setup.js
-│       ├── macos.js                # Sequoia 版本/深链
-│       ├── prompt.js
-│       └── report.js
-└── dist/                   # npm run package 输出（gitignore）
-```
+**DEVELOPER_MEMBERSHIP_GATE=1** 是业务 gate。只有 postLoginDeveloperAccount.authenticated=true、success=true 且 membershipStatus=active 才会创建 Account tab。已认证的非 active 路径发送 developer_membership_gate_blocked，返回浏览器阶段成功但 accountModule.skipped=true 的固定结果；登录失败不是 gate stop。
 
----
+Developer 会员状态在 developer_membership_checked 到达 Node 时立即私有持久化。只允许已认证后的 membership partial 持久化 unknown；Developer 登录失败不写 developer_membership。这样 Account tab 创建或后续 Account 认证失败不会丢失已完成的判定，也不会把失败登录冒充会员结果。
 
-## 4. 运行流程（数据流）
+## 4. 结果、截图与 acceptance
 
-```
-./run.sh
-  → bootstrap（确保 Node 18+）
-  → setup-environment（Firefox、辅助功能等）
-  → promptAppleCredentials（终端输入 → 写 .env 600）
-  → [Mac] mac-settings-apple-login.applescript（env: APPLE_SCRIPT_*）
-  → waitForMacSettingsLoginComplete（轮询 signed-in）
-  → [Browser] 启动 Firefox --profile --remote-debugging-port=0
-  → BiDi session → account.apple.com 登录
-  → two-fa-sidecar + apple-2fa-wait.scpt
-  → 抓取姓名/生日 → data/reports/apple-id-flow-*/report.json
-```
+报告只保留固定、可审计的 metadata：
 
-### 凭证传递
+| 区域 | 关键字段语义 |
+| --- | --- |
+| browserLogin | backend、Account home 是否已确认、session 是否复用等布尔/固定字段。 |
+| postLoginDeveloperAccount | Developer 是否已检查、会员固定分类、失败 stage/class、保留状态。 |
+| accountModule | 是否尝试、是否跳过、gate 是否启用/通过、固定 skip reason。 |
+| postLoginProfileCapture | 个人资料是否成功、固定 failure stage/class、浏览器保留结果。 |
+| screenshots | 仅文件名元数据，例如 03-developer-membership.png、02-account-information.png。 |
 
-- **不再**通过 AppleScript argv 传密码（`@` 等特殊字符会编译失败）
-- Node 设置环境变量：`APPLE_SCRIPT_APPLE_ID`、`APPLE_SCRIPT_PASSWORD`
-- AppleScript 内 `system attribute` 读取
+截图规则：
 
-### AppleScript 要点
+- 03-developer-membership.png：仅 active，且会员详情导航与内容确认后生成；
+- 02-account-information.png：仅 Account 个人信息路由和姓名/生日卡稳定后生成；
+- 认证页、OTP 页、OCR 过程不能成为成功截图；
+- 保留在报告目录的截图属于私有数据，绝不作为默认反馈附件。
 
-- 所有 `click` / `keystroke` 必须在 `tell application "System Events"` 内，否则 **osacompile 失败**
-- Sequoia 深链：`x-apple.systempreferences:com.apple.systempreferences.AppleIDSettings`
+recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=true 时写 marker。Developer gate stop 的 marker 固定为 skipped，不能冒充为 Account 登录成功。
 
----
+## 5. 配置边界
 
-## 5. 环境与安装
+| 配置 | 默认 | 含义 |
+| --- | --- | --- |
+| BROWSER_BACKEND | ruyiPage | 唯一浏览器后端；auto 仅兼容旧配置名。 |
+| BROWSER_PROFILE_MODE | persistent | persistent 复用 profile；fresh 每 run 隔离 profile。 |
+| BROWSER_ATTACH_EXISTING | 1 | 可接管已有 Firefox 会话，随后仍按 Developer-first 顺序推进。 |
+| DEVELOPER_MEMBERSHIP_GATE | 0 | 0 测试双模块；1 仅 active 继续 Account。 |
+| BROWSER_PRESERVE_ON_FAILURE | 1 | 直接运行失败后保留 Firefox 供人工核对。 |
+| BROWSER_PRESERVE_ON_SUCCESS | 1 | 直接运行后保留已登录窗口和标签页。 |
+| BROWSER_2FA_SETTINGS_AFTER_MS | 30000 | popup primary 窗口；Allow 确认后另有固定 OCR 宽限。 |
+| BROWSER_2FA_SETTINGS_FALLBACK | 1 | 是否允许 popup-primary 后的 Settings 来源。 |
+| BROWSER_2FA_MANUAL_FALLBACK | 1 | 是否允许 Settings 后真实 TTY 的隐藏手输。 |
+| APPLE_AUTOMATION_SMS_ENABLED | 1（未设置） | Mac 系统设置 SMS 自动处理；`1` 开启，`0` 关闭。 |
+| APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED | 1（未设置） | SMS 后置动态接续；`1` 开启，`0` 关闭，与 SMS provider 配置独立。 |
+| APPLE_AUTOMATION_SMS_RECONFIGURE | 0 | 号码与短信服务地址重新录入；`1` 开启重新配置，`0` 关闭并沿用已有配置。 |
 
-### install.sh
+.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、name、birthday。它不进入命令行、audit、report 或 Git。
 
-1. 检测 Node 18+；无则下载 nodejs.org 官方 tar 到 `.runtime/node`
-2. `setup-environment.mjs`：检查 Firefox、辅助功能
-3. 辅助功能未授权 → 打开系统设置 → 轮询等待（最长 3 分钟）
+## 6. System Settings 状态机与审计
 
-### 账号密码
+System Settings 只在受监督的 macOS 会话中处理，且不与网页 2FA 共享验证码。
+短信状态机把号码选择视为可选页面，把六位验证码页视为必经页面：只有同一稳定
+六码页连续被观测两次后才轮询 provider。写入后先等待 `code_pending` 消失，再
+要求两次 `waiting` 观察；随后还有最长 90 秒的后置页面初始观察窗口。这样动态
+加载、AX 短暂空白或网络抖动都不会被误当作完成。同一个已验证验证码只能在空的
+六码页重新确认后最多写入三次；仍未推进则进入人工接续。
 
-- **每次** `./run.sh` 终端交互输入
-- 自动写入 `.env`（权限 600）
-- 不要提交 `.env` 到 git
+后置状态机一次只处理一个绑定的页面。条款和定位页最多自动动作三次；同一
+PID/window/stage 超限后保留页面给人工。人工 Enter 只恢复探测，绝不重置该页面
+的动作额度。Mac 密码和 iPhone 解锁页不自动输入，始终停在人工接续点。每个
+成功动作都有 probe-only 转场宽限，避免同一按钮在慢网络下被重复点击。
 
----
+所有设置事件由 `runMacSettingsLoginPhase(..., { onEvent })` 汇总为
+`flow-audit.jsonl` 的 `source=mac_settings,event=event` 条目。sanitizer 只允许
+固定事件、阶段、原因、次数、超时和已验证的 PID/window 数字。以下事件是失败
+收口点，均带固定 `failureCode`（如果有）：
 
-## 6. 打包与发布
+~~~text
+sms_provider_config_failed
+sms_module_failed
+mac_settings_login_wait_failed
+~~~
 
-```bash
-npm run package          # 仅本地打包（保留 dist/）
-npm run package:no-bump  # 不递增版本
-npm run release          # patch+1 → 打包 → 上传 GitHub Releases → 清理本地 dist/
-npm run release:no-bump  # 不递增版本，直接发布当前版本
-```
+`report.json` 保留高层失败阶段；精确的设置模块根因在同一 run 的
+`flow-audit.jsonl` 中。事件 contract 的回归由
+`scripts/test-mac-settings-login-observability.mjs` 固定，任何新事件未加入
+allowlist 都会失败。
 
-本地打包输出：`dist/apple-id-automation-{version}/` 与 `dist/apple-id-automation-{version}-macos.zip`
+## 7. 日志与脱敏
 
-**推荐发布流程**：改完代码后执行 `npm run release`，zip 上传至 [GitHub Releases](https://github.com/jiahaoyin/Apple-AutoMation/releases)，本地 `dist/` 自动清理。
+| 通道 | 内容 |
+| --- | --- |
+| 普通终端 | [→]、[✓]、[!]、[×] 等少量业务进度。 |
+| APPLE_AUTOMATION_TERMINAL_DEBUG=1 | 额外镜像脱敏机器状态；不显示秘密、页面正文和个人资料。 |
+| flow-audit.jsonl | Browser、Developer、Account、mac_settings、screenshot、gate、finalization 与 flow completion 的完整固定状态。 |
+| 2fa-audit.jsonl | popup/AX/OCR/Settings/manual 的 provider 生命周期和固定失败分类。 |
+| launcher-audit.jsonl | 进入、bootstrap、环境、preflight、主流程、完成/失败阶段。 |
+| report.json | 脱敏结果汇总与固定截图文件名。 |
 
-**其他机器拉取**（无需 clone，下载解压即用）：
+每份 JSONL 单独使用从 1 递增的 sequence，同一 runId 将四类报告关联起来。新增状态必须同步允许列表、sanitizer、audit、report、文档与回归测试。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/jiahaoyin/Apple-AutoMation/main/scripts/fetch-latest.sh | bash
-cd apple-id-automation-latest/apple-id-automation-*/
-./install.sh && ./run.sh
-```
+## 8. 测试矩阵
 
-已 clone 仓库时也可运行 `./scripts/fetch-latest.sh`；有 `gh` 时优先用 gh，否则自动 fallback 到 curl。
+| 命令 | 覆盖面 |
+| --- | --- |
+| npm.cmd run -s test:account-browser-flow | Node 编排、Developer result 持久化、gate stop、Account completion、终端/audit sanitization。 |
+| npm.cmd run -s test:ruyipage-protocol | Python ↔ Node JSONL event/command schema。 |
+| npm.cmd run -s test:ruyipage-flow | Python ruyiPage 状态机、tab 顺序、成员判定、个人信息采集边界。 |
+| npm.cmd run -s test:flow-audit | audit schema、sequence、redaction。 |
+| npm.cmd run -s test:release-copy-paths | 分发包、release README、当前运行手册与关键文档合同。 |
+| git diff --check | 空白符与补丁基础检查。 |
 
-`build-release.mjs` 会在打包前 **校验 COPY_PATHS 是否包含所有 lib 依赖**（避免漏文件如 `macos.js`）。
+Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只在当前精确 push 的 SHA 上做只读/受监督验证；流程见 docs/WINDOWS_MAC_CODEX.md。
 
----
+## 9. 故障归属
 
-## 7. 常见问题
+| 状态/现象 | 拥有模块 | 首个排查文件 |
+| --- | --- | --- |
+| Developer login / membership | Python browser state | scripts/ruyipage/apple_account_flow.py、flow-audit.jsonl。 |
+| developer_membership_gate_blocked | Python gate + Node summary | apple_account_flow.py、account-browser-flow.js。 |
+| Account tab / login / profile | Python Account stage | apple_account_flow.py、test-account-browser-flow.mjs。 |
+| 2FA provider / timeout | Node collector | two-fa-sidecar.js、2fa-audit.jsonl。 |
+| OTP 到网页后的输入/提交 | Python owner-frame BiDi | 2FA_HANDOFF_DIAGNOSTICS.md。 |
+| 报告/acceptance marker | Main flow | apple-id-full-flow.mjs。 |
+| 分发文档偏离 | Release builder / static docs check | build-release.mjs、test-release-copy-paths.mjs。 |
 
-| 现象 | 处理 |
-|------|------|
-| `Cannot find module .../macos.js` | 旧 zip 缺文件，用新版本或补拷 `scripts/lib/macos.js` |
-| AppleScript `-2741` 语法错误 | 升级脚本；确认 UI 命令在 System Events tell 内 |
-| Homebrew Permission denied | 本项目**不依赖** brew；用 nodejs.org 装 Node |
-| 系统设置填表失败 | 辅助功能授权；手动打开 Apple Account 页 |
-| 2FA 超时 | Mac 系统设置需已登录；确认 FollowUpUI 弹窗 |
+## 10. 文档治理
 
----
+- [README](../README.md)：最短的上手、模式、产物与入口。
+- [运行手册](RUNTIME_RUNBOOK.md)：当前行为、验收和排错唯一入口。
+- [Mac 交接](MAC_CODEX_HANDOFF.md)：Mac 安全验证与回传。
+- [Windows → Mac](WINDOWS_MAC_CODEX.md)：同步、sandbox、受监督 GUI 和证据。
+- docs/superpowers/plans/：历史实现决策；不替代当前运行手册。
 
-## 8. 与 ChromeTest 的关系
-
-- **ChromeTest**（`/Users/yu/ChromeTest`）：浏览器指纹 / 交互风险**探针**平台（前后端 + Playwright/Puppeteer/Firefox BiDi probe）
-- **本仓库**：仅 Apple ID macOS + Firefox 自动化，从 ChromeTest 的 `scripts/` 拆出（2025-07）
-- 两仓库**独立版本号、独立推送**，互不影响
-
-**正式跑 `./run.sh` 前**，建议在执行机跑探针门禁（云端或本地）：
-
-```bash
-export PROBE_BASE=https://your-probe-server
-cd /path/to/ChromeTest && npm run probe:gate:firefox
-# PASS 后再执行本仓库 ./run.sh
-```
-
-探针配置手册：`ChromeTest/docs/AUTOMATION_PLAYBOOK.md`
-
----
-
-## 9. 开发备忘
-
-- 改功能后：`npm run release` 发布至 GitHub Releases
-- 每次发布默认 **patch 版本 +1**（1.0.2 → 1.0.3）
-- 测试机：macOS 15.6+，Terminal 需辅助功能
-- 勿在仓库中提交：`.env`、`data/`、`.runtime/`、`dist/`
-
----
-
-## 10. 关键入口文件速查
-
-| 需求 | 文件 |
-|------|------|
-| 改总流程 | `scripts/apple-id-full-flow.mjs` |
-| 改系统设置登录 | `scripts/mac-settings-apple-login.applescript` |
-| 改浏览器登录/采集 | `scripts/lib/account-browser-flow.js` |
-| 改 2FA 读码 | `scripts/apple-2fa-wait.scpt` |
-| 改安装/环境 | `scripts/lib/env-setup.js`, `install.sh` |
-| 改打包/发布 | `scripts/build-release.mjs` → `COPY_PATHS`；`npm run release` |
-
----
-
-*最后更新：2025-07-02，版本 1.0.2*
+每次实现改变执行顺序、环境变量、截图、固定状态、报告字段或测试入口时，至少同步 README、运行手册、项目参考、release README 和静态文档合同测试。

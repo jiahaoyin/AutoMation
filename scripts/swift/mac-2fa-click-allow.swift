@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
-// 点击 macOS「允许」弹窗：AX 定位 + CGEvent 鼠标点击 + 默认按钮
-// JSON: { "ok": true, "action": "clicked_allow", "source": "FollowUpUI" }
+// 点击 macOS「允许」弹窗：先锁定正向 AXButton，再尝试 CGEvent/AXPress
+// JSON: { "ok": true, "action": "attempted_allow", "source": "FollowUpUI" }
 
 import ApplicationServices
 import AppKit
@@ -17,8 +17,49 @@ struct Output: Codable {
 }
 
 var probeCoordsOnly = false
+var releaseLeftButtonOnly = false
 
-let priorityApps = ["FollowUpUI", "CoreAuthUI", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow"]
+let priorityApps = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent", "SecurityAgent", "UserNotificationCenter", "akd", "loginwindow"]
+let dedicatedAuthExecutables: Set<String> = ["FollowUpUI", "CoreAuthUI", "CoreAuthentication", "AuthenticationServicesAgent"]
+let sharedHostExecutables: Set<String> = ["UserNotificationCenter", "loginwindow", "SecurityAgent", "akd"]
+let dedicatedAuthBundleIDs: Set<String> = [
+    "com.apple.FollowUpUI",
+    "com.apple.CoreAuthUI",
+    "com.apple.CoreAuthentication",
+    "com.apple.AuthenticationServicesAgent",
+]
+let sharedHostBundleIDs: Set<String> = [
+    "com.apple.UserNotificationCenter",
+    "com.apple.loginwindow",
+    "com.apple.SecurityAgent",
+    "com.apple.akd",
+]
+
+enum CandidateKind {
+    case dedicated
+    case sharedHost
+}
+
+func isAppleSystemExecutable(_ executableURL: URL?) -> Bool {
+    guard let path = executableURL?.standardizedFileURL.path else { return false }
+    return path.hasPrefix("/System/Library/") ||
+        path.hasPrefix("/System/Applications/") ||
+        path.hasPrefix("/usr/libexec/")
+}
+
+func candidateKind(for app: NSRunningApplication) -> CandidateKind? {
+    guard let executableURL = app.executableURL,
+          isAppleSystemExecutable(executableURL) else { return nil }
+    let executableName = executableURL.lastPathComponent
+    let bundleIdentifier = app.bundleIdentifier ?? ""
+    if dedicatedAuthExecutables.contains(executableName) || dedicatedAuthBundleIDs.contains(bundleIdentifier) {
+        return .dedicated
+    }
+    if sharedHostExecutables.contains(executableName) || sharedHostBundleIDs.contains(bundleIdentifier) {
+        return .sharedHost
+    }
+    return nil
+}
 
 func logStep(_ msg: String) {
     FileHandle.standardError.write("[2FA-allow] \(msg)\n".data(using: .utf8)!)
@@ -54,9 +95,23 @@ func axTexts(_ element: AXUIElement) -> [String] {
 func looksLikeAllowDialog(_ blob: String) -> Bool {
     if blob.contains("正用于登录") && blob.contains("新设备") && !blob.contains("在网页上输入此验证码") { return true }
     if blob.contains("正被用于") && blob.contains("登录") { return true }
+    if blob.contains("正用於登入") && blob.contains("新裝置") && !blob.contains("在網頁上輸入此驗證碼") { return true }
+    if blob.contains("正被用於") && blob.contains("登入") { return true }
     if blob.contains("不允许") && blob.contains("允许") { return true }
+    if blob.contains("不允許") && blob.contains("允許") { return true }
     if blob.lowercased().contains("don't allow") && blob.lowercased().contains("allow") { return true }
     return false
+}
+
+func looksLikeAppleLoginDialog(_ blob: String) -> Bool {
+    if blob.contains("正用于") && blob.contains("登录") { return true }
+    if blob.contains("正被用于") && blob.contains("登录") { return true }
+    if blob.contains("正用於") && blob.contains("登入") { return true }
+    if blob.contains("正被用於") && blob.contains("登入") { return true }
+    let lower = blob.lowercased()
+    let mentionsAppleAccount = lower.contains("apple id") || lower.contains("apple account")
+    let mentionsLogin = lower.contains("sign in") || lower.contains("signing in") || lower.contains("log in")
+    return mentionsAppleAccount && mentionsLogin
 }
 
 func looksLikeCodeDialog(_ blob: String) -> Bool {
@@ -102,34 +157,33 @@ func cgClickPoint(from axFrame: CGRect) -> CGPoint {
     CGPoint(x: axFrame.midX, y: axFrame.midY)
 }
 
-func clickScreenPoint(_ pt: CGPoint, holdMs: UInt32 = 280) -> Bool {
+func releaseLeftMouseButton() -> Bool {
     let source = CGEventSource(stateID: .hidSystemState)
-    guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left) else {
-        return false
-    }
-    down.post(tap: .cghidEventTap)
-    usleep(holdMs * 1000)
-    guard let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
+    let position = CGEvent(source: source)?.location ?? .zero
+    guard let up = CGEvent(
+        mouseEventSource: source,
+        mouseType: .leftMouseUp,
+        mouseCursorPosition: position,
+        mouseButton: .left
+    ) else {
         return false
     }
     up.post(tap: .cghidEventTap)
-    usleep(80_000)
-    if let up2 = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
-        up2.post(tap: .cghidEventTap)
-    }
     return true
 }
 
-func postReturnKey() -> Bool {
+func clickScreenPoint(_ pt: CGPoint, holdMs: UInt32 = 280) -> Bool {
     let source = CGEventSource(stateID: .hidSystemState)
-    let vkReturn: CGKeyCode = 36
-    guard let down = CGEvent(keyboardEventSource: source, virtualKey: vkReturn, keyDown: true),
-          let up = CGEvent(keyboardEventSource: source, virtualKey: vkReturn, keyDown: false) else {
+    guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
         return false
     }
+    defer {
+        up.post(tap: .cghidEventTap)
+        usleep(80_000)
+    }
     down.post(tap: .cghidEventTap)
-    usleep(100_000)
-    up.post(tap: .cghidEventTap)
+    usleep(holdMs * 1000)
     return true
 }
 
@@ -137,37 +191,44 @@ func buttonTitle(_ element: AXUIElement) -> String {
     axTexts(element).joined(separator: " ")
 }
 
-func clickElementCenter(_ element: AXUIElement, label: String) -> CGPoint? {
+func isPositiveAllowButton(_ element: AXUIElement) -> Bool {
+    guard axRole(element) == kAXButtonRole as String else { return false }
+    let title = buttonTitle(element).trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = title.lowercased()
+    let negativeTitles = ["Don't Allow", "Do Not Allow", "不允许", "不允許"]
+    if negativeTitles.contains(where: { title.localizedCaseInsensitiveContains($0) }) ||
+        lower.contains("don't allow") || lower.contains("do not allow") {
+        return false
+    }
+    let positiveTitles = ["Allow", "允许", "允許"]
+    if positiveTitles.contains(title) || lower == "allow" { return true }
+    if title.contains("允许") || title.contains("允許") { return true }
+    return lower.hasPrefix("allow ")
+}
+
+func clickElementCenter(_ element: AXUIElement) -> CGPoint? {
     guard let frame = frameOf(element) else {
-        logStep("no frame for button \"\(label)\"")
+        logStep("Allow button has no usable frame")
         return nil
     }
     let pt = cgClickPoint(from: frame)
-    logStep("click \"\(label)\" at \(Int(pt.x)),\(Int(pt.y)) frame=\(Int(frame.origin.x)),\(Int(frame.origin.y)) \(Int(frame.width))x\(Int(frame.height))")
-    _ = clickScreenPoint(pt)
+    logStep("attempting coordinate click on eligible Allow button")
+    guard clickScreenPoint(pt) else {
+        logStep("CGEvent creation failed for eligible Allow button")
+        return nil
+    }
     return pt
 }
 
 func findAllowButton(in root: AXUIElement) -> AXUIElement? {
     var queue: [(AXUIElement, Int)] = [(root, 0)]
-    var buttons: [AXUIElement] = []
     while !queue.isEmpty {
         let (node, depth) = queue.removeFirst()
         if depth > 18 { continue }
-        if axRole(node) == kAXButtonRole as String {
-            buttons.append(node)
-            let title = buttonTitle(node)
-            if title == "允许" || title == "Allow" {
-                return node
-            }
-            if title.contains("允许") && !title.contains("不允许") && !title.lowercased().contains("don't") {
-                return node
-            }
-        }
+        if isPositiveAllowButton(node) { return node }
         for child in axChildren(node) { queue.append((child, depth + 1)) }
     }
-    if buttons.count >= 2 { return buttons.last }
-    return buttons.last
+    return nil
 }
 
 func windowsForApp(_ appEl: AXUIElement) -> [AXUIElement] {
@@ -185,41 +246,47 @@ func raiseWindow(_ win: AXUIElement) {
     AXUIElementPerformAction(win, kAXRaiseAction as CFString)
 }
 
-func tryClickAllowInApp(_ app: NSRunningApplication) -> (Bool, CGPoint?) {
-    let appName = app.localizedName ?? ""
-    app.activate(options: [.activateIgnoringOtherApps])
-    usleep(250_000)
+struct AllowTarget {
+    let window: AXUIElement
+    let button: AXUIElement
+}
+
+func findAllowTarget(in app: NSRunningApplication) -> AllowTarget? {
+    guard let kind = candidateKind(for: app) else { return nil }
     let appEl = AXUIElementCreateApplication(app.processIdentifier)
     for win in windowsForApp(appEl) {
         let blob = blobOf(win)
         if looksLikeCodeDialog(blob) { continue }
-        guard looksLikeAllowDialog(blob) else { continue }
-        logStep("found allow dialog in \(appName): \(blob.prefix(80))")
-        raiseWindow(win)
-        usleep(150_000)
-
-        if let defaultBtn: AXUIElement = axCopy(win, kAXDefaultButtonAttribute as String) {
-            let title = buttonTitle(defaultBtn)
-            logStep("default button: \"\(title)\"")
-            if probeCoordsOnly, let frame = frameOf(defaultBtn) {
-                return (true, cgClickPoint(from: frame))
-            }
-            if let pt = clickElementCenter(defaultBtn, label: title) { return (true, pt) }
-            if pressButton(defaultBtn) { return (true, nil) }
+        guard let button = findAllowButton(in: win) else { continue }
+        let target = AllowTarget(window: win, button: button)
+        switch kind {
+        case .dedicated:
+            return target
+        case .sharedHost:
+            if looksLikeAppleLoginDialog(blob) { return target }
         }
-        if let btn = findAllowButton(in: win) {
-            let title = buttonTitle(btn)
-            if probeCoordsOnly, let frame = frameOf(btn) {
-                return (true, cgClickPoint(from: frame))
-            }
-            if let pt = clickElementCenter(btn, label: title) { return (true, pt) }
-            if pressButton(btn) { return (true, nil) }
-        }
-        logStep("fallback Return key for \(appName)")
-        _ = postReturnKey()
-        usleep(400_000)
-        return (true, nil)
     }
+    return nil
+}
+
+func probeAllowCoordinates(in app: NSRunningApplication) -> CGPoint? {
+    guard let target = findAllowTarget(in: app), let frame = frameOf(target.button) else {
+        return nil
+    }
+    return cgClickPoint(from: frame)
+}
+
+func tryClickAllowInApp(_ app: NSRunningApplication) -> (Bool, CGPoint?) {
+    guard findAllowTarget(in: app) != nil else { return (false, nil) }
+    app.activate(options: [.activateIgnoringOtherApps])
+    usleep(250_000)
+    guard let target = findAllowTarget(in: app) else { return (false, nil) }
+    raiseWindow(target.window)
+    usleep(150_000)
+
+    logStep("found eligible Allow button")
+    if let pt = clickElementCenter(target.button) { return (true, pt) }
+    if pressButton(target.button) { return (true, nil) }
     return (false, nil)
 }
 
@@ -245,7 +312,35 @@ while i < CommandLine.arguments.count {
         i += 1
         continue
     }
+    if CommandLine.arguments[i] == "--release-left-button" {
+        releaseLeftButtonOnly = true
+        i += 1
+        continue
+    }
     i += 1
+}
+
+if releaseLeftButtonOnly {
+    let released = releaseLeftMouseButton()
+    emit(Output(
+        ok: released,
+        action: released ? "released_left_button" : "none",
+        source: nil,
+        message: released ? "ok" : "release_failed",
+        x: nil,
+        y: nil
+    ))
+}
+
+guard AXIsProcessTrusted() else {
+    emit(Output(
+        ok: false,
+        action: "accessibility_unavailable",
+        source: nil,
+        message: "accessibility_unavailable",
+        x: nil,
+        y: nil
+    ))
 }
 
 let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
@@ -260,14 +355,16 @@ while Date() < deadline {
     }
     for app in apps {
         let name = app.localizedName ?? ""
-        let isPriority = priorityApps.contains { name.contains($0) }
-        if !isPriority && app.activationPolicy != .regular { continue }
-        let (clicked, pt) = tryClickAllowInApp(app)
-        if clicked {
-            if probeCoordsOnly, let pt = pt {
+        guard candidateKind(for: app) != nil else { continue }
+        if probeCoordsOnly {
+            if let pt = probeAllowCoordinates(in: app) {
                 emit(Output(ok: true, action: "coords", source: name, message: "ok", x: Int(pt.x), y: Int(pt.y)))
             }
-            emit(Output(ok: true, action: "clicked_allow", source: name, message: "ok", x: pt.map { Int($0.x) }, y: pt.map { Int($0.y) }))
+            continue
+        }
+        let (attempted, pt) = tryClickAllowInApp(app)
+        if attempted {
+            emit(Output(ok: true, action: "attempted_allow", source: name, message: "ok", x: pt.map { Int($0.x) }, y: pt.map { Int($0.y) }))
         }
     }
     usleep(350_000)

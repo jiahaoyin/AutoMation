@@ -22,6 +22,10 @@ export async function waitForEnter(message) {
 export async function waitUntil(message, predicate, options = {}) {
   const intervalMs = options.intervalMs ?? 2000;
   const timeoutMs = options.timeoutMs ?? 600_000;
+  const timeoutCode =
+    typeof options.timeoutCode === "string" && /^MAC_SETTINGS_[A-Z0-9_]{1,96}$/.test(options.timeoutCode)
+      ? options.timeoutCode
+      : null;
   const manualHint =
     options.manualHint ??
     "\n若自动检测失败，可在完成后按 Enter 手动继续…";
@@ -29,17 +33,22 @@ export async function waitUntil(message, predicate, options = {}) {
   console.log(message);
   const deadline = Date.now() + timeoutMs;
 
-  const manual = (async () => {
-    await waitForEnter(manualHint);
-    return true;
-  })();
+  const manual =
+    options.allowManualContinuation === false
+      ? new Promise(() => {})
+      : (async () => {
+          await waitForEnter(manualHint);
+          return true;
+        })();
 
   const poll = (async () => {
     while (Date.now() < deadline) {
       if (await predicate()) return true;
       await sleep(intervalMs);
     }
-    throw new Error(`等待超时（${timeoutMs}ms）`);
+    const error = new Error(`等待超时（${timeoutMs}ms）`);
+    if (timeoutCode) error.code = timeoutCode;
+    throw error;
   })();
 
   return Promise.race([poll, manual]);
