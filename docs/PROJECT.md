@@ -163,7 +163,7 @@ allowlist 都会失败。
 | npm.cmd run -s test:release-copy-paths | 分发包、release README、当前运行手册与关键文档合同。 |
 | git diff --check | 空白符与补丁基础检查。 |
 
-Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只在当前精确 push 的 SHA 上做只读/受监督验证；流程见 docs/WINDOWS_MAC_CODEX.md。
+Windows 运行 Windows-safe 回归，不执行真实 Apple 登录。Mac `verify` 在当前精确 push 的 SHA 上做只读/受监督验证；Mac `implementation` 在受控 writer lock 下做 macOS 特定实现、测试、优化与 ruyiPage 页面注释，返回脱敏 diff/manifest/annotation。流程见 docs/WINDOWS_MAC_CODEX.md。
 
 ## 9. 故障归属
 
@@ -186,3 +186,8 @@ Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只�
 - docs/superpowers/plans/：历史实现决策；不替代当前运行手册。
 
 每次实现改变执行顺序、环境变量、截图、固定状态、报告字段或测试入口时，至少同步 README、运行手册、项目参考、release README 和静态文档合同测试。
+# Platform policy update (2026-08-02)
+
+Windows and Mac are both development hosts. Mac implementation work must use the controlled
+`--mac-mode implementation` writer flow; browser automation remains ruyiPage-only and secrets
+remain denied.

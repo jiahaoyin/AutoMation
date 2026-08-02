@@ -28,6 +28,7 @@ import {
   SUPERVISED_SETTINGS_PROVIDER_FAILURE_REASONS,
   SUPERVISED_SETTINGS_PROVIDER_STATES,
   SUPERVISED_SUCCESS_MARKER,
+  createMacImplementationPermissionProfile,
   createMacVerificationPermissionProfile,
   createSupervisedAttestation,
   parseSupervisedAttestation,
@@ -572,8 +573,8 @@ for (const contract of [projectInstructions, operationsGuide]) {
   assert.match(contract, /final\.json/);
   assert.match(contract, /events\.jsonl/);
 }
-assert.match(projectInstructions, /Windows is the development host/);
-assert.match(projectInstructions, /Mac is the macOS verification host/);
+assert.match(projectInstructions, /Windows and Mac are both development hosts/);
+assert.match(projectInstructions, /controlled implementation host/);
 assert.match(projectInstructions, /fast-forward/);
 assert.match(projectInstructions, /-module-cache-path/);
 assert.match(operationsGuide, /codex-exit\.txt/);
@@ -1591,6 +1592,7 @@ assert.deepEqual(defaults, {
   timeoutMs: DEFAULT_TIMEOUT_MS,
   supervisedGui: false,
   supervisedMode: SUPERVISED_ACCOUNT_MODE,
+  macMode: "verify",
 });
 
 const taskFileDir = fs.mkdtempSync(path.join(os.tmpdir(), "mac-codex-task-"));
@@ -1620,6 +1622,7 @@ try {
     timeoutMs: 45_000,
     supervisedGui: false,
     supervisedMode: SUPERVISED_ACCOUNT_MODE,
+    macMode: "verify",
   });
 } finally {
   removeTreeOneFileAtATime(taskFileDir);
@@ -1639,6 +1642,24 @@ assert.throws(
   () => parseArgs(["--task", "x", "--ssh-alias", "-F"]),
   /SSH alias/i
 );
+assert.equal(
+  parseArgs(["--task", "x", "--remote-repo", "/Volumes/Repo"]).remoteRepo,
+  "/Volumes/Repo",
+  "a valid short absolute macOS repository path must not be rejected"
+);
+for (const remoteRepo of [
+  "/",
+  "/Volumes/Repo/",
+  "/Volumes/../Repo",
+  "/Volumes/./Repo",
+  "/Volumes//Repo",
+]) {
+  assert.throws(
+    () => parseArgs(["--task", "x", "--remote-repo", remoteRepo]),
+    /remote repository path/i,
+    remoteRepo
+  );
+}
 assert.throws(
   () => parseArgs(["--task", "x", "--allow-supervised-gui", "--no-sync"]),
   /synchronized exclusive run/i
@@ -1647,6 +1668,38 @@ assert.throws(
 const supervisedArgs = parseArgs(["--task", "执行受监督 GUI 验收", "--allow-supervised-gui"]);
 assert.equal(supervisedArgs.supervisedGui, true);
 assert.equal(supervisedArgs.supervisedMode, SUPERVISED_ACCOUNT_MODE);
+assert.equal(supervisedArgs.macMode, "verify");
+const implementationArgs = parseArgs([
+  "--task",
+  "Mac implementation and browser annotation",
+  "--mac-mode",
+  "implementation",
+  "--no-sync",
+]);
+assert.equal(implementationArgs.macMode, "implementation");
+assert.equal(implementationArgs.sync, false);
+const defaultImplementationArgs = parseArgs([
+  "--task",
+  "Mac implementation default sync contract",
+  "--mac-mode",
+  "implementation",
+]);
+assert.equal(defaultImplementationArgs.sync, false);
+assert.throws(
+  () => parseArgs(["--task", "x", "--mac-mode", "unknown"]),
+  /invalid Mac mode/i
+);
+assert.throws(
+  () =>
+    parseArgs([
+      "--task",
+      "x",
+      "--mac-mode",
+      "implementation",
+      "--allow-supervised-gui",
+    ]),
+  /requires --mac-mode verify/i
+);
 const settingsSmokeArgs = parseArgs([
   "--task",
   "settings smoke acceptance",
@@ -1789,6 +1842,75 @@ assert.ok(
 );
 assert.match(remoteScript, /Apple-AutoMation\/\.env" = "deny"/);
 assert.match(remoteScript, /~\/\.codex\/auth\.json" = "deny"/);
+
+const implementationPrompt = buildAgentPrompt({
+  task: "Implement macOS browser annotation fix",
+  macMode: "implementation",
+});
+assert.match(implementationPrompt, /mac_implementation/);
+assert.match(implementationPrompt, /允许在项目仓库内修改/);
+assert.match(implementationPrompt, /ruyiPage/);
+const implementationOptions = {
+  ...remoteOptions,
+  sync: false,
+  macMode: "implementation",
+};
+const implementationProfile = createMacImplementationPermissionProfile(
+  implementationOptions.remoteRoundDir + "/tmp",
+  implementationOptions.remoteRepo
+);
+assert.match(implementationProfile, /:read-only/);
+assert.match(implementationProfile, /Apple-AutoMation" = "write"/);
+assert.match(implementationProfile, /Apple-AutoMation\/\.env" = "deny"/);
+assert.match(implementationProfile, /Apple-AutoMation\/\.git" = "deny"/);
+assert.match(implementationProfile, /Apple-AutoMation\/\.runtime" = "deny"/);
+assert.match(implementationProfile, /network = \{ enabled = true, domains = \{\} \}/);
+const implementationScript = buildRemoteScript(implementationOptions);
+assert.match(implementationScript, /LOCK_MODE='writer'/);
+assert.match(implementationScript, /MAC_MODE='implementation'/);
+assert.ok(implementationScript.includes("PERMISSION_PROFILE='" + implementationProfile + "'"));
+assert.match(implementationScript, /permissions\.mac_implementation=/);
+assert.match(implementationScript, /git-diff\.patch/);
+assert.match(implementationScript, /git-untracked\.txt/);
+assert.match(implementationScript, /sanitize-browser-annotations\.mjs/);
+assert.match(implementationScript, /sanitize-mac-codex-artifacts\.mjs/);
+assert.match(implementationScript, /ARTIFACT_SANITIZER_B64=/);
+assert.match(implementationScript, /BROWSER_ANNOTATION_SANITIZER_B64=/);
+assert.match(implementationScript, /git diff --no-index/);
+assert.match(implementationScript, /\$ARTIFACT_SANITIZER" --implementation/);
+assert.doesNotMatch(
+  implementationScript,
+  /\$REMOTE_REPO\/scripts\/sanitize-(?:browser-annotations|mac-codex-artifacts)\.mjs/
+);
+assert.match(implementationScript, /path resolves through a symlink/);
+assert.doesNotMatch(implementationScript, /cp -p .*browser-annotations\.jsonl/);
+const implementationScp = buildScpArgs({
+  sshAlias: "mac-codex",
+  remoteRoundDir: implementationOptions.remoteRoundDir,
+  roundDir: "C:/tmp/mac-round",
+  macMode: "implementation",
+});
+assert.ok(implementationScp.some((value) => value.endsWith("/git-diff.patch")));
+assert.ok(implementationScp.some((value) => value.endsWith("/git-untracked.txt")));
+assert.ok(implementationScp.some((value) => value.endsWith("/browser-annotations.jsonl")));
+for (const profileFactory of [
+  createMacVerificationPermissionProfile,
+  createMacImplementationPermissionProfile,
+]) {
+  for (const unsafePath of [
+    "/",
+    "/Users/admin/Repo/",
+    "/Users/admin/../Repo",
+    "/Users/admin/./Repo",
+    "/Users//admin/Repo",
+  ]) {
+    assert.throws(
+      () => profileFactory("/Users/admin/.codex-orchestrator/runs/test/tmp", unsafePath),
+      /permission path is invalid/i,
+      unsafePath
+    );
+  }
+}
 assert.match(remoteScript, /RUN_TMP_DIR="\$REMOTE_ROUND_DIR\/tmp"/);
 assert.match(remoteScript, /export TMPDIR="\$RUN_TMP_DIR"/);
 assert.match(
@@ -2765,7 +2887,11 @@ for (const property of ["commands", "tests", "findings"]) {
   assert.equal(schema.properties[property].items.additionalProperties, false);
 }
 assert.deepEqual(schema.properties.status.enum, ["passed", "failed"]);
-assert.deepEqual(schema.properties.executionMode.enum, ["noninteractive", "supervised_gui"]);
+assert.deepEqual(schema.properties.executionMode.enum, [
+  "noninteractive",
+  "supervised_gui",
+  "mac_implementation",
+]);
 assert.deepEqual(schema.properties.supervisedGuiStatus.enum, [
   "not_requested",
   "passed",
@@ -3238,6 +3364,68 @@ try {
   assert.equal(passed.expectedExecutionMode, "noninteractive");
   assert.deepEqual(passed.report, validReport());
   assert.equal(passed.artifacts.finalReport, path.join(passedDir, "final.json"));
+
+  const implementationDir = path.join(artifactRoot, "implementation-passed");
+  writeArtifacts(implementationDir, {
+    "events.jsonl": '{"type":"thread.started"}\n{"type":"turn.completed"}\n',
+    "final.json": `${JSON.stringify(validReport("passed", { executionMode: "mac_implementation" }))}\n`,
+    "git-before.txt": " M scripts/example.js\n",
+    "git-after.txt": " M scripts/example.js\n?? scripts/new.js\n",
+    "head-before.txt": `${"a".repeat(40)}\n`,
+    "head-after.txt": `${"b".repeat(40)}\n`,
+    "git-diff.patch": [
+      "diff --git a/scripts/example.js b/scripts/example.js",
+      "diff --git a/scripts/new.js b/scripts/new.js",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/scripts/new.js",
+      "+export const value = 'safe';",
+      "",
+    ].join("\n"),
+    "git-untracked.txt": "scripts/new.js\n",
+    "browser-annotations.jsonl": '{"phase":"developer","selectorHash":"abc123","selectorKind":"membership-card","status":"confirmed"}\n',
+  });
+  const implementation = summarizeRun(
+    implementationDir,
+    processResults,
+    EXPECTED_HEAD,
+    "mac_implementation",
+    "",
+    SUPERVISED_ACCOUNT_MODE
+  );
+  assert.equal(implementation.status, "passed");
+  assert.equal(implementation.git.changed, true);
+
+  const implementationMissingArtifactDir = path.join(artifactRoot, "implementation-missing-artifact");
+  writeArtifacts(implementationMissingArtifactDir, {
+    "final.json": `${JSON.stringify(validReport("passed", { executionMode: "mac_implementation" }))}\n`,
+    "git-diff.patch": "",
+    "git-untracked.txt": "",
+  });
+  const implementationMissingArtifact = summarizeRun(
+    implementationMissingArtifactDir,
+    processResults,
+    EXPECTED_HEAD,
+    "mac_implementation"
+  );
+  assert.equal(implementationMissingArtifact.status, "failed");
+  assert.ok(implementationMissingArtifact.errors.some((error) => error.code === "missing_artifact"));
+
+  const implementationSensitiveAnnotationDir = path.join(artifactRoot, "implementation-sensitive-annotation");
+  writeArtifacts(implementationSensitiveAnnotationDir, {
+    "final.json": `${JSON.stringify(validReport("passed", { executionMode: "mac_implementation" }))}\n`,
+    "git-diff.patch": "",
+    "git-untracked.txt": "",
+    "browser-annotations.jsonl": '{"phase":"developer","url":"https://example.invalid"}\n',
+  });
+  const implementationSensitiveAnnotation = summarizeRun(
+    implementationSensitiveAnnotationDir,
+    processResults,
+    EXPECTED_HEAD,
+    "mac_implementation"
+  );
+  assert.equal(implementationSensitiveAnnotation.status, "failed");
+  assert.ok(implementationSensitiveAnnotation.errors.some((error) => error.code === "invalid_browser_annotations"));
 
   const supervisedDir = path.join(artifactRoot, "supervised-passed");
   writeArtifacts(supervisedDir, {

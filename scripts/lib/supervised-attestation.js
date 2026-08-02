@@ -111,11 +111,36 @@ export function createMacVerificationPermissionProfile(runTmpDir, repository) {
   const writable = String(runTmpDir ?? "");
   const repo = String(repository ?? "");
   for (const value of [writable, repo]) {
-    if (!value.startsWith("/") || /["\\\r\n\0]/.test(value)) {
-      throw new Error("Mac verification permission path is invalid");
-    }
+    assertMacPermissionPath(value, "Mac verification permission path is invalid");
   }
   return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}/.env" = "deny", "~/.codex/auth.json" = "deny", "~/.ssh" = "deny", "~/.git-credentials" = "deny", "~/.netrc" = "deny", "~/.config/gh" = "deny" } }`;
+}
+
+// Implementation mode grants the complete project worktree for normal macOS
+// development. Repository control, credentials, and the bundled runtime stay
+// outside that writable boundary.
+// Credential stores remain explicitly denied because Mac Codex may edit code
+// and browser annotation fixtures without gaining access to account secrets.
+export function createMacImplementationPermissionProfile(runTmpDir, repository) {
+  const writable = String(runTmpDir ?? "");
+  const repo = String(repository ?? "");
+  for (const value of [writable, repo]) {
+    assertMacPermissionPath(value, "Mac implementation permission path is invalid");
+  }
+  return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}" = "write", "${repo}/.runtime" = "deny", "${repo}/.git" = "deny", "${repo}/.env" = "deny", "${repo}/.env.*" = "deny", "~/.codex/auth.json" = "deny", "~/.ssh" = "deny", "~/.git-credentials" = "deny", "~/.netrc" = "deny", "~/.config/gh" = "deny" }, network = { enabled = true, domains = {} } }`;
+}
+
+function assertMacPermissionPath(value, message) {
+  if (
+    !value.startsWith("/") ||
+    value === "/" ||
+    value.endsWith("/") ||
+    value.includes("//") ||
+    value.split("/").some((part) => part === "." || part === "..") ||
+    /["\\\r\n\0]/.test(value)
+  ) {
+    throw new Error(message);
+  }
 }
 
 export const SUPERVISED_STATUSES = new Set([

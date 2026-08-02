@@ -166,7 +166,7 @@ data/reports/apple-id-flow-<timestamp>/
 | --- | --- |
 | **./install.sh** | 安装/更新项目运行环境与 native helper。 |
 | **./run.sh** | 完整系统设置 + Developer-first + Account 流程。 |
-| **./run.sh --skip-mac** | 只验证浏览器两个模块。 |
+| **./run.sh --skip-mac** | 跳过 macOS 系统设置，执行浏览器两个模块。 |
 | **npm run check** | 环境自检。 |
 | **npm run test:account-browser-flow** | Node 浏览器编排、会员持久化、gate 与报告契约。 |
 | **npm run test:ruyipage-protocol** | JSONL 协议契约。 |
@@ -204,7 +204,7 @@ APPLE_AUTOMATION_SMS_RECONFIGURE=0 # 1=重新录入号码与服务地址；0=沿
 - [运行手册](docs/RUNTIME_RUNBOOK.md) — 当前流程、状态机、日志、gate、人工验收与故障矩阵。
 - [项目参考](docs/PROJECT.md) — 架构、模块边界、数据与测试契约。
 - [2FA 交接诊断](docs/2FA_HANDOFF_DIAGNOSTICS.md) — OTP 获取到网页提交的固定检查点。
-- [Mac 交接](docs/MAC_CODEX_HANDOFF.md) — Mac 只读验证与安全证据反馈。
+- [Mac 交接](docs/MAC_CODEX_HANDOFF.md) — Mac verify/implementation 双模式与安全证据反馈。
 - [Windows → Mac 调度](docs/WINDOWS_MAC_CODEX.md) — 精确 SHA 同步、受监督 GUI 与证据回传。
 
 ## 安全与发布
@@ -213,3 +213,8 @@ APPLE_AUTOMATION_SMS_RECONFIGURE=0 # 1=重新录入号码与服务地址；0=沿
 - 不在 JS 中合成敏感输入事件；浏览器敏感输入只走 ruyiPage BiDi。
 - 认证失败不保存认证页全页截图；Vision 只在内存处理，不落临时 OCR 图片。
 - 发布分发包使用 **npm run package**；其他 Mac 使用 **./install.sh && ./run.sh**。
+# Mac collaboration note (2026-08-02)
+
+Mac is supported for controlled implementation and browser annotation through
+`npm.cmd run -s mac:codex -- --mac-mode implementation ...`; the default mode remains read-only
+verification for compatibility.

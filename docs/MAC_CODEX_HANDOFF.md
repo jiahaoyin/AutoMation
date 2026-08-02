@@ -1,6 +1,6 @@
 # Mac 验证交接
 
-> 用于 Mac 只读验证、人工 GUI 测试和脱敏证据回传。当前运行方案以 docs/RUNTIME_RUNBOOK.md 为准。
+> Mac 不是测试专机。`verify` 做精确 SHA 验证，`implementation` 允许 macOS 特定实现、测试、优化和 ruyiPage 页面注释，并回传脱敏产物。当前运行方案以 docs/RUNTIME_RUNBOOK.md 为准。
 
 ## 1. 先读什么
 
@@ -20,8 +20,9 @@
 | 环境 | 职责 |
 | --- | --- |
 | Windows 开发机 | 读源码、修改、跑 Windows-safe tests、review、commit、push。 |
-| Mac 验证机 | 拉取与 Windows 完全一致的精确 SHA，做只读测试或用户监督的 GUI 验收，回传脱敏证据。 |
-| Mac Codex | 不编辑、提交或推送仓库；不自行启动真实 Apple 登录、Firefox、系统设置或 GUI 自动化。 |
+| Mac verify | 拉取精确 SHA，做只读测试或用户监督的 GUI 验收，回传脱敏证据。 | 修改/提交/推送仓库、覆盖脏工作树。 |
+| Mac implementation | 在 writer lock 下修改源码、测试、文档，运行 macOS 检查并用 ruyiPage 标注页面；回传脱敏 diff/manifest/annotation。 | 读取秘密、写 `.git`、提交/推送、强制 checkout、递归删除或覆盖既有脏改动。 |
+| Mac Codex sandbox | verify 只写本轮 TMPDIR；implementation 另写项目工作树。 | 读取 `.env`、auth、SSH/Git 凭据、netrc 或共享系统目录。 |
 
 默认 Mac 仓库路径：
 
@@ -180,7 +181,7 @@ developer_membership_checked
 
 ## 9. 安全的本地检查
 
-Mac Codex 可以做不触发 GUI 的只读/静态检查：
+Mac Codex 在 `verify` 模式可以做不触发 GUI 的只读/静态检查；`implementation` 模式还可做受控源码修改、测试和 ruyiPage 页面注释：
 
 ~~~bash
 node --check scripts/apple-id-full-flow.mjs
@@ -206,7 +207,7 @@ supervised GUI 或自动 Mac 测试。不要输出凭据、OTP、原始 AX/OCR�
 浏览器必须保持 ruyiPage-only。当前顺序是 Developer-first：初始 tab 判定会员并持久化
 developer_membership；仅 gate 允许时创建 Account tab。2FA 必须维持 popup AX/OCR →
 Settings → optional hidden manual 的严格串行策略。等待我提供脱敏日志或已脱敏视觉证据，
-再定位最小拥有模块并给 Windows 修改清单。不得编辑、提交或推送 Mac 工作树。
+implementation 模式的修改通过脱敏 diff、untracked manifest 和 browser-annotations.jsonl 回传；仍不得提交或推送 Mac 工作树。
 ~~~
 
 ## 11. 不可破坏的仓库规则
@@ -216,4 +217,10 @@ Settings → optional hidden manual 的严格串行策略。等待我提供脱�
 - 不使用 bulk/recursive 删除或破坏性 Git 命令。
 - 保留用户无关改动。
 - audit 和报告只保留固定脱敏状态，不插入 raw helper stderr、AX/OCR、截图、OTP 或页面正文。
-- Windows 改源并 push；Mac 只验证精确 SHA 并回传证据。
+Windows 与 Mac 都可改源；verify 负责精确 SHA 验证，implementation 负责受控实现并回传脱敏证据。
+# Current collaboration policy (2026-08-02)
+
+Mac is no longer test-only. Use `--mac-mode implementation` for controlled source changes,
+macOS optimization, and ruyiPage browser annotation. The mode is an exclusive writer run and
+returns a sanitized patch/untracked manifest; `--no-sync` preserves existing Mac edits. Keep
+`.env`, auth files, SSH/Git credentials, raw page text, OTP, and raw screenshots out of reports.
