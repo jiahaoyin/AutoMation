@@ -3990,6 +3990,36 @@ class DeveloperFirstSequencingTests(unittest.TestCase):
             "apple_account_flow.collect_personal_info",
             return_value={"name": "Test Given Test Family", "birthday": "2000-01-02"},
         ), patch(
+            "apple_account_flow.change_account_password",
+            return_value={
+                "success": True,
+                "attempted": True,
+                "passwordStored": True,
+                "passwordLength": 16,
+                "newPassword": "RotatedA2!fixtrX",
+                "failureStage": "unknown",
+                "failureClass": "unknown",
+                "browserAlive": True,
+                "browserPreserved": False,
+                "browserPreservationRequested": False,
+            },
+        ), patch(
+            "apple_account_flow.apply_small_business_program",
+            return_value=(
+                {
+                    "success": True,
+                    "attempted": True,
+                    "submitted": True,
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                account_page,
+                None,
+            ),
+        ), patch(
             "apple_account_flow.finalize_post_login_browser",
             return_value={
                 "browserFinalizationCompleted": True,
@@ -4350,6 +4380,8 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         collect_side_effect=None,
         password_change_result=None,
         small_business_result=None,
+        password_change_side_effect=None,
+        small_business_side_effect=None,
     ):
         class FakeFirefoxOptions:
             def __getattr__(self, _name):
@@ -4399,9 +4431,11 @@ class SafeFailureBoundaryTests(unittest.TestCase):
             side_effect=collect_side_effect or (lambda _page: personal_info),
         ), patch(
             "apple_account_flow.change_account_password",
+            side_effect=password_change_side_effect,
             return_value=password_change_result,
         ), patch(
             "apple_account_flow.apply_small_business_program",
+            side_effect=small_business_side_effect,
             return_value=(small_business_result, None, None),
         ), patch(
             "apple_account_flow.human_pause",
@@ -4641,6 +4675,37 @@ class SafeFailureBoundaryTests(unittest.TestCase):
                 "profile_data_incomplete",
             )
             self.assertNotIn(secret, json.dumps(events))
+
+    def test_profile_name_modal_cleanup_failure_blocks_password_and_small_business(self):
+        events = []
+        password_change = Mock(name="change_account_password")
+        small_business = Mock(name="apply_small_business_program")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_code = self.run_late_flow(
+                Path(temp_dir),
+                self.DiskScreenshotPage("redacted"),
+                {"trusted": True, "error": False},
+                {"name": "Given Family", "birthday": "2000-01-02"},
+                events,
+                collect_side_effect=lambda _page: (_ for _ in ()).throw(
+                    RuntimeError("personal information name modal cleanup failed")
+                ),
+                password_change_side_effect=password_change,
+                small_business_side_effect=small_business,
+            )
+
+        self.assertEqual(result_code, 0)
+        password_change.assert_not_called()
+        small_business.assert_not_called()
+        result = next(event for event in events if event.get("event") == "result")
+        self.assertEqual(
+            result["postLoginProfileCapture"]["failureClass"],
+            "profile_name_modal_cleanup_failed",
+        )
+        self.assertFalse(result["postLoginProfileCapture"]["success"])
+        statuses = [event.get("status") for event in events]
+        self.assertNotIn("profile_capture_completed", statuses)
 
     def test_profile_capture_failure_keeps_personal_information_screenshot_and_browser(self):
         class PreservedProfilePage(self.DiskScreenshotPage):
@@ -10692,6 +10757,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         return json.loads(completed.stdout)
@@ -11049,6 +11115,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
         self.assertTrue(active)
         self.assertIn(("human_click", membership_link), page.actions.calls)
+        self.assertEqual(membership_link.scroll.calls, [("to_see",)])
         details_queries = [
             script
             for script in page.developer_scripts
@@ -11195,7 +11262,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertTrue(active)
         self.assertEqual(page.actions.calls, [])
 
-    def test_membership_details_require_renewal_and_registration_evidence(self):
+    def test_membership_details_require_renewal_evidence(self):
         page = DeveloperFakePage(
             state={
                 "href": "https://developer.apple.com/account#MembershipDetailsCard"
@@ -11221,6 +11288,98 @@ process.stdout.write(JSON.stringify(eval(expression)));
             )
 
         self.assertFalse(active)
+
+    def test_membership_details_with_renewal_evidence_do_not_require_registration_identity(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": False,
+                    "teamId": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": False,
+                    "teamId": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+
+    def test_hash_routed_membership_scrolls_card_before_lazy_field_hydration(self):
+        order = []
+
+        class OrderedDeveloperPage(DeveloperFakePage):
+            def run_js(self, script):
+                if "ruyipage-developer-membership-details" in script:
+                    order.append("probe")
+                return super().run_js(script)
+
+        initial_details = {
+            "detailsPage": True,
+            "appleDeveloperProgram": True,
+            "renewalDate": False,
+            "registrationIdentity": False,
+            "membershipFieldCount": 0,
+        }
+        hydrated_details = {
+            "detailsPage": True,
+            "appleDeveloperProgram": True,
+            "renewalDate": True,
+            "registrationIdentity": True,
+            "membershipFieldCount": 2,
+        }
+        page = OrderedDeveloperPage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=initial_details,
+        )
+        membership_card = FakeElement(
+            attrs={"id": "MembershipDetailsCard"},
+            on_scroll=lambda: (
+                order.append("scroll"),
+                setattr(page, "membership_details", hydrated_details),
+            ),
+        )
+        page.elements_by_selector[
+            "css:[id*='MembershipDetailsCard']"
+        ] = [membership_card]
+        membership_card.scope = page
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 0.2, 0.3],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(active)
+        self.assertEqual(membership_card.scroll.calls, [("to_see",)])
+        self.assertEqual(order, ["scroll", "probe", "probe"])
 
     def test_membership_details_with_live_auth_controls_fails_closed(self):
         page = DeveloperFakePage(
@@ -11252,32 +11411,48 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
         self.assertFalse(active)
 
-    def test_membership_details_with_root_text_only_error_fails_closed(self):
+    def test_membership_details_with_root_text_only_error_waits_for_hydration(self):
         page = DeveloperFakePage(
             state={
                 "href": "https://developer.apple.com/account#MembershipDetailsCard",
                 "error": True,
             },
-            membership_details={
-                "detailsPage": True,
-                "appleDeveloperProgram": True,
-                "renewalDate": True,
-                "registrationIdentity": True,
-                "membershipFieldCount": 2,
-            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": False,
+                    "renewalDate": False,
+                    "registrationIdentity": False,
+                    "membershipFieldCount": 0,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
         )
         page.states = FakeStates(alive=True)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2],
+            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
                 pause=lambda *_: None,
             )
 
-        self.assertFalse(active)
+        self.assertTrue(active)
 
     def test_membership_details_query_reads_hash_and_generic_card_fields(self):
         page = DeveloperFakePage(
@@ -11470,6 +11645,20 @@ process.stdout.write(JSON.stringify(eval(expression)));
                     account_flow.developer_membership_snapshot_is_active(snapshot)
                 )
 
+    def test_membership_details_query_accepts_expiration_date_without_registration_identity(self):
+        snapshot = self.evaluate_membership_details_query(
+            "Membership details\nPlan\nApple Developer Program\n"
+            "Expiration date\nJanuary 2, 2030"
+        )
+
+        self.assertTrue(snapshot["detailsPage"])
+        self.assertTrue(snapshot["appleDeveloperProgram"])
+        self.assertTrue(snapshot["renewalDate"])
+        self.assertFalse(snapshot["registrationIdentity"])
+        self.assertTrue(
+            account_flow.developer_membership_snapshot_is_active(snapshot)
+        )
+
     def test_selector_priority_avoids_counting_nested_wrappers_twice(self):
         membership_item = FakeElement(
             text="Membership details",
@@ -11613,6 +11802,14 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
     def test_collects_active_membership_and_returns_fixed_screenshot(self):
         developer_page = self.authenticated_page(membership_navigation=True)
+        capture_order = []
+        membership_card = FakeElement(
+            attrs={"id": "MembershipDetailsCard"},
+            on_scroll=lambda: capture_order.append("card_scrolled"),
+        )
+        developer_page.elements_by_selector[
+            "css:[id*='MembershipDetailsCard']"
+        ] = [membership_card]
         developer_page.membership_details = {
             "detailsPage": True,
             "appleDeveloperProgram": True,
@@ -11651,7 +11848,10 @@ process.stdout.write(JSON.stringify(eval(expression)));
             return_value=True,
         ), patch(
             "apple_account_flow.take_screenshot",
-            return_value=str(screenshot_path),
+            side_effect=lambda *_args, **_kwargs: (
+                capture_order.append("screenshot"),
+                str(screenshot_path),
+            )[1],
         ) as screenshot, patch(
             "apple_account_flow.human_pause",
             lambda *_: None,
@@ -11682,6 +11882,8 @@ process.stdout.write(JSON.stringify(eval(expression)));
         )
         self.assertIs(returned_page, developer_page)
         self.assertEqual(captured, str(screenshot_path))
+        self.assertEqual(membership_card.scroll.calls, [("to_see",)])
+        self.assertEqual(capture_order, ["card_scrolled", "screenshot"])
         screenshot.assert_called_once_with(
             developer_page,
             screenshot_path,
@@ -11719,6 +11921,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
                 },
             ],
         )
+        membership_card = FakeElement(attrs={"id": "MembershipDetailsCard"})
+        developer_page.elements_by_selector[
+            "css:[id*='MembershipDetailsCard']"
+        ] = [membership_card]
+        membership_card.scope = developer_page
         developer_page.states = FakeStates(alive=True)
         developer_page.wait = type(
             "FakeWait",
@@ -11774,6 +11981,61 @@ process.stdout.write(JSON.stringify(eval(expression)));
             screenshot_path,
             checkpoint="developer_membership",
             full_page=False,
+        )
+        self.assertEqual(membership_card.scroll.calls, [("to_see",), ("to_see",)])
+
+    def test_active_membership_without_a_resolved_details_card_skips_misleading_screenshot(self):
+        developer_page = self.authenticated_page(membership_navigation=True)
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class RootPage:
+            def new_tab(self, _url):
+                return developer_page
+
+        events = []
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "developerAccountShell": True,
+                    "joinProgram": False,
+                    "membershipNavigation": True,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ), patch(
+            "apple_account_flow.confirm_active_developer_membership",
+            return_value=True,
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.take_screenshot"
+        ) as screenshot, patch("apple_account_flow.emit", side_effect=events.append):
+            result, _returned_page, captured = (
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    {"twofaPrepared": True, "nextGeneration": 2},
+                    Path("03-developer-membership.png"),
+                )
+            )
+
+        self.assertEqual(result["membershipStatus"], "active")
+        self.assertIsNone(captured)
+        screenshot.assert_not_called()
+        self.assertIn(
+            {
+                "event": "status",
+                "status": "developer_membership_card_unavailable",
+            },
+            events,
         )
 
     def test_membership_markers_cannot_be_classified_without_confirmed_account_shell(self):
@@ -13336,6 +13598,698 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertEqual(calls, ["name_click"])
         self.assertIn(("human_click", name_card), page.actions.calls)
 
+    def test_collect_personal_info_closes_name_modal_from_owner_overlay(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
+            }
+        )
+        inner_modal = ModalWithoutDefaultClose(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        outer_dialog = ModalWithoutDefaultClose(
+            displayed=False,
+            attrs={
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                }
+            },
+        )
+
+        def dismiss_modal():
+            inner_modal.states.is_displayed = False
+            outer_dialog.states.is_displayed = False
+
+        external_close = FakeElement(
+            on_click=dismiss_modal,
+            attrs={"aria-label": "Close"},
+        )
+        outer_dialog.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [external_close]
+        }
+        name_card = FakeElement(
+            on_click=lambda: (
+                setattr(inner_modal.states, "is_displayed", True),
+                setattr(outer_dialog.states, "is_displayed", True),
+            ),
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+                "css:[id^='modal-content-']": [inner_modal],
+                "css:[role='dialog']": [outer_dialog],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+
+        with patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            result = account_flow.collect_personal_info(page)
+
+        self.assertEqual(result, {"name": "Given Family", "birthday": "2000-01-02"})
+        self.assertIn(("human_click", external_close), page.actions.calls)
+        statuses = [event["status"] for event in events if event.get("event") == "status"]
+        self.assertLess(
+            statuses.index("profile_name_collected"),
+            statuses.index("profile_name_modal_closed"),
+        )
+        self.assertNotIn("profile_name_modal_cleanup_failed", statuses)
+
+    def test_collect_personal_info_uses_portal_close_only_when_aria_controls_matches(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, _selector, timeout=None):
+                return []
+
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
+            }
+        )
+        modal = ModalWithoutDefaultClose(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+
+        def dismiss_modal():
+            modal.states.is_displayed = False
+
+        portal_close = FakeElement(
+            on_click=dismiss_modal,
+            attrs={
+                "aria-controls": "modal-content-name",
+                # Apple can expose a localised close label without the
+                # modal-close CSS token when the button lives in a portal.
+                "profileModalClose": {
+                    "visible": True,
+                    "label": "关闭",
+                    "className": "",
+                },
+            },
+        )
+        unrelated_close = FakeElement(
+            attrs={"aria-label": "Close", "className": "modal-close"}
+        )
+        name_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+                "css:button[aria-controls='modal-content-name']": [portal_close],
+            },
+            buttons=[unrelated_close],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+
+        with patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            result = account_flow.collect_personal_info(page)
+
+        self.assertEqual(result, {"name": "Given Family", "birthday": "2000-01-02"})
+        self.assertIn(("human_click", portal_close), page.actions.calls)
+        self.assertNotIn(("human_click", unrelated_close), page.actions.calls)
+        self.assertIn(
+            {"event": "status", "status": "profile_name_modal_closed"},
+            events,
+        )
+
+    def test_collect_personal_info_emits_redacted_diagnostic_when_modal_cleanup_fails(self):
+        class InnerModalWithoutClose(FakeElement):
+            def eles(self, _selector, timeout=None):
+                return []
+
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
+            }
+        )
+        modal = InnerModalWithoutClose(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            },
+        )
+        unrelated_close = FakeElement(
+            attrs={"aria-label": "Close", "className": "modal-close"}
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            buttons=[unrelated_close],
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+
+        with patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "personal information name modal cleanup failed",
+        ):
+            account_flow.collect_personal_info(page)
+
+        cleanup = next(
+            event
+            for event in events
+            if event.get("status") == "profile_name_modal_cleanup_failed"
+        )
+        self.assertEqual(
+            cleanup,
+            {
+                "event": "status",
+                "status": "profile_name_modal_cleanup_failed",
+                "failureClass": "profile_name_modal_close_control_unavailable",
+                "closeSearchScope": "none",
+            },
+        )
+        self.assertIn(
+            cleanup["failureClass"],
+            account_flow.PROFILE_NAME_MODAL_CLEANUP_FAILURE_CLASSES,
+        )
+        statuses = [event["status"] for event in events if event.get("event") == "status"]
+        self.assertLess(
+            statuses.index("profile_name_collected"),
+            statuses.index("profile_name_modal_cleanup_failed"),
+        )
+        serialized_events = json.dumps(events)
+        self.assertNotIn("Given", serialized_events)
+        self.assertNotIn("Family", serialized_events)
+        self.assertNotIn("2000-01-02", serialized_events)
+        self.assertNotIn(("human_click", unrelated_close), page.actions.calls)
+
+    def test_profile_name_modal_cleanup_failure_maps_to_dedicated_class(self):
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(
+                RuntimeError("personal information name modal cleanup failed")
+            ),
+            "profile_name_modal_cleanup_failed",
+        )
+        self.assertIn(
+            "profile_name_modal_cleanup_failed",
+            account_flow.PROFILE_CAPTURE_FAILURE_CLASSES,
+        )
+
+    def test_close_profile_name_modal_accepts_dismissed_stale_click(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        modal = ModalWithoutDefaultClose(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        def dismiss_then_raise():
+            modal.states.is_displayed = False
+            raise RuntimeError("stale close target")
+
+        stale_close = FakeElement(
+            on_click=dismiss_then_raise,
+            attrs={"aria-label": "Close"},
+        )
+        modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [stale_close]
+        }
+        events = []
+
+        with patch("apple_account_flow.emit", side_effect=events.append):
+            result = account_flow.close_profile_name_modal(
+                page,
+                page,
+                modal,
+                timeout_s=0.5,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(result["closed"])
+        self.assertEqual(result["closeSearchScope"], "modal_content")
+        clicked = [call for call in page.actions.calls if call[0] == "human_click"]
+        self.assertEqual(clicked, [("human_click", stale_close)])
+        self.assertIn(
+            {"event": "status", "status": "profile_name_modal_closed"},
+            events,
+        )
+
+    def test_close_profile_name_modal_refreshes_modal_and_portal_close_after_stale_click(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        modal_attrs = {
+            "id": "modal-content-name",
+            "profileModal": {
+                "visible": True,
+                "fieldCount": 2,
+                "given": "Given",
+                "family": "Family",
+            },
+        }
+        stale_modal = ModalWithoutDefaultClose(attrs=dict(modal_attrs))
+        fresh_modal = ModalWithoutDefaultClose(displayed=False, attrs=dict(modal_attrs))
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [stale_modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+                "css:button[aria-controls='modal-content-name']": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        def dismiss_fresh_modal():
+            fresh_modal.states.is_displayed = False
+
+        fresh_portal_close = FakeElement(
+            on_click=dismiss_fresh_modal,
+            attrs={
+                "aria-controls": "modal-content-name",
+                "profileModalClose": {
+                    "visible": True,
+                    "label": "Close",
+                    "className": "modal-close",
+                },
+            },
+        )
+
+        def replace_modal_then_raise():
+            stale_modal.states.is_displayed = False
+            fresh_modal.states.is_displayed = True
+            fresh_modal.scope = page
+            fresh_portal_close.scope = page
+            page.elements_by_selector["css:[id^='modal-content-']"] = [fresh_modal]
+            page.elements_by_selector[
+                "css:button[aria-controls='modal-content-name']"
+            ] = [fresh_portal_close]
+            raise RuntimeError("stale close target")
+
+        stale_close = FakeElement(
+            on_click=replace_modal_then_raise,
+            attrs={"aria-label": "Close"},
+        )
+        stale_modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [stale_close]
+        }
+
+        result = account_flow.close_profile_name_modal(
+            page,
+            page,
+            stale_modal,
+            timeout_s=0.5,
+            pause=lambda *_: None,
+        )
+
+        self.assertTrue(result["closed"])
+        self.assertEqual(result["closeSearchScope"], "portal_owner")
+        self.assertIn(("human_click", stale_close), page.actions.calls)
+        self.assertIn(("human_click", fresh_portal_close), page.actions.calls)
+
+    def test_close_profile_name_modal_fails_closed_when_click_leaves_personal_information(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        modal = ModalWithoutDefaultClose(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        close = FakeElement(
+            on_click=lambda: page.state.update({"href": account_flow.ACCOUNT_SECURITY_URL}),
+            attrs={"aria-label": "Close"},
+        )
+        modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [close]
+        }
+        events = []
+
+        with patch("apple_account_flow.emit", side_effect=events.append):
+            result = account_flow.close_profile_name_modal(
+                page,
+                page,
+                modal,
+                timeout_s=0.5,
+                pause=lambda *_: None,
+            )
+
+        self.assertFalse(result["closed"])
+        self.assertEqual(
+            result["failureClass"],
+            "profile_name_modal_close_context_lost",
+        )
+        self.assertNotIn(
+            {"event": "status", "status": "profile_name_modal_closed"},
+            events,
+        )
+
+    def test_close_profile_name_modal_classifies_close_query_failure(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        class CloseSummaryFailure(FakeElement):
+            def run_js(self, script):
+                if "ruyipage-profile-modal-close" in script:
+                    raise RuntimeError("temporary ruyipage query failure")
+                return super().run_js(script)
+
+        modal = ModalWithoutDefaultClose(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        failing_close = CloseSummaryFailure()
+        modal.attrs["elementsBySelector"] = {"css:button": [failing_close]}
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        result = account_flow.close_profile_name_modal(
+            page,
+            page,
+            modal,
+            timeout_s=0.5,
+            pause=lambda *_: None,
+        )
+
+        self.assertFalse(result["closed"])
+        self.assertEqual(
+            result["failureClass"],
+            "profile_name_modal_close_query_failed",
+        )
+        self.assertEqual(result["closeSearchScope"], "modal_content")
+
+    def test_close_profile_name_modal_maps_post_click_query_failure(self):
+        class QueryFailureAfterCloseModal(FakeElement):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_cleanup_query = False
+
+            def run_js(self, script):
+                if (
+                    self.fail_cleanup_query
+                    and "ruyipage-profile-name-modal" in script
+                ):
+                    raise RuntimeError("temporary cleanup query failure")
+                return super().run_js(script)
+
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        modal = QueryFailureAfterCloseModal(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        close = FakeElement(
+            on_click=lambda: setattr(modal, "fail_cleanup_query", True),
+            attrs={"aria-label": "Close"},
+        )
+        modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [close]
+        }
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        result = account_flow.close_profile_name_modal(
+            page,
+            page,
+            modal,
+            timeout_s=0.5,
+            pause=lambda *_: None,
+        )
+
+        self.assertFalse(result["closed"])
+        self.assertEqual(
+            result["failureClass"],
+            "profile_name_modal_close_query_failed",
+        )
+
+
+    def test_profile_name_modal_cleanup_state_keeps_visible_unhydrated_modal_open(self):
+        modal = FakeElement(
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": None,
+                    "family": None,
+                },
+            }
+        )
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        self.assertEqual(account_flow.profile_name_modal_cleanup_state(page), "open")
+
+    def test_profile_name_modal_cleanup_state_keeps_idless_hydration_skeleton_open(self):
+        for field_count in (0, 1):
+            with self.subTest(field_count=field_count):
+                modal = FakeElement(
+                    attrs={
+                        "profileModal": {
+                            "visible": True,
+                            "fieldCount": field_count,
+                            "given": None,
+                            "family": None,
+                        }
+                    }
+                )
+                page = FakePage(
+                    {
+                        "css:[id^='modal-content-']": [],
+                        "css:[role='dialog']": [modal],
+                        "css:aside": [],
+                    },
+                    state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+                )
+
+                self.assertEqual(
+                    account_flow.profile_name_modal_cleanup_state(
+                        page,
+                        modal_selector="css:[role='dialog']",
+                        modal_scope=page,
+                    ),
+                    "open",
+                )
+
+    def test_close_profile_name_modal_does_not_clear_an_idless_hydration_skeleton(self):
+        class ModalWithoutDefaultClose(FakeElement):
+            def eles(self, selector, timeout=None):
+                elements = self.attrs.get("elementsBySelector", {}).get(selector, [])
+                for element in elements:
+                    element.scope = self.scope
+                return elements
+
+        modal = ModalWithoutDefaultClose(
+            attrs={
+                "role": "dialog",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            }
+        )
+        close = FakeElement(
+            on_click=lambda: modal.attrs["profileModal"].update(
+                {"fieldCount": 0, "given": None, "family": None}
+            ),
+            attrs={"aria-label": "Close"},
+        )
+        modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [close]
+        }
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [],
+                "css:[role='dialog']": [modal],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        result = account_flow.close_profile_name_modal(
+            page,
+            page,
+            modal,
+            timeout_s=0.02,
+            pause=lambda *_: None,
+        )
+
+        self.assertFalse(result["closed"])
+        self.assertEqual(
+            result["failureClass"],
+            "profile_name_modal_close_unconfirmed",
+        )
+
     def test_profile_confirmation_fails_closed_for_live_authentication_state(self):
         blockers = (
             {"password": True},
@@ -13848,6 +14802,157 @@ process.stdout.write(query.call(modal));
         )
         self.assertNotIn("secret DOM text", json.dumps(events))
 
+    def test_name_modal_unavailable_has_fixed_class_and_bounded_diagnostics(self):
+        page = FakePage(
+            {"css:[id^='modal-content-']": [], "css:[role='dialog']": []},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            side_effect=RuntimeError("personal information name card was not found"),
+        ), patch("apple_account_flow.emit", side_effect=events.append):
+            with self.assertRaisesRegex(
+                RuntimeError, "personal information name modal is unavailable"
+            ) as raised:
+                account_flow.open_profile_name_modal(
+                    page,
+                    timeout_s=1,
+                    pause=lambda *_: None,
+                )
+
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(raised.exception),
+            "profile_name_modal_unavailable",
+        )
+        self.assertIn(
+            "profile_name_modal_unavailable",
+            account_flow.PROFILE_CAPTURE_FAILURE_CLASSES,
+        )
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "profile_name_modal_unavailable",
+                    "attemptCount": account_flow.PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS,
+                    "outcome": "card_missing",
+                }
+            ],
+        )
+
+    def test_clicked_name_card_without_modal_has_fixed_class_and_bounded_diagnostics(
+        self,
+    ):
+        page = FakePage(
+            {"css:[id^='modal-content-']": [], "css:[role='dialog']": []},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        name_card = FakeElement()
+        events = []
+
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            return_value=(page, name_card, {}),
+        ), patch("apple_account_flow.human_click"), patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            side_effect=RuntimeError("personal information name modal was not found"),
+        ), patch("apple_account_flow.emit", side_effect=events.append):
+            with self.assertRaisesRegex(
+                RuntimeError, "personal information name modal is unavailable"
+            ) as raised:
+                account_flow.open_profile_name_modal(
+                    page,
+                    timeout_s=1,
+                    pause=lambda *_: None,
+                )
+
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(raised.exception),
+            "profile_name_modal_unavailable",
+        )
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "profile_name_modal_unavailable",
+                    "attemptCount": account_flow.PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS,
+                    "outcome": "modal_missing",
+                }
+            ],
+        )
+
+    def test_name_modal_unavailable_after_deadline_preserves_fixed_class(self):
+        page = FakePage(
+            {"css:[id^='modal-content-']": [], "css:[role='dialog']": []},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        events = []
+        monotonic_values = iter((0.0, 0.0, 1.1))
+
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            side_effect=RuntimeError("personal information name card was not found"),
+        ), patch("apple_account_flow.emit", side_effect=events.append), patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "personal information name modal is unavailable"
+            ) as raised:
+                account_flow.open_profile_name_modal(
+                    page,
+                    timeout_s=1,
+                    pause=lambda *_: None,
+                )
+
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(raised.exception),
+            "profile_name_modal_unavailable",
+        )
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "profile_name_modal_unavailable",
+                    "attemptCount": account_flow.PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS,
+                    "outcome": "card_missing",
+                }
+            ],
+        )
+
+    def test_ambiguous_name_modal_has_fixed_class_without_clicking_a_card(self):
+        page = FakePage(
+            {"css:[id^='modal-content-']": [], "css:[role='dialog']": []},
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        with patch(
+            "apple_account_flow.resolve_profile_name_modal",
+            side_effect=RuntimeError("personal information name modal is ambiguous"),
+        ), patch("apple_account_flow.wait_for_profile_card") as wait_for_card:
+            with self.assertRaisesRegex(
+                RuntimeError, "personal information name modal is ambiguous"
+            ) as raised:
+                account_flow.open_profile_name_modal(
+                    page,
+                    timeout_s=1,
+                    pause=lambda *_: None,
+                )
+
+        wait_for_card.assert_not_called()
+        self.assertEqual(
+            account_flow.classify_profile_capture_failure(raised.exception),
+            "profile_name_modal_ambiguous",
+        )
+        self.assertIn(
+            "profile_name_modal_ambiguous",
+            account_flow.PROFILE_CAPTURE_FAILURE_CLASSES,
+        )
+
     def test_collects_birthday_before_opening_the_name_modal(self):
         calls: list[str] = []
         birthday_card = FakeElement(
@@ -13918,6 +15023,92 @@ process.stdout.write(query.call(modal));
         self.assertLess(calls.index("birthday"), calls.index("name_click"))
         self.assertEqual(name_card.clicks, 0)
         self.assertIn(("human_click", name_card), page.actions.calls)
+
+    def test_re_resolves_name_card_after_hydration_before_click(self):
+        birthday_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": False,
+                    "birthday": True,
+                    "birthdayValue": "2000-01-02",
+                }
+            }
+        )
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        old_card = FakeElement(
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            }
+        )
+        fresh_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                }
+            },
+        )
+        close = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", False),
+            attrs={"aria-label": "Close"},
+        )
+        modal.attrs["elementsBySelector"] = {
+            "css:button[aria-label='Close']": [close]
+        }
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [fresh_card],
+                "css:button[class*='button-bare']": [fresh_card],
+                "css:.card": [birthday_card],
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        wait_results = iter(
+            [
+                (page, birthday_card, birthday_card.attrs["profileCard"]),
+                (page, old_card, old_card.attrs["profileCard"]),
+                (page, fresh_card, fresh_card.attrs["profileCard"]),
+            ]
+        )
+        events = []
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            side_effect=lambda *_args, **_kwargs: next(wait_results),
+        ), patch("apple_account_flow.human_pause", lambda *_: None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            result = account_flow.collect_personal_info(page)
+
+        self.assertEqual(result, {"name": "Given Family", "birthday": "2000-01-02"})
+        self.assertIn(("human_click", fresh_card), page.actions.calls)
+        self.assertNotIn(("human_click", old_card), page.actions.calls)
+        self.assertIn(
+            {"event": "status", "status": "profile_name_modal_closed"},
+            events,
+        )
 
     def test_rejects_ambiguous_name_cards_without_clicking_either(self):
         cards = [

@@ -112,6 +112,8 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "profile_name_collected",
   "profile_name_modal_closed",
   "profile_name_modal_query_failed",
+  "profile_name_modal_unavailable",
+  "profile_name_modal_cleanup_failed",
   "profile_navigation_started",
   "profile_navigation_sidebar_link_resolved",
   "profile_navigation_sidebar_click_sent",
@@ -129,6 +131,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "developer_account_authenticated",
   "developer_membership_probe",
   "developer_membership_checked",
+  "developer_membership_card_unavailable",
   "developer_account_completed",
   "developer_account_failed",
   "developer_membership_gate_blocked",
@@ -212,6 +215,8 @@ const RUYIPAGE_PROFILE_STATUS_MESSAGES = Object.freeze({
   profile_birthday_collected: "[✓] 已读取出生日期",
   profile_name_collected: "[✓] 已读取姓名",
   profile_name_modal_closed: "[✓] 姓名弹窗已关闭",
+  profile_name_modal_cleanup_failed:
+    "[!] 姓名弹窗未能确认关闭，已停止后续账号修改流程；详情已写入日志",
   developer_account_started: "[→] 正在打开 Apple Developer 账户页面",
   developer_account_authentication_started:
     "[→] Apple Developer 页面需要登录，正在继续认证",
@@ -300,6 +305,9 @@ const PROFILE_CAPTURE_FAILURE_CLASSES = new Set([
   "profile_card_identity_collision",
   "profile_data_incomplete",
   "profile_name_modal_query_failed",
+  "profile_name_modal_ambiguous",
+  "profile_name_modal_unavailable",
+  "profile_name_modal_cleanup_failed",
   "browser_connection_lost",
   "profile_capture_failed",
   "profile_persistence_failed",
@@ -552,6 +560,49 @@ function sanitizeBrowserPageKind(value) {
 
 function sanitizeProfileCaptureFailureClass(value) {
   return PROFILE_CAPTURE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+const PROFILE_NAME_MODAL_CLEANUP_FAILURE_CLASSES = new Set([
+  "profile_name_modal_close_control_unavailable",
+  "profile_name_modal_close_action_failed",
+  "profile_name_modal_close_context_lost",
+  "profile_name_modal_close_query_failed",
+  "profile_name_modal_close_unconfirmed",
+]);
+const PROFILE_NAME_MODAL_CLOSE_SEARCH_SCOPES = new Set([
+  "modal_content",
+  "owner_overlay",
+  "portal_owner",
+  "none",
+]);
+const PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES = new Set([
+  "card_missing",
+  "modal_missing",
+  "timeout",
+]);
+
+function sanitizeProfileNameModalCleanupFailureClass(value) {
+  return PROFILE_NAME_MODAL_CLEANUP_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileNameModalCloseSearchScope(value) {
+  return PROFILE_NAME_MODAL_CLOSE_SEARCH_SCOPES.has(value) ? value : "unknown";
+}
+
+function sanitizeProfileNameModalUnavailableAttemptCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 2 ? value : 0;
+}
+
+function sanitizeProfileNameModalUnavailableOutcome(value) {
+  return PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES.has(value) ? value : "timeout";
+}
+
+function firstKnownBrowserFailureStage(...values) {
+  for (const value of values) {
+    const stage = sanitizeBrowserFailureStage(value);
+    if (stage !== "unknown") return stage;
+  }
+  return "unknown";
 }
 
 function sanitizePasswordChangeFailureClass(value) {
@@ -1514,6 +1565,20 @@ function auditRuyiPageEvent(flowAudit, event) {
       details.browserPreservationRequested =
         event.browserPreservationRequested === true;
     }
+    if (event.status === "profile_name_modal_cleanup_failed") {
+      details.failureClass = sanitizeProfileNameModalCleanupFailureClass(
+        event.failureClass
+      );
+      details.closeSearchScope = sanitizeProfileNameModalCloseSearchScope(
+        event.closeSearchScope
+      );
+    }
+    if (event.status === "profile_name_modal_unavailable") {
+      details.attemptCount = sanitizeProfileNameModalUnavailableAttemptCount(
+        event.attemptCount
+      );
+      details.outcome = sanitizeProfileNameModalUnavailableOutcome(event.outcome);
+    }
     if (event.status === "password_change_form_ready") {
       details.fieldCount = event.fieldCount === 3 ? 3 : 0;
     }
@@ -1614,9 +1679,16 @@ function auditRuyiPageEvent(flowAudit, event) {
     const smallBusinessApplication = sanitizePostLoginSmallBusinessApplication(
       event.postLoginSmallBusinessApplication
     );
+    const resultFailureStage = firstKnownBrowserFailureStage(
+      event.failureStage,
+      event.postLoginProfileCapture?.failureStage,
+      event.postLoginPasswordChange?.failureStage,
+      event.postLoginSmallBusinessApplication?.failureStage,
+      event.postLoginDeveloperAccount?.failureStage
+    );
     writeFlowAudit(flowAudit, "ruyipage", "result", {
       success: event.success === true,
-      failureStage: sanitizeBrowserFailureStage(event.failureStage),
+      failureStage: resultFailureStage,
       accountHomeConfirmed:
         event.browserLogin?.accountHomeConfirmed === true,
       profileCaptureSuccess: event.postLoginProfileCapture?.success === true,

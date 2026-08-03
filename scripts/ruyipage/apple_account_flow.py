@@ -65,12 +65,32 @@ PROFILE_NAME_MODAL_SELECTORS = (
 )
 PROFILE_MODAL_CLOSE_SELECTORS = (
     "css:.modal-close button",
+    "css:button[class*='modal-close']",
     "css:button[aria-label='Close']",
     "css:button[aria-label='关闭']",
     "css:button[aria-label='關閉']",
 )
+PROFILE_NAME_MODAL_CLEANUP_FAILURE_CLASSES = frozenset(
+    {
+        "profile_name_modal_close_control_unavailable",
+        "profile_name_modal_close_action_failed",
+        "profile_name_modal_close_context_lost",
+        "profile_name_modal_close_query_failed",
+        "profile_name_modal_close_unconfirmed",
+    }
+)
+PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES = frozenset(
+    {
+        "card_missing",
+        "modal_missing",
+        "timeout",
+    }
+)
 PROFILE_CARD_WAIT_TIMEOUT_S = 35.0
 PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
+PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS = 2
+PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S = 3.0
+PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS = 2
 PROFILE_VALUE_STABLE_OBSERVATIONS = 2
 PROFILE_VALUE_MAX_LENGTHS = {"name": 256, "birthday": 128}
 ACCOUNT_SECURITY_NAVIGATION_LABELS = frozenset(
@@ -329,6 +349,9 @@ PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
         "profile_reauthentication_exhausted",
         "profile_data_incomplete",
         "profile_name_modal_query_failed",
+        "profile_name_modal_ambiguous",
+        "profile_name_modal_unavailable",
+        "profile_name_modal_cleanup_failed",
         "browser_connection_lost",
         "profile_capture_failed",
     }
@@ -603,6 +626,12 @@ def classify_profile_capture_failure(error: Exception) -> str:
         return "profile_card_ambiguous"
     if "personal information name modal query failed" in message:
         return "profile_name_modal_query_failed"
+    if "personal information name modal is ambiguous" in message:
+        return "profile_name_modal_ambiguous"
+    if "personal information name modal is unavailable" in message:
+        return "profile_name_modal_unavailable"
+    if "personal information name modal cleanup failed" in message:
+        return "profile_name_modal_cleanup_failed"
     if "name and birthday" in message:
         return "profile_data_incomplete"
     if "profile" in message or "personal information" in message:
@@ -875,6 +904,51 @@ def emit_profile_name_modal_query_failure_once() -> None:
             "status": "profile_name_modal_query_failed",
         }
     )
+
+
+def emit_profile_name_modal_unavailable(
+    *,
+    attempt_count: int,
+    outcome: str,
+) -> None:
+    """Emit bounded diagnostics for a name modal that never materialized.
+
+    The page and exception text can contain personal profile data.  Keep the
+    audit event intentionally small: only a capped retry count and a fixed
+    outcome enum are allowed through.
+    """
+    normalized_attempt_count = (
+        attempt_count
+        if isinstance(attempt_count, int) and not isinstance(attempt_count, bool)
+        else 0
+    )
+    normalized_attempt_count = max(
+        0,
+        min(PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS, normalized_attempt_count),
+    )
+    normalized_outcome = (
+        outcome
+        if outcome in PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES
+        else "timeout"
+    )
+    emit(
+        {
+            "event": "status",
+            "status": "profile_name_modal_unavailable",
+            "attemptCount": normalized_attempt_count,
+            "outcome": normalized_outcome,
+        }
+    )
+
+
+def profile_name_modal_unavailable_outcome(error: Exception) -> str | None:
+    """Map only known non-sensitive modal-open terminal errors to an outcome."""
+    message = str(error).casefold()
+    if "personal information name card was not found" in message:
+        return "card_missing"
+    if "personal information name modal was not found" in message:
+        return "modal_missing"
+    return None
 
 
 def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
@@ -3901,6 +3975,18 @@ DEVELOPER_NAVIGATION_SELECTORS = (
     "css:[role='link']",
     "css:[role='button']",
 )
+DEVELOPER_MEMBERSHIP_CARD_SELECTORS = (
+    "css:[id*='MembershipDetailsCard']",
+    "css:[id*='membershipDetailsCard']",
+    "css:[class*='MembershipDetailsCard']",
+    "css:[class*='membershipDetailsCard']",
+    "css:[data-testid*='MembershipDetailsCard']",
+    "css:[data-testid*='membershipDetailsCard']",
+    "css:[id*='membership-details']",
+    "css:[class*='membership-details']",
+    "css:[data-testid*='membership-details']",
+)
+DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS = 3
 
 
 def developer_account_snapshot(page: Any) -> dict[str, bool | int]:
@@ -4323,10 +4409,17 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, Any]:
               /renewal date/,
               /renewed through/,
               /membership expiration/,
+              /expiration date/,
+              /expiry date/,
+              /membership expires/,
               /\u7eed\u8ba2\u65e5\u671f/,
               /\u7e8c\u8a02\u65e5\u671f/,
               /\u7eed\u671f\u65e5\u671f/,
-              /\u7e8c\u671f\u65e5\u671f/
+              /\u7e8c\u671f\u65e5\u671f/,
+              /\u5230\u671f\u65e5\u671f/,
+              /\u5230\u671f\u65e5/,
+              /\u6709\u6548\u671f\u81f3/,
+              /\u6709\u6548\u671f\u9650/
             ],
             registrationIdentity: [
               /registration identity/,
@@ -4504,12 +4597,17 @@ def normalize_developer_registration_identity(value: Any) -> str | None:
 
 
 def developer_membership_snapshot_is_active(snapshot: dict[str, Any]) -> bool:
-    """Require the loaded membership card, plan, renewal and identity evidence."""
+    """Confirm the current program from the card's plan and renewal evidence.
+
+    ``Registration identity`` is useful account metadata, but Apple does not
+    render it consistently for every enrolled account/layout.  Do not turn a
+    loaded Developer Program card with a meaningful renewal value into
+    ``unknown`` merely because that supplemental field is absent.
+    """
     return bool(
         snapshot.get("detailsPage") is True
         and snapshot.get("appleDeveloperProgram") is True
         and snapshot.get("renewalDate") is True
-        and snapshot.get("registrationIdentity") is True
     )
 
 
@@ -4549,6 +4647,63 @@ def developer_membership_details_route(url: str) -> bool:
     )
 
 
+def resolve_developer_membership_details_card(
+    page: Any,
+) -> tuple[Any, Any] | None:
+    """Resolve the concrete details-card root for a viewport screenshot."""
+    if not is_developer_account_url(scope_location_url(page)):
+        return None
+    seen: set[int] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in DEVELOPER_MEMBERSHIP_CARD_SELECTORS:
+            for card in safe_elements(root, selector, timeout_s=0):
+                if id(card) in seen or not element_is_interactable(card):
+                    continue
+                seen.add(id(card))
+                return scope, card
+    return None
+
+
+def scroll_developer_membership_details_card(
+    page: Any,
+    *,
+    pause: Callable[[int, int], None] = human_pause,
+) -> bool:
+    """Scroll the exact details card, tolerating a bounded SPA replacement.
+
+    The membership route can finish changing before its card root is mounted.
+    Retrying this narrow lookup lets the native route scroll settle first, then
+    gives ruyiPage's card-targeted scroll enough time to complete before a
+    field probe or viewport screenshot continues.
+    """
+    for attempt in range(DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS):
+        resolved = resolve_developer_membership_details_card(page)
+        if resolved is None:
+            if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
+                pause(220, 460)
+                continue
+            return False
+        _scope, card = resolved
+        try:
+            card.scroll.to_see()
+        except Exception:
+            if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
+                pause(220, 460)
+                continue
+            return False
+        # Do not begin a DOM probe/screenshot in the middle of ruyiPage's
+        # scroll animation. Re-resolve afterward because React can replace the
+        # card wrapper while it hydrates its detail fields.
+        pause(700, 1300)
+        if resolve_developer_membership_details_card(page) is not None:
+            return True
+        if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
+            pause(160, 360)
+    return False
+
+
 def confirm_active_developer_membership(
     page: Any,
     *,
@@ -4560,7 +4715,16 @@ def confirm_active_developer_membership(
 
     def wait_for_loaded_details(
         initial_snapshot: dict[str, Any] | None = None,
+        *,
+        settle_card_before_probe: bool = False,
     ) -> bool:
+        if settle_card_before_probe:
+            # A hash/nav action makes Apple scroll the details card
+            # asynchronously. Give that native motion a chance to finish, then
+            # scroll the concrete card once through ruyiPage before sampling
+            # its lazy-hydrated fields.
+            pause(700, 1300)
+            scroll_developer_membership_details_card(page, pause=pause)
         stable_count = 0
         last_probe: tuple[bool | int, ...] | None = None
         pending_snapshot = initial_snapshot
@@ -4575,10 +4739,11 @@ def confirm_active_developer_membership(
             try:
                 auth_blocked = developer_scope_has_auth_blocker(
                     page,
-                    # Membership confirmation must fail closed on any root
-                    # authentication/error marker, even when stale page text
-                    # is the only remaining signal.
-                    allow_root_text_only_error=False,
+                    # The already-confirmed Developer shell can retain static
+                    # recovery/security text while the details card hydrates.
+                    # Live email/password/2FA/trust/assertive controls still
+                    # block through developer_state_has_auth_blocker().
+                    allow_root_text_only_error=True,
                     allow_retiring_child_text_only_error=True,
                 )
             except Exception:
@@ -4628,18 +4793,29 @@ def confirm_active_developer_membership(
     while time.monotonic() < deadline:
         current_url = scope_location_url(page)
         if developer_membership_details_route(current_url):
-            return wait_for_loaded_details()
+            return wait_for_loaded_details(settle_card_before_probe=True)
         try:
             snapshot = developer_membership_details_snapshot(page)
         except Exception:
             snapshot = None
         if isinstance(snapshot, dict) and snapshot.get("detailsPage") is True:
-            return wait_for_loaded_details(initial_snapshot=snapshot)
+            return wait_for_loaded_details(
+                initial_snapshot=snapshot,
+                settle_card_before_probe=True,
+            )
         navigation = resolve_developer_membership_navigation(page)
         if navigation is not None:
             scope, element = navigation
+            try:
+                element.scroll.to_see()
+            except Exception:
+                pass
+            pause(250, 500)
+            refreshed_navigation = resolve_developer_membership_navigation(page)
+            if refreshed_navigation is not None:
+                scope, element = refreshed_navigation
             human_click(scope, element, pause=pause)
-            return wait_for_loaded_details()
+            return wait_for_loaded_details(settle_card_before_probe=True)
         pause(250, 500)
     return False
 
@@ -5571,6 +5747,140 @@ def wait_for_profile_name_modal(
     raise RuntimeError("personal information name modal was not found")
 
 
+def open_profile_name_modal(
+    page: Any,
+    *,
+    timeout_s: float = PROFILE_MODAL_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any, dict[str, Any], str]:
+    """Open the name editor through a freshly stabilized card reference.
+
+    Apple Account can replace its Personal Information cards while a React
+    hydration/update is in flight.  The old flow kept a card reference across
+    a human pause and clicked it once, which can be a no-op.  Re-resolve the
+    card after the pause, then use one bounded modal-open retry when the first
+    action races the update.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_error: Exception | None = None
+    attempted_clicks = 0
+    for attempt in range(PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS):
+        # A delayed first click can have opened the modal just after its short
+        # probe elapsed.  Never issue a second card click while it is already
+        # present.
+        try:
+            existing_modal = resolve_profile_name_modal(page)
+        except Exception as error:
+            if "personal information name modal is ambiguous" in str(error).casefold():
+                raise
+            existing_modal = None
+        if existing_modal is not None:
+            existing_scope, existing_modal_root, existing_summary = existing_modal
+            return (
+                existing_scope,
+                existing_modal_root,
+                existing_summary,
+                profile_name_modal_selector(
+                    page,
+                    existing_scope,
+                    existing_modal_root,
+                ),
+            )
+
+        try:
+            attempted_clicks = attempt + 1
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            # First wait proves the card is ready; the second one is the
+            # authoritative reference used for the click after the pause.
+            wait_for_profile_card(
+                page,
+                "name",
+                timeout_s=min(PROFILE_CARD_WAIT_TIMEOUT_S, remaining_s),
+                pause=pause,
+            )
+            pause(280, 620)
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            name_scope, name_card, _name_summary = wait_for_profile_card(
+                page,
+                "name",
+                timeout_s=min(PROFILE_CARD_WAIT_TIMEOUT_S, remaining_s),
+                pause=pause,
+            )
+            human_click(name_scope, name_card, pause=pause)
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
+                pause(160, 340)
+                continue
+            unavailable_outcome = profile_name_modal_unavailable_outcome(error)
+            if unavailable_outcome is not None:
+                emit_profile_name_modal_unavailable(
+                    attempt_count=attempted_clicks,
+                    outcome=unavailable_outcome,
+                )
+                raise RuntimeError(
+                    "personal information name modal is unavailable"
+                ) from error
+            raise
+
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            break
+        modal_wait_timeout_s = (
+            remaining_s
+            if attempt + 1 == PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS
+            else min(remaining_s, PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S)
+        )
+        try:
+            resolved_modal = wait_for_profile_name_modal(
+                page,
+                timeout_s=modal_wait_timeout_s,
+                pause=pause,
+            )
+            modal_scope, modal, modal_summary = resolved_modal
+            return (
+                modal_scope,
+                modal,
+                modal_summary,
+                profile_name_modal_selector(page, modal_scope, modal),
+            )
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
+                pause(160, 340)
+                continue
+            unavailable_outcome = profile_name_modal_unavailable_outcome(error)
+            if unavailable_outcome is not None:
+                emit_profile_name_modal_unavailable(
+                    attempt_count=attempted_clicks,
+                    outcome=unavailable_outcome,
+                )
+                raise RuntimeError(
+                    "personal information name modal is unavailable"
+                ) from error
+            raise
+    if last_error is not None:
+        unavailable_outcome = profile_name_modal_unavailable_outcome(last_error)
+        if unavailable_outcome is not None:
+            emit_profile_name_modal_unavailable(
+                attempt_count=attempted_clicks,
+                outcome=unavailable_outcome,
+            )
+            raise RuntimeError(
+                "personal information name modal is unavailable"
+            ) from last_error
+        raise last_error
+    emit_profile_name_modal_unavailable(
+        attempt_count=attempted_clicks,
+        outcome="timeout",
+    )
+    raise RuntimeError("personal information name modal is unavailable")
+
+
 def profile_state_has_hard_authentication_blocker(state: dict[str, Any]) -> bool:
     has_active_state = all(
         key in state
@@ -5804,11 +6114,8 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
     birthday = normalize_profile_value(birthday_summary.get("birthdayValue"), "birthday")
     emit({"event": "status", "status": "profile_birthday_collected"})
 
-    name_scope, name_card, _name_summary = wait_for_profile_card(page, "name")
     set_browser_startup_stage("profile_name")
-    human_pause(280, 620)
-    human_click(name_scope, name_card)
-    modal_scope, modal, modal_summary = wait_for_profile_name_modal(page)
+    modal_scope, modal, modal_summary, modal_selector = open_profile_name_modal(page)
     given = normalize_profile_value(modal_summary.get("given"), "name")
     family = normalize_profile_value(modal_summary.get("family"), "name")
     ordered_parts = [
@@ -5820,9 +6127,24 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
         [family, given],
     ):
         raise RuntimeError("personal information name field order was not confirmed")
-    close_profile_name_modal(page, modal_scope, modal)
     name = normalize_profile_value(" ".join([given, family]), "name")
     emit({"event": "status", "status": "profile_name_collected"})
+    cleanup = close_profile_name_modal(
+        page,
+        modal_scope,
+        modal,
+        modal_selector=modal_selector,
+    )
+    if cleanup["closed"] is not True:
+        emit(
+            {
+                "event": "status",
+                "status": "profile_name_modal_cleanup_failed",
+                "failureClass": cleanup["failureClass"],
+                "closeSearchScope": cleanup["closeSearchScope"],
+            }
+        )
+        raise RuntimeError("personal information name modal cleanup failed")
     return {"name": name, "birthday": birthday}
 
 
@@ -5859,23 +6181,31 @@ def profile_modal_close_summary(button: Any) -> dict[str, Any]:
     }
 
 
-def resolve_profile_name_modal_close_button(
-    modal: Any,
-) -> Any | None:
+def profile_modal_close_elements(root: Any, selector: str) -> tuple[list[Any], bool]:
+    """Resolve close candidates without flattening ruyiPage query errors."""
+    try:
+        return list(root.eles(selector, timeout=0) or []), False
+    except Exception:
+        return [], True
+
+
+def profile_modal_close_button_in_root(root: Any) -> tuple[Any | None, bool]:
+    query_failed = False
     for selector in PROFILE_MODAL_CLOSE_SELECTORS:
-        candidates = [
-            button
-            for button in safe_elements(modal, selector, timeout_s=0)
-            if element_is_interactable(button)
-        ]
+        elements, selector_failed = profile_modal_close_elements(root, selector)
+        query_failed = query_failed or selector_failed
+        candidates = [button for button in elements if element_is_interactable(button)]
         if candidates:
-            return candidates[0]
-    for button in safe_elements(modal, "css:button", timeout_s=0):
+            return candidates[0], query_failed
+    buttons, buttons_failed = profile_modal_close_elements(root, "css:button")
+    query_failed = query_failed or buttons_failed
+    for button in buttons:
         if not element_is_interactable(button):
             continue
         try:
             summary = profile_modal_close_summary(button)
         except Exception:
+            query_failed = True
             continue
         if not summary["visible"]:
             continue
@@ -5883,8 +6213,233 @@ def resolve_profile_name_modal_close_button(
             "modal-close" in summary["className"]
             or summary["label"] in {"close", "关闭", "關閉"}
         ):
-            return button
-    return None
+            return button, query_failed
+    return None, query_failed
+
+
+def profile_modal_associated_close_button_in_root(
+    root: Any,
+    modal_id: str,
+) -> tuple[Any | None, bool]:
+    """Find a semantically-close control explicitly linked to the active modal.
+
+    Portal/shadow-root controls need both an explicit modal relationship and a
+    close label/class.  That avoids a document-wide scan clicking an unrelated
+    banner, or a non-close control that happens to reference the same dialog.
+    """
+    normalized_id = str(modal_id or "").strip()
+    if not normalized_id:
+        return None, False
+    escaped_id = normalized_id.replace("\\", "\\\\").replace("'", "\\'")
+    selectors = (
+        f"css:button[aria-controls='{escaped_id}']",
+        f"css:[role='button'][aria-controls='{escaped_id}']",
+        f"css:button[data-modal-id='{escaped_id}']",
+        f"css:[role='button'][data-modal-id='{escaped_id}']",
+        f"css:button[data-target='#{escaped_id}']",
+        f"css:[role='button'][data-target='#{escaped_id}']",
+    )
+    query_failed = False
+    for selector in selectors:
+        elements, selector_failed = profile_modal_close_elements(root, selector)
+        query_failed = query_failed or selector_failed
+        for button in elements:
+            if not element_is_interactable(button):
+                continue
+            try:
+                summary = profile_modal_close_summary(button)
+            except Exception:
+                query_failed = True
+                continue
+            if not summary["visible"]:
+                continue
+            if (
+                "modal-close" in summary["className"]
+                or summary["label"] in {"close", "关闭", "關閉"}
+            ):
+                return button, query_failed
+    return None, query_failed
+
+
+def profile_name_modal_close_search_roots(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> list[tuple[str, Any, Any]]:
+    """Return only top-level modal/portal roots; never inspect child frames."""
+    owner_scope = modal_scope or page
+    roots: list[tuple[str, Any, Any]] = [("modal_content", owner_scope, modal)]
+    seen = {id(modal)}
+    page_roots = [
+        (scope, root)
+        for scope, root in current_element_search_roots(page)
+        if scope is page
+    ]
+    for scope, root in page_roots:
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            for overlay in safe_elements(root, selector, timeout_s=0):
+                if id(overlay) in seen or not element_is_interactable(overlay):
+                    continue
+                try:
+                    summary = profile_name_modal_summary(overlay)
+                except Exception:
+                    continue
+                if not (summary["visible"] and summary["fieldCount"] >= 2):
+                    continue
+                seen.add(id(overlay))
+                roots.append(("owner_overlay", scope, overlay))
+    modal_id = ""
+    try:
+        modal_id = str(modal.attr("id") or "").strip()
+    except Exception:
+        modal_id = ""
+    if modal_id:
+        for scope, root in page_roots:
+            if id(root) in seen:
+                continue
+            seen.add(id(root))
+            roots.append(("portal_owner", scope, root))
+    return roots
+
+
+def resolve_profile_name_modal_close_button(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> tuple[tuple[str, Any, Any] | None, bool, str]:
+    query_failed = False
+    query_failure_scope = "none"
+    for search_scope, scope, root in profile_name_modal_close_search_roots(
+        page,
+        modal_scope,
+        modal,
+    ):
+        if search_scope == "portal_owner":
+            try:
+                modal_id = str(modal.attr("id") or "").strip()
+            except Exception:
+                modal_id = ""
+            button, root_query_failed = profile_modal_associated_close_button_in_root(
+                root,
+                modal_id,
+            )
+        else:
+            button, root_query_failed = profile_modal_close_button_in_root(root)
+        if root_query_failed:
+            query_failed = True
+            if query_failure_scope == "none":
+                query_failure_scope = search_scope
+        if button is not None:
+            return (search_scope, scope, button), False, "none"
+    return None, query_failed, query_failure_scope
+
+
+def profile_name_modal_identifier(modal: Any) -> str:
+    try:
+        return str(modal.attr("id") or "").strip()
+    except Exception:
+        return ""
+
+
+def profile_name_modal_selector(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> str:
+    """Remember the selector that identified the trusted name dialog root."""
+    try:
+        target_signature = element_stability_signature(modal_scope, modal)
+    except Exception:
+        target_signature = None
+    for scope, root in current_element_search_roots(page):
+        if scope is not modal_scope:
+            continue
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            for candidate in safe_elements(root, selector, timeout_s=0):
+                same_wrapper = candidate is modal
+                same_signature = False
+                if target_signature is not None:
+                    try:
+                        same_signature = (
+                            element_stability_signature(scope, candidate)
+                            == target_signature
+                        )
+                    except Exception:
+                        same_signature = False
+                if same_wrapper or same_signature:
+                    return selector
+    return ""
+
+
+def profile_name_modal_cleanup_state(
+    page: Any,
+    modal_id: str = "",
+    *,
+    modal_selector: str = "",
+    modal_scope: Any | None = None,
+) -> str:
+    """Confirm that the active name dialog disappeared without leaving its view.
+
+    ``resolve_profile_name_modal`` intentionally requires hydrated name values,
+    so it is not a sufficient close proof on its own: an open dialog can be
+    briefly unreadable during an SPA update.  A visible dialog with the exact
+    original modal id remains open even when its fields have temporarily not
+    rendered; unrelated dialogs still need the two-field name-modal signal.
+    """
+    if not is_personal_information_scope(page, page):
+        return "context_lost"
+    expected_modal_id = str(modal_id or "").strip()
+    expected_modal_selector = (
+        str(modal_selector or "").strip()
+        if modal_selector in PROFILE_NAME_MODAL_SELECTORS
+        else ""
+    )
+    expected_context_id = ""
+    if modal_scope is not None:
+        try:
+            expected_context_id = scope_browsing_context_id(modal_scope)
+        except Exception:
+            expected_context_id = ""
+    query_failed = False
+    seen: set[int] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            modals, selector_failed = profile_modal_close_elements(root, selector)
+            query_failed = query_failed or selector_failed
+            for candidate in modals:
+                if id(candidate) in seen or not element_is_interactable(candidate):
+                    continue
+                seen.add(id(candidate))
+                try:
+                    summary = profile_name_modal_summary(candidate)
+                    candidate_modal_id = profile_name_modal_identifier(candidate)
+                except Exception:
+                    query_failed = True
+                    continue
+                if not summary["visible"]:
+                    continue
+                candidate_context_id = ""
+                try:
+                    candidate_context_id = scope_browsing_context_id(scope)
+                except Exception:
+                    query_failed = True
+                same_origin_selector = bool(
+                    expected_modal_selector
+                    and selector == expected_modal_selector
+                    and (
+                        not expected_context_id
+                        or candidate_context_id == expected_context_id
+                    )
+                )
+                if (
+                    (expected_modal_id and candidate_modal_id == expected_modal_id)
+                    or same_origin_selector
+                    or summary["fieldCount"] >= 2
+                ):
+                    return "open"
+    return "unconfirmed" if query_failed else "closed"
 
 
 def close_profile_name_modal(
@@ -5894,18 +6449,136 @@ def close_profile_name_modal(
     *,
     timeout_s: float = PROFILE_MODAL_WAIT_TIMEOUT_S,
     pause: Callable[[int, int], None] = human_pause,
-) -> None:
-    close_button = resolve_profile_name_modal_close_button(modal)
-    if close_button is None:
-        raise RuntimeError("personal information name modal close button was not found")
-    human_click(modal_scope or page, close_button, pause=pause)
+    modal_selector: str = "",
+) -> dict[str, Any]:
     deadline = time.monotonic() + max(0.0, timeout_s)
-    while time.monotonic() < deadline:
-        if resolve_profile_name_modal(page) is None:
-            emit({"event": "status", "status": "profile_name_modal_closed"})
-            return
-        pause(120, 260)
-    raise RuntimeError("personal information name modal did not close")
+    last_search_scope = "none"
+    active_modal_id = profile_name_modal_identifier(modal)
+    active_modal_selector = (
+        modal_selector
+        if modal_selector in PROFILE_NAME_MODAL_SELECTORS
+        else profile_name_modal_selector(page, modal_scope, modal)
+    )
+    for attempt in range(PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS):
+        # A React hydration/update can replace the inner dialog or close
+        # target between discovery and click.  Retry only a failed click, and
+        # refresh both the modal and its close control before doing so.
+        if attempt:
+            cleanup_state = profile_name_modal_cleanup_state(
+                page,
+                active_modal_id,
+                modal_selector=active_modal_selector,
+                modal_scope=modal_scope,
+            )
+            if cleanup_state == "closed":
+                emit({"event": "status", "status": "profile_name_modal_closed"})
+                return {
+                    "closed": True,
+                    "failureClass": "unknown",
+                    "closeSearchScope": last_search_scope,
+                }
+            if cleanup_state == "context_lost":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_context_lost",
+                    "closeSearchScope": last_search_scope,
+                }
+            if cleanup_state == "unconfirmed":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_query_failed",
+                    "closeSearchScope": last_search_scope,
+                }
+            try:
+                active_modal = resolve_profile_name_modal(page)
+            except Exception:
+                active_modal = None
+            if active_modal is None:
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_action_failed",
+                    "closeSearchScope": last_search_scope,
+                }
+            modal_scope, modal, _modal_summary = active_modal
+            active_modal_selector = profile_name_modal_selector(
+                page,
+                modal_scope,
+                modal,
+            ) or active_modal_selector
+            active_modal_id = profile_name_modal_identifier(modal) or active_modal_id
+
+        resolved, close_query_failed, query_failure_scope = (
+            resolve_profile_name_modal_close_button(page, modal_scope, modal)
+        )
+        if resolved is None:
+            return {
+                "closed": False,
+                "failureClass": (
+                    "profile_name_modal_close_query_failed"
+                    if close_query_failed
+                    else (
+                        "profile_name_modal_close_action_failed"
+                        if attempt
+                        else "profile_name_modal_close_control_unavailable"
+                    )
+                ),
+                "closeSearchScope": (
+                    query_failure_scope if close_query_failed else last_search_scope
+                ),
+            }
+        close_search_scope, close_scope, close_button = resolved
+        last_search_scope = close_search_scope
+        try:
+            human_click(close_scope or modal_scope or page, close_button, pause=pause)
+        except Exception:
+            if attempt + 1 < PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS:
+                pause(120, 260)
+                continue
+            return {
+                "closed": False,
+                "failureClass": "profile_name_modal_close_action_failed",
+                "closeSearchScope": close_search_scope,
+            }
+
+        # A dispatched close action receives the full confirmation window;
+        # only an exception above is eligible for a fresh-target retry.
+        while time.monotonic() < deadline:
+            cleanup_state = profile_name_modal_cleanup_state(
+                page,
+                active_modal_id,
+                modal_selector=active_modal_selector,
+                modal_scope=modal_scope,
+            )
+            if cleanup_state == "closed":
+                emit({"event": "status", "status": "profile_name_modal_closed"})
+                return {
+                    "closed": True,
+                    "failureClass": "unknown",
+                    "closeSearchScope": close_search_scope,
+                }
+            if cleanup_state == "context_lost":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_context_lost",
+                    "closeSearchScope": close_search_scope,
+                }
+            if cleanup_state == "unconfirmed":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_query_failed",
+                    "closeSearchScope": close_search_scope,
+                }
+            pause(120, 260)
+        return {
+            "closed": False,
+            "failureClass": "profile_name_modal_close_unconfirmed",
+            "closeSearchScope": close_search_scope,
+        }
+    return {
+        "closed": False,
+        "failureClass": "profile_name_modal_close_action_failed",
+        "closeSearchScope": last_search_scope,
+    }
 
 
 def normalize_account_security_label(value: Any) -> str:
@@ -8593,12 +9266,20 @@ def collect_developer_account_membership(
                 )
             except Exception:
                 registration_identity_value = None
-            screenshot = take_screenshot(
-                developer_page,
-                screenshot_path,
-                checkpoint="developer_membership",
-                full_page=False,
-            )
+            if scroll_developer_membership_details_card(developer_page):
+                screenshot = take_screenshot(
+                    developer_page,
+                    screenshot_path,
+                    checkpoint="developer_membership",
+                    full_page=False,
+                )
+            else:
+                emit(
+                    {
+                        "event": "status",
+                        "status": "developer_membership_card_unavailable",
+                    }
+                )
     emit(
         {
             "event": "status",

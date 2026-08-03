@@ -344,6 +344,41 @@ async function runFlowAuditForwardingTest() {
       secret: SECRET_FIXTURE,
     });
     await options.onEvent?.({
+      event: "status",
+      status: "profile_name_modal_unavailable",
+      attemptCount: 2,
+      outcome: "modal_missing",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "profile_capture_failed",
+      failureStage: "profile_name",
+      failureClass: "profile_name_modal_ambiguous",
+      browserAlive: true,
+      browserPreservationRequested: true,
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "profile_name_modal_cleanup_failed",
+      failureClass: "profile_name_modal_close_control_unavailable",
+      closeSearchScope: "portal_owner",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "developer_membership_card_unavailable",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
+      event: "status",
+      status: "profile_name_modal_cleanup_failed",
+      failureClass: "profile_name_modal_close_query_failed",
+      closeSearchScope: "modal_content",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent?.({
       event: "need_2fa",
       generation: 1,
       state: {
@@ -456,6 +491,21 @@ async function runFlowAuditForwardingTest() {
   );
   assert.deepEqual(
     entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_capture_failed"
+    )?.details,
+    {
+      status: "profile_capture_failed",
+      failureStage: "profile_name",
+      failureClass: "profile_name_modal_ambiguous",
+      browserAlive: true,
+      browserPreservationRequested: true,
+    }
+  );
+  assert.deepEqual(
+    entries.find(
       (entry) => entry.source === "ruyipage" && entry.event === "need_2fa"
     )?.details,
     {
@@ -496,6 +546,51 @@ async function runFlowAuditForwardingTest() {
         entry.details.status === "profile_name_modal_query_failed"
     )?.details,
     { status: "profile_name_modal_query_failed" }
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_name_modal_unavailable"
+    )?.details,
+    {
+      status: "profile_name_modal_unavailable",
+      attemptCount: 2,
+      outcome: "modal_missing",
+    }
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_name_modal_cleanup_failed"
+    )?.details,
+    {
+      status: "profile_name_modal_cleanup_failed",
+      failureClass: "profile_name_modal_close_control_unavailable",
+      closeSearchScope: "portal_owner",
+    }
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "profile_name_modal_cleanup_failed" &&
+        entry.details.failureClass === "profile_name_modal_close_query_failed" &&
+        entry.details.closeSearchScope === "modal_content"
+      )
+  );
+  assert.deepEqual(
+    entries.find(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "developer_membership_card_unavailable"
+    )?.details,
+    { status: "developer_membership_card_unavailable" }
   );
   assert.equal(JSON.stringify(entries).includes(SECRET_FIXTURE), false);
   assert.equal(JSON.stringify(entries).includes("Test Given Test Family"), false);
@@ -2716,6 +2811,64 @@ async function runBrowserResultMetadataAllowlistTest() {
   assert.equal(JSON.stringify(result).includes(SECRET_FIXTURE), false);
 }
 
+async function runNestedResultFailureStageSelectionTest() {
+  const entries = [];
+  const flowAudit = {
+    addSecrets() {},
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const base = successfulResult();
+  const passwordFailure = {
+    ...base,
+    postLoginPasswordChange: {
+      ...base.postLoginPasswordChange,
+      success: false,
+      attempted: true,
+      failureStage: "password_change",
+      failureClass: "password_change_failed",
+    },
+  };
+  const smallBusinessFailure = {
+    ...base,
+    postLoginPasswordChange: {
+      ...base.postLoginPasswordChange,
+      success: true,
+      attempted: true,
+      passwordStored: true,
+      passwordLength: 16,
+      failureStage: "unknown",
+      failureClass: "unknown",
+    },
+    postLoginSmallBusinessApplication: {
+      ...base.postLoginSmallBusinessApplication,
+      success: false,
+      attempted: true,
+      failureStage: "small_business_application",
+      failureClass: "small_business_application_failed",
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({ event: "result", ...passwordFailure });
+    await options.onEvent({ event: "result", ...smallBusinessFailure });
+    return successfulResult();
+  });
+
+  await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+
+  const terminalResults = entries.filter(
+    (entry) => entry.source === "ruyipage" && entry.event === "result"
+  );
+  assert.deepEqual(
+    terminalResults.map((entry) => entry.details.failureStage),
+    ["password_change", "small_business_application"]
+  );
+}
+
 async function runPostHomeProfileFailureRetentionTest() {
   const entries = [];
   const storedProfiles = [];
@@ -2749,6 +2902,18 @@ async function runPostHomeProfileFailureRetentionTest() {
       browserFinalizationCompleted: true,
       browserPreservationRequested: true,
       browserSessionPreserved: true,
+    });
+    await options.onEvent({
+      event: "result",
+      ...successfulResult(),
+      postLoginProfileCapture: {
+        success: false,
+        failureStage: "profile_name",
+        failureClass: "profile_data_incomplete",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: true,
+      },
     });
     return {
       ...successfulResult(),
@@ -2811,6 +2976,10 @@ async function runPostHomeProfileFailureRetentionTest() {
   assert.equal(partial?.details.failureStage, "profile_name");
   assert.equal(partial?.details.failureClass, "profile_data_incomplete");
   assert.equal(partial?.details.browserPreserved, true);
+  const terminalResult = entries.find(
+    (entry) => entry.source === "ruyipage" && entry.event === "result"
+  );
+  assert.equal(terminalResult?.details.failureStage, "profile_name");
   const profileWarnings = warnings.filter((line) =>
     line.includes("个人资料采集未完成")
   );
@@ -4555,6 +4724,7 @@ const focusedTests = {
   "profile-result-missing": runMissingProfileResultReturnsPartialTest,
   "result-allowlist": runBrowserResultMetadataAllowlistTest,
   "post-home-profile-failure": runPostHomeProfileFailureRetentionTest,
+  "nested-result-failure-stage": runNestedResultFailureStageSelectionTest,
   "concise-browser-progress": runConciseBrowserProgressTest,
   "profile-navigation-recovery": runProfileNavigationRecoveryProgressTest,
   "browser-stage-terminal": runBrowserStageTerminalOutputTest,
@@ -4628,6 +4798,7 @@ await runDeveloperTwoFactorUnavailableStopsAccountModuleTest();
 await runDeveloperMembershipGateStopTest();
 await runBrowserResultMetadataAllowlistTest();
 await runPostHomeProfileFailureRetentionTest();
+await runNestedResultFailureStageSelectionTest();
 await runProfilePersistenceFailureReturnsPartialTest();
 await runMissingProfileResultReturnsPartialTest();
 await runConciseBrowserProgressTest();
