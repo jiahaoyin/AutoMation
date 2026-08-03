@@ -57,7 +57,18 @@ PROFILE_CARD_SELECTORS = (
     "css:button",
     "css:[role='button']",
 )
-PROFILE_NAME_CARD_SELECTORS = PROFILE_CARD_SELECTORS
+# Apple commonly renders the name editor action as a button inside the visual
+# card wrapper. Keep this name-only preference isolated from birthday and the
+# later account-security card flows.
+PROFILE_NAME_CARD_SELECTORS = (
+    "css:button.button.button-bare",
+    "css:button[class*='button-bare']",
+    "css:.card button",
+    "css:.card [role='button']",
+    "css:.card",
+    "css:button",
+    "css:[role='button']",
+)
 PROFILE_NAME_MODAL_SELECTORS = (
     "css:[id^='modal-content-']",
     "css:[role='dialog']",
@@ -91,8 +102,11 @@ PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
 PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS = 2
 PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S = 3.0
 # The profile page has already passed a stable-card readiness gate before the
-# name editor opens. A later transient React replacement must not consume the
-# entire modal-open budget before the first click is even sent.
+# name editor opens. Re-confirm the live card briefly here because a React
+# replacement can otherwise make a visible wrapper absorb the click.
+PROFILE_NAME_CARD_INITIAL_WAIT_TIMEOUT_S = 6.0
+# A later transient React replacement must not consume the entire modal-open
+# budget before the first click is even sent.
 PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S = 3.0
 PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS = 2
 PROFILE_VALUE_STABLE_OBSERVATIONS = 2
@@ -5757,23 +5771,50 @@ def resolve_profile_name_card_for_click(
     timeout_s: float,
     pause: Callable[[int, int], None],
 ) -> tuple[Any, Any, dict[str, Any]]:
-    """Resolve a current name card without exhausting the modal-open budget.
+    """Return the live clickable name card after a bounded settle cycle.
 
-    The Personal Information readiness gate has already observed the name card
-    as stable. Prefer that currently visible card immediately. If React replaces
-    it between readiness and the click, use only a short bounded re-acquire
-    window so the click still leaves time to observe the resulting modal.
+    The page-level readiness gate proves that a name card was rendered, but the
+    card can be replaced while React finishes mounting the action target. Mirror
+    the formerly reliable sequence here: stabilize the card, scroll it into
+    view, allow the scroll to settle, then resolve it again immediately before
+    the click. A short re-acquire remains only for a replacement during that
+    settle window.
     """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    initial_wait_timeout_s = min(
+        PROFILE_NAME_CARD_INITIAL_WAIT_TIMEOUT_S,
+        max(0.0, deadline - time.monotonic()),
+    )
+    if initial_wait_timeout_s <= 0:
+        raise RuntimeError("personal information name card was not found")
+    _initial_scope, initial_card, _initial_summary = wait_for_profile_card(
+        page,
+        "name",
+        timeout_s=initial_wait_timeout_s,
+        pause=pause,
+    )
+    try:
+        initial_card.scroll.to_see()
+    except Exception:
+        # A stable, interactable card can already be in view. Do not discard it
+        # solely because ruyiPage did not need (or could not perform) a scroll.
+        pass
+    pause(280, 620)
+
     resolved = resolve_profile_card(page, "name")
     if resolved is not None:
         return resolved
+
+    reacquire_wait_timeout_s = min(
+        PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S,
+        max(0.0, deadline - time.monotonic()),
+    )
+    if reacquire_wait_timeout_s <= 0:
+        raise RuntimeError("personal information name card was not found")
     return wait_for_profile_card(
         page,
         "name",
-        timeout_s=min(
-            PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S,
-            max(0.0, timeout_s),
-        ),
+        timeout_s=reacquire_wait_timeout_s,
         pause=pause,
     )
 
@@ -5876,10 +5917,13 @@ def open_profile_name_modal(
                 # on screen. Only retry the card after its shell is confirmed
                 # absent; otherwise give the remaining budget to hydration.
                 try:
-                    modal_shell_state = profile_name_modal_cleanup_state(page)
+                    modal_shell_state = profile_name_modal_cleanup_state(
+                        page,
+                        opening_probe=True,
+                    )
                 except Exception:
                     modal_shell_state = "unconfirmed"
-                if modal_shell_state != "closed":
+                if modal_shell_state == "open":
                     remaining_s = deadline - time.monotonic()
                     if remaining_s <= 0:
                         break
@@ -5899,6 +5943,14 @@ def open_profile_name_modal(
                     except Exception as hydration_error:
                         last_error = hydration_error
                         break
+                if modal_shell_state == "context_lost":
+                    break
+                # ``closed`` proves the first click missed. ``unconfirmed``
+                # means the shell probe had no positive evidence of an open
+                # dialog (for example, a transient query failure), so it must
+                # not consume the entire deadline waiting for hydration. The
+                # next iteration first probes for a modal again, then may
+                # safely re-resolve and click the name card.
                 pause(160, 340)
                 continue
             unavailable_outcome = profile_name_modal_unavailable_outcome(error)
@@ -6425,6 +6477,7 @@ def profile_name_modal_cleanup_state(
     *,
     modal_selector: str = "",
     modal_scope: Any | None = None,
+    opening_probe: bool = False,
 ) -> str:
     """Confirm that the active name dialog disappeared without leaving its view.
 
@@ -6433,6 +6486,11 @@ def profile_name_modal_cleanup_state(
     briefly unreadable during an SPA update.  A visible dialog with the exact
     original modal id remains open even when its fields have temporarily not
     rendered; unrelated dialogs still need the two-field name-modal signal.
+
+    During the opening probe, no modal identity exists yet. A visible native
+    modal/dialog root is then sufficient evidence to protect an idless,
+    not-yet-mounted name editor from a second card click. Close-confirmation
+    callers keep the stricter identity/field checks above.
     """
     if not is_personal_information_scope(page, page):
         return "context_lost"
@@ -6481,10 +6539,19 @@ def profile_name_modal_cleanup_state(
                         or candidate_context_id == expected_context_id
                     )
                 )
+                visible_opening_shell = bool(
+                    opening_probe
+                    and selector
+                    in {
+                        "css:[id^='modal-content-']",
+                        "css:[role='dialog']",
+                    }
+                )
                 if (
                     (expected_modal_id and candidate_modal_id == expected_modal_id)
                     or same_origin_selector
                     or summary["fieldCount"] >= 2
+                    or visible_opening_shell
                 ):
                     return "open"
     return "unconfirmed" if query_failed else "closed"

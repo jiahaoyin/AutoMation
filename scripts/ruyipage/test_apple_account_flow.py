@@ -13397,6 +13397,47 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertIs(candidates[0][1], name_button)
         self.assertIs(account_flow.resolve_profile_card(page, "name")[1], name_button)
 
+    def test_profile_card_candidates_prefer_nested_card_action_target(self):
+        card_wrapper = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/main:1/div:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        name_button = FakeElement(
+            attrs={
+                "tagName": "BUTTON",
+                "profileDomIdentity": "html:1/body:1/main:1/div:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        page = FakePage(
+            elements_by_selector={
+                # Deliberately expose the inner action target only through the
+                # nested-card selector. The old selector order selected the
+                # wrapper instead of this clickable button.
+                "css:.card button": [name_button],
+                "css:.card": [card_wrapper],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        candidates = account_flow.profile_card_candidates(page, "name")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIs(candidates[0][1], name_button)
+        self.assertIs(account_flow.resolve_profile_card(page, "name")[1], name_button)
+
     def test_profile_card_candidates_prefer_an_outer_semantic_button(self):
         name_button = FakeElement(
             attrs={
@@ -14842,8 +14883,8 @@ process.stdout.write(query.call(modal));
             ],
         )
 
-    def test_visible_name_card_is_clicked_without_a_second_full_card_wait(self):
-        """A card already visible after readiness must receive the first click."""
+    def test_visible_name_card_is_stabilized_scrolled_and_clicked(self):
+        """The first click uses a re-stabilized, freshly re-resolved card."""
         modal = FakeElement(
             displayed=False,
             attrs={
@@ -14877,15 +14918,37 @@ process.stdout.write(query.call(modal));
             },
             state={"href": account_flow.ACCOUNT_INFORMATION_URL},
         )
+        pauses: list[tuple[int, int]] = []
 
-        with patch("apple_account_flow.wait_for_profile_card") as wait_for_card:
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            return_value=(page, name_card, name_card.attrs["profileCard"]),
+        ) as wait_for_card, patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            return_value=(
+                page,
+                modal,
+                {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                    "orderedParts": ["Given", "Family"],
+                },
+            ),
+        ):
             _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
                 page,
                 timeout_s=1,
-                pause=lambda *_: None,
+                pause=lambda minimum, maximum: pauses.append((minimum, maximum)),
             )
 
-        wait_for_card.assert_not_called()
+        wait_for_card.assert_called_once()
+        self.assertEqual(wait_for_card.call_args.args, (page, "name"))
+        self.assertGreater(wait_for_card.call_args.kwargs["timeout_s"], 0)
+        self.assertLessEqual(wait_for_card.call_args.kwargs["timeout_s"], 1)
+        self.assertEqual(name_card.scroll.calls, [("to_see",)])
+        self.assertIn((280, 620), pauses)
         self.assertIs(opened_modal, modal)
         self.assertEqual(summary["given"], "Given")
         self.assertEqual(summary["family"], "Family")
@@ -14956,6 +15019,142 @@ process.stdout.write(query.call(modal));
             [("human_click", name_card)],
         )
 
+    def test_idless_visible_name_modal_shell_blocks_a_second_card_click(self):
+        """A visible dialog shell is open even before its name fields mount."""
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "role": "dialog",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 0,
+                    "given": None,
+                    "family": None,
+                },
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "tagName": "BUTTON",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:[id^='modal-content-']": [],
+                "css:[role='dialog']": [modal],
+                "css:aside": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        hydrated_summary = {
+            "visible": True,
+            "fieldCount": 2,
+            "given": "Given",
+            "family": "Family",
+            "orderedParts": ["Given", "Family"],
+        }
+
+        with patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            side_effect=[
+                RuntimeError("personal information name modal was not found"),
+                (page, modal, hydrated_summary),
+            ],
+        ) as wait_for_modal:
+            _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
+                page,
+                timeout_s=1,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(wait_for_modal.call_count, 2)
+        self.assertEqual(
+            [call for call in page.actions.calls if call == ("human_click", name_card)],
+            [("human_click", name_card)],
+        )
+        self.assertIs(opened_modal, modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+
+    def test_unconfirmed_name_modal_shell_retries_the_card_click(self):
+        """A failed shell probe is not proof that a dialog is hydrating."""
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        first_card = FakeElement()
+        second_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True)
+        )
+        page = FakePage(
+            {
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        hydrated_summary = {
+            "visible": True,
+            "fieldCount": 2,
+            "given": "Given",
+            "family": "Family",
+            "orderedParts": ["Given", "Family"],
+        }
+
+        with patch(
+            "apple_account_flow.resolve_profile_name_card_for_click",
+            side_effect=[
+                (page, first_card, {}),
+                (page, second_card, {}),
+            ],
+        ) as resolve_card, patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            side_effect=[
+                RuntimeError("personal information name modal was not found"),
+                (page, modal, hydrated_summary),
+            ],
+        ) as wait_for_modal, patch(
+            "apple_account_flow.profile_name_modal_cleanup_state",
+            return_value="unconfirmed",
+        ) as cleanup_state:
+            _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
+                page,
+                timeout_s=1,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(resolve_card.call_count, 2)
+        self.assertEqual(wait_for_modal.call_count, 2)
+        cleanup_state.assert_called_once_with(page, opening_probe=True)
+        self.assertEqual(
+            [
+                call
+                for call in page.actions.calls
+                if call in (("human_click", first_card), ("human_click", second_card))
+            ],
+            [("human_click", first_card), ("human_click", second_card)],
+        )
+        self.assertIs(opened_modal, modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+
     def test_clicked_name_card_without_modal_has_fixed_class_and_bounded_diagnostics(
         self,
     ):
@@ -15004,10 +15203,10 @@ process.stdout.write(query.call(modal));
             state={"href": account_flow.ACCOUNT_INFORMATION_URL},
         )
         events = []
-        monotonic_values = iter((0.0, 0.0, 1.1))
+        monotonic_values = iter((0.0, 0.0, 0.0, 1.1))
 
         with patch(
-            "apple_account_flow.wait_for_profile_card",
+            "apple_account_flow.resolve_profile_name_card_for_click",
             side_effect=RuntimeError("personal information name card was not found"),
         ), patch("apple_account_flow.emit", side_effect=events.append), patch(
             "apple_account_flow.time.monotonic",
@@ -15223,6 +15422,58 @@ process.stdout.write(query.call(modal));
             {"event": "status", "status": "profile_name_modal_closed"},
             events,
         )
+
+    def test_name_card_click_preparation_stabilizes_scrolls_and_reresolves(self):
+        initial_card = FakeElement(
+            attrs={
+                "profileDomIdentity": "html:1/body:1/main:1/div:1/button:1",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        refreshed_card = FakeElement(
+            attrs={
+                "tagName": "BUTTON",
+                "profileDomIdentity": "html:1/body:1/main:1/div:1/button:2",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            }
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [refreshed_card],
+                "css:button[class*='button-bare']": [refreshed_card],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        pauses: list[tuple[int, int]] = []
+
+        with patch(
+            "apple_account_flow.wait_for_profile_card",
+            return_value=(page, initial_card, initial_card.attrs["profileCard"]),
+        ) as wait_for_card:
+            scope, card, _summary = account_flow.resolve_profile_name_card_for_click(
+                page,
+                timeout_s=1,
+                pause=lambda minimum, maximum: pauses.append((minimum, maximum)),
+            )
+
+        self.assertIs(scope, page)
+        self.assertIs(card, refreshed_card)
+        wait_for_card.assert_called_once()
+        self.assertEqual(wait_for_card.call_args.args, (page, "name"))
+        self.assertGreater(wait_for_card.call_args.kwargs["timeout_s"], 0)
+        self.assertLessEqual(wait_for_card.call_args.kwargs["timeout_s"], 1)
+        self.assertEqual(initial_card.scroll.calls, [("to_see",)])
+        self.assertEqual(pauses, [(280, 620)])
 
     def test_rejects_ambiguous_name_cards_without_clicking_either(self):
         cards = [
