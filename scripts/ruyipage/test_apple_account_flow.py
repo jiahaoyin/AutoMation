@@ -10668,6 +10668,15 @@ class DeveloperAccountTests(unittest.TestCase):
         page.states = FakeStates(alive=True)
         return page
 
+    @staticmethod
+    def attach_membership_details_card(page):
+        card = FakeElement(attrs={"id": "MembershipDetailsCard"})
+        page.elements_by_selector[
+            "css:[id*='MembershipDetailsCard']"
+        ] = [card]
+        card.scope = page
+        return card
+
     def evaluate_membership_details_query(
         self,
         text="",
@@ -11104,8 +11113,12 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
-        with patch("apple_account_flow.time.monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]), patch(
+        with patch(
+            "apple_account_flow.time.monotonic",
+            return_value=0.0,
+        ), patch(
             "apple_account_flow.human_pause", lambda *_: None
         ):
             active = account_flow.confirm_active_developer_membership(
@@ -11161,10 +11174,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11203,10 +11217,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11225,6 +11240,273 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ),
             3,
         )
+
+    def test_active_details_probe_stops_when_the_targeted_card_settle_fails(self):
+        order = []
+
+        class OrderedDeveloperPage(DeveloperFakePage):
+            def run_js(self, script):
+                if "ruyipage-developer-membership-details" in script:
+                    order.append("probe")
+                return super().run_js(script)
+
+        page = OrderedDeveloperPage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            return_value=0.0,
+        ), patch(
+            "apple_account_flow.scroll_developer_membership_details_card",
+            side_effect=lambda *_args, **_kwargs: (
+                order.append("scroll_attempt"),
+                False,
+            )[1],
+        ), patch("apple_account_flow.emit"):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertFalse(active)
+        self.assertEqual(order, ["scroll_attempt"])
+
+    def test_membership_card_settle_respects_the_confirmation_timeout(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": True,
+                "renewalDate": True,
+                "registrationIdentity": True,
+                "membershipFieldCount": 2,
+            },
+        )
+        page.states = FakeStates(alive=True)
+        pauses = []
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 0.1, 1.1],
+        ), patch("apple_account_flow.emit"):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=1.0,
+                pause=lambda *args: pauses.append(args),
+            )
+
+        self.assertFalse(active)
+        self.assertEqual(pauses, [])
+        self.assertFalse(
+            any(
+                "ruyipage-developer-membership-details" in script
+                for script in page.developer_scripts
+            )
+        )
+
+    def test_membership_card_scroll_does_not_act_after_a_zero_budget(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+        )
+        page.states = FakeStates(alive=True)
+        membership_card = self.attach_membership_details_card(page)
+
+        self.assertFalse(
+            account_flow.scroll_developer_membership_details_card(
+                page,
+                timeout_s=0,
+                pause=lambda *_: self.fail("zero timeout must not pause"),
+            )
+        )
+        self.assertEqual(membership_card.scroll.calls, [])
+
+    def test_membership_card_scroll_does_not_start_with_insufficient_positive_budget(self):
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+        )
+        page.states = FakeStates(alive=True)
+        membership_card = self.attach_membership_details_card(page)
+
+        with patch("apple_account_flow.time.monotonic", return_value=9.6):
+            self.assertFalse(
+                account_flow.scroll_developer_membership_details_card(
+                    page,
+                    deadline=10.0,
+                    pause=lambda *_: self.fail(
+                        "insufficient scroll budget must not pause"
+                    ),
+                )
+            )
+
+        self.assertEqual(membership_card.scroll.calls, [])
+
+    def test_membership_card_scroll_retries_until_the_deadline_at_the_fastest_cadence(self):
+        clock = {"value": 0.0}
+        pauses = []
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        def pause(min_ms, max_ms):
+            pauses.append((min_ms, max_ms))
+            clock["value"] += min_ms / 1000
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            self.assertFalse(
+                account_flow.scroll_developer_membership_details_card(
+                    page,
+                    deadline=35.0,
+                    pause=pause,
+                )
+            )
+
+        self.assertGreaterEqual(len(pauses), 50)
+        self.assertAlmostEqual(clock["value"], 35.0, places=6)
+
+    def test_membership_confirmation_skips_a_late_card_when_settle_leaves_only_half_a_second(self):
+        clock = {"value": 0.0}
+        pauses = []
+        page = DeveloperFakePage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details={
+                "detailsPage": True,
+                "appleDeveloperProgram": False,
+            },
+        )
+        page.states = FakeStates(alive=True)
+        membership_card = self.attach_membership_details_card(page)
+
+        def pause(*args):
+            pauses.append(args)
+            clock["value"] = 2.0 if len(pauses) == 1 else 2.6
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=2.5,
+                pause=pause,
+            )
+
+        self.assertFalse(active)
+        self.assertEqual(membership_card.scroll.calls, [])
+        self.assertEqual(pauses, [(1200, 2000)])
+
+    def test_membership_navigation_does_not_click_after_its_scroll_spends_the_budget(self):
+        clock = {"value": 0.0}
+        pauses = []
+        membership_link = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+            on_scroll=lambda: clock.__setitem__("value", 34.8),
+        )
+        page = DeveloperFakePage(
+            {"css:a": [membership_link]},
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+            membership_details={
+                "detailsPage": False,
+                "appleDeveloperProgram": False,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=35.0,
+                pause=lambda *args: pauses.append(args),
+            )
+
+        self.assertFalse(active)
+        self.assertEqual(membership_link.scroll.calls, [("to_see",)])
+        self.assertEqual(pauses, [(200, 200)])
+        self.assertNotIn(("human_click", membership_link), page.actions.calls)
+
+    def test_membership_navigation_reserves_budget_for_human_click_implicit_scroll(self):
+        clock = {"value": 0.0}
+        pauses = []
+        membership_link = FakeElement(
+            text="Membership details",
+            attrs={
+                "developerMembershipNavigation": {
+                    "visible": True,
+                    "label": "membership details",
+                }
+            },
+            on_scroll=lambda: clock.__setitem__("value", 31.0),
+        )
+        page = DeveloperFakePage(
+            {"css:a": [membership_link]},
+            state={"href": account_flow.DEVELOPER_ACCOUNT_URL},
+            membership_details={
+                "detailsPage": False,
+                "appleDeveloperProgram": False,
+            },
+        )
+        page.states = FakeStates(alive=True)
+
+        def pause(*args):
+            pauses.append(args)
+            clock["value"] = 31.6
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: clock["value"],
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                timeout_s=35.0,
+                pause=pause,
+            )
+
+        self.assertFalse(active)
+        self.assertEqual(membership_link.scroll.calls, [("to_see",)])
+        self.assertEqual(pauses, [(250, 500)])
+        self.assertNotIn(("human_click", membership_link), page.actions.calls)
 
     def test_canonical_account_url_confirms_visible_membership_details_without_navigation(self):
         page = DeveloperFakePage(
@@ -11249,10 +11531,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3],
+            return_value=0.0,
         ), patch("apple_account_flow.emit"):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11279,7 +11562,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 1.1],
+            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.1, 1.2],
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11314,10 +11597,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11370,7 +11654,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11380,6 +11664,87 @@ process.stdout.write(JSON.stringify(eval(expression)));
         self.assertTrue(active)
         self.assertEqual(membership_card.scroll.calls, [("to_see",)])
         self.assertEqual(order, ["scroll", "probe", "probe"])
+
+    def test_membership_confirmation_waits_for_a_late_details_card_to_settle(self):
+        order = []
+        pauses = []
+
+        class DelayedDetailsCardPage(DeveloperFakePage):
+            card_available = False
+
+            def eles(self, selector, timeout=None):
+                if (
+                    selector in account_flow.DEVELOPER_MEMBERSHIP_CARD_SELECTORS
+                    and not self.card_available
+                ):
+                    self.eles_calls.append((selector, timeout))
+                    return []
+                return super().eles(selector, timeout)
+
+            def run_js(self, script):
+                if "ruyipage-developer-membership-details" in script:
+                    order.append("probe")
+                return super().run_js(script)
+
+        page = DelayedDetailsCardPage(
+            state={
+                "href": "https://developer.apple.com/account#MembershipDetailsCard"
+            },
+            membership_details=[
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+                {
+                    "detailsPage": True,
+                    "appleDeveloperProgram": True,
+                    "renewalDate": True,
+                    "registrationIdentity": True,
+                    "membershipFieldCount": 2,
+                },
+            ],
+        )
+        membership_card = FakeElement(
+            attrs={"id": "MembershipDetailsCard"},
+            on_scroll=lambda: order.append("scroll"),
+        )
+        page.elements_by_selector[
+            "css:[id*='MembershipDetailsCard']"
+        ] = [membership_card]
+        membership_card.scope = page
+        page.states = FakeStates(alive=True)
+
+        def pause(*_args):
+            pauses.append(_args)
+            # The card mounts only after the old eight-try budget would have
+            # given up. The confirmation deadline, not that small retry cap,
+            # must control the wait for SPA hydration.
+            if len(pauses) == 9:
+                page.card_available = True
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            return_value=0.0,
+        ):
+            active = account_flow.confirm_active_developer_membership(
+                page,
+                pause=pause,
+            )
+
+        self.assertTrue(active)
+        self.assertGreaterEqual(len(pauses), 10)
+        self.assertEqual(order, ["scroll", "probe", "probe"])
+        self.assertEqual(membership_card.scroll.calls, [("to_see",)])
+        card_lookups = [
+            timeout
+            for selector, timeout in page.eles_calls
+            if selector in account_flow.DEVELOPER_MEMBERSHIP_CARD_SELECTORS
+        ]
+        self.assertTrue(card_lookups)
+        self.assertTrue(all(timeout == 0 for timeout in card_lookups))
 
     def test_membership_details_with_live_auth_controls_fails_closed(self):
         page = DeveloperFakePage(
@@ -11402,7 +11767,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11442,10 +11807,11 @@ process.stdout.write(JSON.stringify(eval(expression)));
             ],
         )
         page.states = FakeStates(alive=True)
+        self.attach_membership_details_card(page)
 
         with patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
+            return_value=0.0,
         ):
             active = account_flow.confirm_active_developer_membership(
                 page,
@@ -11953,7 +12319,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
             },
         ), patch(
             "apple_account_flow.time.monotonic",
-            side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
+            return_value=0.0,
         ), patch(
             "apple_account_flow.take_screenshot",
             return_value=str(screenshot_path),
@@ -13291,6 +13657,36 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertTrue(state["hardAuthenticationError"])
         self.assertTrue(state["rootHardAuthenticationError"])
 
+    def test_profile_capture_waits_past_the_single_card_timeout_for_stability(self):
+        name_card, birthday_card = self.stable_profile_cards()
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:.card": [birthday_card],
+            },
+            state={
+                "href": account_flow.ACCOUNT_INFORMATION_URL,
+                "accountManage": True,
+                "accountMarker": True,
+            },
+        )
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=[0.0, 34.9, 35.1],
+        ), patch("apple_account_flow.emit"):
+            state = account_flow.wait_for_profile_capture_ready(
+                page,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(state["trusted"])
+        self.assertGreater(
+            account_flow.PROFILE_CAPTURE_READY_TIMEOUT_S,
+            account_flow.PROFILE_CARD_WAIT_TIMEOUT_S,
+        )
+
     def test_shadow_root_profile_cards_have_distinct_dom_identities(self):
         name_card = FakeElement(
             attrs={
@@ -13396,6 +13792,28 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertIs(candidates[0][1], name_button)
         self.assertIs(account_flow.resolve_profile_card(page, "name")[1], name_button)
+
+    def test_profile_card_candidate_queries_are_nonblocking(self):
+        name_card, birthday_card = self.stable_profile_cards()
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:.card": [birthday_card],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        account_flow.profile_card_candidates(page, "name")
+        name_queries = list(page.eles_calls)
+        page.eles_calls.clear()
+        account_flow.profile_card_candidates(page, "birthday")
+        birthday_queries = list(page.eles_calls)
+
+        self.assertTrue(name_queries)
+        self.assertTrue(birthday_queries)
+        self.assertTrue(
+            all(timeout == 0 for _selector, timeout in name_queries + birthday_queries)
+        )
 
     def test_profile_card_candidates_prefer_nested_card_action_target(self):
         card_wrapper = FakeElement(

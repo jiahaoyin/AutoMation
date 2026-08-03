@@ -98,6 +98,9 @@ PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES = frozenset(
     }
 )
 PROFILE_CARD_WAIT_TIMEOUT_S = 35.0
+# Page readiness has to cover both profile cards and two consecutive stable
+# observations. Keep that budget independent from the later single-card waits.
+PROFILE_CAPTURE_READY_TIMEOUT_S = 60.0
 PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
 PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS = 2
 PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S = 3.0
@@ -4004,7 +4007,23 @@ DEVELOPER_MEMBERSHIP_CARD_SELECTORS = (
     "css:[class*='membership-details']",
     "css:[data-testid*='membership-details']",
 )
-DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS = 3
+# A standalone screenshot retry should remain short, but the 35 s membership
+# confirmation must be driven by its absolute deadline rather than this small
+# retry cap. At the 700 ms minimum cadence, 64 retries safely cover that
+# deadline; the live deadline still stops the loop first.
+DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS = 8
+DEVELOPER_MEMBERSHIP_CARD_SCROLL_DEADLINE_ATTEMPTS = 64
+DEVELOPER_MEMBERSHIP_CONFIRMATION_TIMEOUT_S = 35.0
+# ruyiPage's targeted ``to_see()`` can perform up to twenty 100 ms scroll
+# steps before returning. Do not begin that synchronous action once there is
+# too little confirmation time left for it to finish and for the page to
+# settle. The extra half second leaves room for the BiDi round trips.
+DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S = 2.5
+# ruyiPage's human_click() can issue another targeted scroll when the
+# navigation item is not wholly visible, then adds cursor motion and click
+# delays. Reserve a full target-scroll window plus a conservative click
+# allowance, because the action itself cannot be interrupted mid-BiDi call.
+DEVELOPER_MEMBERSHIP_NAVIGATION_CLICK_MIN_REMAINING_S = 3.5
 
 
 def developer_account_snapshot(page: Any) -> dict[str, bool | int]:
@@ -4684,10 +4703,26 @@ def resolve_developer_membership_details_card(
     return None
 
 
+def developer_membership_deadline_remaining_s(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def developer_membership_deadline_allows(
+    deadline: float | None,
+    minimum_remaining_s: float = 0.0,
+) -> bool:
+    remaining_s = developer_membership_deadline_remaining_s(deadline)
+    return remaining_s is None or remaining_s >= minimum_remaining_s
+
+
 def scroll_developer_membership_details_card(
     page: Any,
     *,
     pause: Callable[[int, int], None] = human_pause,
+    timeout_s: float | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Scroll the exact details card, tolerating a bounded SPA replacement.
 
@@ -4696,40 +4731,100 @@ def scroll_developer_membership_details_card(
     gives ruyiPage's card-targeted scroll enough time to complete before a
     field probe or viewport screenshot continues.
     """
-    for attempt in range(DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS):
+    if deadline is None and timeout_s is not None:
+        if timeout_s <= 0:
+            return False
+        deadline = time.monotonic() + timeout_s
+    if not developer_membership_deadline_allows(deadline):
+        return False
+    attempt_limit = (
+        DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS
+        if deadline is None
+        else DEVELOPER_MEMBERSHIP_CARD_SCROLL_DEADLINE_ATTEMPTS
+    )
+
+    def bounded_pause(min_ms: int, max_ms: int) -> bool:
+        remaining_s = developer_membership_deadline_remaining_s(deadline)
+        if remaining_s is None:
+            pause(min_ms, max_ms)
+            return True
+        capped_max_ms = min(max_ms, max(0, round(remaining_s * 1000)))
+        if capped_max_ms <= 0:
+            return False
+        pause(min(min_ms, capped_max_ms), capped_max_ms)
+        return developer_membership_deadline_allows(deadline)
+
+    for attempt in range(attempt_limit):
         resolved = resolve_developer_membership_details_card(page)
         if resolved is None:
-            if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
-                pause(220, 460)
+            if (
+                attempt + 1 < attempt_limit
+                and bounded_pause(700, 1200)
+            ):
                 continue
             return False
         _scope, card = resolved
+        # ``to_see()`` is synchronous. A short residual budget can otherwise
+        # let a late-mounted card force the membership confirmation beyond its
+        # caller's deadline before the first settled probe is even attempted.
+        if not developer_membership_deadline_allows(
+            deadline,
+            DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S,
+        ):
+            return False
         try:
             card.scroll.to_see()
         except Exception:
-            if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
-                pause(220, 460)
+            if (
+                attempt + 1 < attempt_limit
+                and bounded_pause(700, 1200)
+            ):
                 continue
             return False
         # Do not begin a DOM probe/screenshot in the middle of ruyiPage's
         # scroll animation. Re-resolve afterward because React can replace the
         # card wrapper while it hydrates its detail fields.
-        pause(700, 1300)
+        if not bounded_pause(1400, 2200):
+            return False
         if resolve_developer_membership_details_card(page) is not None:
-            return True
-        if attempt + 1 < DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS:
-            pause(160, 360)
+            # A second lookup after a short quiet period keeps a React wrapper
+            # replacement from racing the first details probe or screenshot.
+            if not bounded_pause(300, 650):
+                return False
+            if resolve_developer_membership_details_card(page) is not None:
+                return True
+        if (
+            attempt + 1 < attempt_limit
+            and bounded_pause(450, 800)
+        ):
+            continue
+        return False
     return False
 
 
 def confirm_active_developer_membership(
     page: Any,
     *,
-    timeout_s: float = 20.0,
+    timeout_s: float = DEVELOPER_MEMBERSHIP_CONFIRMATION_TIMEOUT_S,
     pause: Callable[[int, int], None] = human_pause,
     registration_identity_holder: dict[str, str | None] | None = None,
 ) -> bool:
     deadline = time.monotonic() + max(0.0, timeout_s)
+
+    def pause_until_deadline(min_ms: int, max_ms: int) -> bool:
+        remaining_s = developer_membership_deadline_remaining_s(deadline)
+        if remaining_s is None:
+            pause(min_ms, max_ms)
+            return True
+        capped_max_ms = min(max_ms, max(0, round(remaining_s * 1000)))
+        if capped_max_ms <= 0:
+            return False
+        pause(min(min_ms, capped_max_ms), capped_max_ms)
+        return developer_membership_deadline_allows(deadline)
+
+    def deadline_pause(min_ms: int, max_ms: int) -> None:
+        if not pause_until_deadline(min_ms, max_ms):
+            raise TimeoutError("developer membership confirmation deadline expired")
 
     def wait_for_loaded_details(
         initial_snapshot: dict[str, Any] | None = None,
@@ -4741,8 +4836,22 @@ def confirm_active_developer_membership(
             # asynchronously. Give that native motion a chance to finish, then
             # scroll the concrete card once through ruyiPage before sampling
             # its lazy-hydrated fields.
-            pause(700, 1300)
-            scroll_developer_membership_details_card(page, pause=pause)
+            if not pause_until_deadline(1200, 2000):
+                return False
+            if not scroll_developer_membership_details_card(
+                page,
+                pause=pause,
+                deadline=deadline,
+            ):
+                # A route marker or stale page snapshot alone is not enough to
+                # claim an active membership. The concrete details card must
+                # have been located and settled before its two probes count.
+                return False
+            # The route-detection snapshot can predate the card scroll and
+            # lazy field hydration. A responsive layout can replace the exact
+            # card selector, so wait through the whole targeted scroll window
+            # and then count only samples taken after that window as evidence.
+            initial_snapshot = None
         stable_count = 0
         last_probe: tuple[bool | int, ...] | None = None
         pending_snapshot = initial_snapshot
@@ -4800,7 +4909,8 @@ def confirm_active_developer_membership(
                         )
                     )
                 return True
-            pause(250, 500)
+            if not pause_until_deadline(250, 500):
+                break
         return False
 
     # Apple can land on the hash-routed details card before the nav items are
@@ -4808,7 +4918,10 @@ def confirm_active_developer_membership(
     # not frozen into the initial ``membershipNavigation`` snapshot.  Its SPA
     # can also canonicalize the URL back to ``/account`` while retaining the
     # visible details card, so the live snapshot is an independent route cue.
-    while time.monotonic() < deadline:
+    while True:
+        current_time = time.monotonic()
+        if current_time >= deadline:
+            break
         current_url = scope_location_url(page)
         if developer_membership_details_route(current_url):
             return wait_for_loaded_details(settle_card_before_probe=True)
@@ -4824,17 +4937,32 @@ def confirm_active_developer_membership(
         navigation = resolve_developer_membership_navigation(page)
         if navigation is not None:
             scope, element = navigation
+            if not developer_membership_deadline_allows(
+                deadline,
+                DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S,
+            ):
+                break
             try:
                 element.scroll.to_see()
             except Exception:
                 pass
-            pause(250, 500)
+            if not pause_until_deadline(250, 500):
+                break
             refreshed_navigation = resolve_developer_membership_navigation(page)
             if refreshed_navigation is not None:
                 scope, element = refreshed_navigation
-            human_click(scope, element, pause=pause)
+            if not developer_membership_deadline_allows(
+                deadline,
+                DEVELOPER_MEMBERSHIP_NAVIGATION_CLICK_MIN_REMAINING_S,
+            ):
+                break
+            try:
+                human_click(scope, element, pause=deadline_pause)
+            except TimeoutError:
+                break
             return wait_for_loaded_details(settle_card_before_probe=True)
-        pause(250, 500)
+        if not pause_until_deadline(250, 500):
+            break
     return False
 
 
@@ -5470,7 +5598,7 @@ def profile_card_candidates(page: Any, kind: str) -> list[tuple[Any, Any, dict[s
         if scope is not page:
             continue
         for selector in selectors:
-            for card in safe_elements(root, selector):
+            for card in safe_elements(root, selector, timeout_s=0):
                 if not element_is_interactable(card):
                     continue
                 try:
@@ -6122,7 +6250,7 @@ def profile_capture_readiness_observation(
 
 def wait_for_profile_capture_ready(
     page: Any,
-    timeout_s: float = PROFILE_CARD_WAIT_TIMEOUT_S,
+    timeout_s: float = PROFILE_CAPTURE_READY_TIMEOUT_S,
     pause: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     if pause is None:
