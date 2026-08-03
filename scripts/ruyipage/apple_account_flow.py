@@ -90,6 +90,10 @@ PROFILE_CARD_WAIT_TIMEOUT_S = 35.0
 PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
 PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS = 2
 PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S = 3.0
+# The profile page has already passed a stable-card readiness gate before the
+# name editor opens. A later transient React replacement must not consume the
+# entire modal-open budget before the first click is even sent.
+PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S = 3.0
 PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS = 2
 PROFILE_VALUE_STABLE_OBSERVATIONS = 2
 PROFILE_VALUE_MAX_LENGTHS = {"name": 256, "birthday": 128}
@@ -5747,6 +5751,33 @@ def wait_for_profile_name_modal(
     raise RuntimeError("personal information name modal was not found")
 
 
+def resolve_profile_name_card_for_click(
+    page: Any,
+    *,
+    timeout_s: float,
+    pause: Callable[[int, int], None],
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Resolve a current name card without exhausting the modal-open budget.
+
+    The Personal Information readiness gate has already observed the name card
+    as stable. Prefer that currently visible card immediately. If React replaces
+    it between readiness and the click, use only a short bounded re-acquire
+    window so the click still leaves time to observe the resulting modal.
+    """
+    resolved = resolve_profile_card(page, "name")
+    if resolved is not None:
+        return resolved
+    return wait_for_profile_card(
+        page,
+        "name",
+        timeout_s=min(
+            PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S,
+            max(0.0, timeout_s),
+        ),
+        pause=pause,
+    )
+
+
 def open_profile_name_modal(
     page: Any,
     *,
@@ -5756,10 +5787,10 @@ def open_profile_name_modal(
     """Open the name editor through a freshly stabilized card reference.
 
     Apple Account can replace its Personal Information cards while a React
-    hydration/update is in flight.  The old flow kept a card reference across
-    a human pause and clicked it once, which can be a no-op.  Re-resolve the
-    card after the pause, then use one bounded modal-open retry when the first
-    action races the update.
+    hydration/update is in flight. Prefer the already-stable visible card for
+    the first click, then perform one short re-resolve/retry only if that click
+    did not produce a modal. This prevents card readiness waits from consuming
+    the complete modal-open deadline.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     last_error: Exception | None = None
@@ -5792,22 +5823,9 @@ def open_profile_name_modal(
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 break
-            # First wait proves the card is ready; the second one is the
-            # authoritative reference used for the click after the pause.
-            wait_for_profile_card(
+            name_scope, name_card, _name_summary = resolve_profile_name_card_for_click(
                 page,
-                "name",
-                timeout_s=min(PROFILE_CARD_WAIT_TIMEOUT_S, remaining_s),
-                pause=pause,
-            )
-            pause(280, 620)
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-            name_scope, name_card, _name_summary = wait_for_profile_card(
-                page,
-                "name",
-                timeout_s=min(PROFILE_CARD_WAIT_TIMEOUT_S, remaining_s),
+                timeout_s=remaining_s,
                 pause=pause,
             )
             human_click(name_scope, name_card, pause=pause)
@@ -5851,6 +5869,36 @@ def open_profile_name_modal(
         except Exception as error:
             last_error = error
             if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
+                # ``wait_for_profile_name_modal`` intentionally rejects an
+                # unhydrated dialog because its values are not safe to collect
+                # yet. Do not mistake that state for a failed click: a second
+                # card click can close or interrupt the dialog that is already
+                # on screen. Only retry the card after its shell is confirmed
+                # absent; otherwise give the remaining budget to hydration.
+                try:
+                    modal_shell_state = profile_name_modal_cleanup_state(page)
+                except Exception:
+                    modal_shell_state = "unconfirmed"
+                if modal_shell_state != "closed":
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        break
+                    try:
+                        resolved_modal = wait_for_profile_name_modal(
+                            page,
+                            timeout_s=remaining_s,
+                            pause=pause,
+                        )
+                        modal_scope, modal, modal_summary = resolved_modal
+                        return (
+                            modal_scope,
+                            modal,
+                            modal_summary,
+                            profile_name_modal_selector(page, modal_scope, modal),
+                        )
+                    except Exception as hydration_error:
+                        last_error = hydration_error
+                        break
                 pause(160, 340)
                 continue
             unavailable_outcome = profile_name_modal_unavailable_outcome(error)

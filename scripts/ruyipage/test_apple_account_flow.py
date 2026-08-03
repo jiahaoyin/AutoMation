@@ -14842,6 +14842,120 @@ process.stdout.write(query.call(modal));
             ],
         )
 
+    def test_visible_name_card_is_clicked_without_a_second_full_card_wait(self):
+        """A card already visible after readiness must receive the first click."""
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": "Given",
+                    "family": "Family",
+                },
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "tagName": "BUTTON",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        with patch("apple_account_flow.wait_for_profile_card") as wait_for_card:
+            _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
+                page,
+                timeout_s=1,
+                pause=lambda *_: None,
+            )
+
+        wait_for_card.assert_not_called()
+        self.assertIs(opened_modal, modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+        self.assertIn(("human_click", name_card), page.actions.calls)
+
+    def test_unhydrated_visible_name_modal_blocks_a_second_card_click(self):
+        """An open dialog may need hydration, but must never be card-clicked again."""
+        modal = FakeElement(
+            displayed=False,
+            attrs={
+                "id": "modal-content-name",
+                "profileModal": {
+                    "visible": True,
+                    "fieldCount": 2,
+                    "given": None,
+                    "family": None,
+                },
+            },
+        )
+        name_card = FakeElement(
+            on_click=lambda: setattr(modal.states, "is_displayed", True),
+            attrs={
+                "tagName": "BUTTON",
+                "profileCard": {
+                    "visible": True,
+                    "name": True,
+                    "birthday": False,
+                    "birthdayValue": None,
+                },
+            },
+        )
+        page = FakePage(
+            {
+                "css:button.button.button-bare": [name_card],
+                "css:button[class*='button-bare']": [name_card],
+                "css:[id^='modal-content-']": [modal],
+                "css:[role='dialog']": [],
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        hydrated_summary = {
+            "visible": True,
+            "fieldCount": 2,
+            "given": "Given",
+            "family": "Family",
+            "orderedParts": ["Given", "Family"],
+        }
+
+        with patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            side_effect=[
+                RuntimeError("personal information name modal was not found"),
+                (page, modal, hydrated_summary),
+            ],
+        ) as wait_for_modal:
+            _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
+                page,
+                timeout_s=1,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(wait_for_modal.call_count, 2)
+        self.assertIs(opened_modal, modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(summary["family"], "Family")
+        self.assertEqual(
+            [call for call in page.actions.calls if call == ("human_click", name_card)],
+            [("human_click", name_card)],
+        )
+
     def test_clicked_name_card_without_modal_has_fixed_class_and_bounded_diagnostics(
         self,
     ):

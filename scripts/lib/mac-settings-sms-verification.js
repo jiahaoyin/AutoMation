@@ -83,11 +83,14 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
     90_000,
     "MAC_SETTINGS_SMS_CODE_TRANSITION_GRACE_INVALID"
   );
+  // SMS provider cadence is a user-visible contract: one request every five
+  // seconds.  Keep a small lower bound for focused tests, but use 5_000ms in
+  // production unless a caller explicitly supplies a test/diagnostic value.
   const providerPollIntervalMs = Math.max(
     250,
     boundedPositiveInteger(
       options.providerPollIntervalMs,
-      2_000,
+      5_000,
       "MAC_SETTINGS_SMS_PROVIDER_POLL_INTERVAL_INVALID"
     )
   );
@@ -146,6 +149,11 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   let codeWriteAttempted = false;
   let postCodeWaitingObservations = 0;
   let manualPostCodeWaitingObservations = 0;
+  let providerPolls = 0;
+  const repeatableProgressEvents = new Set([
+    "code_provider_poll_started",
+    "code_provider_poll_empty",
+  ]);
 
   const reportEvent = (event, details = {}) => {
     if (!onEvent) return;
@@ -157,7 +165,7 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   };
   const reportProgress = (event, details = {}) => {
     reportEvent(event, details);
-    if (!onProgress || lastProgress === event) return;
+    if (!onProgress || (lastProgress === event && !repeatableProgressEvents.has(event))) return;
     lastProgress = event;
     try {
       onProgress({ event, ...details });
@@ -206,19 +214,35 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
   const pollProviderUntilCode = async (provider) => {
     if (typeof provider !== "function") return null;
     const pollDeadline = Math.min(deadline, now() + providerTimeoutMs);
-    let polls = 0;
     while (readRemainingMs(pollDeadline, now) > 0) {
-      polls += 1;
-      const requestBudget = Math.min(readRemainingMs(pollDeadline, now), 30_000);
-      reportEvent("code_provider_poll_started", { polls, timeoutMs: requestBudget });
+      providerPolls += 1;
+      const pollStartedAt = now();
+      const requestBudget = Math.min(readRemainingMs(pollDeadline, now), providerPollIntervalMs);
+      reportProgress("code_provider_poll_started", {
+        polls: providerPolls,
+        timeoutMs: requestBudget,
+        pollIntervalMs: providerPollIntervalMs,
+      });
       const value = await acquireCode(provider, requestBudget);
       if (value) {
-        reportEvent("code_provider_code_ready", { polls });
+        reportEvent("code_provider_code_ready", { polls: providerPolls });
         return value;
       }
-      reportEvent("code_provider_poll_empty", { polls });
+      const elapsedMs = Math.max(0, now() - pollStartedAt);
+      reportProgress("code_provider_poll_empty", {
+        polls: providerPolls,
+        elapsedMs,
+        pollIntervalMs: providerPollIntervalMs,
+      });
       if (readRemainingMs(pollDeadline, now) <= 0) break;
-      if (!(await waitBounded(Math.min(providerPollIntervalMs, readRemainingMs(pollDeadline, now))))) {
+      // Schedule by poll start time, not by response completion time.  A slow
+      // request cannot silently stretch the configured 5-second cadence.
+      const elapsedWithinInterval = Math.min(providerPollIntervalMs, elapsedMs);
+      const waitMs = Math.min(
+        Math.max(0, providerPollIntervalMs - elapsedWithinInterval),
+        readRemainingMs(pollDeadline, now)
+      );
+      if (waitMs > 0 && !(await waitBounded(waitMs))) {
         break;
       }
     }
@@ -581,6 +605,12 @@ export async function completeSupervisedMacSettingsSmsVerification(options = {})
       if (!verificationCode) {
         reportProgress("code_polling_started");
         const providerCode = await pollProviderUntilCode(codeProvider);
+        if (!providerCode) {
+          reportProgress("sms_code_not_received", {
+            polls: providerPolls,
+            elapsedMs: Math.max(0, timeoutMs - readRemainingMs(deadline, now)),
+          });
+        }
         verificationCode = providerCode ?? await acquireCode(manualCodeProvider, manualTimeoutMs);
       }
       if (!verificationCode && readRemainingMs(deadline, now) <= 0) {

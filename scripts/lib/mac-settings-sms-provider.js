@@ -3,8 +3,10 @@ import { stdin as input, stdout as output } from "node:process";
 
 const SIX_DIGIT_CODE_RE = /(?<!\d)(\d{6})(?!\d)/g;
 const MAX_RESPONSE_BYTES = 256 * 1024;
-const MAX_PROVIDER_REDIRECTS = 3;
-const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 20_000;
+// A provider request is one poll.  Keep its upper bound at the same cadence
+// as the coordinator so a slow endpoint cannot make the terminal look idle for
+// tens of seconds between visible poll heartbeats.
+const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_SMS_PROVIDER_HEADERS = Object.freeze({
   accept: "application/json, text/html;q=0.9, text/plain;q=0.8, */*;q=0.1",
   "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -403,11 +405,40 @@ function collectSmsMessageRecords(value, inheritedTimestamp = null) {
   return nestedRecords;
 }
 
+// LixSMS returns a JSON envelope whose useful payload is specifically
+// `messages[].body`.  Parse that shape explicitly instead of flattening ids,
+// dates, or unrelated fields into the candidate text.  The recipient suffix
+// and sent timestamp remain metadata used to choose the correct message.
+function recordsFromLixSmsMessages(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  // Once a response declares the LixSMS envelope, only messages[].body is
+  // eligible. Never fall back to message IDs, root-level codes, or unrelated
+  // metadata when that envelope is empty or malformed.
+  if (!Object.prototype.hasOwnProperty.call(value, "messages")) return null;
+  if (!Array.isArray(value.messages)) return [];
+  return value.messages.flatMap((message) => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) return [];
+    const body = primitiveText(message.body)?.trim() ?? "";
+    if (!body) return [];
+    const suffixes = new Set();
+    const recipient = primitiveText(message.to);
+    if (recipient) {
+      const digits = recipient.replace(/\D/g, "");
+      if (digits.length >= 2) suffixes.add(digits.slice(-2));
+    }
+    const sentAt = primitiveText(message.date_sent);
+    const timestamp = timestampFromScalar(sentAt) ?? timestampFromText(sentAt);
+    return [{ text: body, suffixes, timestamp }];
+  });
+}
+
 export function extractSmsVerificationCode(body, suffix) {
   const text = typeof body === "string" ? body : "";
   const records = (() => {
     try {
-      return collectSmsMessageRecords(JSON.parse(text));
+      const parsed = JSON.parse(text);
+      const lixSmsRecords = recordsFromLixSmsMessages(parsed);
+      return lixSmsRecords ?? collectSmsMessageRecords(parsed);
     } catch {
       const embeddedJson = recordsFromEmbeddedJson(text);
       const renderedRows = recordsFromHtml(text);
@@ -553,27 +584,26 @@ function isRedirectStatus(response) {
 }
 
 async function requestProviderResponse({ request, state, origin, cookieJar, signal }) {
-  let requestUrl = state.url;
-  for (let redirectCount = 0; redirectCount <= MAX_PROVIDER_REDIRECTS; redirectCount += 1) {
-    const response = await request(requestUrl, {
-      method: "GET",
-      redirect: "manual",
-      cache: "no-store",
-      keepalive: true,
-      credentials: "include",
-      signal,
-      headers: providerRequestHeaders(origin, cookieJar),
-    });
-    updateProviderCookieJar(cookieJar, response?.headers);
-    if (!isRedirectStatus(response)) {
-      state.url = requestUrl;
-      return response;
-    }
-    const next = safeProviderRedirect(response.headers?.get?.("location"), requestUrl, origin);
-    if (!next) return null;
-    requestUrl = next.toString();
+  const requestUrl = state.url;
+  const response = await request(requestUrl, {
+    method: "GET",
+    redirect: "manual",
+    cache: "no-store",
+    keepalive: true,
+    credentials: "include",
+    signal,
+    headers: providerRequestHeaders(origin, cookieJar),
+  });
+  updateProviderCookieJar(cookieJar, response?.headers);
+  if (!isRedirectStatus(response)) {
     state.url = requestUrl;
+    return response;
   }
+  const next = safeProviderRedirect(response.headers?.get?.("location"), requestUrl, origin);
+  if (next) state.url = next.toString();
+  // A provider invocation is exactly one HTTP request. Follow a safe redirect
+  // on the next coordinator heartbeat instead of bursting several GETs inside
+  // a single five-second polling slot.
   return null;
 }
 
@@ -584,45 +614,47 @@ export function createSmsProviderCodePoller(config, options = {}) {
   const providerOrigin = new URL(providerUrl).origin;
   const suffix = validateSmsProviderPhone(config?.phoneNumber).replace(/\D/g, "").slice(-2);
   const request = options.fetch ?? globalThis.fetch;
-  const pause = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const now = options.now ?? Date.now;
-  const pollIntervalMs = Math.max(250, Math.trunc(options.pollIntervalMs ?? 3_000));
   const configuredRequestTimeoutMs = Number.isFinite(options.requestTimeoutMs)
     ? Math.trunc(options.requestTimeoutMs)
     : DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS;
   const requestTimeoutMs = Math.max(1_000, Math.min(30_000, configuredRequestTimeoutMs));
   if (typeof request !== "function") throw failure("MAC_SETTINGS_SMS_PROVIDER_UNAVAILABLE");
+  // Keep cookies and redirect state across coordinator polls, but perform only
+  // one HTTP request per invocation.  The coordinator owns the 5-second cadence
+  // and can therefore emit a heartbeat for every attempt.
+  const cookieJar = new Map();
+  const requestState = { url: providerUrl };
   return async ({ signal, timeoutMs }) => {
-    const deadline = now() + timeoutMs;
-    const cookieJar = new Map();
-    const requestState = { url: providerUrl };
-    while (!signal?.aborted && now() < deadline) {
-      const controller = new AbortController();
-      const onAbort = () => controller.abort();
-      signal?.addEventListener("abort", onAbort, { once: true });
-      try {
-        const remainingMs = Math.max(1, deadline - now());
-        const timer = setTimeout(() => controller.abort(), Math.min(requestTimeoutMs, remainingMs));
-        try {
-          const response = await requestProviderResponse({
-            request,
-            state: requestState,
-            origin: providerOrigin,
-            cookieJar,
-            signal: controller.signal,
-          });
-          if (response?.ok) {
-            const code = extractSmsVerificationCode(await readBoundedBody(response, controller.signal), suffix);
-            if (code) return code;
-          }
-        } finally { clearTimeout(timer); }
-      } catch {
-        // Provider availability details and secret URL are intentionally not exposed.
-      } finally { signal?.removeEventListener("abort", onAbort); }
-      const remainingMs = deadline - now();
-      if (remainingMs <= 0) break;
-      await pause(Math.min(pollIntervalMs, remainingMs));
+    if (signal?.aborted) return null;
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const callerTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.trunc(timeoutMs)
+      : requestTimeoutMs;
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(1, Math.min(requestTimeoutMs, callerTimeoutMs))
+    );
+    try {
+      const response = await requestProviderResponse({
+        request,
+        state: requestState,
+        origin: providerOrigin,
+        cookieJar,
+        signal: controller.signal,
+      });
+      if (!response?.ok) return null;
+      return extractSmsVerificationCode(
+        await readBoundedBody(response, controller.signal),
+        suffix
+      );
+    } catch {
+      // Provider availability details and secret URL are intentionally not exposed.
+      return null;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
-    return null;
   };
 }

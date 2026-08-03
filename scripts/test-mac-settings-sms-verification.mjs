@@ -586,7 +586,16 @@ await expectCode("MAC_SETTINGS_SMS_TIMEOUT", async () => {
   );
   assert.deepEqual(
     progress.map(({ event }) => event),
-    ["waiting_for_sms_surface", "sms_surface_loading", "code_entry_detected", "code_polling_started", "code_written", "code_transition_waiting", "code_transition_observed"]
+    [
+      "waiting_for_sms_surface",
+      "sms_surface_loading",
+      "code_entry_detected",
+      "code_polling_started",
+      "code_provider_poll_started",
+      "code_written",
+      "code_transition_waiting",
+      "code_transition_observed",
+    ]
   );
 }
 

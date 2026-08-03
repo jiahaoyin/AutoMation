@@ -243,6 +243,7 @@ const MAC_SETTINGS_EVENT_NAMES = new Set([
   "code_provider_poll_started",
   "code_provider_poll_empty",
   "code_provider_code_ready",
+  "sms_code_not_received",
   "state_probe",
   "state_stable",
   "sms_surface_loading",
@@ -472,7 +473,7 @@ export function sanitizeMacSettingsEvent(event = {}) {
   if (typeof event?.probeOnly === "boolean") safe.probeOnly = event.probeOnly;
   if (typeof event?.ok === "boolean") safe.ok = event.ok;
   if (typeof event?.signedIn === "boolean") safe.signedIn = event.signedIn;
-  for (const key of ["step", "attempt", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "nextPasswordLength", "axOwnerPid", "visualOwnerPid", "windowId"]) {
+  for (const key of ["step", "attempt", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "pollIntervalMs", "nextPasswordLength", "axOwnerPid", "visualOwnerPid", "windowId"]) {
     const value = safeMacSettingsEventNumber(event?.[key]);
     if (value !== undefined) safe[key] = value;
   }
