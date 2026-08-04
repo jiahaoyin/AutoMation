@@ -13,6 +13,7 @@ import importlib
 import json
 import os
 import random
+import secrets
 import re
 import signal
 import subprocess
@@ -24,9 +25,15 @@ from urllib.parse import urljoin, urlsplit
 
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
+ACCOUNT_SECURITY_URL = "https://account.apple.com/account/manage/section/security"
 DEVELOPER_ACCOUNT_URL = "https://developer.apple.com/account"
+SMALL_BUSINESS_PROGRAM_ENROLL_URL = (
+    "https://developer.apple.com/app-store/small-business-program/enroll/"
+)
 PERSONAL_INFORMATION_PATH = "/account/manage/section/information"
+ACCOUNT_SECURITY_PATH = "/account/manage/section/security"
 ACCOUNT_SIGN_IN_PATH = "/sign-in"
+SMALL_BUSINESS_PROGRAM_ENROLL_PATH = "/app-store/small-business-program/enroll"
 PROFILE_NAVIGATION_LINK_SELECTORS = (
     "css:a[href]",
     "css:a",
@@ -50,16 +57,106 @@ PROFILE_CARD_SELECTORS = (
     "css:button",
     "css:[role='button']",
 )
-PROFILE_NAME_CARD_SELECTORS = PROFILE_CARD_SELECTORS
+# Apple commonly renders the name editor action as a button inside the visual
+# card wrapper. Keep this name-only preference isolated from birthday and the
+# later account-security card flows.
+PROFILE_NAME_CARD_SELECTORS = (
+    "css:button.button.button-bare",
+    "css:button[class*='button-bare']",
+    "css:.card button",
+    "css:.card [role='button']",
+    "css:.card",
+    "css:button",
+    "css:[role='button']",
+)
 PROFILE_NAME_MODAL_SELECTORS = (
     "css:[id^='modal-content-']",
     "css:[role='dialog']",
     "css:aside",
 )
+PROFILE_MODAL_CLOSE_SELECTORS = (
+    "css:.modal-close button",
+    "css:button[class*='modal-close']",
+    "css:button[aria-label='Close']",
+    "css:button[aria-label='关闭']",
+    "css:button[aria-label='關閉']",
+)
+PROFILE_NAME_MODAL_CLEANUP_FAILURE_CLASSES = frozenset(
+    {
+        "profile_name_modal_close_control_unavailable",
+        "profile_name_modal_close_action_failed",
+        "profile_name_modal_close_context_lost",
+        "profile_name_modal_close_query_failed",
+        "profile_name_modal_close_unconfirmed",
+    }
+)
+PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES = frozenset(
+    {
+        "card_missing",
+        "modal_missing",
+        "timeout",
+    }
+)
 PROFILE_CARD_WAIT_TIMEOUT_S = 35.0
+# Page readiness has to cover both profile cards and two consecutive stable
+# observations. Keep that budget independent from the later single-card waits.
+PROFILE_CAPTURE_READY_TIMEOUT_S = 60.0
 PROFILE_MODAL_WAIT_TIMEOUT_S = 20.0
+PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS = 2
+PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S = 3.0
+# The profile page has already passed a stable-card readiness gate before the
+# name editor opens. Re-confirm the live card briefly here because a React
+# replacement can otherwise make a visible wrapper absorb the click.
+PROFILE_NAME_CARD_INITIAL_WAIT_TIMEOUT_S = 6.0
+# A later transient React replacement must not consume the entire modal-open
+# budget before the first click is even sent.
+PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S = 3.0
+PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS = 2
 PROFILE_VALUE_STABLE_OBSERVATIONS = 2
 PROFILE_VALUE_MAX_LENGTHS = {"name": 256, "birthday": 128}
+ACCOUNT_SECURITY_NAVIGATION_LABELS = frozenset(
+    {
+        "login and security",
+        "login & security",
+        "\u767b\u5f55\u4e0e\u5b89\u5168\u6027",
+        "\u767b\u9304\u8207\u5b89\u5168\u6027",
+    }
+)
+ACCOUNT_SECURITY_NAVIGATION_WAIT_TIMEOUT_S = 15.0
+ACCOUNT_PASSWORD_CARD_SELECTORS = PROFILE_CARD_SELECTORS
+ACCOUNT_PASSWORD_FIELD_SELECTORS = (
+    "css:input[type='password']",
+    "css:input[autocomplete='current-password']",
+    "css:input[autocomplete='new-password']",
+)
+ACCOUNT_PASSWORD_SUBMIT_SELECTORS = (
+    "css:button",
+    "css:input[type='submit']",
+    "css:[role='button']",
+)
+ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S = 35.0
+ACCOUNT_PASSWORD_CHANGE_SUCCESS_TIMEOUT_S = 25.0
+ACCOUNT_PASSWORD_LENGTH = 16
+ACCOUNT_PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*_-+=?"
+ACCOUNT_PASSWORD_UPPERCASE = "ABCDEFGHJKMNPQRSTUVWXYZ"
+ACCOUNT_PASSWORD_LOWERCASE = "abcdefghjkmnpqrstuvwxyz"
+ACCOUNT_PASSWORD_DIGITS = "23456789"
+SMALL_BUSINESS_APPLICATION_WAIT_TIMEOUT_S = 35.0
+SMALL_BUSINESS_SUBMISSION_SUCCESS_TIMEOUT_S = 35.0
+SMALL_BUSINESS_ASSOCIATED_NO_COUNT = 4
+SMALL_BUSINESS_CONTROL_SELECTORS = (
+    "css:fieldset label",
+    "css:section label",
+    "css:label",
+    "css:input[type='radio']",
+    "css:input[type='checkbox']",
+)
+SMALL_BUSINESS_SUBMIT_SELECTORS = (
+    "css:input#submit",
+    "css:input[type='submit']",
+    "css:button[type='submit']",
+    "css:button",
+)
 EMAIL_SELECTORS = (
     "css:#account_name_text_field",
     "css:input[name='accountName']",
@@ -149,7 +246,7 @@ APPLE_AUTH_HOSTS = frozenset(
 ACCOUNT_SIGN_IN_HOSTS = frozenset({"account.apple.com", "appleid.apple.com"})
 OPAQUE_TWO_FACTOR_FRAME_URLS = frozenset({"about:blank", "about:srcdoc"})
 SCREENSHOT_CHECKPOINTS = frozenset(
-    {"account_information", "developer_membership"}
+    {"account_information", "developer_membership", "small_business_application"}
 )
 QUIT_FAILURE_REASON = "ruyipage_quit_failed"
 TOP_LEVEL_FAILURE_REASON = "ruyipage_browser_flow_failed"
@@ -196,6 +293,11 @@ BROWSER_STARTUP_STAGES = {
     "developer_login",
     "developer_membership",
     "account_navigation",
+    "account_security",
+    "password_change",
+    "small_business_application",
+    "small_business_login",
+    "small_business_enrollment",
     "post_login_finalization",
     "result_emitting",
     "result_emitted",
@@ -268,6 +370,9 @@ PROFILE_CAPTURE_FAILURE_CLASSES = frozenset(
         "profile_reauthentication_exhausted",
         "profile_data_incomplete",
         "profile_name_modal_query_failed",
+        "profile_name_modal_ambiguous",
+        "profile_name_modal_unavailable",
+        "profile_name_modal_cleanup_failed",
         "browser_connection_lost",
         "profile_capture_failed",
     }
@@ -542,6 +647,12 @@ def classify_profile_capture_failure(error: Exception) -> str:
         return "profile_card_ambiguous"
     if "personal information name modal query failed" in message:
         return "profile_name_modal_query_failed"
+    if "personal information name modal is ambiguous" in message:
+        return "profile_name_modal_ambiguous"
+    if "personal information name modal is unavailable" in message:
+        return "profile_name_modal_unavailable"
+    if "personal information name modal cleanup failed" in message:
+        return "profile_name_modal_cleanup_failed"
     if "name and birthday" in message:
         return "profile_data_incomplete"
     if "profile" in message or "personal information" in message:
@@ -814,6 +925,51 @@ def emit_profile_name_modal_query_failure_once() -> None:
             "status": "profile_name_modal_query_failed",
         }
     )
+
+
+def emit_profile_name_modal_unavailable(
+    *,
+    attempt_count: int,
+    outcome: str,
+) -> None:
+    """Emit bounded diagnostics for a name modal that never materialized.
+
+    The page and exception text can contain personal profile data.  Keep the
+    audit event intentionally small: only a capped retry count and a fixed
+    outcome enum are allowed through.
+    """
+    normalized_attempt_count = (
+        attempt_count
+        if isinstance(attempt_count, int) and not isinstance(attempt_count, bool)
+        else 0
+    )
+    normalized_attempt_count = max(
+        0,
+        min(PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS, normalized_attempt_count),
+    )
+    normalized_outcome = (
+        outcome
+        if outcome in PROFILE_NAME_MODAL_UNAVAILABLE_OUTCOMES
+        else "timeout"
+    )
+    emit(
+        {
+            "event": "status",
+            "status": "profile_name_modal_unavailable",
+            "attemptCount": normalized_attempt_count,
+            "outcome": normalized_outcome,
+        }
+    )
+
+
+def profile_name_modal_unavailable_outcome(error: Exception) -> str | None:
+    """Map only known non-sensitive modal-open terminal errors to an outcome."""
+    message = str(error).casefold()
+    if "personal information name card was not found" in message:
+        return "card_missing"
+    if "personal information name modal was not found" in message:
+        return "modal_missing"
+    return None
 
 
 def read_command(input_stream: TextIO | None = None) -> dict[str, Any]:
@@ -3840,6 +3996,34 @@ DEVELOPER_NAVIGATION_SELECTORS = (
     "css:[role='link']",
     "css:[role='button']",
 )
+DEVELOPER_MEMBERSHIP_CARD_SELECTORS = (
+    "css:[id*='MembershipDetailsCard']",
+    "css:[id*='membershipDetailsCard']",
+    "css:[class*='MembershipDetailsCard']",
+    "css:[class*='membershipDetailsCard']",
+    "css:[data-testid*='MembershipDetailsCard']",
+    "css:[data-testid*='membershipDetailsCard']",
+    "css:[id*='membership-details']",
+    "css:[class*='membership-details']",
+    "css:[data-testid*='membership-details']",
+)
+# A standalone screenshot retry should remain short, but the 35 s membership
+# confirmation must be driven by its absolute deadline rather than this small
+# retry cap. At the 700 ms minimum cadence, 64 retries safely cover that
+# deadline; the live deadline still stops the loop first.
+DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS = 8
+DEVELOPER_MEMBERSHIP_CARD_SCROLL_DEADLINE_ATTEMPTS = 64
+DEVELOPER_MEMBERSHIP_CONFIRMATION_TIMEOUT_S = 35.0
+# ruyiPage's targeted ``to_see()`` can perform up to twenty 100 ms scroll
+# steps before returning. Do not begin that synchronous action once there is
+# too little confirmation time left for it to finish and for the page to
+# settle. The extra half second leaves room for the BiDi round trips.
+DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S = 2.5
+# ruyiPage's human_click() can issue another targeted scroll when the
+# navigation item is not wholly visible, then adds cursor motion and click
+# delays. Reserve a full target-scroll window plus a conservative click
+# allowance, because the action itself cannot be interrupted mid-BiDi call.
+DEVELOPER_MEMBERSHIP_NAVIGATION_CLICK_MIN_REMAINING_S = 3.5
 
 
 def developer_account_snapshot(page: Any) -> dict[str, bool | int]:
@@ -4138,13 +4322,14 @@ def resolve_developer_membership_navigation(page: Any) -> tuple[Any, Any] | None
     return None
 
 
-def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
+def developer_membership_details_snapshot(page: Any) -> dict[str, Any]:
     if not is_developer_account_url(scope_location_url(page)):
         return {
             "detailsPage": False,
             "appleDeveloperProgram": False,
             "renewalDate": False,
             "registrationIdentity": False,
+            "registrationIdentityValue": None,
             "teamId": False,
             "membershipFieldCount": 0,
         }
@@ -4261,10 +4446,17 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
               /renewal date/,
               /renewed through/,
               /membership expiration/,
+              /expiration date/,
+              /expiry date/,
+              /membership expires/,
               /\u7eed\u8ba2\u65e5\u671f/,
               /\u7e8c\u8a02\u65e5\u671f/,
               /\u7eed\u671f\u65e5\u671f/,
-              /\u7e8c\u671f\u65e5\u671f/
+              /\u7e8c\u671f\u65e5\u671f/,
+              /\u5230\u671f\u65e5\u671f/,
+              /\u5230\u671f\u65e5/,
+              /\u6709\u6548\u671f\u81f3/,
+              /\u6709\u6548\u671f\u9650/
             ],
             registrationIdentity: [
               /registration identity/,
@@ -4321,10 +4513,12 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
               ? normalized
               : '';
           };
-          const hasLabeledValue = (patterns, { requireNumeric = false } = {}) => {
+          const findLabeledValue = (patterns, { requireNumeric = false } = {}) => {
             const validValue = (value) => {
               const normalized = normalizeMeaningfulValue(value);
-              return normalized && (!requireNumeric || /\d/.test(normalized));
+              return normalized && (!requireNumeric || /\d/.test(normalized))
+                ? normalized
+                : '';
             };
             for (const group of evidenceTextGroups) {
               for (let index = 0; index < group.lines.length; index += 1) {
@@ -4334,14 +4528,16 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
                   (value, pattern) => value.replace(pattern, ''),
                   line
                 ).replace(/^[\s:：-]+|[\s:：-]+$/g, '').trim();
-                if (validValue(remainder) && !allFieldLabels.some((pattern) => pattern.test(remainder))) {
-                  return true;
+                const inlineValue = validValue(remainder);
+                if (inlineValue && !allFieldLabels.some((pattern) => pattern.test(remainder))) {
+                  return inlineValue;
                 }
                 // A following field label closes this field.  Do not skip over
                 // it looking for a later unrelated shell heading.
                 const candidate = group.lines[index + 1];
-                if (validValue(candidate) && !allFieldLabels.some((pattern) => pattern.test(candidate))) {
-                  return true;
+                const followingValue = validValue(candidate);
+                if (followingValue && !allFieldLabels.some((pattern) => pattern.test(candidate))) {
+                  return followingValue;
                 }
               }
               // The Developer Account card is a responsive grid.  On narrower
@@ -4369,16 +4565,19 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
                     0,
                     boundaries.length ? Math.min(...boundaries) : remaining.length
                   ));
-                  if (value && (!requireNumeric || /\d/.test(value))) return true;
+                  if (value && (!requireNumeric || /\d/.test(value))) return value;
                   cursor = valueStart;
                 }
               }
             }
-            return false;
+            return '';
           };
-          const renewalDate = hasLabeledValue(fieldLabels.renewalDate, { requireNumeric: true });
-          const registrationIdentity = hasLabeledValue(fieldLabels.registrationIdentity);
-          const teamId = hasLabeledValue(fieldLabels.teamId);
+          const renewalDateValue = findLabeledValue(fieldLabels.renewalDate, { requireNumeric: true });
+          const registrationIdentityValue = findLabeledValue(fieldLabels.registrationIdentity);
+          const teamIdValue = findLabeledValue(fieldLabels.teamId);
+          const renewalDate = Boolean(renewalDateValue);
+          const registrationIdentity = Boolean(registrationIdentityValue);
+          const teamId = Boolean(teamIdValue);
           const membershipFieldCount = [
             renewalDate,
             registrationIdentity,
@@ -4391,6 +4590,7 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
             appleDeveloperProgram,
             renewalDate,
             registrationIdentity,
+            registrationIdentityValue: registrationIdentityValue || null,
             teamId,
             membershipFieldCount
           };
@@ -4408,6 +4608,9 @@ def developer_membership_details_snapshot(page: Any) -> dict[str, bool | int]:
         "appleDeveloperProgram": result.get("appleDeveloperProgram") is True,
         "renewalDate": result.get("renewalDate") is True,
         "registrationIdentity": result.get("registrationIdentity") is True,
+        "registrationIdentityValue": normalize_developer_registration_identity(
+            result.get("registrationIdentityValue")
+        ),
         "teamId": result.get("teamId") is True,
         "membershipFieldCount": normalize_membership_field_count(
             result.get("membershipFieldCount")
@@ -4419,13 +4622,29 @@ def normalize_membership_field_count(value: Any) -> int:
     return min(5, max(0, value if type(value) is int else 0))
 
 
+def normalize_developer_registration_identity(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split()).strip()
+    if not normalized or len(normalized) > 64 or any(
+        character in normalized for character in ("\r", "\n", "\x00")
+    ):
+        return None
+    return normalized
+
+
 def developer_membership_snapshot_is_active(snapshot: dict[str, Any]) -> bool:
-    """Require the loaded membership card, plan, renewal and identity evidence."""
+    """Confirm the current program from the card's plan and renewal evidence.
+
+    ``Registration identity`` is useful account metadata, but Apple does not
+    render it consistently for every enrolled account/layout.  Do not turn a
+    loaded Developer Program card with a meaningful renewal value into
+    ``unknown`` merely because that supplemental field is absent.
+    """
     return bool(
         snapshot.get("detailsPage") is True
         and snapshot.get("appleDeveloperProgram") is True
         and snapshot.get("renewalDate") is True
-        and snapshot.get("registrationIdentity") is True
     )
 
 
@@ -4465,17 +4684,193 @@ def developer_membership_details_route(url: str) -> bool:
     )
 
 
+def resolve_developer_membership_details_card(
+    page: Any,
+) -> tuple[Any, Any] | None:
+    """Resolve the concrete details-card root for a complete element clip."""
+    if not is_developer_account_url(scope_location_url(page)):
+        return None
+    seen: set[int] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in DEVELOPER_MEMBERSHIP_CARD_SELECTORS:
+            for card in safe_elements(root, selector, timeout_s=0):
+                if id(card) in seen or not element_is_interactable(card):
+                    continue
+                seen.add(id(card))
+                return scope, card
+    return None
+
+
+def developer_membership_deadline_remaining_s(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def developer_membership_deadline_allows(
+    deadline: float | None,
+    minimum_remaining_s: float = 0.0,
+) -> bool:
+    remaining_s = developer_membership_deadline_remaining_s(deadline)
+    return remaining_s is None or remaining_s >= minimum_remaining_s
+
+
+def scroll_developer_membership_details_card(
+    page: Any,
+    *,
+    pause: Callable[[int, int], None] = human_pause,
+    timeout_s: float | None = None,
+    deadline: float | None = None,
+) -> bool:
+    """Scroll the exact details card, tolerating a bounded SPA replacement.
+
+    The membership route can finish changing before its card root is mounted.
+    Retrying this narrow lookup lets the native route scroll settle first, then
+    gives ruyiPage's card-targeted scroll enough time to complete before a
+    field probe or complete-card element clip continues.
+    """
+    if deadline is None and timeout_s is not None:
+        if timeout_s <= 0:
+            return False
+        deadline = time.monotonic() + timeout_s
+    if not developer_membership_deadline_allows(deadline):
+        return False
+    attempt_limit = (
+        DEVELOPER_MEMBERSHIP_CARD_SCROLL_ATTEMPTS
+        if deadline is None
+        else DEVELOPER_MEMBERSHIP_CARD_SCROLL_DEADLINE_ATTEMPTS
+    )
+
+    def bounded_pause(min_ms: int, max_ms: int) -> bool:
+        remaining_s = developer_membership_deadline_remaining_s(deadline)
+        if remaining_s is None:
+            pause(min_ms, max_ms)
+            return True
+        capped_max_ms = min(max_ms, max(0, round(remaining_s * 1000)))
+        if capped_max_ms <= 0:
+            return False
+        pause(min(min_ms, capped_max_ms), capped_max_ms)
+        return developer_membership_deadline_allows(deadline)
+
+    for attempt in range(attempt_limit):
+        resolved = resolve_developer_membership_details_card(page)
+        if resolved is None:
+            if (
+                attempt + 1 < attempt_limit
+                and bounded_pause(700, 1200)
+            ):
+                continue
+            return False
+        scope, card = resolved
+        # ``to_see()`` is synchronous. A short residual budget can otherwise
+        # let a late-mounted card force the membership confirmation beyond its
+        # caller's deadline before the first settled probe is even attempted.
+        if not developer_membership_deadline_allows(
+            deadline,
+            DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S,
+        ):
+            return False
+        try:
+            # ``card.scroll.to_see()`` defaults to ``center=False``. In that
+            # mode ruyiPage returns as soon as a sliver of a tall card is
+            # visible, which is not enough for a stable diagnostic view.
+            # Use the page-level centered scroll exposed by ruyiPage.
+            scope.scroll.to_see(card, center=True)
+        except Exception:
+            # Keep compatibility with the narrow fake/legacy adapters used by
+            # local tests. Production ruyiPage takes the page-level path above.
+            try:
+                card.scroll.to_see(center=True)
+            except TypeError:
+                try:
+                    card.scroll.to_see()
+                except Exception:
+                    if (
+                        attempt + 1 < attempt_limit
+                        and bounded_pause(700, 1200)
+                    ):
+                        continue
+                    return False
+            except Exception:
+                if (
+                    attempt + 1 < attempt_limit
+                    and bounded_pause(700, 1200)
+                ):
+                    continue
+                return False
+        # Do not begin a DOM probe/screenshot in the middle of ruyiPage's
+        # scroll animation. Re-resolve afterward because React can replace the
+        # card wrapper while it hydrates its detail fields.
+        if not bounded_pause(1400, 2200):
+            return False
+        if resolve_developer_membership_details_card(page) is not None:
+            # A second lookup after a short quiet period keeps a React wrapper
+            # replacement from racing the first details probe or screenshot.
+            if not bounded_pause(300, 650):
+                return False
+            if resolve_developer_membership_details_card(page) is not None:
+                return True
+        if (
+            attempt + 1 < attempt_limit
+            and bounded_pause(450, 800)
+        ):
+            continue
+        return False
+    return False
+
+
 def confirm_active_developer_membership(
     page: Any,
     *,
-    timeout_s: float = 20.0,
+    timeout_s: float = DEVELOPER_MEMBERSHIP_CONFIRMATION_TIMEOUT_S,
     pause: Callable[[int, int], None] = human_pause,
+    registration_identity_holder: dict[str, str | None] | None = None,
 ) -> bool:
     deadline = time.monotonic() + max(0.0, timeout_s)
 
+    def pause_until_deadline(min_ms: int, max_ms: int) -> bool:
+        remaining_s = developer_membership_deadline_remaining_s(deadline)
+        if remaining_s is None:
+            pause(min_ms, max_ms)
+            return True
+        capped_max_ms = min(max_ms, max(0, round(remaining_s * 1000)))
+        if capped_max_ms <= 0:
+            return False
+        pause(min(min_ms, capped_max_ms), capped_max_ms)
+        return developer_membership_deadline_allows(deadline)
+
+    def deadline_pause(min_ms: int, max_ms: int) -> None:
+        if not pause_until_deadline(min_ms, max_ms):
+            raise TimeoutError("developer membership confirmation deadline expired")
+
     def wait_for_loaded_details(
         initial_snapshot: dict[str, Any] | None = None,
+        *,
+        settle_card_before_probe: bool = False,
     ) -> bool:
+        if settle_card_before_probe:
+            # A hash/nav action makes Apple scroll the details card
+            # asynchronously. Give that native motion a chance to finish, then
+            # scroll the concrete card once through ruyiPage before sampling
+            # its lazy-hydrated fields.
+            if not pause_until_deadline(1200, 2000):
+                return False
+            if not scroll_developer_membership_details_card(
+                page,
+                pause=pause,
+                deadline=deadline,
+            ):
+                # A route marker or stale page snapshot alone is not enough to
+                # claim an active membership. The concrete details card must
+                # have been located and settled before its two probes count.
+                return False
+            # The route-detection snapshot can predate the card scroll and
+            # lazy field hydration. A responsive layout can replace the exact
+            # card selector, so wait through the whole targeted scroll window
+            # and then count only samples taken after that window as evidence.
+            initial_snapshot = None
         stable_count = 0
         last_probe: tuple[bool | int, ...] | None = None
         pending_snapshot = initial_snapshot
@@ -4490,10 +4885,11 @@ def confirm_active_developer_membership(
             try:
                 auth_blocked = developer_scope_has_auth_blocker(
                     page,
-                    # Membership confirmation must fail closed on any root
-                    # authentication/error marker, even when stale page text
-                    # is the only remaining signal.
-                    allow_root_text_only_error=False,
+                    # The already-confirmed Developer shell can retain static
+                    # recovery/security text while the details card hydrates.
+                    # Live email/password/2FA/trust/assertive controls still
+                    # block through developer_state_has_auth_blocker().
+                    allow_root_text_only_error=True,
                     allow_retiring_child_text_only_error=True,
                 )
             except Exception:
@@ -4525,8 +4921,15 @@ def confirm_active_developer_membership(
             if auth_blocked:
                 return False
             if stable_count >= 2:
+                if registration_identity_holder is not None:
+                    registration_identity_holder["value"] = (
+                        normalize_developer_registration_identity(
+                            snapshot.get("registrationIdentityValue")
+                        )
+                    )
                 return True
-            pause(250, 500)
+            if not pause_until_deadline(250, 500):
+                break
         return False
 
     # Apple can land on the hash-routed details card before the nav items are
@@ -4534,22 +4937,51 @@ def confirm_active_developer_membership(
     # not frozen into the initial ``membershipNavigation`` snapshot.  Its SPA
     # can also canonicalize the URL back to ``/account`` while retaining the
     # visible details card, so the live snapshot is an independent route cue.
-    while time.monotonic() < deadline:
+    while True:
+        current_time = time.monotonic()
+        if current_time >= deadline:
+            break
         current_url = scope_location_url(page)
         if developer_membership_details_route(current_url):
-            return wait_for_loaded_details()
+            return wait_for_loaded_details(settle_card_before_probe=True)
         try:
             snapshot = developer_membership_details_snapshot(page)
         except Exception:
             snapshot = None
         if isinstance(snapshot, dict) and snapshot.get("detailsPage") is True:
-            return wait_for_loaded_details(initial_snapshot=snapshot)
+            return wait_for_loaded_details(
+                initial_snapshot=snapshot,
+                settle_card_before_probe=True,
+            )
         navigation = resolve_developer_membership_navigation(page)
         if navigation is not None:
             scope, element = navigation
-            human_click(scope, element, pause=pause)
-            return wait_for_loaded_details()
-        pause(250, 500)
+            if not developer_membership_deadline_allows(
+                deadline,
+                DEVELOPER_MEMBERSHIP_TARGET_SCROLL_MIN_REMAINING_S,
+            ):
+                break
+            try:
+                element.scroll.to_see()
+            except Exception:
+                pass
+            if not pause_until_deadline(250, 500):
+                break
+            refreshed_navigation = resolve_developer_membership_navigation(page)
+            if refreshed_navigation is not None:
+                scope, element = refreshed_navigation
+            if not developer_membership_deadline_allows(
+                deadline,
+                DEVELOPER_MEMBERSHIP_NAVIGATION_CLICK_MIN_REMAINING_S,
+            ):
+                break
+            try:
+                human_click(scope, element, pause=deadline_pause)
+            except TimeoutError:
+                break
+            return wait_for_loaded_details(settle_card_before_probe=True)
+        if not pause_until_deadline(250, 500):
+            break
     return False
 
 
@@ -5185,7 +5617,7 @@ def profile_card_candidates(page: Any, kind: str) -> list[tuple[Any, Any, dict[s
         if scope is not page:
             continue
         for selector in selectors:
-            for card in safe_elements(root, selector):
+            for card in safe_elements(root, selector, timeout_s=0):
                 if not element_is_interactable(card):
                     continue
                 try:
@@ -5415,7 +5847,12 @@ def resolve_profile_name_modal(page: Any) -> tuple[Any, Any, dict[str, Any]] | N
         for scope, root in current_element_search_roots(page):
             if scope is not page:
                 continue
-            for modal in safe_elements(root, selector):
+            # This resolver is used as a polling predicate before the name
+            # card is clicked as well as after it. Do not let ruyiPage's
+            # default element-find timeout consume the whole modal-open
+            # deadline while no dialog exists yet; the callers own that
+            # deadline and perform their own bounded retry/pause cycle.
+            for modal in safe_elements(root, selector, timeout_s=0):
                 if not element_is_interactable(modal):
                     continue
                 try:
@@ -5478,6 +5915,233 @@ def wait_for_profile_name_modal(
     if profile_name_modal_query_failure_emitted:
         raise RuntimeError("personal information name modal query failed")
     raise RuntimeError("personal information name modal was not found")
+
+
+def resolve_profile_name_card_for_click(
+    page: Any,
+    *,
+    timeout_s: float,
+    pause: Callable[[int, int], None],
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Return the live clickable name card after a bounded settle cycle.
+
+    The page-level readiness gate proves that a name card was rendered, but the
+    card can be replaced while React finishes mounting the action target. Mirror
+    the formerly reliable sequence here: stabilize the card, scroll it into
+    view, allow the scroll to settle, then resolve it again immediately before
+    the click. A short re-acquire remains only for a replacement during that
+    settle window.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    initial_wait_timeout_s = min(
+        PROFILE_NAME_CARD_INITIAL_WAIT_TIMEOUT_S,
+        max(0.0, deadline - time.monotonic()),
+    )
+    if initial_wait_timeout_s <= 0:
+        raise RuntimeError("personal information name card was not found")
+    _initial_scope, initial_card, _initial_summary = wait_for_profile_card(
+        page,
+        "name",
+        timeout_s=initial_wait_timeout_s,
+        pause=pause,
+    )
+    try:
+        initial_card.scroll.to_see()
+    except Exception:
+        # A stable, interactable card can already be in view. Do not discard it
+        # solely because ruyiPage did not need (or could not perform) a scroll.
+        pass
+    pause(280, 620)
+
+    resolved = resolve_profile_card(page, "name")
+    if resolved is not None:
+        return resolved
+
+    reacquire_wait_timeout_s = min(
+        PROFILE_NAME_CARD_REACQUIRE_WAIT_TIMEOUT_S,
+        max(0.0, deadline - time.monotonic()),
+    )
+    if reacquire_wait_timeout_s <= 0:
+        raise RuntimeError("personal information name card was not found")
+    return wait_for_profile_card(
+        page,
+        "name",
+        timeout_s=reacquire_wait_timeout_s,
+        pause=pause,
+    )
+
+
+def open_profile_name_modal(
+    page: Any,
+    *,
+    timeout_s: float = PROFILE_MODAL_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any, dict[str, Any], str]:
+    """Open the name editor through a freshly stabilized card reference.
+
+    Apple Account can replace its Personal Information cards while a React
+    hydration/update is in flight. Prefer the already-stable visible card for
+    the first click, then perform one short re-resolve/retry only if that click
+    did not produce a modal. This prevents card readiness waits from consuming
+    the complete modal-open deadline.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_error: Exception | None = None
+    attempted_clicks = 0
+    for attempt in range(PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS):
+        # A delayed first click can have opened the modal just after its short
+        # probe elapsed.  Never issue a second card click while it is already
+        # present.
+        try:
+            existing_modal = resolve_profile_name_modal(page)
+        except Exception as error:
+            if "personal information name modal is ambiguous" in str(error).casefold():
+                raise
+            existing_modal = None
+        if existing_modal is not None:
+            existing_scope, existing_modal_root, existing_summary = existing_modal
+            return (
+                existing_scope,
+                existing_modal_root,
+                existing_summary,
+                profile_name_modal_selector(
+                    page,
+                    existing_scope,
+                    existing_modal_root,
+                ),
+            )
+
+        try:
+            attempted_clicks = attempt + 1
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            name_scope, name_card, _name_summary = resolve_profile_name_card_for_click(
+                page,
+                timeout_s=remaining_s,
+                pause=pause,
+            )
+            human_click(name_scope, name_card, pause=pause)
+            # The unavailable diagnostic alone cannot prove a real click was
+            # dispatched: a pre-click probe timeout used to consume the
+            # deadline first. Keep a de-identified action marker so a later
+            # Mac audit can distinguish an absent modal from an omitted click.
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_name_card_click_sent",
+                    "attempt": attempted_clicks,
+                }
+            )
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
+                pause(160, 340)
+                continue
+            unavailable_outcome = profile_name_modal_unavailable_outcome(error)
+            if unavailable_outcome is not None:
+                emit_profile_name_modal_unavailable(
+                    attempt_count=attempted_clicks,
+                    outcome=unavailable_outcome,
+                )
+                raise RuntimeError(
+                    "personal information name modal is unavailable"
+                ) from error
+            raise
+
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            break
+        modal_wait_timeout_s = (
+            remaining_s
+            if attempt + 1 == PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS
+            else min(remaining_s, PROFILE_NAME_MODAL_RETRY_WAIT_TIMEOUT_S)
+        )
+        try:
+            resolved_modal = wait_for_profile_name_modal(
+                page,
+                timeout_s=modal_wait_timeout_s,
+                pause=pause,
+            )
+            modal_scope, modal, modal_summary = resolved_modal
+            return (
+                modal_scope,
+                modal,
+                modal_summary,
+                profile_name_modal_selector(page, modal_scope, modal),
+            )
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
+                # ``wait_for_profile_name_modal`` intentionally rejects an
+                # unhydrated dialog because its values are not safe to collect
+                # yet. Do not mistake that state for a failed click: a second
+                # card click can close or interrupt the dialog that is already
+                # on screen. Only retry the card after its shell is confirmed
+                # absent; otherwise give the remaining budget to hydration.
+                try:
+                    modal_shell_state = profile_name_modal_cleanup_state(
+                        page,
+                        opening_probe=True,
+                    )
+                except Exception:
+                    modal_shell_state = "unconfirmed"
+                if modal_shell_state == "open":
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        break
+                    try:
+                        resolved_modal = wait_for_profile_name_modal(
+                            page,
+                            timeout_s=remaining_s,
+                            pause=pause,
+                        )
+                        modal_scope, modal, modal_summary = resolved_modal
+                        return (
+                            modal_scope,
+                            modal,
+                            modal_summary,
+                            profile_name_modal_selector(page, modal_scope, modal),
+                        )
+                    except Exception as hydration_error:
+                        last_error = hydration_error
+                        break
+                if modal_shell_state == "context_lost":
+                    break
+                # ``closed`` proves the first click missed. ``unconfirmed``
+                # means the shell probe had no positive evidence of an open
+                # dialog (for example, a transient query failure), so it must
+                # not consume the entire deadline waiting for hydration. The
+                # next iteration first probes for a modal again, then may
+                # safely re-resolve and click the name card.
+                pause(160, 340)
+                continue
+            unavailable_outcome = profile_name_modal_unavailable_outcome(error)
+            if unavailable_outcome is not None:
+                emit_profile_name_modal_unavailable(
+                    attempt_count=attempted_clicks,
+                    outcome=unavailable_outcome,
+                )
+                raise RuntimeError(
+                    "personal information name modal is unavailable"
+                ) from error
+            raise
+    if last_error is not None:
+        unavailable_outcome = profile_name_modal_unavailable_outcome(last_error)
+        if unavailable_outcome is not None:
+            emit_profile_name_modal_unavailable(
+                attempt_count=attempted_clicks,
+                outcome=unavailable_outcome,
+            )
+            raise RuntimeError(
+                "personal information name modal is unavailable"
+            ) from last_error
+        raise last_error
+    emit_profile_name_modal_unavailable(
+        attempt_count=attempted_clicks,
+        outcome="timeout",
+    )
+    raise RuntimeError("personal information name modal is unavailable")
 
 
 def profile_state_has_hard_authentication_blocker(state: dict[str, Any]) -> bool:
@@ -5621,7 +6285,7 @@ def profile_capture_readiness_observation(
 
 def wait_for_profile_capture_ready(
     page: Any,
-    timeout_s: float = PROFILE_CARD_WAIT_TIMEOUT_S,
+    timeout_s: float = PROFILE_CAPTURE_READY_TIMEOUT_S,
     pause: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     if pause is None:
@@ -5713,11 +6377,8 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
     birthday = normalize_profile_value(birthday_summary.get("birthdayValue"), "birthday")
     emit({"event": "status", "status": "profile_birthday_collected"})
 
-    name_scope, name_card, _name_summary = wait_for_profile_card(page, "name")
     set_browser_startup_stage("profile_name")
-    human_pause(280, 620)
-    human_click(name_scope, name_card)
-    _modal_scope, _modal, modal_summary = wait_for_profile_name_modal(page)
+    modal_scope, modal, modal_summary, modal_selector = open_profile_name_modal(page)
     given = normalize_profile_value(modal_summary.get("given"), "name")
     family = normalize_profile_value(modal_summary.get("family"), "name")
     ordered_parts = [
@@ -5731,7 +6392,2003 @@ def collect_personal_info(page: Any) -> dict[str, Any]:
         raise RuntimeError("personal information name field order was not confirmed")
     name = normalize_profile_value(" ".join([given, family]), "name")
     emit({"event": "status", "status": "profile_name_collected"})
+    cleanup = close_profile_name_modal(
+        page,
+        modal_scope,
+        modal,
+        modal_selector=modal_selector,
+    )
+    if cleanup["closed"] is not True:
+        emit(
+            {
+                "event": "status",
+                "status": "profile_name_modal_cleanup_failed",
+                "failureClass": cleanup["failureClass"],
+                "closeSearchScope": cleanup["closeSearchScope"],
+            }
+        )
+        raise RuntimeError("personal information name modal cleanup failed")
     return {"name": name, "birthday": birthday}
+
+
+def profile_modal_close_summary(button: Any) -> dict[str, Any]:
+    raw = button.run_js(
+        r"""
+        function () {
+          // ruyipage-profile-modal-close
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          return JSON.stringify({
+            visible,
+            label: String(
+              this.getAttribute('aria-label') ||
+              this.innerText ||
+              this.textContent ||
+              ''
+            ).replace(/\s+/g, ' ').trim().toLocaleLowerCase(),
+            className: String(this.className || '').toLocaleLowerCase()
+          });
+        }
+        """
+    )
+    result = parse_profile_query_result(raw, "profile modal close")
+    return {
+        "visible": result.get("visible") is True,
+        "label": " ".join(str(result.get("label") or "").split()).casefold(),
+        "className": " ".join(
+            str(result.get("className") or "").split()
+        ).casefold(),
+    }
+
+
+def profile_modal_close_elements(root: Any, selector: str) -> tuple[list[Any], bool]:
+    """Resolve close candidates without flattening ruyiPage query errors."""
+    try:
+        return list(root.eles(selector, timeout=0) or []), False
+    except Exception:
+        return [], True
+
+
+def profile_modal_close_button_in_root(root: Any) -> tuple[Any | None, bool]:
+    query_failed = False
+    for selector in PROFILE_MODAL_CLOSE_SELECTORS:
+        elements, selector_failed = profile_modal_close_elements(root, selector)
+        query_failed = query_failed or selector_failed
+        candidates = [button for button in elements if element_is_interactable(button)]
+        if candidates:
+            return candidates[0], query_failed
+    buttons, buttons_failed = profile_modal_close_elements(root, "css:button")
+    query_failed = query_failed or buttons_failed
+    for button in buttons:
+        if not element_is_interactable(button):
+            continue
+        try:
+            summary = profile_modal_close_summary(button)
+        except Exception:
+            query_failed = True
+            continue
+        if not summary["visible"]:
+            continue
+        if (
+            "modal-close" in summary["className"]
+            or summary["label"] in {"close", "关闭", "關閉"}
+        ):
+            return button, query_failed
+    return None, query_failed
+
+
+def profile_modal_associated_close_button_in_root(
+    root: Any,
+    modal_id: str,
+) -> tuple[Any | None, bool]:
+    """Find a semantically-close control explicitly linked to the active modal.
+
+    Portal/shadow-root controls need both an explicit modal relationship and a
+    close label/class.  That avoids a document-wide scan clicking an unrelated
+    banner, or a non-close control that happens to reference the same dialog.
+    """
+    normalized_id = str(modal_id or "").strip()
+    if not normalized_id:
+        return None, False
+    escaped_id = normalized_id.replace("\\", "\\\\").replace("'", "\\'")
+    selectors = (
+        f"css:button[aria-controls='{escaped_id}']",
+        f"css:[role='button'][aria-controls='{escaped_id}']",
+        f"css:button[data-modal-id='{escaped_id}']",
+        f"css:[role='button'][data-modal-id='{escaped_id}']",
+        f"css:button[data-target='#{escaped_id}']",
+        f"css:[role='button'][data-target='#{escaped_id}']",
+    )
+    query_failed = False
+    for selector in selectors:
+        elements, selector_failed = profile_modal_close_elements(root, selector)
+        query_failed = query_failed or selector_failed
+        for button in elements:
+            if not element_is_interactable(button):
+                continue
+            try:
+                summary = profile_modal_close_summary(button)
+            except Exception:
+                query_failed = True
+                continue
+            if not summary["visible"]:
+                continue
+            if (
+                "modal-close" in summary["className"]
+                or summary["label"] in {"close", "关闭", "關閉"}
+            ):
+                return button, query_failed
+    return None, query_failed
+
+
+def profile_name_modal_close_search_roots(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> list[tuple[str, Any, Any]]:
+    """Return only top-level modal/portal roots; never inspect child frames."""
+    owner_scope = modal_scope or page
+    roots: list[tuple[str, Any, Any]] = [("modal_content", owner_scope, modal)]
+    seen = {id(modal)}
+    page_roots = [
+        (scope, root)
+        for scope, root in current_element_search_roots(page)
+        if scope is page
+    ]
+    for scope, root in page_roots:
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            for overlay in safe_elements(root, selector, timeout_s=0):
+                if id(overlay) in seen or not element_is_interactable(overlay):
+                    continue
+                try:
+                    summary = profile_name_modal_summary(overlay)
+                except Exception:
+                    continue
+                if not (summary["visible"] and summary["fieldCount"] >= 2):
+                    continue
+                seen.add(id(overlay))
+                roots.append(("owner_overlay", scope, overlay))
+    modal_id = ""
+    try:
+        modal_id = str(modal.attr("id") or "").strip()
+    except Exception:
+        modal_id = ""
+    if modal_id:
+        for scope, root in page_roots:
+            if id(root) in seen:
+                continue
+            seen.add(id(root))
+            roots.append(("portal_owner", scope, root))
+    return roots
+
+
+def resolve_profile_name_modal_close_button(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> tuple[tuple[str, Any, Any] | None, bool, str]:
+    query_failed = False
+    query_failure_scope = "none"
+    for search_scope, scope, root in profile_name_modal_close_search_roots(
+        page,
+        modal_scope,
+        modal,
+    ):
+        if search_scope == "portal_owner":
+            try:
+                modal_id = str(modal.attr("id") or "").strip()
+            except Exception:
+                modal_id = ""
+            button, root_query_failed = profile_modal_associated_close_button_in_root(
+                root,
+                modal_id,
+            )
+        else:
+            button, root_query_failed = profile_modal_close_button_in_root(root)
+        if root_query_failed:
+            query_failed = True
+            if query_failure_scope == "none":
+                query_failure_scope = search_scope
+        if button is not None:
+            return (search_scope, scope, button), False, "none"
+    return None, query_failed, query_failure_scope
+
+
+def profile_name_modal_identifier(modal: Any) -> str:
+    try:
+        return str(modal.attr("id") or "").strip()
+    except Exception:
+        return ""
+
+
+def profile_name_modal_selector(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+) -> str:
+    """Remember the selector that identified the trusted name dialog root."""
+    try:
+        target_signature = element_stability_signature(modal_scope, modal)
+    except Exception:
+        target_signature = None
+    for scope, root in current_element_search_roots(page):
+        if scope is not modal_scope:
+            continue
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            for candidate in safe_elements(root, selector, timeout_s=0):
+                same_wrapper = candidate is modal
+                same_signature = False
+                if target_signature is not None:
+                    try:
+                        same_signature = (
+                            element_stability_signature(scope, candidate)
+                            == target_signature
+                        )
+                    except Exception:
+                        same_signature = False
+                if same_wrapper or same_signature:
+                    return selector
+    return ""
+
+
+def profile_name_modal_cleanup_state(
+    page: Any,
+    modal_id: str = "",
+    *,
+    modal_selector: str = "",
+    modal_scope: Any | None = None,
+    opening_probe: bool = False,
+) -> str:
+    """Confirm that the active name dialog disappeared without leaving its view.
+
+    ``resolve_profile_name_modal`` intentionally requires hydrated name values,
+    so it is not a sufficient close proof on its own: an open dialog can be
+    briefly unreadable during an SPA update.  A visible dialog with the exact
+    original modal id remains open even when its fields have temporarily not
+    rendered; unrelated dialogs still need the two-field name-modal signal.
+
+    During the opening probe, no modal identity exists yet. A visible native
+    modal/dialog root is then sufficient evidence to protect an idless,
+    not-yet-mounted name editor from a second card click. Close-confirmation
+    callers keep the stricter identity/field checks above.
+    """
+    if not is_personal_information_scope(page, page):
+        return "context_lost"
+    expected_modal_id = str(modal_id or "").strip()
+    expected_modal_selector = (
+        str(modal_selector or "").strip()
+        if modal_selector in PROFILE_NAME_MODAL_SELECTORS
+        else ""
+    )
+    expected_context_id = ""
+    if modal_scope is not None:
+        try:
+            expected_context_id = scope_browsing_context_id(modal_scope)
+        except Exception:
+            expected_context_id = ""
+    query_failed = False
+    seen: set[int] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in PROFILE_NAME_MODAL_SELECTORS:
+            modals, selector_failed = profile_modal_close_elements(root, selector)
+            query_failed = query_failed or selector_failed
+            for candidate in modals:
+                if id(candidate) in seen or not element_is_interactable(candidate):
+                    continue
+                seen.add(id(candidate))
+                try:
+                    summary = profile_name_modal_summary(candidate)
+                    candidate_modal_id = profile_name_modal_identifier(candidate)
+                except Exception:
+                    query_failed = True
+                    continue
+                if not summary["visible"]:
+                    continue
+                candidate_context_id = ""
+                try:
+                    candidate_context_id = scope_browsing_context_id(scope)
+                except Exception:
+                    query_failed = True
+                same_origin_selector = bool(
+                    expected_modal_selector
+                    and selector == expected_modal_selector
+                    and (
+                        not expected_context_id
+                        or candidate_context_id == expected_context_id
+                    )
+                )
+                visible_opening_shell = bool(
+                    opening_probe
+                    and selector
+                    in {
+                        "css:[id^='modal-content-']",
+                        "css:[role='dialog']",
+                    }
+                )
+                if (
+                    (expected_modal_id and candidate_modal_id == expected_modal_id)
+                    or same_origin_selector
+                    or summary["fieldCount"] >= 2
+                    or visible_opening_shell
+                ):
+                    return "open"
+    return "unconfirmed" if query_failed else "closed"
+
+
+def close_profile_name_modal(
+    page: Any,
+    modal_scope: Any,
+    modal: Any,
+    *,
+    timeout_s: float = PROFILE_MODAL_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+    modal_selector: str = "",
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_search_scope = "none"
+    active_modal_id = profile_name_modal_identifier(modal)
+    active_modal_selector = (
+        modal_selector
+        if modal_selector in PROFILE_NAME_MODAL_SELECTORS
+        else profile_name_modal_selector(page, modal_scope, modal)
+    )
+    for attempt in range(PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS):
+        # A React hydration/update can replace the inner dialog or close
+        # target between discovery and click.  Retry only a failed click, and
+        # refresh both the modal and its close control before doing so.
+        if attempt:
+            cleanup_state = profile_name_modal_cleanup_state(
+                page,
+                active_modal_id,
+                modal_selector=active_modal_selector,
+                modal_scope=modal_scope,
+            )
+            if cleanup_state == "closed":
+                emit({"event": "status", "status": "profile_name_modal_closed"})
+                return {
+                    "closed": True,
+                    "failureClass": "unknown",
+                    "closeSearchScope": last_search_scope,
+                }
+            if cleanup_state == "context_lost":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_context_lost",
+                    "closeSearchScope": last_search_scope,
+                }
+            if cleanup_state == "unconfirmed":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_query_failed",
+                    "closeSearchScope": last_search_scope,
+                }
+            try:
+                active_modal = resolve_profile_name_modal(page)
+            except Exception:
+                active_modal = None
+            if active_modal is None:
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_action_failed",
+                    "closeSearchScope": last_search_scope,
+                }
+            modal_scope, modal, _modal_summary = active_modal
+            active_modal_selector = profile_name_modal_selector(
+                page,
+                modal_scope,
+                modal,
+            ) or active_modal_selector
+            active_modal_id = profile_name_modal_identifier(modal) or active_modal_id
+
+        resolved, close_query_failed, query_failure_scope = (
+            resolve_profile_name_modal_close_button(page, modal_scope, modal)
+        )
+        if resolved is None:
+            return {
+                "closed": False,
+                "failureClass": (
+                    "profile_name_modal_close_query_failed"
+                    if close_query_failed
+                    else (
+                        "profile_name_modal_close_action_failed"
+                        if attempt
+                        else "profile_name_modal_close_control_unavailable"
+                    )
+                ),
+                "closeSearchScope": (
+                    query_failure_scope if close_query_failed else last_search_scope
+                ),
+            }
+        close_search_scope, close_scope, close_button = resolved
+        last_search_scope = close_search_scope
+        try:
+            human_click(close_scope or modal_scope or page, close_button, pause=pause)
+        except Exception:
+            if attempt + 1 < PROFILE_MODAL_CLOSE_CLICK_ATTEMPTS:
+                pause(120, 260)
+                continue
+            return {
+                "closed": False,
+                "failureClass": "profile_name_modal_close_action_failed",
+                "closeSearchScope": close_search_scope,
+            }
+
+        # A dispatched close action receives the full confirmation window;
+        # only an exception above is eligible for a fresh-target retry.
+        while time.monotonic() < deadline:
+            cleanup_state = profile_name_modal_cleanup_state(
+                page,
+                active_modal_id,
+                modal_selector=active_modal_selector,
+                modal_scope=modal_scope,
+            )
+            if cleanup_state == "closed":
+                emit({"event": "status", "status": "profile_name_modal_closed"})
+                return {
+                    "closed": True,
+                    "failureClass": "unknown",
+                    "closeSearchScope": close_search_scope,
+                }
+            if cleanup_state == "context_lost":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_context_lost",
+                    "closeSearchScope": close_search_scope,
+                }
+            if cleanup_state == "unconfirmed":
+                return {
+                    "closed": False,
+                    "failureClass": "profile_name_modal_close_query_failed",
+                    "closeSearchScope": close_search_scope,
+                }
+            pause(120, 260)
+        return {
+            "closed": False,
+            "failureClass": "profile_name_modal_close_unconfirmed",
+            "closeSearchScope": close_search_scope,
+        }
+    return {
+        "closed": False,
+        "failureClass": "profile_name_modal_close_action_failed",
+        "closeSearchScope": last_search_scope,
+    }
+
+
+def normalize_account_security_label(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def is_account_security_url(url: str) -> bool:
+    parsed = parse_valid_apple_url(url)
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() == "account.apple.com"
+        and parsed.path == ACCOUNT_SECURITY_PATH
+    )
+
+
+def parse_account_security_query_result(raw: Any, label: str) -> dict[str, Any]:
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(value, dict):
+        raise RuntimeError(f"account security {label} query returned an invalid result")
+    return value
+
+
+def resolve_account_security_navigation_link(
+    page: Any,
+) -> tuple[Any, Any] | None:
+    if not is_account_manage_url(scope_location_url(page)):
+        return None
+    exact_candidates: list[tuple[Any, Any]] = []
+    semantic_candidates: list[tuple[Any, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in PROFILE_NAVIGATION_LINK_SELECTORS:
+            for link in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(link):
+                    continue
+                try:
+                    summary = profile_navigation_link_summary(link)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        summary["domIdentity"]
+                        or element_stability_signature(scope, link),
+                        summary["href"],
+                        summary["label"],
+                    )
+                except Exception:
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if not summary["visible"]:
+                    continue
+                if is_account_security_url(summary["href"]):
+                    exact_candidates.append((scope, link))
+                elif summary["label"] in ACCOUNT_SECURITY_NAVIGATION_LABELS:
+                    semantic_candidates.append((scope, link))
+    if len(exact_candidates) == 1:
+        return exact_candidates[0]
+    return semantic_candidates[0] if len(semantic_candidates) == 1 else None
+
+
+def wait_for_account_security_navigation_result(
+    page: Any,
+    timeout_s: float = ACCOUNT_SECURITY_NAVIGATION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> str:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        current_url = scope_location_url(page)
+        if is_account_security_url(current_url):
+            return "account_security"
+        if is_account_sign_in_url(current_url):
+            return "sign_in"
+        if not is_apple_url(current_url):
+            raise RuntimeError(
+                "account security navigation left the verified Apple HTTPS origin"
+            )
+        pause(180, 420)
+    return "unconfirmed"
+
+
+def navigate_to_account_security(
+    page: Any,
+    *,
+    navigation_attempt: int,
+    pause: Callable[[int, int], None] = human_pause,
+) -> str:
+    if isinstance(navigation_attempt, bool) or navigation_attempt not in (1, 2):
+        raise RuntimeError("account security navigation attempt is invalid")
+    emit(
+        {
+            "event": "status",
+            "status": "account_security_navigation_started",
+            "attempt": navigation_attempt,
+        }
+    )
+    if is_account_security_url(scope_location_url(page)):
+        emit(
+            {
+                "event": "status",
+                "status": "account_security_navigation_arrived",
+                "route": "existing",
+                "attempt": navigation_attempt,
+            }
+        )
+        return "account_security"
+
+    resolved_link = resolve_account_security_navigation_link(page)
+    if resolved_link is not None:
+        scope, link = resolved_link
+        emit(
+            {
+                "event": "status",
+                "status": "account_security_navigation_link_resolved",
+                "attempt": navigation_attempt,
+            }
+        )
+        human_click(scope, link, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "account_security_navigation_sidebar_click_sent",
+                "attempt": navigation_attempt,
+            }
+        )
+        wait_for_document_settle(page)
+        route = "sidebar"
+        result = wait_for_account_security_navigation_result(page, pause=pause)
+        if result == "unconfirmed":
+            emit(
+                {
+                    "event": "status",
+                    "status": "account_security_navigation_direct_fallback",
+                    "attempt": navigation_attempt,
+                    "after": "sidebar_unconfirmed",
+                }
+            )
+            page.get(ACCOUNT_SECURITY_URL)
+            wait_for_document_settle(page, timeout_s=20)
+            route = "sidebar_then_direct"
+            result = wait_for_account_security_navigation_result(page, pause=pause)
+    else:
+        emit(
+            {
+                "event": "status",
+                "status": "account_security_navigation_direct_fallback",
+                "attempt": navigation_attempt,
+            }
+        )
+        page.get(ACCOUNT_SECURITY_URL)
+        wait_for_document_settle(page, timeout_s=20)
+        route = "direct"
+        result = wait_for_account_security_navigation_result(page, pause=pause)
+    status = (
+        "account_security_navigation_arrived"
+        if result == "account_security"
+        else "account_security_navigation_sign_in_redirect"
+        if result == "sign_in"
+        else "account_security_navigation_unconfirmed"
+    )
+    emit(
+        {
+            "event": "status",
+            "status": status,
+            "route": route,
+            "attempt": navigation_attempt,
+        }
+    )
+    return result
+
+
+def account_security_page_snapshot(page: Any) -> dict[str, Any]:
+    if not is_account_security_url(scope_location_url(page)):
+        return {
+            "securityPage": False,
+            "passwordCard": False,
+            "passwordForm": False,
+            "passwordFieldCount": 0,
+            "passwordChanged": False,
+        }
+    raw = page.run_js(
+        r"""
+        return JSON.stringify((() => {
+          // ruyipage-account-security-page-snapshot
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              element.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleLowerCase();
+          const text = normalize(
+            document.querySelector('main')?.innerText ||
+            document.body?.innerText ||
+            ''
+          );
+          const fields = [...document.querySelectorAll('input[type="password"]')]
+            .filter(visible)
+            .filter((field) => !field.disabled && !field.readOnly);
+          return {
+            securityPage: location.pathname === '/account/manage/section/security',
+            passwordCard: /(?:^|\s)(?:password|\u5bc6\u7801|\u5bc6\u78bc)(?:\s|$)/.test(text) &&
+              /(?:last updated|\u4e0a\u6b21\u66f4\u65b0|\u4e0a\u6b21\u66f4\u65b0)/.test(text),
+            passwordForm: fields.length >= 3,
+            passwordFieldCount: Math.min(5, fields.length),
+            passwordChanged: /(?:your password has been changed|password has been changed|\u4f60\u7684\u5bc6\u7801\u5df2\u66f4\u6539|\u5bc6\u7801\u5df2\u66f4\u6539|\u5bc6\u78bc\u5df2\u66f4\u6539)/.test(text)
+          };
+        })())
+        """
+    )
+    result = parse_account_security_query_result(raw, "page snapshot")
+    return {
+        "securityPage": result.get("securityPage") is True,
+        "passwordCard": result.get("passwordCard") is True,
+        "passwordForm": result.get("passwordForm") is True,
+        "passwordFieldCount": min(
+            5,
+            max(
+                0,
+                result.get("passwordFieldCount")
+                if type(result.get("passwordFieldCount")) is int
+                else 0,
+            ),
+        ),
+        "passwordChanged": result.get("passwordChanged") is True,
+    }
+
+
+def account_password_card_summary(card: Any) -> dict[str, Any]:
+    raw = card.run_js(
+        r"""
+        function () {
+          // ruyipage-account-password-card
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          const text = String(this.innerText || this.textContent || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const domIdentity = (() => {
+            const parts = [];
+            let current = this;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 12; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          return JSON.stringify({
+            visible,
+            passwordCard: /(?:^|\s)(?:password|\u5bc6\u7801|\u5bc6\u78bc)(?:\s|$)/.test(text),
+            lastUpdated: /(?:last updated|\u4e0a\u6b21\u66f4\u65b0|\u4e0a\u6b21\u66f4\u65b0)/.test(text),
+            domIdentity
+          });
+        }
+        """
+    )
+    result = parse_account_security_query_result(raw, "password card")
+    return {
+        "visible": result.get("visible") is True,
+        "passwordCard": result.get("passwordCard") is True,
+        "lastUpdated": result.get("lastUpdated") is True,
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+    }
+
+
+def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
+    if not is_account_security_url(scope_location_url(page)):
+        return None
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in ACCOUNT_PASSWORD_CARD_SELECTORS:
+            for card in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(card):
+                    continue
+                try:
+                    summary = account_password_card_summary(card)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        summary["domIdentity"] or element_stability_signature(scope, card),
+                    )
+                except Exception:
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if summary["visible"] and summary["passwordCard"] and summary["lastUpdated"]:
+                    candidates.append((scope, card, summary))
+    if len(candidates) != 1:
+        return None
+    return candidates[0][0], candidates[0][1]
+
+
+def wait_for_account_password_card(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    previous_identity: tuple[Any, ...] | None = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_card(page)
+        if resolved is not None:
+            scope, card = resolved
+            identity = (
+                scope_browsing_context_id(scope),
+                element_stability_signature(scope, card),
+            )
+            stable_count = stable_count + 1 if identity == previous_identity else 1
+            previous_identity = identity
+            if stable_count >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return resolved
+        else:
+            previous_identity = None
+            stable_count = 0
+        pause(180, 420)
+    raise RuntimeError("account password card was not found")
+
+
+def password_change_field_summary(field: Any) -> dict[str, Any]:
+    raw = field.run_js(
+        r"""
+        function () {
+          // ruyipage-account-password-change-field
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              element.getAttribute('aria-hidden') !== 'true';
+          };
+          const field = this;
+          const labels = Array.from(field.labels || []).map(
+            (label) => label.innerText || label.textContent || ''
+          );
+          const parentText = field.parentElement?.innerText || '';
+          const signals = [
+            field.getAttribute('autocomplete'),
+            field.getAttribute('name'),
+            field.getAttribute('id'),
+            field.getAttribute('aria-label'),
+            field.getAttribute('placeholder'),
+            ...labels,
+            parentText
+          ].filter(Boolean).map((value) => String(value).replace(/\s+/g, ' ').trim());
+          const domIdentity = (() => {
+            const parts = [];
+            let current = field;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 12; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          return JSON.stringify({
+            visible: visible(field),
+            editable: !field.disabled && !field.readOnly,
+            inputType: String(field.type || '').toLowerCase(),
+            signals,
+            domIdentity
+          });
+        }
+        """
+    )
+    result = parse_account_security_query_result(raw, "password field")
+    signals = [
+        " ".join(str(value or "").split()).casefold()
+        for value in result.get("signals", [])
+        if str(value or "").strip()
+    ]
+    joined = " ".join(signals)
+    kind = "unknown"
+    if any(token in joined for token in ("current-password", "current password", "\u5f53\u524d\u5bc6\u7801", "\u7576\u524d\u5bc6\u78bc")):
+        kind = "current"
+    elif any(token in joined for token in ("confirm-password", "confirm password", "confirmation", "\u786e\u8ba4\u65b0\u5bc6\u7801", "\u78ba\u8a8d\u65b0\u5bc6\u78bc")):
+        kind = "confirm"
+    elif any(token in joined for token in ("new-password", "new password", "\u65b0\u5bc6\u7801", "\u65b0\u5bc6\u78bc")):
+        kind = "new"
+    return {
+        "visible": result.get("visible") is True,
+        "editable": result.get("editable") is True,
+        "inputType": str(result.get("inputType") or "").casefold(),
+        "signals": signals,
+        "kind": kind,
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+    }
+
+
+def resolve_account_password_change_fields(
+    page: Any,
+) -> dict[str, tuple[Any, Any]] | None:
+    if not is_account_security_url(scope_location_url(page)):
+        return None
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in ACCOUNT_PASSWORD_FIELD_SELECTORS:
+            for field in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(field):
+                    continue
+                try:
+                    summary = password_change_field_summary(field)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        summary["domIdentity"] or element_stability_signature(scope, field),
+                    )
+                except Exception:
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if (
+                    summary["visible"]
+                    and summary["editable"]
+                    and summary["inputType"] == "password"
+                ):
+                    candidates.append((scope, field, summary))
+    if len(candidates) < 3:
+        return None
+    classified = {
+        summary["kind"]: (scope, field)
+        for scope, field, summary in candidates
+        if summary["kind"] in {"current", "new", "confirm"}
+    }
+    if {"current", "new", "confirm"} <= classified.keys():
+        return {
+            "current": classified["current"],
+            "new": classified["new"],
+            "confirm": classified["confirm"],
+        }
+    if len(candidates) == 3:
+        return {
+            "current": (candidates[0][0], candidates[0][1]),
+            "new": (candidates[1][0], candidates[1][1]),
+            "confirm": (candidates[2][0], candidates[2][1]),
+        }
+    return None
+
+
+def wait_for_account_password_change_form(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> dict[str, tuple[Any, Any]]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    previous_identity: tuple[Any, ...] | None = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        snapshot = account_security_page_snapshot(page)
+        fields = resolve_account_password_change_fields(page)
+        if snapshot["passwordForm"] and fields is not None:
+            identity = tuple(
+                element_stability_signature(scope, field)
+                for scope, field in fields.values()
+            )
+            stable_count = stable_count + 1 if identity == previous_identity else 1
+            previous_identity = identity
+            if stable_count >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return fields
+        else:
+            previous_identity = None
+            stable_count = 0
+        pause(180, 420)
+    raise RuntimeError("account password change form was not ready")
+
+
+def account_password_submit_summary(button: Any) -> dict[str, Any]:
+    raw = button.run_js(
+        r"""
+        function () {
+          // ruyipage-account-password-submit
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          return JSON.stringify({
+            visible,
+            enabled: !this.disabled && this.getAttribute('aria-disabled') !== 'true',
+            label: String(
+              this.getAttribute('aria-label') ||
+              this.innerText ||
+              this.textContent ||
+              ''
+            ).replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+          });
+        }
+        """
+    )
+    result = parse_account_security_query_result(raw, "password submit")
+    label = normalize_account_security_label(result.get("label"))
+    return {
+        "visible": result.get("visible") is True,
+        "enabled": result.get("enabled") is True,
+        "label": label,
+        "changePassword": label in {
+            "change password",
+            "\u66f4\u6539\u5bc6\u7801",
+            "\u66f4\u6539\u5bc6\u78bc",
+        },
+    }
+
+
+def resolve_account_password_change_submit(page: Any) -> tuple[Any, Any] | None:
+    if not is_account_security_url(scope_location_url(page)):
+        return None
+    candidates: list[tuple[Any, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in ACCOUNT_PASSWORD_SUBMIT_SELECTORS:
+            for button in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(button):
+                    continue
+                try:
+                    summary = account_password_submit_summary(button)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        element_stability_signature(scope, button),
+                    )
+                except Exception:
+                    continue
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if summary["visible"] and summary["enabled"] and summary["changePassword"]:
+                    candidates.append((scope, button))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def wait_for_account_password_change_submit(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_change_submit(page)
+        if resolved is not None:
+            return resolved
+        pause(180, 420)
+    raise RuntimeError("account password change submit button was not ready")
+
+
+def wait_for_account_password_change_success(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_CHANGE_SUCCESS_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    stable_count = 0
+    while time.monotonic() < deadline:
+        snapshot = account_security_page_snapshot(page)
+        if snapshot["passwordChanged"]:
+            stable_count += 1
+            if stable_count >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return
+        else:
+            stable_count = 0
+        pause(180, 420)
+    raise RuntimeError("account password change confirmation was not found")
+
+
+def generate_account_password(length: int = ACCOUNT_PASSWORD_LENGTH) -> str:
+    if length != ACCOUNT_PASSWORD_LENGTH:
+        raise RuntimeError("generated account password length is invalid")
+    random_source = secrets.SystemRandom()
+    password = [
+        random_source.choice(ACCOUNT_PASSWORD_UPPERCASE),
+        random_source.choice(ACCOUNT_PASSWORD_LOWERCASE),
+        random_source.choice(ACCOUNT_PASSWORD_DIGITS),
+        random_source.choice(ACCOUNT_PASSWORD_SPECIAL_CHARACTERS),
+    ]
+    alphabet = (
+        ACCOUNT_PASSWORD_UPPERCASE
+        + ACCOUNT_PASSWORD_LOWERCASE
+        + ACCOUNT_PASSWORD_DIGITS
+        + ACCOUNT_PASSWORD_SPECIAL_CHARACTERS
+    )
+    password.extend(
+        random_source.choice(alphabet)
+        for _ in range(length - len(password))
+    )
+    random_source.shuffle(password)
+    return "".join(password)
+
+
+def classify_account_password_change_failure(error: Exception) -> str:
+    message = str(error).casefold()
+    if "navigation" in message or "security" in message:
+        return "password_change_navigation_failed"
+    if "form" in message or "field" in message or "card" in message:
+        return "password_change_form_unready"
+    if "submit" in message:
+        return "password_change_submit_unconfirmed"
+    if "confirmation" in message or "changed" in message:
+        return "password_change_confirmation_missing"
+    return "password_change_failed"
+
+
+def change_account_password(
+    page: Any,
+    current_password: str,
+    Keys: Any,
+    *,
+    pause: Callable[[int, int], None] = human_pause,
+) -> dict[str, Any]:
+    if not isinstance(current_password, str) or not current_password:
+        raise RuntimeError("account current password is invalid")
+    set_browser_startup_stage("account_security")
+    emit({"event": "status", "status": "password_change_started"})
+    try:
+        route = navigate_to_account_security(page, navigation_attempt=1, pause=pause)
+        if route == "sign_in":
+            raise RuntimeError("account security navigation redirected to sign in")
+        if route != "account_security":
+            raise RuntimeError("account security navigation was not confirmed")
+        emit({"event": "status", "status": "password_change_page_ready"})
+
+        set_browser_startup_stage("password_change")
+        card_scope, card = wait_for_account_password_card(page, pause=pause)
+        human_click(card_scope, card, pause=pause)
+        fields = wait_for_account_password_change_form(page, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "password_change_form_ready",
+                "fieldCount": 3,
+            }
+        )
+        new_password = generate_account_password()
+        for kind, value in (
+            ("current", current_password),
+            ("new", new_password),
+            ("confirm", new_password),
+        ):
+            scope, field = fields[kind]
+            input_and_verify(
+                scope,
+                field,
+                value,
+                "password",
+                Keys,
+                pause=pause,
+                root_page=page,
+            )
+        submit_scope, submit_button = wait_for_account_password_change_submit(
+            page,
+            pause=pause,
+        )
+        human_click(submit_scope, submit_button, pause=pause)
+        emit({"event": "status", "status": "password_change_submitted"})
+        wait_for_account_password_change_success(page, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "password_change_completed",
+                "newPassword": new_password,
+                "passwordLength": len(new_password),
+            }
+        )
+        return {
+            "success": True,
+            "attempted": True,
+            "passwordLength": len(new_password),
+            "newPassword": new_password,
+            "failureStage": "unknown",
+            "failureClass": "unknown",
+            "browserAlive": browser_connection_is_alive(page),
+            "browserPreserved": False,
+            "browserPreservationRequested": False,
+        }
+    except Exception as error:
+        failure_stage = browser_startup_stage
+        failure_class = classify_account_password_change_failure(error)
+        emit(
+            {
+                "event": "status",
+                "status": "password_change_failed",
+                "failureStage": failure_stage,
+                "failureClass": failure_class,
+            }
+        )
+        raise
+
+
+def normalize_small_business_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def small_business_text_blob(summary: dict[str, Any]) -> str:
+    return normalize_small_business_text(
+        " ".join(
+            str(summary.get(key) or "")
+            for key in (
+                "label",
+                "text",
+                "groupText",
+                "sectionId",
+                "className",
+                "id",
+                "name",
+                "value",
+            )
+        )
+    )
+
+
+def parse_small_business_query_result(raw: Any, label: str) -> dict[str, Any]:
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"small business application {label} query returned an invalid result"
+        )
+    return value
+
+
+def is_small_business_program_enroll_url(url: str) -> bool:
+    parsed = urlsplit(str(url or "").strip())
+    return bool(
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == "developer.apple.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port in (None, 443)
+        and parsed.path.rstrip("/") == SMALL_BUSINESS_PROGRAM_ENROLL_PATH
+    )
+
+
+def small_business_enrollment_snapshot(page: Any) -> dict[str, Any]:
+    if not is_small_business_program_enroll_url(scope_location_url(page)):
+        return {
+            "enrollPage": False,
+            "thankYou": False,
+            "formReady": False,
+            "paidAgreementYes": False,
+            "associatedNoCount": 0,
+            "revenueCertification": False,
+            "submitAvailable": False,
+        }
+    raw = page.run_js(
+        r"""
+        return JSON.stringify((() => {
+          // ruyipage-small-business-enrollment-snapshot
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              element.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleLowerCase();
+          const textFor = (element) => normalize([
+            element?.innerText,
+            element?.textContent,
+            element?.value,
+            element?.getAttribute?.('aria-label'),
+            element?.getAttribute?.('title')
+          ].filter(Boolean).join(' '));
+          const labelsFor = (input) => Array.from(input?.labels || [])
+            .map((label) => textFor(label));
+          const inputVisible = (input) =>
+            visible(input) || labelsFor(input).some((text) => text);
+          const enabled = (element) =>
+            element && !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+          const bodyText = normalize(
+            document.querySelector('main')?.innerText ||
+            document.body?.innerText ||
+            ''
+          );
+          const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
+            .filter((input) => inputVisible(input) && enabled(input));
+          const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+            .filter((input) => inputVisible(input) && enabled(input));
+          const radioText = (input) => normalize([
+            ...labelsFor(input),
+            input.value,
+            input.name,
+            input.id,
+            input.closest('fieldset')?.innerText || ''
+          ].filter(Boolean).join(' '));
+          const labelOnly = (input) => normalize([
+            ...labelsFor(input),
+            input.value
+          ].filter(Boolean).join(' ')).replace(/^[\s.。:：]+|[\s.。:：]+$/g, '');
+          const paidAgreementYes = radios.some((input) => {
+            const text = radioText(input);
+            return /(paid applications agreement|paid apps agreement|\u4ed8\u8d39\u5e94\u7528|\u4ed8\u8cbb\u61c9\u7528)/i.test(text) &&
+              /(yes,? i have accepted|i have accepted|\u6211\u5df2\u63a5\u53d7|\u6211\u5df2\u540c\u610f|\u5df2\u63a5\u53d7|\u5df2\u540c\u610f)/i.test(text);
+          });
+          const noRadios = radios.filter((input) => {
+            const label = labelOnly(input);
+            const text = radioText(input);
+            if (/(paid applications agreement|paid apps agreement|\u4ed8\u8d39\u5e94\u7528|\u4ed8\u8cbb\u61c9\u7528)/i.test(text)) {
+              return false;
+            }
+            return /^(no|\u5426|\u4e0d\u662f|\u6ca1\u6709|\u6c92\u6709)$/i.test(label);
+          });
+          const revenueCertification = checkboxes.some((input) => {
+            const text = normalize([
+              ...labelsFor(input),
+              input.value,
+              input.name,
+              input.id,
+              input.className,
+              input.closest('section')?.id || '',
+              input.closest('section')?.innerText || '',
+              input.closest('fieldset')?.innerText || ''
+            ].filter(Boolean).join(' '));
+            return /best of your knowledge|associated developer accounts earned|1,000,000|1000000|usd|\u636e\u4f60\u6240\u77e5|\u64da\u4f60\u6240\u77e5|\u5173\u8054\u5f00\u53d1\u8005|\u95dc\u806f\u958b\u767c\u8005|\u7f8e\u5143|\u6536\u5165|\u6536\u76ca|paid-apps-agreement-chkbox|chkpolicyagree/i.test(text);
+          });
+          const submitAvailable = Array.from(
+            document.querySelectorAll('input#submit,input[type="submit"],button[type="submit"],button')
+          ).some((button) => {
+            const text = normalize([
+              button.value,
+              button.innerText,
+              button.textContent,
+              button.getAttribute('aria-label'),
+              button.id,
+              button.name
+            ].filter(Boolean).join(' '));
+            return visible(button) && enabled(button) &&
+              /^(submit|continue|\u63d0\u4ea4|\u9001\u51fa|\u7ee7\u7eed|\u7e7c\u7e8c)$|submit|\u63d0\u4ea4|\u9001\u51fa/.test(text);
+          });
+          return {
+            enrollPage: location.protocol === 'https:' &&
+              location.hostname === 'developer.apple.com' &&
+              location.pathname.replace(/\/+$/, '') === '/app-store/small-business-program/enroll',
+            thankYou: /thank you for your submission|thanks for your submission|\u611f\u8c22(?:\u60a8)?\u7684?\u63d0\u4ea4|\u611f\u8b1d(?:\u60a8)?\u7684?\u63d0\u4ea4|\u5df2\u6536\u5230.*(?:\u7533\u8bf7|\u7533\u8acb)|\u63d0\u4ea4\u6210\u529f/.test(bodyText),
+            formReady: paidAgreementYes && noRadios.length >= 4 &&
+              revenueCertification,
+            paidAgreementYes,
+            associatedNoCount: Math.min(8, noRadios.length),
+            revenueCertification,
+            submitAvailable
+          };
+        })())
+        """
+    )
+    result = parse_small_business_query_result(raw, "snapshot")
+    return {
+        "enrollPage": result.get("enrollPage") is True,
+        "thankYou": result.get("thankYou") is True,
+        "formReady": result.get("formReady") is True,
+        "paidAgreementYes": result.get("paidAgreementYes") is True,
+        "associatedNoCount": min(
+            8,
+            max(
+                0,
+                result.get("associatedNoCount")
+                if type(result.get("associatedNoCount")) is int
+                else 0,
+            ),
+        ),
+        "revenueCertification": result.get("revenueCertification") is True,
+        "submitAvailable": result.get("submitAvailable") is True,
+    }
+
+
+def small_business_scope_has_auth_blocker(page: Any) -> bool:
+    for scope in iter_page_scopes(page):
+        try:
+            state = detect_scope_login_state(scope)
+        except Exception:
+            if scope is page:
+                return True
+            continue
+        if any(
+            state.get(key) is True
+            for key in (
+                "password",
+                "email",
+                "twofa",
+                "trustPrompt",
+                "error",
+                "otpRejected",
+                "blocked",
+                "hardAuthenticationError",
+            )
+        ):
+            return True
+    return False
+
+
+def confirmed_small_business_application_state(page: Any) -> dict[str, Any] | None:
+    if not browser_connection_is_alive(page):
+        return None
+    try:
+        snapshot = small_business_enrollment_snapshot(page)
+    except Exception:
+        return None
+    if snapshot["enrollPage"] is not True:
+        return None
+    if small_business_scope_has_auth_blocker(page):
+        return None
+    if not (snapshot["thankYou"] or snapshot["formReady"]):
+        return None
+    return {
+        "trusted": True,
+        "rootSessionTrusted": True,
+        "rootError": False,
+        "smallBusinessApplication": True,
+        "smallBusinessSubmitted": snapshot["thankYou"],
+        "smallBusinessFormReady": snapshot["formReady"],
+        "inspectionAvailable": True,
+        "twofa": False,
+        "twofaVisible": False,
+        "trustPrompt": False,
+        "inputReady": False,
+        "codeInputCount": 0,
+        "password": False,
+        "email": False,
+        "error": False,
+        "otpRejected": False,
+        "blocked": False,
+    }
+
+
+def small_business_control_summary(element: Any) -> dict[str, Any]:
+    raw = element.run_js(
+        r"""
+        function () {
+          // ruyipage-small-business-control-summary
+          const visible = (candidate) => {
+            if (!candidate) return false;
+            const rect = candidate.getBoundingClientRect();
+            const style = window.getComputedStyle(candidate);
+            return rect.width > 2 && rect.height > 2 &&
+              style.display !== 'none' && style.visibility !== 'hidden' &&
+              candidate.getAttribute('aria-hidden') !== 'true';
+          };
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          const element = this;
+          const resolveControl = () => {
+            if (element.matches?.('input,button')) return element;
+            const nested = element.querySelector?.(
+              'input[type="radio"],input[type="checkbox"],input[type="submit"],button'
+            );
+            if (nested) return nested;
+            if (String(element.tagName || '').toUpperCase() === 'LABEL') {
+              const htmlFor = element.getAttribute('for');
+              if (htmlFor) return document.getElementById(htmlFor) || element;
+            }
+            return element;
+          };
+          const control = resolveControl();
+          const labels = control?.labels
+            ? Array.from(control.labels).map((label) =>
+                normalize(label.innerText || label.textContent || '')
+              )
+            : [];
+          const closestLabel = element.closest?.('label');
+          const closestFieldset = element.closest?.('fieldset');
+          const closestSection = element.closest?.('section');
+          const label = normalize([
+            element.innerText,
+            element.textContent,
+            control?.value,
+            control?.getAttribute?.('aria-label'),
+            control?.getAttribute?.('title'),
+            ...labels
+          ].filter(Boolean).join(' '));
+          const domIdentity = (() => {
+            const parts = [];
+            let current = element;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 14; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          const domOrder = Array.prototype.indexOf.call(
+            document.querySelectorAll('label,input,button'),
+            element
+          );
+          return JSON.stringify({
+            visible: visible(element) || visible(control) ||
+              labels.some((text) => text.length > 0),
+            enabled: Boolean(control) &&
+              !control.disabled &&
+              !control.readOnly &&
+              control.getAttribute?.('aria-disabled') !== 'true',
+            tagName: String(element.tagName || '').toLowerCase(),
+            inputType: String(control?.type || '').toLowerCase(),
+            checked: control?.checked === true,
+            label,
+            text: normalize([
+              element.innerText,
+              element.textContent,
+              closestLabel?.innerText,
+              closestLabel?.textContent
+            ].filter(Boolean).join(' ')),
+            groupText: normalize([
+              closestFieldset?.innerText,
+              closestSection?.innerText
+            ].filter(Boolean).join(' ')),
+            sectionId: normalize(closestSection?.id || ''),
+            className: normalize([
+              element.className,
+              control?.className
+            ].filter(Boolean).join(' ')),
+            id: normalize(control?.id || element.id || ''),
+            name: normalize(control?.name || element.getAttribute?.('name') || ''),
+            value: normalize(control?.value || element.getAttribute?.('value') || ''),
+            domIdentity,
+            controlIdentity: [
+              String(control?.tagName || element.tagName || '').toLowerCase(),
+              String(control?.type || '').toLowerCase(),
+              normalize(control?.id || ''),
+              normalize(control?.name || ''),
+              normalize(control?.value || ''),
+              domIdentity
+            ].join('|'),
+            domOrder: domOrder < 0 ? 999999 : domOrder
+          });
+        }
+        """
+    )
+    result = parse_small_business_query_result(raw, "control")
+    label = normalize_small_business_text(result.get("label"))
+    return {
+        "visible": result.get("visible") is True,
+        "enabled": result.get("enabled") is True,
+        "tagName": normalize_small_business_text(result.get("tagName")),
+        "inputType": normalize_small_business_text(result.get("inputType")),
+        "checked": result.get("checked") is True,
+        "label": label,
+        "text": normalize_small_business_text(result.get("text")),
+        "groupText": normalize_small_business_text(result.get("groupText")),
+        "sectionId": normalize_small_business_text(result.get("sectionId")),
+        "className": normalize_small_business_text(result.get("className")),
+        "id": normalize_small_business_text(result.get("id")),
+        "name": normalize_small_business_text(result.get("name")),
+        "value": normalize_small_business_text(result.get("value")),
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+        "controlIdentity": str(result.get("controlIdentity") or "").strip(),
+        "domOrder": (
+            result.get("domOrder")
+            if type(result.get("domOrder")) is int
+            and 0 <= result.get("domOrder") <= 1_000_000
+            else 1_000_000
+        ),
+    }
+
+
+def small_business_control_candidates(
+    page: Any,
+    selectors: tuple[str, ...],
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    if not is_small_business_program_enroll_url(scope_location_url(page)):
+        return []
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen_elements: set[tuple[Any, ...]] = set()
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for selector in selectors:
+            for element in safe_elements(root, selector, timeout_s=0):
+                if not element_is_interactable(element):
+                    continue
+                try:
+                    summary = small_business_control_summary(element)
+                    identity = (
+                        scope_browsing_context_id(scope),
+                        summary["domIdentity"]
+                        or element_stability_signature(scope, element),
+                    )
+                except Exception:
+                    continue
+                if identity in seen_elements:
+                    continue
+                seen_elements.add(identity)
+                if summary["visible"] and summary["enabled"]:
+                    candidates.append((scope, element, summary))
+    candidates.sort(key=lambda candidate: candidate[2]["domOrder"])
+    return candidates
+
+
+def small_business_distinct_controls(
+    candidates: list[tuple[Any, Any, dict[str, Any]]],
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    distinct: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for scope, element, summary in candidates:
+        identity = (
+            scope_browsing_context_id(scope),
+            summary.get("controlIdentity") or summary.get("domIdentity"),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        distinct.append((scope, element, summary))
+    return distinct
+
+
+def small_business_is_paid_agreement_yes(summary: dict[str, Any]) -> bool:
+    if summary.get("inputType") != "radio":
+        return False
+    text = small_business_text_blob(summary)
+    return bool(
+        (
+            "paid applications agreement" in text
+            or "paid apps agreement" in text
+            or "\u4ed8\u8d39\u5e94\u7528" in text
+            or "\u4ed8\u8cbb\u61c9\u7528" in text
+        )
+        and (
+            "yes, i have accepted" in text
+            or "yes i have accepted" in text
+            or "i have accepted" in text
+            or "\u6211\u5df2\u63a5\u53d7" in text
+            or "\u6211\u5df2\u540c\u610f" in text
+            or "\u5df2\u63a5\u53d7" in text
+            or "\u5df2\u540c\u610f" in text
+        )
+    )
+
+
+def small_business_is_no_radio(summary: dict[str, Any]) -> bool:
+    if summary.get("inputType") != "radio":
+        return False
+    text = small_business_text_blob(summary)
+    if (
+        "paid applications agreement" in text
+        or "paid apps agreement" in text
+        or "\u4ed8\u8d39\u5e94\u7528" in text
+        or "\u4ed8\u8cbb\u61c9\u7528" in text
+    ):
+        return False
+    label = normalize_small_business_text(summary.get("label")).strip(" .。:：")
+    return label in {"no", "\u5426", "\u4e0d\u662f", "\u6ca1\u6709", "\u6c92\u6709"}
+
+
+def small_business_is_revenue_certification(summary: dict[str, Any]) -> bool:
+    if summary.get("inputType") != "checkbox":
+        return False
+    text = small_business_text_blob(summary)
+    return bool(
+        "best of your knowledge" in text
+        or "associated developer accounts earned" in text
+        or "1,000,000" in text
+        or "1000000" in text
+        or "usd" in text
+        or "\u636e\u4f60\u6240\u77e5" in text
+        or "\u64da\u4f60\u6240\u77e5" in text
+        or "\u5173\u8054\u5f00\u53d1\u8005" in text
+        or "\u95dc\u806f\u958b\u767c\u8005" in text
+        or "\u7f8e\u5143" in text
+        or "\u6536\u5165" in text
+        or "\u6536\u76ca" in text
+        or "paid-apps-agreement-chkbox" in text
+        or "chkpolicyagree" in text
+    )
+
+
+def small_business_is_submit(summary: dict[str, Any]) -> bool:
+    if summary.get("inputType") not in {"submit", "button"} and summary.get("tagName") != "button":
+        return False
+    label = normalize_small_business_text(
+        summary.get("label") or summary.get("value") or summary.get("text")
+    ).strip(" .。:：")
+    return bool(
+        label in {
+            "submit",
+            "continue",
+            "\u63d0\u4ea4",
+            "\u9001\u51fa",
+            "\u7ee7\u7eed",
+            "\u7e7c\u7e8c",
+        }
+        or "submit" in label
+        or "\u63d0\u4ea4" in label
+        or "\u9001\u51fa" in label
+    )
+
+
+def resolve_small_business_paid_agreement_yes(page: Any) -> tuple[Any, Any, dict[str, Any]] | None:
+    candidates = [
+        candidate
+        for candidate in small_business_distinct_controls(
+            small_business_control_candidates(page, SMALL_BUSINESS_CONTROL_SELECTORS)
+        )
+        if small_business_is_paid_agreement_yes(candidate[2])
+    ]
+    return candidates[0] if candidates else None
+
+
+def resolve_small_business_associated_no_options(
+    page: Any,
+) -> list[tuple[Any, Any, dict[str, Any]]]:
+    candidates = [
+        candidate
+        for candidate in small_business_distinct_controls(
+            small_business_control_candidates(page, SMALL_BUSINESS_CONTROL_SELECTORS)
+        )
+        if small_business_is_no_radio(candidate[2])
+    ]
+    return (
+        candidates[:SMALL_BUSINESS_ASSOCIATED_NO_COUNT]
+        if len(candidates) >= SMALL_BUSINESS_ASSOCIATED_NO_COUNT
+        else []
+    )
+
+
+def resolve_small_business_revenue_certification(page: Any) -> tuple[Any, Any, dict[str, Any]] | None:
+    candidates = [
+        candidate
+        for candidate in small_business_distinct_controls(
+            small_business_control_candidates(page, SMALL_BUSINESS_CONTROL_SELECTORS)
+        )
+        if small_business_is_revenue_certification(candidate[2])
+    ]
+    return candidates[0] if candidates else None
+
+
+def resolve_small_business_submit(page: Any) -> tuple[Any, Any, dict[str, Any]] | None:
+    candidates = [
+        candidate
+        for candidate in small_business_distinct_controls(
+            small_business_control_candidates(page, SMALL_BUSINESS_SUBMIT_SELECTORS)
+        )
+        if small_business_is_submit(candidate[2])
+    ]
+    return candidates[0] if candidates else None
+
+
+def wait_for_small_business_control(
+    resolver: Callable[[Any], Any],
+    page: Any,
+    *,
+    description: str,
+    timeout_s: float = SMALL_BUSINESS_APPLICATION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> Any:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        resolved = resolver(page)
+        if resolved:
+            return resolved
+        snapshot = small_business_enrollment_snapshot(page)
+        if snapshot["thankYou"]:
+            return resolved
+        pause(180, 420)
+    raise RuntimeError(f"small business application {description} was not ready")
+
+
+def wait_for_small_business_enrollment_page(
+    page: Any,
+    timeout_s: float = SMALL_BUSINESS_APPLICATION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    stable_count = 0
+    while time.monotonic() < deadline:
+        snapshot = small_business_enrollment_snapshot(page)
+        if snapshot["enrollPage"] and (snapshot["formReady"] or snapshot["thankYou"]):
+            stable_count += 1
+            if stable_count >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return
+        else:
+            stable_count = 0
+        pause(180, 420)
+    raise RuntimeError("small business application form was not ready")
+
+
+def wait_for_small_business_submission_success(
+    page: Any,
+    timeout_s: float = SMALL_BUSINESS_SUBMISSION_SUCCESS_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> None:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    stable_count = 0
+    while time.monotonic() < deadline:
+        snapshot = small_business_enrollment_snapshot(page)
+        if snapshot["enrollPage"] and snapshot["thankYou"]:
+            stable_count += 1
+            if stable_count >= PROFILE_VALUE_STABLE_OBSERVATIONS:
+                return
+        else:
+            stable_count = 0
+        pause(180, 420)
+    raise RuntimeError("small business application submission confirmation was not found")
+
+
+def open_small_business_application_tab(page: Any) -> Any:
+    set_browser_startup_stage("small_business_application")
+    emit({"event": "status", "status": "small_business_application_started"})
+    try:
+        small_business_page = page.new_tab(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
+    except Exception as error:
+        raise RuntimeError(
+            "new small business application tab could not be created"
+        ) from error
+    if small_business_page is None or not browser_connection_is_alive(small_business_page):
+        raise RuntimeError("new small business application tab could not be created")
+    emit({"event": "status", "status": "small_business_application_tab_created"})
+    try:
+        small_business_page.wait.doc_loaded(timeout=20)
+    except Exception:
+        if not browser_connection_is_alive(small_business_page):
+            raise RuntimeError(
+                "small business browser connection was lost while opening enrollment page"
+            )
+    human_pause(700, 1400)
+    return small_business_page
+
+
+def classify_small_business_application_failure(error: Exception) -> str:
+    message = str(error).casefold()
+    if "new small business" in message or "opening" in message or "navigation" in message:
+        return "small_business_navigation_failed"
+    if "2fa" in message or "authentication" in message or "login" in message or "sign in" in message:
+        return "small_business_login_unconfirmed"
+    if (
+        "form" in message
+        or "agreement" in message
+        or "associated" in message
+        or "certification" in message
+        or "control" in message
+    ):
+        return "small_business_form_unready"
+    if "submit" in message or "submission" in message or "confirmation" in message:
+        return "small_business_submission_unconfirmed"
+    return "small_business_application_failed"
+
+
+def apply_small_business_program(
+    page: Any,
+    apple_id: str,
+    password: str,
+    Keys: Any,
+    authentication_context: dict[str, Any],
+    screenshot_path: Path,
+    *,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[dict[str, Any], Any, str | None]:
+    if not isinstance(password, str) or not password:
+        raise RuntimeError("small business authentication password is invalid")
+    small_business_page = open_small_business_application_tab(page)
+    try:
+        set_browser_startup_stage("small_business_login")
+        authentication = complete_account_authentication(
+            small_business_page,
+            apple_id,
+            password,
+            Keys,
+            account_home_confirmed=True,
+            authentication_context=authentication_context,
+            session_probe=confirmed_small_business_application_state,
+        )
+        confirmed_state = authentication["confirmedState"]
+        if confirmed_state.get("smallBusinessApplication") is not True:
+            raise RuntimeError(
+                "small business application page was not confirmed after authentication"
+            )
+        emit({"event": "status", "status": "small_business_application_authenticated"})
+
+        set_browser_startup_stage("small_business_enrollment")
+        wait_for_small_business_enrollment_page(small_business_page, pause=pause)
+        emit({"event": "status", "status": "small_business_enrollment_page_ready"})
+        if small_business_enrollment_snapshot(small_business_page)["thankYou"]:
+            screenshot = take_screenshot(
+                small_business_page,
+                screenshot_path,
+                checkpoint="small_business_application",
+                full_page=False,
+            )
+            emit({"event": "status", "status": "small_business_application_completed"})
+            return (
+                {
+                    "success": True,
+                    "attempted": True,
+                    "submitted": True,
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": browser_connection_is_alive(small_business_page),
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                small_business_page,
+                screenshot,
+            )
+
+        paid_scope, paid_yes, paid_summary = wait_for_small_business_control(
+            resolve_small_business_paid_agreement_yes,
+            small_business_page,
+            description="paid applications agreement choice",
+            pause=pause,
+        )
+        if paid_summary.get("checked") is not True:
+            human_click(paid_scope, paid_yes, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "small_business_paid_agreement_accepted",
+            }
+        )
+
+        no_options = wait_for_small_business_control(
+            resolve_small_business_associated_no_options,
+            small_business_page,
+            description="associated developer account answers",
+            pause=pause,
+        )
+        if len(no_options) < SMALL_BUSINESS_ASSOCIATED_NO_COUNT:
+            raise RuntimeError(
+                "small business associated developer account answers were not ready"
+            )
+        for no_scope, no_choice, no_summary in no_options:
+            if no_summary.get("checked") is not True:
+                human_click(no_scope, no_choice, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "small_business_associated_accounts_answered",
+                "answerCount": SMALL_BUSINESS_ASSOCIATED_NO_COUNT,
+            }
+        )
+
+        checkbox_scope, checkbox, checkbox_summary = wait_for_small_business_control(
+            resolve_small_business_revenue_certification,
+            small_business_page,
+            description="revenue certification checkbox",
+            pause=pause,
+        )
+        if checkbox_summary.get("checked") is not True:
+            human_click(checkbox_scope, checkbox, pause=pause)
+        emit(
+            {
+                "event": "status",
+                "status": "small_business_revenue_certification_checked",
+            }
+        )
+
+        submit_scope, submit, _submit_summary = wait_for_small_business_control(
+            resolve_small_business_submit,
+            small_business_page,
+            description="submit button",
+            pause=pause,
+        )
+        human_click(submit_scope, submit, pause=pause)
+        emit({"event": "status", "status": "small_business_application_submitted"})
+        wait_for_small_business_submission_success(small_business_page, pause=pause)
+        screenshot = take_screenshot(
+            small_business_page,
+            screenshot_path,
+            checkpoint="small_business_application",
+            full_page=False,
+        )
+        emit({"event": "status", "status": "small_business_application_completed"})
+        return (
+            {
+                "success": True,
+                "attempted": True,
+                "submitted": True,
+                "failureStage": "unknown",
+                "failureClass": "unknown",
+                "browserAlive": browser_connection_is_alive(small_business_page),
+                "browserPreserved": False,
+                "browserPreservationRequested": False,
+            },
+            small_business_page,
+            screenshot,
+        )
+    except Exception as error:
+        failure_stage = browser_startup_stage
+        failure_class = classify_small_business_application_failure(error)
+        emit(
+            {
+                "event": "status",
+                "status": "small_business_application_failed",
+                "failureStage": failure_stage,
+                "failureClass": failure_class,
+                "submitted": False,
+            }
+        )
+        raise
+
+
+def default_post_login_small_business_application(
+    page: Any | None = None,
+    *,
+    failure_stage: str = "small_business_application",
+    failure_class: str = "small_business_not_attempted",
+    browser_preservation_requested: bool = False,
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "attempted": False,
+        "submitted": False,
+        "failureStage": failure_stage,
+        "failureClass": failure_class,
+        "browserAlive": bool(
+            page is not None and browser_connection_is_alive(page)
+        ),
+        "browserPreserved": False,
+        "browserPreservationRequested": browser_preservation_requested,
+    }
 
 
 def validate_personal_info_result(
@@ -5750,13 +8407,20 @@ def take_screenshot(
     *,
     checkpoint: str,
     full_page: bool = True,
+    element: Any | None = None,
 ) -> str | None:
     safe_checkpoint = checkpoint if checkpoint in SCREENSHOT_CHECKPOINTS else "unknown"
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if hasattr(path.parent, "chmod"):
             path.parent.chmod(0o700)
-        page.screenshot(str(path), full_page=full_page)
+        if element is None:
+            page.screenshot(str(path), full_page=full_page)
+        else:
+            # ruyiPage uses a native BiDi element clip here, so a tall
+            # MembershipDetailsCard is captured as the complete card rather
+            # than being cut off by the viewport bottom edge.
+            element.screenshot(str(path))
         if hasattr(path, "chmod"):
             path.chmod(0o600)
         emit(
@@ -6870,6 +9534,7 @@ def collect_developer_account_membership(
 
     set_browser_startup_stage("developer_membership")
     membership_status = "unknown"
+    registration_identity_value: str | None = None
     screenshot: str | None = None
     if confirmed_state.get("joinProgram") is True:
         membership_status = "not_enrolled"
@@ -6878,17 +9543,51 @@ def collect_developer_account_membership(
         # Re-read the live page instead of freezing the initial nav boolean.
         if confirm_active_developer_membership(developer_page):
             membership_status = "active"
-            screenshot = take_screenshot(
-                developer_page,
-                screenshot_path,
-                checkpoint="developer_membership",
-                full_page=False,
-            )
+            try:
+                registration_identity_value = normalize_developer_registration_identity(
+                    developer_membership_details_snapshot(developer_page).get(
+                        "registrationIdentityValue"
+                    )
+                )
+            except Exception:
+                registration_identity_value = None
+            if scroll_developer_membership_details_card(developer_page):
+                # Re-resolve after the centered, settled scroll. Apple can
+                # replace this SPA card wrapper while its fields hydrate; the
+                # element clip must target the current concrete card, never a
+                # stale wrapper or the generic page viewport.
+                resolved_card = resolve_developer_membership_details_card(
+                    developer_page
+                )
+                if resolved_card is not None:
+                    _scope, membership_card = resolved_card
+                    screenshot = take_screenshot(
+                        developer_page,
+                        screenshot_path,
+                        checkpoint="developer_membership",
+                        full_page=False,
+                        element=membership_card,
+                    )
+                else:
+                    emit(
+                        {
+                            "event": "status",
+                            "status": "developer_membership_card_unavailable",
+                        }
+                    )
+            else:
+                emit(
+                    {
+                        "event": "status",
+                        "status": "developer_membership_card_unavailable",
+                    }
+                )
     emit(
         {
             "event": "status",
             "status": "developer_membership_checked",
             "membershipStatus": membership_status,
+            "registrationIdentityValue": registration_identity_value,
         }
     )
     emit({"event": "status", "status": "developer_account_completed"})
@@ -6897,6 +9596,7 @@ def collect_developer_account_membership(
             "success": True,
             "authenticated": True,
             "membershipStatus": membership_status,
+            "registrationIdentityValue": registration_identity_value,
             "failureStage": "unknown",
             "failureClass": "unknown",
             "browserAlive": browser_connection_is_alive(developer_page),
@@ -6960,6 +9660,37 @@ def inspect_profile_failure_state(page: Any) -> dict[str, Any]:
     return {**state, "inspectionAvailable": True}
 
 
+def default_post_login_password_change(
+    page: Any | None = None,
+    *,
+    failure_stage: str = "password_change",
+    failure_class: str = "password_change_not_attempted",
+    browser_preservation_requested: bool = False,
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "attempted": False,
+        "passwordStored": False,
+        "passwordLength": 0,
+        "failureStage": failure_stage,
+        "failureClass": failure_class,
+        "browserAlive": bool(
+            page is not None and browser_connection_is_alive(page)
+        ),
+        "browserPreserved": False,
+        "browserPreservationRequested": browser_preservation_requested,
+    }
+
+
+def public_post_login_password_change_result(
+    password_change_result: dict[str, Any],
+) -> dict[str, Any]:
+    public_result = dict(password_change_result)
+    public_result.pop("newPassword", None)
+    public_result.setdefault("passwordStored", False)
+    return public_result
+
+
 def _browser_flow(args: argparse.Namespace) -> int:
     report_dir = Path(args.report_dir)
     configure_browser_stage_file(report_dir)
@@ -6994,6 +9725,9 @@ def _browser_flow(args: argparse.Namespace) -> int:
     screenshots_dir = report_dir / "screenshots"
     success_screenshot_path = screenshots_dir / "02-account-information.png"
     developer_screenshot_path = screenshots_dir / "03-developer-membership.png"
+    small_business_screenshot_path = (
+        screenshots_dir / "04-small-business-application.png"
+    )
     generated_screenshot_paths: list[Path] = []
     screenshots: dict[str, str | None] = {}
     account_home_confirmed = False
@@ -7021,13 +9755,22 @@ def _browser_flow(args: argparse.Namespace) -> int:
             "success": False,
             "authenticated": False,
             "membershipStatus": "unknown",
+            "registrationIdentityValue": None,
             "failureStage": "developer_account",
             "failureClass": "developer_result_missing",
             "browserAlive": browser_connection_is_alive(page),
             "browserPreserved": False,
             "browserPreservationRequested": False,
         }
+        post_login_password_change: dict[str, Any] = default_post_login_password_change(
+            page
+        )
+        post_login_small_business_application: dict[str, Any] = (
+            default_post_login_small_business_application(page)
+        )
+        current_browser_password = password
         developer_page = page
+        small_business_page = None
         developer_page_holder: dict[str, Any] = {}
         try:
             (
@@ -7055,6 +9798,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 "success": False,
                 "authenticated": failure_stage == "developer_membership",
                 "membershipStatus": "unknown",
+                "registrationIdentityValue": None,
                 "failureStage": failure_stage,
                 "failureClass": failure_class,
                 "browserAlive": browser_alive,
@@ -7138,6 +9882,24 @@ def _browser_flow(args: argparse.Namespace) -> int:
             post_login_profile_capture["browserPreserved"] = post_login_finalization[
                 "browserSessionPreserved"
             ]
+            post_login_password_change["browserAlive"] = browser_connection_is_alive(
+                developer_page
+            )
+            post_login_password_change["browserPreservationRequested"] = (
+                preserve_after_flow
+            )
+            post_login_password_change["browserPreserved"] = post_login_finalization[
+                "browserSessionPreserved"
+            ]
+            post_login_small_business_application["browserAlive"] = (
+                browser_connection_is_alive(developer_page)
+            )
+            post_login_small_business_application["browserPreservationRequested"] = (
+                preserve_after_flow
+            )
+            post_login_small_business_application["browserPreserved"] = (
+                post_login_finalization["browserSessionPreserved"]
+            )
             post_login_developer_account["browserPreserved"] = (
                 post_login_finalization["browserSessionPreserved"]
             )
@@ -7156,6 +9918,10 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     },
                     "postLoginProfileCapture": post_login_profile_capture,
                     "postLoginDeveloperAccount": post_login_developer_account,
+                    "postLoginPasswordChange": post_login_password_change,
+                    "postLoginSmallBusinessApplication": (
+                        post_login_small_business_application
+                    ),
                     "postLoginFinalization": post_login_finalization,
                     "accountModule": account_module,
                     "personalInfo": {},
@@ -7211,6 +9977,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
             "browserPreserved": False,
             "browserPreservationRequested": False,
         }
+        post_login_password_change = default_post_login_password_change(page)
         try:
             set_browser_startup_stage("account_information")
             emit({"event": "status", "status": "profile_capture_started"})
@@ -7281,6 +10048,81 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     "status": "profile_capture_completed",
                 }
             )
+            try:
+                internal_password_change_result = change_account_password(
+                    page,
+                    current_browser_password,
+                    Keys,
+                )
+                rotated_password = internal_password_change_result.get("newPassword")
+                if (
+                    internal_password_change_result.get("success") is True
+                    and isinstance(rotated_password, str)
+                    and rotated_password
+                ):
+                    current_browser_password = rotated_password
+                    add_diagnostic_secret(rotated_password)
+                post_login_password_change = public_post_login_password_change_result(
+                    internal_password_change_result
+                )
+            except Exception as password_error:
+                failure_stage = browser_startup_stage
+                failure_class = classify_account_password_change_failure(
+                    password_error
+                )
+                post_login_password_change = {
+                    "success": False,
+                    "attempted": True,
+                    "passwordStored": False,
+                    "passwordLength": 0,
+                    "failureStage": failure_stage,
+                    "failureClass": failure_class,
+                    "browserAlive": browser_connection_is_alive(page),
+                    "browserPreserved": False,
+                    "browserPreservationRequested": (
+                        preserve_on_success or preserve_on_failure
+                    ),
+                }
+            if post_login_password_change["success"] is True:
+                try:
+                    (
+                        post_login_small_business_application,
+                        small_business_page,
+                        screenshots["smallBusinessApplication"],
+                    ) = apply_small_business_program(
+                        page,
+                        apple_id,
+                        current_browser_password,
+                        Keys,
+                        authentication_context,
+                        small_business_screenshot_path,
+                    )
+                    if screenshots["smallBusinessApplication"] is not None:
+                        generated_screenshot_paths.append(
+                            small_business_screenshot_path
+                        )
+                except Exception as small_business_error:
+                    failure_stage = browser_startup_stage
+                    failure_class = classify_small_business_application_failure(
+                        small_business_error
+                    )
+                    target_page = (
+                        small_business_page
+                        if small_business_page is not None
+                        else page
+                    )
+                    post_login_small_business_application = {
+                        "success": False,
+                        "attempted": True,
+                        "submitted": False,
+                        "failureStage": failure_stage,
+                        "failureClass": failure_class,
+                        "browserAlive": browser_connection_is_alive(target_page),
+                        "browserPreserved": False,
+                        "browserPreservationRequested": (
+                            preserve_on_success or preserve_on_failure
+                        ),
+                    }
         except Exception as profile_error:
             failure_stage = browser_startup_stage
             failure_class = classify_profile_capture_failure(profile_error)
@@ -7317,25 +10159,56 @@ def _browser_flow(args: argparse.Namespace) -> int:
         preserve_after_flow = preserve_on_success or (
             post_login_profile_capture["success"] is False and preserve_on_failure
         ) or (
+            post_login_password_change["success"] is False
+            and post_login_password_change["attempted"] is True
+            and preserve_on_failure
+        ) or (
+            post_login_small_business_application["success"] is False
+            and post_login_small_business_application["attempted"] is True
+            and preserve_on_failure
+        ) or (
             post_login_developer_account["success"] is False and preserve_on_failure
         )
         post_login_profile_capture["browserPreservationRequested"] = (
             preserve_after_flow
         )
+        post_login_password_change["browserPreservationRequested"] = (
+            preserve_after_flow
+        )
+        post_login_password_change["browserAlive"] = browser_connection_is_alive(page)
+        post_login_small_business_application["browserPreservationRequested"] = (
+            preserve_after_flow
+        )
+        post_login_small_business_application["browserAlive"] = (
+            browser_connection_is_alive(
+                small_business_page if small_business_page is not None else page
+            )
+        )
         post_login_developer_account["browserAlive"] = browser_connection_is_alive(
             developer_page
+        )
+        required_pages = tuple(
+            required_page
+            for required_page in (developer_page, small_business_page)
+            if required_page is not None
         )
         set_browser_startup_stage("post_login_finalization")
         post_login_finalization = finalize_post_login_browser(
             page,
             preserve_requested=preserve_after_flow,
             profile_capture_success=post_login_profile_capture["success"],
-            required_pages=(developer_page,),
+            required_pages=required_pages,
         )
         post_login_browser_finalized = True
         post_login_profile_capture["browserPreserved"] = post_login_finalization[
             "browserSessionPreserved"
         ]
+        post_login_password_change["browserPreserved"] = post_login_finalization[
+            "browserSessionPreserved"
+        ]
+        post_login_small_business_application["browserPreserved"] = (
+            post_login_finalization["browserSessionPreserved"]
+        )
         post_login_developer_account["browserPreservationRequested"] = (
             preserve_after_flow
         )
@@ -7358,6 +10231,10 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 },
                 "postLoginProfileCapture": post_login_profile_capture,
                 "postLoginDeveloperAccount": post_login_developer_account,
+                "postLoginPasswordChange": post_login_password_change,
+                "postLoginSmallBusinessApplication": (
+                    post_login_small_business_application
+                ),
                 "postLoginFinalization": post_login_finalization,
                 "accountModule": account_module,
                 "personalInfo": personal_info

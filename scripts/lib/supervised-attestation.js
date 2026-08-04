@@ -111,11 +111,33 @@ export function createMacVerificationPermissionProfile(runTmpDir, repository) {
   const writable = String(runTmpDir ?? "");
   const repo = String(repository ?? "");
   for (const value of [writable, repo]) {
-    if (!value.startsWith("/") || /["\\\r\n\0]/.test(value)) {
-      throw new Error("Mac verification permission path is invalid");
-    }
+    assertMacPermissionPath(value, "Mac verification permission path is invalid");
   }
   return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}/.env" = "deny", "~/.codex/auth.json" = "deny", "~/.ssh" = "deny", "~/.git-credentials" = "deny", "~/.netrc" = "deny", "~/.config/gh" = "deny" } }`;
+}
+
+// Implementation mode is the full project development profile. Artifact
+// sanitizers still enforce that secrets and personal data do not leave the Mac.
+export function createMacImplementationPermissionProfile(runTmpDir, repository) {
+  const writable = String(runTmpDir ?? "");
+  const repo = String(repository ?? "");
+  for (const value of [writable, repo]) {
+    assertMacPermissionPath(value, "Mac implementation permission path is invalid");
+  }
+  return `{ extends = ":read-only", filesystem = { "${writable}" = "write", "${repo}" = "write" }, network = { enabled = true, domains = {} } }`;
+}
+
+function assertMacPermissionPath(value, message) {
+  if (
+    !value.startsWith("/") ||
+    value === "/" ||
+    value.endsWith("/") ||
+    value.includes("//") ||
+    value.split("/").some((part) => part === "." || part === "..") ||
+    /["\\\r\n\0]/.test(value)
+  ) {
+    throw new Error(message);
+  }
 }
 
 export const SUPERVISED_STATUSES = new Set([

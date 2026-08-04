@@ -1,6 +1,6 @@
 # Apple-AutoMation 项目参考
 
-> 当前可运行方案：**Developer-first 会员判定 → Account 个人信息采集**。操作入口见 [运行手册](RUNTIME_RUNBOOK.md)。
+> 当前可运行方案：**Developer-first 会员判定 → Account 个人信息采集/改密 → 小开发者申请**。操作入口见 [运行手册](RUNTIME_RUNBOOK.md)。
 
 ## 1. 目标与非目标
 
@@ -10,7 +10,8 @@
 | Firefox 浏览器阶段 | ruyiPage-only；初始 tab 先跑 Developer，再为 Account 新建 tab。 |
 | Apple 认证 | email、password、remember-account、OTP 和 trust 提示复用同一可信认证链。 |
 | Developer 判定 | active、not_enrolled、unknown 三态；仅 active 保存会员详情截图。 |
-| Account 采集 | 稳定个人信息页后读取 birthday 与 name，并私有持久化。 |
+| Account 采集与改密 | 稳定个人信息页后读取 birthday 与 name，并私有持久化；随后进入登录与安全性修改密码并更新私有 APPLE_PASSWORD。 |
+| 小开发者申请 | Account 改密成功后新建 Small Business Program 申请 tab，按中英文语义选择表单并确认提交。 |
 | 诊断 | 完整脱敏 JSONL + 简洁终端进度；不把秘密/页面正文混入报告。 |
 
 浏览器生命周期不使用 Playwright、Puppeteer、Selenium、Node BiDi 或 DOM synthetic input 回退。ruyiPage 对敏感输入使用 BiDi-native 行为；JavaScript 仅做无副作用的状态/文本查询。
@@ -29,6 +30,7 @@ flowchart LR
     Python --> Firefox[Firefox via ruyiPage]
     Python --> Dev[developer.apple.com/account]
     Python --> Account[account.apple.com/account/manage/section/information]
+    Python --> SmallBiz[developer.apple.com/app-store/small-business-program/enroll]
 ~~~
 
 | 文件 | 所有权 |
@@ -58,7 +60,13 @@ browser_ready
   -> account authentication / shared 2FA
   -> account_home_confirmed
   -> account_information
-  -> profile capture / finalization
+  -> profile capture
+  -> account_security
+  -> password_change
+  -> small_business_application
+  -> small_business_login
+  -> small_business_enrollment
+  -> finalization
 ~~~
 
 ### Developer-first 与 gate
@@ -79,12 +87,15 @@ Developer 会员状态在 developer_membership_checked 到达 Node 时立即私�
 | postLoginDeveloperAccount | Developer 是否已检查、会员固定分类、失败 stage/class、保留状态。 |
 | accountModule | 是否尝试、是否跳过、gate 是否启用/通过、固定 skip reason。 |
 | postLoginProfileCapture | 个人资料是否成功、固定 failure stage/class、浏览器保留结果。 |
-| screenshots | 仅文件名元数据，例如 03-developer-membership.png、02-account-information.png。 |
+| postLoginPasswordChange | 改密是否尝试/成功、密码是否已写入私有 .env、固定 failure stage/class。 |
+| postLoginSmallBusinessApplication | 小开发者申请是否尝试/提交成功、固定 failure stage/class。 |
+| screenshots | 仅文件名元数据，例如 03-developer-membership.png、02-account-information.png、04-small-business-application.png。 |
 
 截图规则：
 
 - 03-developer-membership.png：仅 active，且会员详情导航与内容确认后生成；
 - 02-account-information.png：仅 Account 个人信息路由和姓名/生日卡稳定后生成；
+- 04-small-business-application.png：仅小开发者申请提交确认后生成；
 - 认证页、OTP 页、OCR 过程不能成为成功截图；
 - 保留在报告目录的截图属于私有数据，绝不作为默认反馈附件。
 
@@ -107,7 +118,7 @@ recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=tru
 | APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED | 1（未设置） | SMS 后置动态接续；`1` 开启，`0` 关闭，与 SMS provider 配置独立。 |
 | APPLE_AUTOMATION_SMS_RECONFIGURE | 0 | 号码与短信服务地址重新录入；`1` 开启重新配置，`0` 关闭并沿用已有配置。 |
 
-.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、name、birthday。它不进入命令行、audit、report 或 Git。
+.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、developer_registration_identity、name、birthday；Account 改密成功后会覆盖 APPLE_PASSWORD。它不进入命令行、audit、report 或 Git，终端也不打印新密码明文。
 
 ## 6. System Settings 状态机与审计
 
@@ -163,7 +174,7 @@ allowlist 都会失败。
 | npm.cmd run -s test:release-copy-paths | 分发包、release README、当前运行手册与关键文档合同。 |
 | git diff --check | 空白符与补丁基础检查。 |
 
-Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只在当前精确 push 的 SHA 上做只读/受监督验证；流程见 docs/WINDOWS_MAC_CODEX.md。
+Windows 运行 Windows-safe 回归，不执行真实 Apple 登录。Mac `verify` 在当前精确 push 的 SHA 上做只读/受监督验证；Mac `implementation` 在受控 writer lock 下做 macOS 特定实现、测试、优化与 ruyiPage 页面注释，返回脱敏 diff/manifest/annotation。流程见 docs/WINDOWS_MAC_CODEX.md。
 
 ## 9. 故障归属
 
@@ -171,7 +182,8 @@ Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只�
 | --- | --- | --- |
 | Developer login / membership | Python browser state | scripts/ruyipage/apple_account_flow.py、flow-audit.jsonl。 |
 | developer_membership_gate_blocked | Python gate + Node summary | apple_account_flow.py、account-browser-flow.js。 |
-| Account tab / login / profile | Python Account stage | apple_account_flow.py、test-account-browser-flow.mjs。 |
+| Account tab / login / profile / password | Python Account stage | apple_account_flow.py、test-account-browser-flow.mjs。 |
+| 小开发者申请 | Python Small Business stage + Node summary | apple_account_flow.py、account-browser-flow.js、flow-audit.jsonl。 |
 | 2FA provider / timeout | Node collector | two-fa-sidecar.js、2fa-audit.jsonl。 |
 | OTP 到网页后的输入/提交 | Python owner-frame BiDi | 2FA_HANDOFF_DIAGNOSTICS.md。 |
 | 报告/acceptance marker | Main flow | apple-id-full-flow.mjs。 |
@@ -186,3 +198,8 @@ Windows 只运行 Windows-safe 回归，不执行真实 Apple 登录。Mac 只�
 - docs/superpowers/plans/：历史实现决策；不替代当前运行手册。
 
 每次实现改变执行顺序、环境变量、截图、固定状态、报告字段或测试入口时，至少同步 README、运行手册、项目参考、release README 和静态文档合同测试。
+# Platform policy update (2026-08-02)
+
+Windows and Mac are both development hosts. Mac implementation work must use the controlled
+`--mac-mode implementation` writer flow; browser automation remains ruyiPage-only and secrets
+remain denied.

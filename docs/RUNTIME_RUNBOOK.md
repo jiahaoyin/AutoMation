@@ -1,4 +1,4 @@
-# 当前运行手册：Developer-first → Account
+# 当前运行手册：Developer-first → Account → Small Business
 
 > 本文是当前运行行为的唯一操作入口。历史计划保留为决策记录；遇到旧流程描述时，以本文、README.md 与当前源码为准。
 
@@ -10,7 +10,9 @@
 2. 复用统一 Apple 身份验证与 2FA 上下文，判定 Developer 会员状态；
 3. 立即持久化固定的 developer_membership 结果；
 4. 根据 DEVELOPER_MEMBERSHIP_GATE 决定是否新建 Account 标签页；
-5. Account 模块在 https://account.apple.com/account/manage/section/information 采集个人信息。
+5. Account 模块在 https://account.apple.com/account/manage/section/information 采集个人信息；
+6. 进入 Account「登录与安全性」修改密码，并把新密码写回私有 `.env` 的 `APPLE_PASSWORD`；
+7. 新建 Small Business Program 申请标签页并提交小开发者申请。
 
 Firefox 启动、标签页创建、导航、页面查询、输入、点击和截图都由 scripts/ruyipage/apple_account_flow.py 经 ruyiPage 完成。Node 进程只做 JSONL、2FA provider、脱敏 audit、报告、私有 .env 持久化和终端进度，不持有浏览器控制连接。
 
@@ -33,6 +35,10 @@ sequenceDiagram
         Account-->>Ruyi: Account home 已确认
         Ruyi->>Account: 打开个人信息页
         Ruyi-->>Node: 资料采集状态 / 截图元数据
+        Ruyi->>Account: 登录与安全性改密
+        Node->>Node: 隐藏明文并更新私有 APPLE_PASSWORD
+        Ruyi->>Dev: 新建小开发者申请标签页
+        Dev-->>Ruyi: Thank you for your submission
     else Developer 已认证且 gate=1 且非 active
         Ruyi-->>Node: developer_membership_gate_blocked
         Node-->>User: 正常 gate stop
@@ -112,7 +118,7 @@ Enter 不代表成功，只是让扫描器重新读取状态。最终仍以 sign
 
 ### 测试模式：DEVELOPER_MEMBERSHIP_GATE=0
 
-默认值。Developer 登录确认后，模块产生 active、not_enrolled 或 unknown 时都会继续执行 Account 模块。这个模式用于回归两段流程、确认新的 Account tab 和个人信息采集。Developer 仍停在 Apple 登录页、凭据输入失败或 2FA 未完成时属于登录失败：不得把它降级为 unknown，也不得创建 Account tab。
+默认值。Developer 登录确认后，模块产生 active、not_enrolled 或 unknown 时都会继续执行 Account 模块。这个模式用于回归完整浏览器链路，确认新的 Account tab、个人信息采集、改密和小开发者申请。Developer 仍停在 Apple 登录页、凭据输入失败或 2FA 未完成时属于登录失败：不得把它降级为 unknown，也不得创建 Account tab。
 
 ### 业务模式：DEVELOPER_MEMBERSHIP_GATE=1
 
@@ -131,7 +137,7 @@ Enter 不代表成功，只是让扫描器重新读取状态。最终仍以 sign
 
 | 内部状态 | .env 写入 | 用户可见终端 | 详情截图 |
 | --- | --- | --- | --- |
-| active | developer_membership=已加入 | 已加入会员的固定提示 | 03-developer-membership.png，且仅在会员详情导航成功、详情内容确认后保存。 |
+| active | developer_membership=已加入；developer_registration_identity=详情卡注册身份 | 已加入会员的固定提示 | 03-developer-membership.png，且仅在会员详情导航成功、详情内容确认后保存。 |
 | not_enrolled | developer_membership=未加入 | 未加入的固定提示 | 不保存。 |
 | unknown | developer_membership=未确认 | 未确认的固定提示 | 不保存。 |
 
@@ -144,6 +150,16 @@ Account 个人信息页的契约独立于 Developer 截图：
 - 先读生日，再打开姓名弹窗并按**名在前、姓在后**组合；
 - 成功就保存 screenshots/02-account-information.png；
 - 私有 .env 写入 name、birthday。
+
+个人信息写入后继续执行 Account 改密：新密码固定生成 16 位，包含大小写英文、数字和常见特殊字符，并排除易混淆字符。网页确认密码已更改后，Node 立即更新私有 `.env` 中的 `APPLE_PASSWORD`；终端只显示“已写入且隐藏”，不会输出明文。后续小开发者申请如果需要重新登录，Python 会直接使用本轮生成的新密码。
+
+小开发者申请页固定打开：
+
+~~~text
+https://developer.apple.com/app-store/small-business-program/enroll/
+~~~
+
+模块会兼容英文和中文页面：选择 Paid Applications Agreement 的 Yes/已接受，四个 Associated Developer Accounts 问题选择 No/否，勾选收益声明，再点击 Submit/提交。成功确认后保存 screenshots/04-small-business-application.png。
 
 认证页和 OTP 页不是截图目标；它们不应产出全页截图。
 
@@ -175,8 +191,8 @@ APPLE_AUTOMATION_TERMINAL_DEBUG=1 ./run.sh --skip-mac
 | flow-audit.jsonl | Node、ruyiPage、Developer、Account、mac_settings、截图、gate、最终完成状态。 | 否，只含固定分类与布尔字段。 |
 | 2fa-audit.jsonl | popup / OCR / Settings / manual 的 provider 生命周期。 | 否，绝不含 OTP。 |
 | report.json | 面向调用方的状态汇总、截图文件名和失败分类。 | 不含账号、密码、OTP、Cookie、个人资料值。 |
-| screenshots/ | 仅 active 会员详情和稳定个人信息页面。 | 是，按私有数据保管，勿上传。 |
-| .env | 本机输入凭据与成功采集的 developer_membership、name、birthday。 | 是，私有文件，勿读取/共享/提交。 |
+| screenshots/ | 仅 active 会员详情、稳定个人信息页面、小开发者提交确认页面。 | 是，按私有数据保管，勿上传。 |
+| .env | 本机输入凭据、成功采集的 developer_membership/name/birthday，以及改密后的 APPLE_PASSWORD。 | 是，私有文件，勿读取/共享/提交。 |
 
 System Settings 的详细记录也在 `flow-audit.jsonl` 中，以
 `source=mac_settings,event=event` 形式出现。`event` 的字段经过固定 allowlist
@@ -225,7 +241,10 @@ rg '"source":"mac_settings"' data/reports/apple-id-flow-*/flow-audit.jsonl
 | 3 | account_home_confirmed | Account 登录态已确认。 |
 | 4 | profile_capture_started | 正在打开个人信息页。 |
 | 5 | screenshot_capture（account_information） | 个人信息截图已经生成。 |
-| 6 | profile_capture_failed | Account 登录可以已成功，但资料采集 partial；Firefox 按保留策略留在现场。 |
+| 6 | profile_name_modal_closed | 姓名读取后已关闭姓名弹窗。 |
+| 7 | password_change_completed | 网页已确认密码更改；Node 随即把新密码写入私有 .env。 |
+| 8 | small_business_application_completed | 小开发者申请已提交并确认成功。 |
+| 异常 | profile_capture_failed / password_change_failed / small_business_application_failed | Account 登录可以已成功，但后置步骤 partial；Firefox 按保留策略留在现场。 |
 
 最终在 flow-audit.jsonl 查 acceptance_marker_completed、acceptance_marker_partial 或 acceptance_marker_skipped。只有 account_home_confirmed 为真时，才允许出现 Account home acceptance marker。
 
@@ -256,13 +275,15 @@ twofa_code_delivery_started
 | active 但没有会员截图 | 会员详情导航/内容确认没有成功。 | developer_membership_checked 前后的状态与 screenshots.developerMembership 元数据。 |
 | Account tab 创建失败 | Developer 结果已持久化；是 Account 模块问题。 | account_module_started、account_module_tab_created、failureStage。 |
 | Account home 确认后资料采集失败 | 登录成功与资料采集 partial 是两个结果。 | account_home_confirmed、profile_capture_failed、浏览器是否保留。 |
+| 密码网页已改但后续登录失败 | 先核对私有 .env 是否已更新 APPLE_PASSWORD。 | password_change_completed、password_change_partial、终端隐藏写入提示。 |
+| 小开发者申请没有提交成功 | 表单语义匹配、Submit 可用性或提交确认失败。 | small_business_application_*、postLoginSmallBusinessApplication。 |
 | 个人信息截图不是目标页面 | route 或卡片稳定性不足。 | profile_capture_readiness、screenshot_capture 的 checkpoint。 |
 | 2FA 窗口已关但终端仍显示旧提示 | popup 清理是独立的尽力收尾；看 collector 固定结果，不要以 UI 消失单独判断失败。 | 2fa-audit.jsonl 的 provider completion/cleanup。 |
 | target_resolved 之后无 input_completed | OTP 控件已经找到，但 BiDi 输入确认未完成。 | 2FA_HANDOFF_DIAGNOSTICS.md 与 owner frame / empty-cell guards。 |
 
 ## 9. Windows 开发与 Mac 验证
 
-Windows 修改、测试、提交、推送；Mac 只验证**已推送的精确 SHA**。真实 Apple 登录、人工 2FA 与 GUI 会话仅在用户明确监督的 Mac 验证中执行。常规 Windows 回归不跑真实登录：
+Windows and Mac are full development hosts. Mac `verify` validates the pushed exact SHA; Mac `implementation` has full writer-lock authority for source, tests, macOS optimization, ruyiPage browser work, native GUI, runtime, network, credentials required by the task, and Git commit/push when required. Returned artifacts remain sanitized.
 
 ~~~powershell
 npm.cmd run -s test:account-browser-flow
@@ -273,10 +294,16 @@ npm.cmd run -s test:release-copy-paths
 git diff --check
 ~~~
 
-Mac 同步、只读 sandbox、受监督 GUI、回传证据与重测规则见 [Windows → Mac 调度手册](WINDOWS_MAC_CODEX.md) 和 [Mac 交接](MAC_CODEX_HANDOFF.md)。
+Mac 同步、双模式 sandbox、受监督 GUI、实现回传与重测规则见 [Windows → Mac 调度手册](WINDOWS_MAC_CODEX.md) 和 [Mac 交接](MAC_CODEX_HANDOFF.md)。
 
 ## 10. 维护规则
 
 - 先改拥有该状态的最小模块，再加定点测试；不要为了一个状态缺口换浏览器框架。
 - 每次新增/改名固定状态，都要同步 flow-audit.jsonl、report.json sanitization、README/本手册及静态文档合同测试。
 - 当前执行顺序是 Developer-first。旧的“Account 完成后再跑 Developer”仅是历史计划，不是可运行行为。
+# Current Mac execution policy (2026-08-02)
+
+Mac supports two orchestrated modes: `verify` (default, read-only exact-SHA validation) and
+`implementation` (full-permission exclusive writer for all macOS-specific implementation, runtime, GUI, network, and ruyiPage annotation work).
+Implementation results are returned as sanitized diff/untracked/annotation artifacts; the full project-development contract remains active.
+separate and verification-only.

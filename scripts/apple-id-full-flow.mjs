@@ -243,6 +243,7 @@ const MAC_SETTINGS_EVENT_NAMES = new Set([
   "code_provider_poll_started",
   "code_provider_poll_empty",
   "code_provider_code_ready",
+  "sms_code_not_received",
   "state_probe",
   "state_stable",
   "sms_surface_loading",
@@ -472,7 +473,7 @@ export function sanitizeMacSettingsEvent(event = {}) {
   if (typeof event?.probeOnly === "boolean") safe.probeOnly = event.probeOnly;
   if (typeof event?.ok === "boolean") safe.ok = event.ok;
   if (typeof event?.signedIn === "boolean") safe.signedIn = event.signedIn;
-  for (const key of ["step", "attempt", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "nextPasswordLength", "axOwnerPid", "visualOwnerPid", "windowId"]) {
+  for (const key of ["step", "attempt", "attempts", "rounds", "polls", "probeAttempt", "stableReads", "observations", "elapsedMs", "timeoutMs", "pollIntervalMs", "nextPasswordLength", "axOwnerPid", "visualOwnerPid", "windowId"]) {
     const value = safeMacSettingsEventNumber(event?.[key]);
     if (value !== undefined) safe[key] = value;
   }
@@ -580,6 +581,15 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
     source.postLoginProfileCapture && typeof source.postLoginProfileCapture === "object"
       ? source.postLoginProfileCapture
       : null;
+  const passwordChange =
+    source.postLoginPasswordChange && typeof source.postLoginPasswordChange === "object"
+      ? source.postLoginPasswordChange
+      : null;
+  const smallBusinessApplication =
+    source.postLoginSmallBusinessApplication &&
+    typeof source.postLoginSmallBusinessApplication === "object"
+      ? source.postLoginSmallBusinessApplication
+      : null;
   const finalization =
     source.postLoginFinalization && typeof source.postLoginFinalization === "object"
       ? source.postLoginFinalization
@@ -597,6 +607,36 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
   const browserSkipped = source.skipped === true;
   const profileCaptureSkipped = browserSkipped || developerMembershipGateBlocked;
   const accountHomeConfirmed = browserLogin.accountHomeConfirmed === true;
+  const passwordChangeSkipped =
+    browserSkipped ||
+    developerMembershipGateBlocked ||
+    profileCapture?.success === false;
+  const passwordChangeState = passwordChangeSkipped
+    ? "skipped"
+    : passwordChange?.success === true && passwordChange?.passwordStored === true
+      ? "succeeded"
+      : passwordChange?.attempted === true
+        ? "partial"
+        : accountHomeConfirmed && profileCapture?.success === true
+          ? "unknown"
+          : "skipped";
+  const smallBusinessApplicationState =
+    smallBusinessApplication?.success === true &&
+    smallBusinessApplication?.submitted === true
+      ? "succeeded"
+      : smallBusinessApplication?.attempted === true
+        ? "partial"
+        : browserSkipped ||
+            developerMembershipGateBlocked ||
+            profileCapture?.success === false ||
+            passwordChangeState !== "succeeded"
+          ? "skipped"
+          : "unknown";
+  const rawPasswordStored = passwordChange ? passwordChange.passwordStored === true : null;
+  const rawPasswordLength =
+    passwordChange && Number.isInteger(passwordChange.passwordLength)
+      ? Math.min(1024, Math.max(0, passwordChange.passwordLength))
+      : null;
   const finalizationClass = finalization
     ? finalizationClassToken(finalization.finalizationClass)
     : null;
@@ -632,6 +672,37 @@ export function summarizeAccountBrowserCompletion(accountBrowser) {
         : accountHomeConfirmed
           ? "partial"
           : "unknown",
+    passwordChangeState,
+    passwordStored:
+      passwordChangeState === "succeeded" || passwordChangeState === "partial"
+        ? rawPasswordStored
+        : null,
+    passwordLength:
+      passwordChangeState === "succeeded" || passwordChangeState === "partial"
+        ? rawPasswordLength
+        : null,
+    passwordChangeFailureStage:
+      passwordChangeState === "partial"
+        ? failureToken(passwordChange?.failureStage)
+        : null,
+    passwordChangeFailureClass:
+      passwordChangeState === "partial"
+        ? failureToken(passwordChange?.failureClass)
+        : null,
+    smallBusinessApplicationState,
+    smallBusinessApplicationSubmitted:
+      smallBusinessApplicationState === "succeeded" ||
+      smallBusinessApplicationState === "partial"
+        ? smallBusinessApplication?.submitted === true
+        : null,
+    smallBusinessApplicationFailureStage:
+      smallBusinessApplicationState === "partial"
+        ? failureToken(smallBusinessApplication?.failureStage)
+        : null,
+    smallBusinessApplicationFailureClass:
+      smallBusinessApplicationState === "partial"
+        ? failureToken(smallBusinessApplication?.failureClass)
+        : null,
     postLoginFinalizationState: browserSkipped
       ? "skipped"
       : !finalization
@@ -845,6 +916,9 @@ export async function main() {
           report.phases.accountBrowser
         );
         const profileCapture = report.phases.accountBrowser?.postLoginProfileCapture;
+        const passwordChange = report.phases.accountBrowser?.postLoginPasswordChange;
+        const smallBusinessApplication =
+          report.phases.accountBrowser?.postLoginSmallBusinessApplication;
         flowAudit.write("account_browser", "completed", {
           success: true,
           ...browserCompletion,
@@ -852,11 +926,14 @@ export async function main() {
         recordFlowPhase(flowAudit, "account_browser", "completed", {
           accountHomeConfirmed: browserCompletion.accountHomeConfirmed,
           profileCaptureState: browserCompletion.profileCaptureState,
+          passwordChangeState: browserCompletion.passwordChangeState,
+          smallBusinessApplicationState:
+            browserCompletion.smallBusinessApplicationState,
           postLoginFinalizationState: browserCompletion.postLoginFinalizationState,
         });
         if (mirrorDiagnostics) {
           console.log(
-            `[apple-automation] status:account_browser_completed:home:${browserCompletion.accountHomeConfirmed ? 1 : 0}:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}`
+            `[apple-automation] status:account_browser_completed:home:${browserCompletion.accountHomeConfirmed ? 1 : 0}:profile:${browserCompletion.profileCaptureState}:password:${browserCompletion.passwordChangeState}:small_business:${browserCompletion.smallBusinessApplicationState}:finalization:${browserCompletion.postLoginFinalizationState}`
           );
         }
         if (browserCompletion.profileCaptureState === "partial") {
@@ -869,6 +946,31 @@ export async function main() {
           if (mirrorDiagnostics) {
             console.warn(
               `[apple-automation] status:browser_login_succeeded_profile_capture_partial:stage:${profileCapture?.failureStage ?? "unknown"}:class:${profileCapture?.failureClass ?? "unknown"}:preserved:${profileCapture?.browserPreserved === true ? 1 : 0}`
+            );
+          }
+        }
+        if (browserCompletion.passwordChangeState === "partial") {
+          flowAudit.write("account_browser", "password_change_partial", {
+            failureStage: passwordChange?.failureStage,
+            failureClass: passwordChange?.failureClass,
+            passwordStored: passwordChange?.passwordStored === true,
+            passwordLength: passwordChange?.passwordLength ?? 0,
+          });
+          if (mirrorDiagnostics) {
+            console.warn(
+              `[apple-automation] status:browser_login_succeeded_password_change_partial:stage:${passwordChange?.failureStage ?? "unknown"}:class:${passwordChange?.failureClass ?? "unknown"}:stored:${passwordChange?.passwordStored === true ? 1 : 0}:length:${passwordChange?.passwordLength ?? 0}`
+            );
+          }
+        }
+        if (browserCompletion.smallBusinessApplicationState === "partial") {
+          flowAudit.write("account_browser", "small_business_application_partial", {
+            failureStage: smallBusinessApplication?.failureStage,
+            failureClass: smallBusinessApplication?.failureClass,
+            submitted: smallBusinessApplication?.submitted === true,
+          });
+          if (mirrorDiagnostics) {
+            console.warn(
+              `[apple-automation] status:browser_login_succeeded_small_business_partial:stage:${smallBusinessApplication?.failureStage ?? "unknown"}:class:${smallBusinessApplication?.failureClass ?? "unknown"}:submitted:${smallBusinessApplication?.submitted === true ? 1 : 0}`
             );
           }
         }
@@ -951,11 +1053,13 @@ export async function main() {
     });
     recordFlowPhase(flowAudit, "flow", "completed", {
       profileCaptureState: browserCompletion.profileCaptureState,
+      smallBusinessApplicationState:
+        browserCompletion.smallBusinessApplicationState,
       postLoginFinalizationState: browserCompletion.postLoginFinalizationState,
     });
     if (mirrorDiagnostics) {
       console.log(
-        `[apple-automation] status:flow_completed:profile:${browserCompletion.profileCaptureState}:finalization:${browserCompletion.postLoginFinalizationState}:acceptance_marker:${acceptanceMarkerState}`
+        `[apple-automation] status:flow_completed:profile:${browserCompletion.profileCaptureState}:small_business:${browserCompletion.smallBusinessApplicationState}:finalization:${browserCompletion.postLoginFinalizationState}:acceptance_marker:${acceptanceMarkerState}`
       );
     }
   } catch (e) {

@@ -276,6 +276,24 @@ function macSettingsEventSanitizationTest() {
   assert.deepEqual(
     sanitizeMacSettingsEvent({
       module: "sms",
+      event: "sms_code_not_received",
+      polls: 2,
+      elapsedMs: 10_000,
+      pollIntervalMs: 5_000,
+      body: SECRET,
+      code: "123456",
+    }),
+    {
+      module: "sms",
+      event: "sms_code_not_received",
+      polls: 2,
+      elapsedMs: 10_000,
+      pollIntervalMs: 5_000,
+    }
+  );
+  assert.deepEqual(
+    sanitizeMacSettingsEvent({
+      module: "sms",
       event: "manual_required",
       stage: "surface_unavailable",
       reason: "state_waiting",

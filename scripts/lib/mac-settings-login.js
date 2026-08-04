@@ -988,7 +988,12 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
       try {
         smsResult = await completeSupervisedMacSettingsSmsVerification({
         phoneNumber: smsConfig.phoneNumber,
-        codeProvider: createSmsProviderCodePoller(smsConfig),
+        codeProvider: createSmsProviderCodePoller(smsConfig, {
+          // One HTTP request per invocation; the coordinator owns the fixed
+          // five-second cadence and emits an observable heartbeat for each poll.
+          requestTimeoutMs: 5_000,
+        }),
+        providerPollIntervalMs: 5_000,
         supervised: true,
         manualContinuation:
           canConfirmMacSettingsManually
@@ -999,7 +1004,7 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
                 return true;
               }
             : undefined,
-        onProgress: ({ event }) => {
+        onProgress: ({ event, polls, pollIntervalMs, elapsedMs }) => {
           const message = {
             phone_selection_detected: "检测到验证码接收方式，正在匹配已配置号码",
             phone_selection_submitted: "验证码接收方式已提交，等待验证码输入页加载",
@@ -1008,12 +1013,22 @@ export async function runMacSettingsLoginPhase(creds, options = {}) {
             manual_sms_code_entry_waiting: "人工接续后正在等待六位验证码输入页",
             code_entry_detected: "验证码输入页已就绪",
             code_polling_started: "正在轮询验证码",
+            code_provider_poll_started: "\u6b63\u5728\u67e5\u8be2\u77ed\u4fe1\u670d\u52a1",
+            code_provider_poll_empty: "\u77ed\u4fe1\u670d\u52a1\u6682\u672a\u8fd4\u56de\u9a8c\u8bc1\u7801\uff0c5\u79d2\u540e\u7ee7\u7eed\u8f6e\u8be2",
+            sms_code_not_received: "\u9650\u5b9a\u8f6e\u8be2\u65f6\u95f4\u5185\u672a\u83b7\u53d6\u5230\u77ed\u4fe1\u9a8c\u8bc1\u7801\uff0c\u8bf7\u68c0\u67e5\u77ed\u4fe1\u670d\u52a1\u6216\u624b\u52a8\u8f93\u5165",
             code_written: "验证码已写入，等待页面切换确认",
             code_transition_waiting: "验证码页面仍在处理，等待切换确认",
             code_submitted: "验证码已写入，等待下一确认模块",
             code_transition_observed: "验证码页面已跳转，继续后续确认",
           }[event];
-          if (message) console.log(`[Mac 设置][短信] ${message}`);
+          if (message) {
+            const suffix = event === "code_provider_poll_started" && Number.isFinite(polls)
+              ? `\uFF08\u7B2C${polls}\u6B21\uFF0C\u95F4\u9694${Math.round((pollIntervalMs ?? 5_000) / 1_000)}\u79D2\uFF09`
+              : event === "code_provider_poll_empty" && Number.isFinite(elapsedMs)
+                ? `\uFF08\u672C\u8F6E\u8017\u65F6${Math.round(elapsedMs / 100) / 10}\u79D2\uFF09`
+                : "";
+            console.log(`[\u004Dac \u8BBE\u7F6E][\u77ED\u4FE1] ${message}${suffix}`);
+          }
         },
           onEvent: options.onEvent,
         });

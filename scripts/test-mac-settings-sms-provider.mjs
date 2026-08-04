@@ -58,6 +58,69 @@ assert.equal(
   "222222",
   "a front-end query input value must be treated as page data, not discarded with HTML tags"
 );
+assert.equal(
+  extractSmsVerificationCode(
+    JSON.stringify({
+      messages: [
+        {
+          id: 1,
+          from: "Apple",
+          to: "+13802529155",
+          body: "Apple account verification code: 111111",
+          date_sent: "2026-08-03T07:28:55.000Z",
+        },
+        {
+          id: 2,
+          from: "Apple",
+          to: "+13802529155",
+          body: "Apple account verification code: 222222",
+          date_sent: "2026-08-03T07:28:56.000Z",
+        },
+      ],
+    }),
+    "55"
+  ),
+  "222222",
+  "the LixSMS JSON envelope must read messages[].body and choose the newest configured recipient message"
+);
+assert.equal(
+  extractSmsVerificationCode(
+    JSON.stringify({
+      messages: [
+        {
+          to: "+13802529156",
+          body: "Apple account verification code: 333333",
+          date_sent: "2026-08-03T07:28:56.000Z",
+        },
+      ],
+    }),
+    "55"
+  ),
+  null,
+  "a LixSMS message sent to another configured suffix must not be used"
+);
+assert.equal(
+  extractSmsVerificationCode(
+    JSON.stringify({
+      messages: [{ to: "+13802529155", id: "123456", body: "" }],
+    }),
+    "55"
+  ),
+  null,
+  "an empty LixSMS body must not fall back to a message id"
+);
+assert.equal(
+  extractSmsVerificationCode(
+    JSON.stringify({
+      messages: [],
+      to: "+13802529155",
+      code: "123456",
+    }),
+    "55"
+  ),
+  null,
+  "an empty LixSMS envelope must not fall back to root-level code fields"
+);
 
 function providerResponse(body, { status = 200, headers = {}, setCookies = [] } = {}) {
   const baseHeaders = new Headers(headers);
@@ -95,7 +158,6 @@ function providerResponse(body, { status = 200, headers = {}, setCookies = [] } 
             setCookies: ["sms_session=ready; Path=/; HttpOnly"],
           });
         }
-        if (calls.length === 2) return providerResponse("<div>正在查询短信记录</div>");
         return providerResponse(
           JSON.stringify([
             { phone: "+8613800130051", code: "111111", createdAt: "2026-07-31T10:01:00Z" },
@@ -105,8 +167,11 @@ function providerResponse(body, { status = 200, headers = {}, setCookies = [] } 
       },
     }
   );
+  const first = await poller({ signal: new AbortController().signal, timeoutMs: 2_000 });
   const code = await poller({ signal: new AbortController().signal, timeoutMs: 2_000 });
+  assert.equal(first, null, "a redirect consumes one polling slot and is followed on the next heartbeat");
   assert.equal(code, "222222");
+  assert.equal(calls.length, 2, "each provider invocation must issue exactly one HTTP request");
   assert.equal(calls[0].options.redirect, "manual");
   assert.equal(calls[0].options.cache, "no-store");
   assert.equal(calls[0].options.keepalive, true);
@@ -117,7 +182,6 @@ function providerResponse(body, { status = 200, headers = {}, setCookies = [] } 
   assert.equal(calls[0].options.headers.referer, "https://example.test/");
   assert.equal(calls[1].url, "https://example.test/inbox");
   assert.match(calls[1].options.headers.cookie, /sms_session=ready/);
-  assert.match(calls[2].options.headers.cookie, /sms_session=ready/);
 }
 
 {
