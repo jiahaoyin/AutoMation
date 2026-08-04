@@ -1724,6 +1724,133 @@ async function runPasswordChangePersistenceAndRedactionTest() {
   assert.equal(failureWarnings.join("\n").includes(rotatedPassword), false);
 }
 
+async function runPasswordPendingRecoveryAuditTest() {
+  const auditEntries = [];
+  const auditSecrets = [];
+  const flowAudit = {
+    addSecrets(values) {
+      auditSecrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+  const storedPasswords = [];
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_backup_saved",
+      passwordLength: 16,
+      backupKey: "APPLE_PASSWORD_PENDING",
+      rawPassword: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "password_change_failed",
+      failureStage: "password_change",
+      failureClass: "password_change_confirmation_missing",
+      rawPassword: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: {
+        success: false,
+        attempted: true,
+        passwordStored: false,
+        passwordLength: 16,
+        failureStage: "password_change",
+        failureClass: "password_change_confirmation_missing",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: false,
+      },
+    };
+  }, {
+    saveApplePasswordToEnv(value) {
+      storedPasswords.push(value);
+      return "/tmp/test-password.env";
+    },
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase(
+        { ...params, flowAudit },
+        harness.runtime
+      );
+    });
+  });
+
+  assert.deepEqual(storedPasswords, []);
+  assert.equal(result.postLoginPasswordChange.success, false);
+  assert.equal(result.postLoginPasswordChange.attempted, true);
+  assert.equal(result.postLoginPasswordChange.passwordStored, false);
+  assert.equal(result.postLoginPasswordChange.passwordBackupStored, true);
+  assert.equal(result.postLoginPasswordChange.passwordLength, 16);
+  assert.equal(
+    result.postLoginPasswordChange.failureClass,
+    "password_change_confirmation_missing"
+  );
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "password_change_backup_saved" &&
+        entry.details.passwordLength === 16 &&
+        entry.details.backupKey === "APPLE_PASSWORD_PENDING" &&
+        !Object.hasOwn(entry.details, "rawPassword")
+    )
+  );
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_backup_saved" &&
+        entry.details.passwordLength === 16 &&
+        entry.details.backupKey === "APPLE_PASSWORD_PENDING"
+    )
+  );
+  const recoveryEntries = auditEntries.filter(
+    (entry) =>
+      entry.source === "account_browser" &&
+      entry.event === "password_change_recovery_available"
+  );
+  assert.deepEqual(recoveryEntries, [
+    {
+      source: "account_browser",
+      event: "password_change_recovery_available",
+      details: {
+        passwordLength: 16,
+        backupKey: "APPLE_PASSWORD_PENDING",
+        failureClass: "password_change_confirmation_missing",
+      },
+    },
+  ]);
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_partial" &&
+        entry.details.passwordBackupStored === true &&
+        entry.details.failureClass === "password_change_confirmation_missing"
+    )
+  );
+  assert.ok(logs.some((line) => line.includes(".env") && line.includes("16")));
+  assert.ok(
+    warnings.some(
+      (line) => line.includes("APPLE_PASSWORD_PENDING") && line.includes("16")
+    )
+  );
+  const allOutput = JSON.stringify({ result, auditEntries, auditSecrets, logs, warnings });
+  assert.equal(allOutput.includes(SECRET_FIXTURE), false);
+}
+
 async function runPasswordChangeMenuStatusSanitizationTest() {
   const entries = [];
   const secrets = [];
@@ -4287,6 +4414,7 @@ function runEnvDataParsingTest() {
     "APPLE_AUTOMATION_SMS_API_URL",
     "APPLE_AUTOMATION_SMS_RECONFIGURE",
     "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+    "APPLE_PASSWORD_PENDING",
     "APPLE_AUTOMATION_SUPERVISED_GUI",
     "APPLE_AUTOMATION_TERMINAL_DEBUG",
   ];
@@ -4298,7 +4426,7 @@ function runEnvDataParsingTest() {
   try {
     fs.writeFileSync(
       envPath,
-      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nAPPLE_AUTOMATION_SUPERVISED_GUI=1\r\nAPPLE_AUTOMATION_TERMINAL_DEBUG=true\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
+      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nAPPLE_PASSWORD_PENDING=stale-password\r\nAPPLE_PASSWORD_PENDING=duplicate-password\r\nAPPLE_AUTOMATION_SUPERVISED_GUI=1\r\nAPPLE_AUTOMATION_TERMINAL_DEBUG=true\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
       "utf8"
     );
     fs.chmodSync(envPath, 0o644);
@@ -4314,6 +4442,7 @@ function runEnvDataParsingTest() {
     assert.equal(process.env.APPLE_AUTOMATION_SMS_API_URL, "https://example.test/record?token=private");
     assert.equal(process.env.APPLE_AUTOMATION_SMS_RECONFIGURE, "1");
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
+    assert.equal(Object.hasOwn(process.env, "APPLE_PASSWORD_PENDING"), false);
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_SUPERVISED_GUI"), false);
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_TERMINAL_DEBUG"), false);
     assert.equal(
@@ -4364,6 +4493,7 @@ function runEnvDataParsingTest() {
     const saved = fs.readFileSync(envPath, "utf8");
     assert.match(saved, /^APPLE_PASSWORD=Nw2!SafePass_2026$/m);
     assert.equal((saved.match(/^APPLE_PASSWORD=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^APPLE_PASSWORD_PENDING=/gm) ?? []).length, 0);
     assert.match(saved, /^name="Test Given Test Family"$/m);
     assert.match(saved, /^birthday=2000-01-02$/m);
     assert.match(saved, /^developer_membership=未确认$/m);
@@ -4987,6 +5117,7 @@ const focusedTests = {
   },
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
   "password-change": runPasswordChangePersistenceAndRedactionTest,
+  "password-pending-recovery": runPasswordPendingRecoveryAuditTest,
   "password-change-menu-status": runPasswordChangeMenuStatusSanitizationTest,
   "password-failure-small-business":
     runPasswordChangeFailureContinuesSmallBusinessApplicationTest,
@@ -5071,6 +5202,7 @@ await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
   await runProfilePersistenceAndAuditRedactionTest();
   await runPasswordChangePersistenceAndRedactionTest();
+  await runPasswordPendingRecoveryAuditTest();
   await runPasswordChangeMenuStatusSanitizationTest();
   await runPasswordChangeFailureContinuesSmallBusinessApplicationTest();
   await runSmallBusinessApplicationSanitizationTest();

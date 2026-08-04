@@ -16469,6 +16469,142 @@ process.stdout.write(query.call(modal));
             )
             self.assertTrue(confusing.isdisjoint(password))
 
+    def test_pending_password_backup_is_atomic_private_and_deduplicated(self):
+        pending_password = "Aa2!Bb3@Cc4#Dd5$"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_bytes(
+                (
+                    "APPLE_PASSWORD=OldPass123!\r\n"
+                    "APPLE_PASSWORD_PENDING=stale-value\r\n"
+                    "APPLE_PASSWORD_PENDING=duplicate-value\r\n"
+                    "name=Test User\r\n"
+                ).encode("utf-8")
+            )
+            with patch(
+                "apple_account_flow.resolve_pending_password_env_path",
+                return_value=env_path,
+            ):
+                self.assertEqual(
+                    account_flow.persist_pending_apple_password_to_env(pending_password),
+                    env_path,
+                )
+
+            saved = env_path.read_bytes().decode("utf-8")
+            self.assertIn(
+                (
+                    f"{account_flow.APPLE_PASSWORD_PENDING_ENV_KEY}="
+                    f"{account_flow.format_pending_password_env_value(pending_password)}"
+                ),
+                saved,
+            )
+            self.assertEqual(
+                saved.count(f"{account_flow.APPLE_PASSWORD_PENDING_ENV_KEY}="),
+                1,
+            )
+            self.assertIn("APPLE_PASSWORD=OldPass123!", saved)
+            self.assertIn("name=Test User", saved)
+            self.assertIn("\r\n", saved)
+            self.assertEqual(re.sub(r"(?<!\r)\n", "", saved), saved)
+            self.assertEqual(list(Path(temp_dir).glob(".*.tmp")), [])
+            if os.name != "nt":
+                self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+
+    def test_pending_password_backup_normalizes_parent_directory_write_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / "pending" / ".env"
+            with patch(
+                "apple_account_flow.resolve_pending_password_env_path",
+                return_value=env_path,
+            ), patch.object(Path, "mkdir", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "account password backup could not be saved",
+                ) as raised:
+                    account_flow.persist_pending_apple_password_to_env("Aa2!Bb3@Cc4#Dd5$")
+
+        self.assertEqual(
+            account_flow.classify_account_password_change_failure(raised.exception),
+            "password_change_backup_failed",
+        )
+
+    def test_account_security_snapshot_includes_visible_portal_confirmation_text(self):
+        class PortalConfirmationPage:
+            def __init__(self):
+                self.snapshot_script = ""
+
+            def run_js(self, script):
+                if "location.href" in script and "JSON.stringify" not in script:
+                    return account_flow.ACCOUNT_SECURITY_URL
+                if "ruyipage-account-security-page-snapshot" in script:
+                    self.snapshot_script = script
+                    return json.dumps(
+                        {
+                            "securityPage": True,
+                            "passwordCard": True,
+                            "passwordForm": False,
+                            "passwordFieldCount": 0,
+                            "passwordChanged": True,
+                        }
+                    )
+                raise AssertionError("unexpected page query")
+
+        page = PortalConfirmationPage()
+        snapshot = account_flow.account_security_page_snapshot(page)
+
+        self.assertTrue(snapshot["passwordChanged"])
+        self.assertIn("const bodyText = visibleText(document.body)", page.snapshot_script)
+        self.assertIn("[role='dialog']", page.snapshot_script)
+        self.assertNotIn("document.querySelector('main')?.innerText ||", page.snapshot_script)
+
+    def test_password_backup_failure_prevents_all_password_field_input(self):
+        events = []
+        fields = {
+            "current": (object(), FakeElement()),
+            "new": (object(), FakeElement()),
+            "confirm": (object(), FakeElement()),
+        }
+        with patch(
+            "apple_account_flow.navigate_to_account_security",
+            return_value="account_security",
+        ), patch(
+            "apple_account_flow.wait_for_account_password_card",
+            return_value=(object(), FakeElement()),
+        ), patch(
+            "apple_account_flow.wait_for_account_password_card_action",
+            return_value=(object(), FakeElement(), "direct"),
+        ), patch("apple_account_flow.human_click"), patch(
+            "apple_account_flow.wait_for_account_password_change_form",
+            return_value=fields,
+        ), patch(
+            "apple_account_flow.generate_account_password",
+            return_value="Aa2!Bb3@Cc4#Dd5$",
+        ), patch(
+            "apple_account_flow.persist_pending_apple_password_to_env",
+            side_effect=RuntimeError("account password backup could not be saved"),
+        ), patch("apple_account_flow.input_and_verify") as input_and_verify_mock, patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            with self.assertRaisesRegex(RuntimeError, "password backup"):
+                account_flow.change_account_password(
+                    object(),
+                    "OldPass123!",
+                    FakeKeys,
+                    pause=lambda *_: None,
+                )
+
+        input_and_verify_mock.assert_not_called()
+        failures = [
+            event
+            for event in events
+            if event.get("status") == "password_change_failed"
+        ]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(
+            failures[0]["failureClass"],
+            "password_change_backup_failed",
+        )
+
     def test_password_change_fields_use_semantics_then_dom_order_fallback(self):
         current = FakeElement(
             attrs={
@@ -16694,6 +16830,7 @@ process.stdout.write(query.call(modal));
         events = []
         typed: list[tuple[str, str]] = []
         click_order: list[str] = []
+        password_write_order: list[str] = []
         new_password = "Aa2!Bb3@Cc4#Dd5$"
         link = FakeElement(
             attrs={
@@ -16851,7 +16988,13 @@ process.stdout.write(query.call(modal));
         def fake_input(scope, field, value, label, keys, **kwargs):
             self.assertIs(scope, page)
             self.assertEqual(label, "password")
+            password_write_order.append("input")
             typed.append((field.attrs["id"], value))
+
+        def fake_backup(value):
+            self.assertEqual(value, new_password)
+            password_write_order.append("backup")
+            return Path("pending-password.env")
 
         with patch("apple_account_flow.emit", side_effect=events.append), patch(
             "apple_account_flow.human_click",
@@ -16859,6 +17002,9 @@ process.stdout.write(query.call(modal));
         ), patch("apple_account_flow.wait_for_document_settle"), patch(
             "apple_account_flow.generate_account_password",
             return_value=new_password,
+        ), patch(
+            "apple_account_flow.persist_pending_apple_password_to_env",
+            side_effect=fake_backup,
         ), patch("apple_account_flow.input_and_verify", side_effect=fake_input), patch(
             "apple_account_flow.human_pause", lambda *_: None
         ):
@@ -16870,6 +17016,8 @@ process.stdout.write(query.call(modal));
             )
 
         self.assertTrue(result["success"])
+        self.assertEqual(password_write_order[0], "backup")
+        self.assertEqual(password_write_order.count("input"), 3)
         self.assertEqual(click_order, ["menu", "start_action", "submit"])
         self.assertEqual(
             typed,
@@ -16904,6 +17052,10 @@ process.stdout.write(query.call(modal));
             statuses.index("password_change_start_action_click_sent"),
             statuses.index("password_change_form_ready"),
         )
+        self.assertLess(
+            statuses.index("password_change_backup_saved"),
+            statuses.index("password_change_submitted"),
+        )
         self.assertNotIn("password_change_card_click_sent", statuses)
         diagnostic_events = [
             event
@@ -16930,6 +17082,7 @@ process.stdout.write(query.call(modal));
     def test_change_account_password_runs_security_card_form_submit_and_success(self):
         events = []
         typed: list[tuple[str, str]] = []
+        backed_up_passwords: list[str] = []
         new_password = "Aa2!Bb3@Cc4#Dd5$"
         link = FakeElement(
             text="登录与安全性",
@@ -17041,12 +17194,20 @@ process.stdout.write(query.call(modal));
             self.assertEqual(label, "password")
             typed.append((field.attrs["id"], value))
 
+        def fake_backup(value):
+            self.assertEqual(value, new_password)
+            backed_up_passwords.append(value)
+            return Path("pending-password.env")
+
         with patch("apple_account_flow.emit", side_effect=events.append), patch(
             "apple_account_flow.human_click",
             side_effect=lambda scope, element, pause=None: scope.actions.human_click(element).perform(),
         ), patch("apple_account_flow.wait_for_document_settle"), patch(
             "apple_account_flow.generate_account_password",
             return_value=new_password,
+        ), patch(
+            "apple_account_flow.persist_pending_apple_password_to_env",
+            side_effect=fake_backup,
         ), patch("apple_account_flow.input_and_verify", side_effect=fake_input), patch(
             "apple_account_flow.human_pause", lambda *_: None
         ):
@@ -17070,6 +17231,7 @@ process.stdout.write(query.call(modal));
         self.assertEqual(result["attempted"], True)
         self.assertEqual(result["newPassword"], new_password)
         self.assertEqual(result["passwordLength"], 16)
+        self.assertEqual(backed_up_passwords, [new_password])
         statuses = [event["status"] for event in events if event.get("event") == "status"]
         self.assertLess(
             statuses.index("account_security_navigation_started"),
@@ -17077,6 +17239,10 @@ process.stdout.write(query.call(modal));
         )
         self.assertLess(
             statuses.index("password_change_form_ready"),
+            statuses.index("password_change_backup_saved"),
+        )
+        self.assertLess(
+            statuses.index("password_change_backup_saved"),
             statuses.index("password_change_submitted"),
         )
         self.assertIn("password_change_completed", statuses)

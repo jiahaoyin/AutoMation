@@ -165,6 +165,7 @@ ACCOUNT_PASSWORD_SUBMIT_SELECTORS = (
 ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S = 35.0
 ACCOUNT_PASSWORD_CHANGE_SUCCESS_TIMEOUT_S = 25.0
 ACCOUNT_PASSWORD_LENGTH = 16
+APPLE_PASSWORD_PENDING_ENV_KEY = "APPLE_PASSWORD_PENDING"
 ACCOUNT_PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*_-+=?"
 ACCOUNT_PASSWORD_UPPERCASE = "ABCDEFGHJKMNPQRSTUVWXYZ"
 ACCOUNT_PASSWORD_LOWERCASE = "abcdefghjkmnpqrstuvwxyz"
@@ -7082,11 +7083,20 @@ def account_security_page_snapshot(page: Any) -> dict[str, Any]:
             .replace(/\s+/g, ' ')
             .trim()
             .toLocaleLowerCase();
-          const text = normalize(
-            document.querySelector('main')?.innerText ||
-            document.body?.innerText ||
-            ''
-          );
+          // Apple renders transient confirmations through portal/dialog roots
+          // that can live outside <main>. Do not use `main || body` here:
+          // ordinary page text makes main non-empty and hides the confirmation.
+          const visibleText = (element) => visible(element)
+            ? String(element.innerText || element.textContent || '')
+            : '';
+          const bodyText = visibleText(document.body);
+          const overlayText = [...document.querySelectorAll(
+            "[role='dialog'], [role='alert'], [role='status'], [aria-live]"
+          )]
+            .filter(visible)
+            .map((element) => String(element.innerText || element.textContent || ''))
+            .join(' ');
+          const text = normalize([bodyText, overlayText].join(' '));
           const fields = [...document.querySelectorAll('input[type="password"]')]
             .filter(visible)
             .filter((field) => !field.disabled && !field.readOnly);
@@ -7831,8 +7841,108 @@ def generate_account_password(length: int = ACCOUNT_PASSWORD_LENGTH) -> str:
     return "".join(password)
 
 
+def format_pending_password_env_value(value: str) -> str:
+    """Format a single .env value without permitting line-oriented injection."""
+    if not isinstance(value, str) or not value or "\r" in value or "\n" in value or "\0" in value:
+        raise RuntimeError("account password backup value is invalid")
+    if re.search(r"[\s#\"'\\\\]", value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def resolve_pending_password_env_path() -> Path:
+    """Use the same project-local .env file as the Node flow runner."""
+    cwd_path = (Path.cwd() / ".env").expanduser()
+    if cwd_path.exists():
+        return cwd_path.resolve()
+    return (Path(__file__).resolve().parents[2] / ".env").resolve()
+
+
+def persist_pending_apple_password_to_env(password: str) -> Path:
+    """Atomically persist a recoverable password before browser input starts.
+
+    The pending key is intentionally separate from APPLE_PASSWORD. It stays in
+    place if the browser reports an ambiguous post-submit state, and Node
+    promotes it to APPLE_PASSWORD only after a confirmed successful change.
+    """
+    formatted_password = format_pending_password_env_value(password)
+    env_path = resolve_pending_password_env_path()
+    try:
+        if env_path.exists():
+            # Keep the existing line ending style. Path.read_text() uses universal
+            # newline conversion, which would turn CRLF into LF before the atomic
+            # rewrite and make a Windows/macOS backup silently change the file.
+            with env_path.open("r", encoding="utf-8", newline="") as stream:
+                original = stream.read()
+        else:
+            original = ""
+    except OSError as error:
+        raise RuntimeError("account password backup could not read .env") from error
+
+    line_ending = "\r\n" if "\r\n" in original else "\n"
+    updated_lines: list[str] = []
+    handled = False
+    for line in original.splitlines():
+        trimmed = line.strip()
+        if trimmed and not trimmed.startswith("#") and "=" in trimmed:
+            key = trimmed.split("=", 1)[0].strip()
+            if key == APPLE_PASSWORD_PENDING_ENV_KEY:
+                if not handled:
+                    updated_lines.append(
+                        f"{APPLE_PASSWORD_PENDING_ENV_KEY}={formatted_password}"
+                    )
+                    handled = True
+                continue
+        updated_lines.append(line)
+    if not handled:
+        if updated_lines and updated_lines[-1] != "":
+            updated_lines.append("")
+        updated_lines.append("# Pending Apple password recovery backup; do not commit this file.")
+        updated_lines.append(f"{APPLE_PASSWORD_PENDING_ENV_KEY}={formatted_password}")
+
+    content = line_ending.join(updated_lines)
+    if not content.endswith(line_ending):
+        content += line_ending
+    temporary: Path | None = None
+    descriptor: int | None = None
+    try:
+        env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = env_path.with_name(
+            f".{env_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            descriptor = None
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, env_path)
+        temporary = None
+        try:
+            env_path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as error:
+        raise RuntimeError("account password backup could not be saved") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return env_path
+
+
 def classify_account_password_change_failure(error: Exception) -> str:
     message = str(error).casefold()
+    if "password backup" in message:
+        return "password_change_backup_failed"
     if "navigation" in message or "security" in message:
         return "password_change_navigation_failed"
     if "menu action" in message:
@@ -7927,6 +8037,16 @@ def change_account_password(
             }
         )
         new_password = generate_account_password()
+        add_diagnostic_secret(new_password)
+        persist_pending_apple_password_to_env(new_password)
+        emit(
+            {
+                "event": "status",
+                "status": "password_change_backup_saved",
+                "passwordLength": len(new_password),
+                "backupKey": APPLE_PASSWORD_PENDING_ENV_KEY,
+            }
+        )
         for kind, value in (
             ("current", current_password),
             ("new", new_password),
@@ -8596,12 +8716,24 @@ def open_small_business_application_tab(page: Any) -> Any:
     emit({"event": "status", "status": "small_business_application_started"})
     try:
         small_business_page = page.new_tab(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
-    except Exception as error:
-        raise RuntimeError(
-            "new small business application tab could not be created"
-        ) from error
+    except Exception:
+        small_business_page = None
     if small_business_page is None or not browser_connection_is_alive(small_business_page):
-        raise RuntimeError("new small business application tab could not be created")
+        try:
+            blank_tab = page.new_tab("about:blank")
+        except Exception as error:
+            raise RuntimeError(
+                "new small business application tab could not be created"
+            ) from error
+        if blank_tab is None or not browser_connection_is_alive(blank_tab):
+            raise RuntimeError("new small business application tab could not be created")
+        try:
+            blank_tab.get(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
+        except Exception as error:
+            raise RuntimeError(
+                "new small business application tab could not be opened"
+            ) from error
+        small_business_page = blank_tab
     emit({"event": "status", "status": "small_business_application_tab_created"})
     try:
         small_business_page.wait.doc_loaded(timeout=20)

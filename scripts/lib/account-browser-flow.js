@@ -26,6 +26,7 @@ const ALLOWED_READY_MODES = new Set([
 
 const FIXED_ENVIRONMENT_WARNING = "[!] Firefox 环境提示：详情已写入日志";
 const TWO_FACTOR_TIMEOUT_MS = 240_000;
+const PENDING_APPLE_PASSWORD_BACKUP_KEY = "APPLE_PASSWORD_PENDING";
 const DEVELOPER_MEMBERSHIP_STATUSES = new Set([
   "active",
   "not_enrolled",
@@ -155,6 +156,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "password_change_form_wait_started",
   "password_change_card_click_sent",
   "password_change_form_ready",
+  "password_change_backup_saved",
   "password_change_submitted",
   "password_change_completed",
   "password_change_failed",
@@ -350,6 +352,7 @@ const PASSWORD_CHANGE_FAILURE_CLASSES = new Set([
   "password_change_form_unready",
   "password_change_submit_unconfirmed",
   "password_change_confirmation_missing",
+  "password_change_backup_failed",
   "password_change_failed",
   "password_persistence_failed",
   "password_persistence_missing",
@@ -626,6 +629,12 @@ function firstKnownBrowserFailureStage(...values) {
 
 function sanitizePasswordChangeFailureClass(value) {
   return PASSWORD_CHANGE_FAILURE_CLASSES.has(value) ? value : "unknown";
+}
+
+function sanitizePendingApplePasswordBackupKey(value) {
+  return value === PENDING_APPLE_PASSWORD_BACKUP_KEY
+    ? PENDING_APPLE_PASSWORD_BACKUP_KEY
+    : null;
 }
 
 function sanitizeSmallBusinessApplicationFailureClass(value) {
@@ -1070,12 +1079,14 @@ function saveRotatedApplePassword(event, flowAudit, savePassword) {
   writeFlowAudit(flowAudit, "account_browser", "password_persisted", {
     passwordLength,
     passwordStored: true,
+    pendingBackupCleared: true,
   });
   console.log(`[✓] 新密码已写入 .env（${passwordLength} 位，已隐藏）`);
   return {
     attempted: true,
     passwordStored: true,
     passwordLength,
+    pendingBackupCleared: true,
   };
 }
 
@@ -1601,6 +1612,11 @@ function auditRuyiPageEvent(flowAudit, event) {
     if (event.status === "password_change_form_ready") {
       details.fieldCount = event.fieldCount === 3 ? 3 : 0;
     }
+    if (event.status === "password_change_backup_saved") {
+      details.passwordLength = sanitizePasswordLength(event.passwordLength);
+      const backupKey = sanitizePendingApplePasswordBackupKey(event.backupKey);
+      if (backupKey) details.backupKey = backupKey;
+    }
     if (event.status === "password_change_completed") {
       details.passwordLength = sanitizePasswordLength(event.passwordLength);
     }
@@ -1884,6 +1900,9 @@ export async function runAccountBrowserPhase(
     passwordStored: false,
     passwordLength: 0,
     failureClass: "password_change_not_attempted",
+    pendingBackupSaved: false,
+    pendingBackupKey: null,
+    recoveryLogged: false,
   };
   let developerAccount = {
     checked: false,
@@ -1989,6 +2008,28 @@ export async function runAccountBrowserPhase(
         }
         if (
           event.event === "status" &&
+          event.status === "password_change_backup_saved"
+        ) {
+          const passwordLength = sanitizePasswordLength(event.passwordLength);
+          const backupKey = sanitizePendingApplePasswordBackupKey(event.backupKey);
+          if (passwordLength > 0 && backupKey) {
+            passwordChangePersistence = {
+              ...passwordChangePersistence,
+              attempted: true,
+              passwordLength,
+              pendingBackupSaved: true,
+              pendingBackupKey: backupKey,
+              recoveryLogged: false,
+              failureClass: "unknown",
+            };
+            writeFlowAudit(flowAudit, "account_browser", "password_change_backup_saved", {
+              passwordLength,
+              backupKey,
+            });
+          }
+        }
+        if (
+          event.event === "status" &&
           event.status === "password_change_completed" &&
           passwordChangePersistence.passwordStored !== true
         ) {
@@ -2004,6 +2045,7 @@ export async function runAccountBrowserPhase(
             };
           } catch (error) {
             passwordChangePersistence = {
+              ...passwordChangePersistence,
               attempted: true,
               passwordStored: false,
               passwordLength: sanitizePasswordLength(event.passwordLength),
@@ -2023,6 +2065,43 @@ export async function runAccountBrowserPhase(
               "[!] 新密码已在网页确认，但写入 .env 失败，详情已写入日志"
             );
           }
+        }
+        if (
+          event.event === "status" &&
+          event.status === "password_change_failed" &&
+          passwordChangePersistence.pendingBackupSaved === true &&
+          passwordChangePersistence.recoveryLogged !== true
+        ) {
+          const failureClass = sanitizePasswordChangeFailureClass(event.failureClass);
+          passwordChangePersistence = {
+            ...passwordChangePersistence,
+            recoveryLogged: true,
+          };
+          writeFlowAudit(flowAudit, "account_browser", "password_change_recovery_available", {
+            passwordLength: passwordChangePersistence.passwordLength,
+            backupKey: passwordChangePersistence.pendingBackupKey,
+            failureClass,
+          });
+        }
+        if (
+          event.event === "status" &&
+          event.status === "password_change_completed" &&
+          passwordChangePersistence.passwordStored !== true &&
+          passwordChangePersistence.pendingBackupSaved === true &&
+          passwordChangePersistence.recoveryLogged !== true
+        ) {
+          passwordChangePersistence = {
+            ...passwordChangePersistence,
+            recoveryLogged: true,
+          };
+          writeFlowAudit(flowAudit, "account_browser", "password_change_recovery_available", {
+            passwordLength: passwordChangePersistence.passwordLength,
+            backupKey: passwordChangePersistence.pendingBackupKey,
+            failureClass: "password_persistence_failed",
+          });
+          console.warn(
+            `[!] 待确认的新密码备份仍保留在 .env 的 ${PENDING_APPLE_PASSWORD_BACKUP_KEY} 字段（${passwordChangePersistence.passwordLength} 位，已隐藏）`
+          );
         }
         if (event.event === "ready") {
           console.log("[✓] Firefox 浏览器已就绪");
@@ -2162,6 +2241,14 @@ export async function runAccountBrowserPhase(
           );
         } else if (
           event.event === "status" &&
+          event.status === "password_change_backup_saved"
+        ) {
+          const passwordLength = sanitizePasswordLength(event.passwordLength);
+          console.log(
+            `[✓] 已备份待确认的新密码到 .env（${passwordLength} 位，已隐藏）`
+          );
+        } else if (
+          event.event === "status" &&
           event.status === "password_change_failed"
         ) {
           const stage = sanitizeBrowserFailureStage(event.failureStage);
@@ -2169,6 +2256,11 @@ export async function runAccountBrowserPhase(
           console.warn(
             `[!] Apple 账户密码修改未完成（阶段：${stage}，原因：${failureClass}），详情已写入日志`
           );
+          if (passwordChangePersistence.pendingBackupSaved === true) {
+            console.warn(
+              `[!] 待确认的新密码备份仍保留在 .env 的 ${PENDING_APPLE_PASSWORD_BACKUP_KEY} 字段（${passwordChangePersistence.passwordLength} 位，已隐藏）`
+            );
+          }
         } else if (
           event.event === "status" &&
           event.status === "account_security_navigation_sign_in_redirect"
@@ -2407,6 +2499,34 @@ export async function runAccountBrowserPhase(
     sanitizePostLoginSmallBusinessApplication(
       result.postLoginSmallBusinessApplication
     );
+  if (
+    postLoginPasswordChange.success !== true &&
+    passwordChangePersistence.pendingBackupSaved === true
+  ) {
+    postLoginPasswordChange = {
+      ...postLoginPasswordChange,
+      attempted: true,
+      passwordStored: false,
+      passwordBackupStored: true,
+      passwordLength:
+        passwordChangePersistence.passwordLength ||
+        postLoginPasswordChange.passwordLength,
+    };
+    if (passwordChangePersistence.recoveryLogged !== true) {
+      passwordChangePersistence = {
+        ...passwordChangePersistence,
+        recoveryLogged: true,
+      };
+      writeFlowAudit(flowAudit, "account_browser", "password_change_recovery_available", {
+        passwordLength: postLoginPasswordChange.passwordLength,
+        backupKey: passwordChangePersistence.pendingBackupKey,
+        failureClass: postLoginPasswordChange.failureClass,
+      });
+      console.warn(
+        `[!] 待确认的新密码备份仍保留在 .env 的 ${PENDING_APPLE_PASSWORD_BACKUP_KEY} 字段（${postLoginPasswordChange.passwordLength} 位，已隐藏）`
+      );
+    }
+  }
   if (postLoginPasswordChange.success) {
     if (passwordChangePersistence.passwordStored === true) {
       postLoginPasswordChange = {
@@ -2452,6 +2572,7 @@ export async function runAccountBrowserPhase(
     writeFlowAudit(flowAudit, "account_browser", "password_change_partial", {
       passwordLength: postLoginPasswordChange.passwordLength,
       passwordStored: postLoginPasswordChange.passwordStored,
+      passwordBackupStored: postLoginPasswordChange.passwordBackupStored === true,
       failureStage: postLoginPasswordChange.failureStage,
       failureClass: postLoginPasswordChange.failureClass,
     });
