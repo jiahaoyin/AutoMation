@@ -16726,6 +16726,278 @@ process.stdout.write(query.call(modal));
             account_flow.resolve_account_password_change_submit(ambiguous_page)
         )
 
+    def test_password_card_action_accepts_single_unlabeled_icon_button_as_menu(self):
+        icon_button = FakeElement(
+            attrs={
+                "id": "password-more-icon",
+                "tagName": "button",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "",
+                    "label": "",
+                    "hasPopup": "",
+                    "expanded": "",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "semanticActionTarget": False,
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": [icon_button],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        page = FakePage(
+            {"css:main div": [container]},
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        self.assertEqual(
+            account_flow.resolve_account_password_card_action(page, container),
+            (page, icon_button, "menu"),
+        )
+
+    def test_password_card_action_rejects_ambiguous_unlabeled_icon_buttons(self):
+        """Never guess which unlabeled icon controls the password card."""
+        icon_buttons = [
+            FakeElement(
+                attrs={
+                    "id": f"password-icon-{index}",
+                    "tagName": "button",
+                    "accountPasswordAction": {
+                        "visible": True,
+                        "enabled": True,
+                        "tagName": "button",
+                        "role": "",
+                        "label": "",
+                        "hasPopup": "",
+                        "expanded": "",
+                        "semanticActionTarget": True,
+                    },
+                }
+            )
+            for index in range(2)
+        ]
+        container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "semanticActionTarget": False,
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": icon_buttons,
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        page = FakePage(
+            {"css:main div": [container]},
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        self.assertIsNone(
+            account_flow.resolve_account_password_card_action(page, container)
+        )
+
+    def test_password_card_action_rejects_unlabeled_links_or_multiple_buttons(self):
+        def control(element_id: str, tag_name: str) -> FakeElement:
+            return FakeElement(
+                attrs={
+                    "id": element_id,
+                    "tagName": tag_name,
+                    "accountPasswordAction": {
+                        "visible": True,
+                        "enabled": True,
+                        "tagName": tag_name,
+                        "role": "",
+                        "label": "",
+                        "hasPopup": "",
+                        "expanded": "",
+                        "semanticActionTarget": True,
+                    },
+                }
+            )
+
+        for name, controls in (
+            ("unlabeled_link", [control("password-help", "a")]),
+            (
+                "two_unlabeled_buttons",
+                [
+                    control("password-more-icon", "button"),
+                    control("password-other-icon", "button"),
+                ],
+            ),
+        ):
+            with self.subTest(name=name):
+                buttons = [
+                    element
+                    for element in controls
+                    if element.attrs.get("tagName") == "button"
+                ]
+                links = [
+                    element
+                    for element in controls
+                    if element.attrs.get("tagName") == "a"
+                ]
+                container = FakeElement(
+                    attrs={
+                        "id": "password-card-container",
+                        "tagName": "div",
+                        "accountPasswordCard": {
+                            "visible": True,
+                            "passwordCard": True,
+                            "lastUpdated": True,
+                            "semanticActionTarget": False,
+                        },
+                        "elementsBySelector": {
+                            "css:button[aria-haspopup='menu']": [],
+                            "css:[role='button'][aria-haspopup='menu']": [],
+                            "css:button": buttons,
+                            "css:[role='button']": [],
+                            "css:a": links,
+                        },
+                    }
+                )
+                page = FakePage(
+                    {"css:main div": [container]},
+                    state={"href": account_flow.ACCOUNT_SECURITY_URL},
+                )
+
+                self.assertIsNone(
+                    account_flow.resolve_account_password_card_action(page, container)
+                )
+
+    def test_password_card_menu_chain_accepts_chinese_actions(self):
+        click_order: list[str] = []
+        menu_trigger = FakeElement(
+            attrs={
+                "id": "password-more-actions",
+                "tagName": "button",
+                "aria-haspopup": "menu",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "",
+                    "label": "\u66f4\u591a\u64cd\u4f5c",
+                    "hasPopup": "menu",
+                    "expanded": "false",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "semanticActionTarget": False,
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [menu_trigger],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": [menu_trigger],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        start_action = FakeElement(
+            attrs={
+                "id": "change-password-menu-item",
+                "tagName": "button",
+                "role": "menuitem",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "menuitem",
+                    "label": "\u66f4\u6539\u5bc6\u7801",
+                    "hasPopup": "",
+                    "expanded": "",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        menu_root = FakeElement(
+            attrs={
+                "elementsBySelector": {
+                    "css:[role='menuitem']": [start_action],
+                    "css:button": [start_action],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                }
+            }
+        )
+        page = FakePage(
+            {
+                "css:main div": [container],
+                "css:[role='menu']": [],
+            },
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        def open_menu():
+            click_order.append("menu")
+            page.elements_by_selector["css:[role='menu']"] = [menu_root]
+
+        menu_trigger.on_click = open_menu
+        start_action.on_click = lambda: click_order.append("change")
+
+        card_scope, card = account_flow.resolve_account_password_card(page) or (None, None)
+        self.assertIs(card_scope, page)
+        self.assertIs(card, container)
+        trigger_scope, trigger, action_kind = (
+            account_flow.resolve_account_password_card_action(card_scope, card)
+            or (None, None, None)
+        )
+        self.assertIs(trigger_scope, page)
+        self.assertIs(trigger, menu_trigger)
+        self.assertEqual(action_kind, "menu")
+
+        account_flow.human_click(trigger_scope, trigger, pause=lambda *_: None)
+        start_scope, start = account_flow.resolve_account_password_change_action(page) or (
+            None,
+            None,
+        )
+        self.assertIs(start_scope, page)
+        self.assertIs(start, start_action)
+        account_flow.human_click(start_scope, start, pause=lambda *_: None)
+
+        self.assertEqual(click_order, ["menu", "change"])
+        click_targets = [
+            call[1]
+            for call in page.actions.calls
+            if call[0] == "human_click"
+        ]
+        self.assertEqual(click_targets, [menu_trigger, start_action])
+        self.assertNotIn(container, click_targets)
+
     def test_password_card_container_requires_a_card_owned_action(self):
         container = FakeElement(
             attrs={
@@ -17374,6 +17646,293 @@ class SmallBusinessApplicationTests(unittest.TestCase):
                 self.assertFalse(
                     account_flow.is_small_business_program_enroll_url(url)
                 )
+
+    def test_open_small_business_application_tab_reuses_independent_blank_direct_tab(self):
+        events = []
+        new_tab_calls = []
+        source_navigation_calls = []
+        direct_navigation_calls = []
+        direct_tab = FakePage(state={"href": "about:blank"})
+        direct_tab.states = FakeStates(alive=True)
+        direct_tab.wait = type(
+            "Wait", (), {"doc_loaded": lambda *_args, **_kwargs: None}
+        )()
+
+        def navigate_direct_tab(url):
+            direct_navigation_calls.append(url)
+            direct_tab.state["href"] = url
+
+        direct_tab.get = navigate_direct_tab
+
+        class AccountPage:
+            states = FakeStates(alive=True)
+            tab_id = "account-context"
+
+            def new_tab(self, url):
+                new_tab_calls.append(url)
+                if url == account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL:
+                    return direct_tab
+                raise AssertionError(f"unexpected second new-tab URL: {url}")
+
+            def get(self, url):
+                source_navigation_calls.append(url)
+
+        def capture_event(event):
+            events.append((event, direct_tab.state["href"]))
+
+        with patch.object(
+            account_flow, "browser_startup_stage", "profile_capture"
+        ), patch.object(account_flow, "browser_stage_file", None), patch(
+            "apple_account_flow.emit", side_effect=capture_event
+        ), patch("apple_account_flow.human_pause", lambda *_args: None):
+            returned = account_flow.open_small_business_application_tab(AccountPage())
+
+        self.assertIs(returned, direct_tab)
+        self.assertEqual(
+            new_tab_calls,
+            [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL],
+        )
+        self.assertEqual(
+            direct_navigation_calls,
+            [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL],
+        )
+        self.assertEqual(source_navigation_calls, [])
+        tab_created_urls = [
+            url
+            for event, url in events
+            if event == {
+                "event": "status",
+                "status": "small_business_application_tab_created",
+            }
+        ]
+        self.assertEqual(
+            tab_created_urls,
+            [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL],
+        )
+
+    def test_open_small_business_application_tab_allows_verified_pre_auth_redirects(
+        self,
+    ):
+        """A fresh enrollment tab may hit Apple auth before the final target."""
+        for redirected_url in (
+            account_flow.DEVELOPER_ACCOUNT_URL,
+            "https://account.apple.com/sign-in",
+        ):
+            with self.subTest(redirected_url=redirected_url):
+                events = []
+                direct_navigation_calls = []
+                direct_tab = FakePage(state={"href": "about:blank"})
+                direct_tab.states = FakeStates(alive=True)
+                direct_tab.wait = type(
+                    "Wait", (), {"doc_loaded": lambda *_args, **_kwargs: None}
+                )()
+
+                def navigate_direct_tab(url):
+                    direct_navigation_calls.append(url)
+                    direct_tab.state["href"] = redirected_url
+
+                direct_tab.get = navigate_direct_tab
+
+                class AccountPage:
+                    states = FakeStates(alive=True)
+                    tab_id = "account-context"
+
+                    def new_tab(self, url):
+                        if url != account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL:
+                            raise AssertionError(f"unexpected target URL: {url}")
+                        return direct_tab
+
+                with patch.object(
+                    account_flow, "browser_startup_stage", "profile_capture"
+                ), patch.object(account_flow, "browser_stage_file", None), patch(
+                    "apple_account_flow.emit", side_effect=events.append
+                ), patch("apple_account_flow.human_pause", lambda *_args: None):
+                    returned = account_flow.open_small_business_application_tab(
+                        AccountPage()
+                    )
+
+                self.assertIs(returned, direct_tab)
+                self.assertEqual(
+                    direct_navigation_calls,
+                    [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL],
+                )
+                self.assertIn(
+                    {
+                        "event": "status",
+                        "status": "small_business_application_tab_created",
+                    },
+                    events,
+                )
+
+    def test_open_small_business_application_tab_rejects_untrusted_redirect(self):
+        events = []
+        direct_tab = FakePage(state={"href": "about:blank"})
+        direct_tab.states = FakeStates(alive=True)
+        direct_tab.wait = type(
+            "Wait", (), {"doc_loaded": lambda *_args, **_kwargs: None}
+        )()
+        direct_tab.get = lambda _url: direct_tab.state.__setitem__(
+            "href", "https://example.invalid/not-apple"
+        )
+
+        class AccountPage:
+            states = FakeStates(alive=True)
+            tab_id = "account-context"
+
+            def new_tab(self, url):
+                if url != account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL:
+                    raise AssertionError(f"unexpected target URL: {url}")
+                return direct_tab
+
+        with patch.object(
+            account_flow, "browser_startup_stage", "profile_capture"
+        ), patch.object(account_flow, "browser_stage_file", None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ), patch("apple_account_flow.human_pause", lambda *_args: None):
+            with self.assertRaisesRegex(
+                RuntimeError, "expected Apple navigation URL"
+            ):
+                account_flow.open_small_business_application_tab(AccountPage())
+
+        statuses = [event.get("status") for event in events]
+        self.assertIn("small_business_application_started", statuses)
+        self.assertNotIn("small_business_application_tab_created", statuses)
+
+    def test_open_small_business_application_tab_falls_back_to_blank_tab(self):
+        """A failed or disconnected direct target tab keeps the new-tab contract."""
+        for direct_outcome in (
+            "raises",
+            "disconnected",
+            "source_alias",
+            "context_alias",
+        ):
+            with self.subTest(direct_outcome=direct_outcome):
+                events = []
+                tab_calls = []
+                navigation_calls = []
+                source_navigation_calls = []
+                blank_tab = FakePage(state={"href": "about:blank"})
+                blank_tab.states = FakeStates(alive=True)
+                blank_tab.wait = type(
+                    "Wait", (), {"doc_loaded": lambda *_args, **_kwargs: None}
+                )()
+
+                def navigate(url):
+                    navigation_calls.append(url)
+                    blank_tab.state["href"] = url
+
+                blank_tab.get = navigate
+                disconnected_tab = FakePage(
+                    state={"href": account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL}
+                )
+                disconnected_tab.states = FakeStates(alive=False)
+                same_context_tab = FakePage(
+                    state={"href": account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL},
+                    tab_id="account-context",
+                )
+                same_context_tab.states = FakeStates(alive=True)
+
+                class AccountPage:
+                    states = FakeStates(alive=True)
+                    tab_id = "account-context"
+
+                    def new_tab(self, url):
+                        tab_calls.append(url)
+                        if url == account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL:
+                            if direct_outcome == "raises":
+                                raise RuntimeError("direct target tab failed")
+                            if direct_outcome == "source_alias":
+                                return self
+                            if direct_outcome == "context_alias":
+                                return same_context_tab
+                            return disconnected_tab
+                        if url == "about:blank":
+                            return blank_tab
+                        raise AssertionError(f"unexpected new-tab URL: {url}")
+
+                    def get(self, url):
+                        source_navigation_calls.append(url)
+
+                with patch.object(
+                    account_flow, "browser_startup_stage", "profile_capture"
+                ), patch.object(account_flow, "browser_stage_file", None), patch(
+                    "apple_account_flow.emit", side_effect=events.append
+                ), patch("apple_account_flow.human_pause", lambda *_args: None):
+                    returned = account_flow.open_small_business_application_tab(
+                        AccountPage()
+                    )
+
+                self.assertIs(returned, blank_tab)
+                self.assertEqual(
+                    tab_calls,
+                    [
+                        account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL,
+                        "about:blank",
+                    ],
+                )
+                self.assertEqual(
+                    navigation_calls,
+                    [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL],
+                )
+                self.assertEqual(source_navigation_calls, [])
+                self.assertIn(
+                    {
+                        "event": "status",
+                        "status": "small_business_application_tab_created",
+                    },
+                    events,
+                )
+
+    def test_open_small_business_application_tab_rejects_source_context_alias_fallback(
+        self,
+    ):
+        """The blank-tab fallback must not navigate the current Account context."""
+        events = []
+        tab_calls = []
+        source_navigation_calls = []
+        alias_navigation_calls = []
+        alias_tab = FakePage(tab_id="account-context")
+        alias_tab.states = FakeStates(alive=True)
+
+        def navigate_alias(url):
+            alias_navigation_calls.append(url)
+
+        class AccountPage:
+            states = FakeStates(alive=True)
+            tab_id = "account-context"
+
+            def new_tab(self, url):
+                tab_calls.append(url)
+                if url == account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL:
+                    return None
+                if url == "about:blank":
+                    return alias_tab
+                raise AssertionError(f"unexpected new-tab URL: {url}")
+
+            def get(self, url):
+                source_navigation_calls.append(url)
+
+        alias_tab.get = navigate_alias
+
+        with patch.object(
+            account_flow, "browser_startup_stage", "profile_capture"
+        ), patch.object(account_flow, "browser_stage_file", None), patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ), patch("apple_account_flow.human_pause", lambda *_args: None):
+            with self.assertRaisesRegex(
+                RuntimeError, "new small business application tab could not be created"
+            ):
+                account_flow.open_small_business_application_tab(AccountPage())
+
+        self.assertEqual(
+            tab_calls,
+            [account_flow.SMALL_BUSINESS_PROGRAM_ENROLL_URL, "about:blank"],
+        )
+        self.assertEqual(source_navigation_calls, [])
+        self.assertEqual(alias_navigation_calls, [])
+        statuses = [event.get("status") for event in events]
+        self.assertIn("small_business_application_started", statuses)
+        self.assertNotIn("small_business_application_tab_created", statuses)
 
     def test_small_business_form_controls_resolve_in_english_and_chinese(self):
         for chinese in (False, True):

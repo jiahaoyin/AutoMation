@@ -1338,6 +1338,16 @@ def scope_browsing_context_id(scope: Any) -> str:
     return context_id
 
 
+def same_browsing_context(left: Any, right: Any) -> bool:
+    """Return true when two ruyiPage wrappers point at the same tab context."""
+    if left is right:
+        return True
+    try:
+        return scope_browsing_context_id(left) == scope_browsing_context_id(right)
+    except Exception:
+        return False
+
+
 def element_stability_signature(scope: Any, element: Any) -> tuple[str, tuple[str, ...]]:
     """Use non-secret attributes plus the owner context to reject hydration races."""
     attributes: list[str] = []
@@ -7263,11 +7273,11 @@ def account_password_action_is_menu_trigger(summary: dict[str, Any]) -> bool:
                     "options",
                     "actions",
                     "menu",
-                    "更多",
-                    "更多操作",
-                    "更多选项",
-                    "更多選項",
-                    "…",
+                    "\u66f4\u591a",
+                    "\u66f4\u591a\u64cd\u4f5c",
+                    "\u66f4\u591a\u9009\u9879",
+                    "\u66f4\u591a\u9078\u9805",
+                    "\u2026",
                     "...",
                 )
             )
@@ -7283,12 +7293,43 @@ def account_password_action_is_change_password(summary: dict[str, Any]) -> bool:
         "change password" in label
         or "modify password" in label
         or "update password" in label
-        or "更改密码" in label
-        or "更改密碼" in label
-        or "修改密码" in label
-        or "修改密碼" in label
-        or "变更密码" in label
-        or "變更密碼" in label
+        or "\u66f4\u6539\u5bc6\u7801" in label
+        or "\u66f4\u6539\u5bc6\u78bc" in label
+        or "\u4fee\u6539\u5bc6\u7801" in label
+        or "\u4fee\u6539\u5bc6\u78bc" in label
+        or "\u53d8\u66f4\u5bc6\u7801" in label
+        or "\u8b8a\u66f4\u5bc6\u78bc" in label
+    )
+
+
+def account_password_action_is_semantic_button_or_link(
+    summary: dict[str, Any],
+) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    if not summary.get("semanticActionTarget"):
+        return False
+    tag_name = normalize_account_security_label(summary.get("tagName"))
+    role = normalize_account_security_label(summary.get("role"))
+    return tag_name in {"button", "a"} or role in {"button", "link"}
+
+
+def account_password_action_is_semantic_button(summary: dict[str, Any]) -> bool:
+    if not account_password_action_is_semantic_button_or_link(summary):
+        return False
+    tag_name = normalize_account_security_label(summary.get("tagName"))
+    role = normalize_account_security_label(summary.get("role"))
+    return tag_name == "button" or role == "button"
+
+
+def account_password_action_is_unlabeled_button(summary: dict[str, Any]) -> bool:
+    """Recognize one unlabeled semantic button without broadening the card.
+
+    The caller separately proves the card owns exactly one semantic control.
+    """
+    return bool(
+        account_password_action_is_semantic_button(summary)
+        and not normalize_account_security_label(summary.get("label"))
     )
 
 
@@ -7367,6 +7408,27 @@ def resolve_account_password_card_action(
         ),
         None,
     )
+    card_owned_semantic_controls = [
+        candidate
+        for candidate in candidates
+        if candidate[1] is not card
+        and account_password_action_is_semantic_button_or_link(candidate[2])
+    ]
+    # The live Password card can expose a blue ellipsis button with no usable
+    # text or aria metadata. This is deliberately narrower than a generic
+    # card click: one card-owned semantic control total, and it must be a
+    # button rather than an unlabeled link.
+    if (
+        card_summary is not None
+        and not card_summary.get("semanticActionTarget")
+        and len(card_owned_semantic_controls) == 1
+        and account_password_action_is_unlabeled_button(
+            card_owned_semantic_controls[0][2]
+        )
+    ):
+        scope, element, _summary = card_owned_semantic_controls[0]
+        return scope, element, "menu"
+
     if (
         card_summary is not None
         and card_summary.get("semanticActionTarget")
@@ -8711,6 +8773,31 @@ def wait_for_small_business_submission_success(
     raise RuntimeError("small business application submission confirmation was not found")
 
 
+def small_business_application_tab_is_enroll_url(page: Any) -> bool:
+    try:
+        return is_small_business_program_enroll_url(scope_location_url(page))
+    except Exception:
+        return False
+
+
+def small_business_application_tab_has_expected_navigation_url(page: Any) -> bool:
+    """Allow the verified enrollment target or Apple's pre-auth redirect chain.
+
+    The exact enrollment URL is the only terminal success condition after
+    authentication, but a fresh isolated tab can legitimately stop on a
+    verified Apple sign-in or Developer account route before that handoff.
+    """
+    try:
+        url = scope_location_url(page)
+    except Exception:
+        return False
+    return bool(
+        is_small_business_program_enroll_url(url)
+        or is_developer_account_url(url)
+        or is_apple_url(url)
+    )
+
+
 def open_small_business_application_tab(page: Any) -> Any:
     set_browser_startup_stage("small_business_application")
     emit({"event": "status", "status": "small_business_application_started"})
@@ -8718,23 +8805,38 @@ def open_small_business_application_tab(page: Any) -> Any:
         small_business_page = page.new_tab(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
     except Exception:
         small_business_page = None
-    if small_business_page is None or not browser_connection_is_alive(small_business_page):
+    # A ruyiPage tab factory must never alias the Account source page here.
+    # The enrollment workflow needs an independent tab so a failed direct tab
+    # creation cannot navigate away from the already-authenticated Account UI.
+    if (
+        small_business_page is None
+        or same_browsing_context(small_business_page, page)
+        or not browser_connection_is_alive(small_business_page)
+    ):
         try:
             blank_tab = page.new_tab("about:blank")
         except Exception as error:
             raise RuntimeError(
                 "new small business application tab could not be created"
             ) from error
-        if blank_tab is None or not browser_connection_is_alive(blank_tab):
+        if (
+            blank_tab is None
+            or same_browsing_context(blank_tab, page)
+            or not browser_connection_is_alive(blank_tab)
+        ):
             raise RuntimeError("new small business application tab could not be created")
+        small_business_page = blank_tab
+
+    # Some ruyiPage builds return a live, independent tab before its requested
+    # URL has committed. Reuse that same tab rather than opening another one.
+    if not small_business_application_tab_is_enroll_url(small_business_page):
         try:
-            blank_tab.get(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
+            small_business_page.get(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
         except Exception as error:
             raise RuntimeError(
                 "new small business application tab could not be opened"
             ) from error
-        small_business_page = blank_tab
-    emit({"event": "status", "status": "small_business_application_tab_created"})
+
     try:
         small_business_page.wait.doc_loaded(timeout=20)
     except Exception:
@@ -8742,6 +8844,13 @@ def open_small_business_application_tab(page: Any) -> Any:
             raise RuntimeError(
                 "small business browser connection was lost while opening enrollment page"
             )
+    if not small_business_application_tab_has_expected_navigation_url(
+        small_business_page
+    ):
+        raise RuntimeError(
+            "new small business application tab did not reach an expected Apple navigation URL"
+        )
+    emit({"event": "status", "status": "small_business_application_tab_created"})
     human_pause(700, 1400)
     return small_business_page
 
