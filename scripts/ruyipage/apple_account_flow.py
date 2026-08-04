@@ -4687,7 +4687,7 @@ def developer_membership_details_route(url: str) -> bool:
 def resolve_developer_membership_details_card(
     page: Any,
 ) -> tuple[Any, Any] | None:
-    """Resolve the concrete details-card root for a viewport screenshot."""
+    """Resolve the concrete details-card root for a complete element clip."""
     if not is_developer_account_url(scope_location_url(page)):
         return None
     seen: set[int] = set()
@@ -4729,7 +4729,7 @@ def scroll_developer_membership_details_card(
     The membership route can finish changing before its card root is mounted.
     Retrying this narrow lookup lets the native route scroll settle first, then
     gives ruyiPage's card-targeted scroll enough time to complete before a
-    field probe or viewport screenshot continues.
+    field probe or complete-card element clip continues.
     """
     if deadline is None and timeout_s is not None:
         if timeout_s <= 0:
@@ -4763,7 +4763,7 @@ def scroll_developer_membership_details_card(
             ):
                 continue
             return False
-        _scope, card = resolved
+        scope, card = resolved
         # ``to_see()`` is synchronous. A short residual budget can otherwise
         # let a late-mounted card force the membership confirmation beyond its
         # caller's deadline before the first settled probe is even attempted.
@@ -4773,14 +4773,33 @@ def scroll_developer_membership_details_card(
         ):
             return False
         try:
-            card.scroll.to_see()
+            # ``card.scroll.to_see()`` defaults to ``center=False``. In that
+            # mode ruyiPage returns as soon as a sliver of a tall card is
+            # visible, which is not enough for a stable diagnostic view.
+            # Use the page-level centered scroll exposed by ruyiPage.
+            scope.scroll.to_see(card, center=True)
         except Exception:
-            if (
-                attempt + 1 < attempt_limit
-                and bounded_pause(700, 1200)
-            ):
-                continue
-            return False
+            # Keep compatibility with the narrow fake/legacy adapters used by
+            # local tests. Production ruyiPage takes the page-level path above.
+            try:
+                card.scroll.to_see(center=True)
+            except TypeError:
+                try:
+                    card.scroll.to_see()
+                except Exception:
+                    if (
+                        attempt + 1 < attempt_limit
+                        and bounded_pause(700, 1200)
+                    ):
+                        continue
+                    return False
+            except Exception:
+                if (
+                    attempt + 1 < attempt_limit
+                    and bounded_pause(700, 1200)
+                ):
+                    continue
+                return False
         # Do not begin a DOM probe/screenshot in the middle of ruyiPage's
         # scroll animation. Re-resolve afterward because React can replace the
         # card wrapper while it hydrates its detail fields.
@@ -5828,7 +5847,12 @@ def resolve_profile_name_modal(page: Any) -> tuple[Any, Any, dict[str, Any]] | N
         for scope, root in current_element_search_roots(page):
             if scope is not page:
                 continue
-            for modal in safe_elements(root, selector):
+            # This resolver is used as a polling predicate before the name
+            # card is clicked as well as after it. Do not let ruyiPage's
+            # default element-find timeout consume the whole modal-open
+            # deadline while no dialog exists yet; the callers own that
+            # deadline and perform their own bounded retry/pause cycle.
+            for modal in safe_elements(root, selector, timeout_s=0):
                 if not element_is_interactable(modal):
                     continue
                 try:
@@ -5998,6 +6022,17 @@ def open_profile_name_modal(
                 pause=pause,
             )
             human_click(name_scope, name_card, pause=pause)
+            # The unavailable diagnostic alone cannot prove a real click was
+            # dispatched: a pre-click probe timeout used to consume the
+            # deadline first. Keep a de-identified action marker so a later
+            # Mac audit can distinguish an absent modal from an omitted click.
+            emit(
+                {
+                    "event": "status",
+                    "status": "profile_name_card_click_sent",
+                    "attempt": attempted_clicks,
+                }
+            )
         except Exception as error:
             last_error = error
             if attempt + 1 < PROFILE_NAME_MODAL_OPEN_CLICK_ATTEMPTS:
@@ -8372,13 +8407,20 @@ def take_screenshot(
     *,
     checkpoint: str,
     full_page: bool = True,
+    element: Any | None = None,
 ) -> str | None:
     safe_checkpoint = checkpoint if checkpoint in SCREENSHOT_CHECKPOINTS else "unknown"
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if hasattr(path.parent, "chmod"):
             path.parent.chmod(0o700)
-        page.screenshot(str(path), full_page=full_page)
+        if element is None:
+            page.screenshot(str(path), full_page=full_page)
+        else:
+            # ruyiPage uses a native BiDi element clip here, so a tall
+            # MembershipDetailsCard is captured as the complete card rather
+            # than being cut off by the viewport bottom edge.
+            element.screenshot(str(path))
         if hasattr(path, "chmod"):
             path.chmod(0o600)
         emit(
@@ -9510,12 +9552,29 @@ def collect_developer_account_membership(
             except Exception:
                 registration_identity_value = None
             if scroll_developer_membership_details_card(developer_page):
-                screenshot = take_screenshot(
-                    developer_page,
-                    screenshot_path,
-                    checkpoint="developer_membership",
-                    full_page=False,
+                # Re-resolve after the centered, settled scroll. Apple can
+                # replace this SPA card wrapper while its fields hydrate; the
+                # element clip must target the current concrete card, never a
+                # stale wrapper or the generic page viewport.
+                resolved_card = resolve_developer_membership_details_card(
+                    developer_page
                 )
+                if resolved_card is not None:
+                    _scope, membership_card = resolved_card
+                    screenshot = take_screenshot(
+                        developer_page,
+                        screenshot_path,
+                        checkpoint="developer_membership",
+                        full_page=False,
+                        element=membership_card,
+                    )
+                else:
+                    emit(
+                        {
+                            "event": "status",
+                            "status": "developer_membership_card_unavailable",
+                        }
+                    )
             else:
                 emit(
                     {

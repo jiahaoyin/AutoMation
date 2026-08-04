@@ -5099,6 +5099,97 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         )
         self.assertNotIn(self.SECRET_SENTINEL, json.dumps(emit_event.call_args.args[0]))
 
+    def test_screenshot_uses_an_explicit_element_clip_instead_of_the_page_viewport(self):
+        class PageThatMustNotCapture:
+            def __init__(self):
+                self.calls = []
+
+            def screenshot(self, *_args, **_kwargs):
+                self.calls.append((_args, _kwargs))
+                raise AssertionError("page viewport screenshot must not be used")
+
+        class RecordingElement:
+            def __init__(self):
+                self.calls = []
+
+            def screenshot(self, path):
+                self.calls.append(path)
+                Path(path).write_bytes(b"element-clip")
+                return path
+
+        page = PageThatMustNotCapture()
+        element = RecordingElement()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "apple_account_flow.emit"
+        ) as emit_event:
+            screenshot_path = Path(temp_dir) / "membership.png"
+            result = account_flow.take_screenshot(
+                page,
+                screenshot_path,
+                checkpoint="developer_membership",
+                full_page=False,
+                element=element,
+            )
+
+        self.assertEqual(result, str(screenshot_path))
+        self.assertEqual(element.calls, [str(screenshot_path)])
+        self.assertEqual(page.calls, [])
+        self.assertEqual(
+            emit_event.call_args.args[0],
+            {
+                "event": "status",
+                "status": "screenshot_capture",
+                "checkpoint": "developer_membership",
+            },
+        )
+
+    def test_element_clip_failure_never_falls_back_to_page_viewport(self):
+        class PageThatMustNotCapture:
+            def __init__(self):
+                self.calls = []
+
+            def screenshot(self, *_args, **_kwargs):
+                self.calls.append((_args, _kwargs))
+                raise AssertionError("page viewport fallback must not be used")
+
+        class FailingElement:
+            def __init__(self):
+                self.calls = []
+
+            def screenshot(self, path):
+                self.calls.append(path)
+                raise RuntimeError(f"element clip failed {self.SECRET_SENTINEL}")
+
+        page = PageThatMustNotCapture()
+        element = FailingElement()
+        events = []
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "apple_account_flow.emit", side_effect=events.append
+        ):
+            screenshot_path = Path(temp_dir) / "membership.png"
+            result = account_flow.take_screenshot(
+                page,
+                screenshot_path,
+                checkpoint="developer_membership",
+                full_page=False,
+                element=element,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(element.calls, [str(screenshot_path)])
+        self.assertEqual(page.calls, [])
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "status",
+                    "status": "screenshot_failed",
+                    "checkpoint": "developer_membership",
+                }
+            ],
+        )
+        self.assertNotIn(self.SECRET_SENTINEL, json.dumps(events))
+
     def test_quit_failure_emits_only_a_fixed_safe_reason(self):
         secret = self.SECRET_SENTINEL
 
@@ -12255,7 +12346,117 @@ process.stdout.write(JSON.stringify(eval(expression)));
             screenshot_path,
             checkpoint="developer_membership",
             full_page=False,
+            element=membership_card,
         )
+
+    def test_membership_details_card_scroll_uses_centered_page_scroller(self):
+        developer_page = self.authenticated_page(membership_navigation=True)
+        membership_card = self.attach_membership_details_card(developer_page)
+
+        class RecordingPageScroll:
+            def __init__(self):
+                self.calls = []
+
+            def to_see(self, element, center=False):
+                self.calls.append((element, center))
+
+        developer_page.scroll = RecordingPageScroll()
+
+        self.assertTrue(
+            account_flow.scroll_developer_membership_details_card(
+                developer_page,
+                pause=lambda *_: None,
+            )
+        )
+        self.assertEqual(
+            developer_page.scroll.calls,
+            [(membership_card, True)],
+        )
+        self.assertEqual(membership_card.scroll.calls, [])
+
+    def test_membership_capture_reresolves_replaced_card_before_element_clip(self):
+        developer_page = self.authenticated_page(membership_navigation=True)
+        first_card = FakeElement(attrs={"id": "MembershipDetailsCard"})
+        second_card = FakeElement(attrs={"id": "MembershipDetailsCard"})
+        details_selector = "css:[id*='MembershipDetailsCard']"
+        developer_page.elements_by_selector[details_selector] = [first_card]
+        first_card.scope = developer_page
+        second_card.scope = developer_page
+        developer_page.membership_details = {
+            "detailsPage": True,
+            "appleDeveloperProgram": True,
+            "renewalDate": True,
+            "registrationIdentity": True,
+            "registrationIdentityValue": "\u4e2a\u4eba",
+            "membershipFieldCount": 2,
+        }
+        developer_page.wait = type(
+            "FakeWait",
+            (),
+            {"doc_loaded": lambda *_args, **_kwargs: None},
+        )()
+
+        class ReplacingPageScroll:
+            def __init__(self):
+                self.calls = []
+
+            def to_see(self, element, center=False):
+                self.calls.append((element, center))
+                developer_page.elements_by_selector[details_selector] = [second_card]
+
+        developer_page.scroll = ReplacingPageScroll()
+
+        class RootPage:
+            def new_tab(self, _url):
+                return developer_page
+
+        screenshot_path = Path("03-developer-membership.png")
+        with patch(
+            "apple_account_flow.complete_account_authentication",
+            return_value={
+                "confirmedState": {
+                    "trusted": True,
+                    "developerAccountShell": True,
+                    "joinProgram": False,
+                    "membershipNavigation": True,
+                },
+                "skippedLogin": True,
+                "skipped2FA": True,
+                "rememberAccount": None,
+            },
+        ), patch(
+            "apple_account_flow.confirm_active_developer_membership",
+            return_value=True,
+        ), patch(
+            "apple_account_flow.take_screenshot",
+            return_value=str(screenshot_path),
+        ) as screenshot, patch(
+            "apple_account_flow.human_pause",
+            lambda *_: None,
+        ), patch("apple_account_flow.emit"):
+            result, returned_page, captured = (
+                account_flow.collect_developer_account_membership(
+                    RootPage(),
+                    "person@example.com",
+                    "secret",
+                    FakeKeys,
+                    {"twofaPrepared": True, "nextGeneration": 2},
+                    screenshot_path,
+                )
+            )
+
+        self.assertEqual(result["membershipStatus"], "active")
+        self.assertIs(returned_page, developer_page)
+        self.assertEqual(captured, str(screenshot_path))
+        self.assertEqual(developer_page.scroll.calls, [(first_card, True)])
+        screenshot.assert_called_once_with(
+            developer_page,
+            screenshot_path,
+            checkpoint="developer_membership",
+            full_page=False,
+            element=second_card,
+        )
+        self.assertIsNot(screenshot.call_args.kwargs["element"], first_card)
 
     def test_collects_active_membership_after_late_hash_hydration_without_nav_snapshot(self):
         developer_page = DeveloperFakePage(
@@ -12347,6 +12548,7 @@ process.stdout.write(JSON.stringify(eval(expression)));
             screenshot_path,
             checkpoint="developer_membership",
             full_page=False,
+            element=membership_card,
         )
         self.assertEqual(membership_card.scroll.calls, [("to_see",), ("to_see",)])
 
@@ -15046,6 +15248,95 @@ class PersonalInformationTests(unittest.TestCase):
         self.assertEqual(len(page.wrappers), 2)
         self.assertIsNot(page.wrappers[0], page.wrappers[1])
 
+    def test_profile_name_modal_candidate_queries_are_nonblocking(self):
+        page = FakePage(
+            {
+                selector: []
+                for selector in account_flow.PROFILE_NAME_MODAL_SELECTORS
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+
+        self.assertIsNone(account_flow.resolve_profile_name_modal(page))
+        modal_calls = [
+            (selector, timeout)
+            for selector, timeout in page.eles_calls
+            if selector in account_flow.PROFILE_NAME_MODAL_SELECTORS
+        ]
+        self.assertEqual(
+            {selector for selector, _timeout in modal_calls},
+            set(account_flow.PROFILE_NAME_MODAL_SELECTORS),
+        )
+        self.assertTrue(
+            all(timeout == 0 for _selector, timeout in modal_calls),
+            modal_calls,
+        )
+
+    def test_open_name_modal_does_not_consume_deadline_before_first_card_click(self):
+        clock = {"now": 0.0}
+
+        class DefaultWaitingModalProbePage(FakePage):
+            def eles(self, selector, timeout=None):
+                self.eles_calls.append((selector, timeout))
+                # Emulate ruyiPage's default 10 s find timeout. A regression to
+                # an omitted ``timeout=0`` here burns the entire 20 s budget
+                # before the first card click can be dispatched.
+                if (
+                    selector in account_flow.PROFILE_NAME_MODAL_SELECTORS
+                    and timeout is None
+                ):
+                    clock["now"] += 10.0
+                return self.elements_by_selector.get(selector, [])
+
+        page = DefaultWaitingModalProbePage(
+            {
+                selector: []
+                for selector in account_flow.PROFILE_NAME_MODAL_SELECTORS
+            },
+            state={"href": account_flow.ACCOUNT_INFORMATION_URL},
+        )
+        name_card = FakeElement()
+        modal = FakeElement(displayed=False)
+        hydrated_summary = {
+            "visible": True,
+            "fieldCount": 2,
+            "given": "Given",
+            "family": "Family",
+            "orderedParts": ["Given", "Family"],
+        }
+
+        with patch(
+            "apple_account_flow.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), patch(
+            "apple_account_flow.resolve_profile_name_card_for_click",
+            return_value=(page, name_card, {}),
+        ), patch(
+            "apple_account_flow.wait_for_profile_name_modal",
+            return_value=(page, modal, hydrated_summary),
+        ), patch(
+            "apple_account_flow.profile_name_modal_selector",
+            return_value="css:[id^='modal-content-']",
+        ), patch("apple_account_flow.human_click") as click, patch(
+            "apple_account_flow.emit"
+        ):
+            _scope, opened_modal, summary, _selector = account_flow.open_profile_name_modal(
+                page,
+                timeout_s=account_flow.PROFILE_MODAL_WAIT_TIMEOUT_S,
+                pause=lambda *_: None,
+            )
+
+        click.assert_called_once_with(page, name_card, pause=ANY)
+        self.assertIs(opened_modal, modal)
+        self.assertEqual(summary["given"], "Given")
+        self.assertEqual(clock["now"], 0.0)
+        modal_calls = [
+            (selector, timeout)
+            for selector, timeout in page.eles_calls
+            if selector in account_flow.PROFILE_NAME_MODAL_SELECTORS
+        ]
+        self.assertTrue(all(timeout == 0 for _selector, timeout in modal_calls))
+
     def test_name_modal_rejects_order_guessing_and_excludes_chinese_middle_name(self):
         modal = FakeElement(
             attrs={
@@ -15606,6 +15897,16 @@ process.stdout.write(query.call(modal));
         self.assertEqual(
             events,
             [
+                {
+                    "event": "status",
+                    "status": "profile_name_card_click_sent",
+                    "attempt": 1,
+                },
+                {
+                    "event": "status",
+                    "status": "profile_name_card_click_sent",
+                    "attempt": 2,
+                },
                 {
                     "event": "status",
                     "status": "profile_name_modal_unavailable",
