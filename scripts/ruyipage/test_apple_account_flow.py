@@ -16772,6 +16772,47 @@ process.stdout.write(query.call(modal));
             (page, icon_button, "menu"),
         )
 
+    def test_password_card_action_refreshes_a_replaced_card_before_timeout(self):
+        """Do not keep probing the stale card when security-page hydration swaps it."""
+        initial_scope = object()
+        initial_card = object()
+        root_page = object()
+        refreshed_scope = object()
+        refreshed_card = object()
+        menu_trigger = object()
+        action_calls = []
+
+        def resolve_action(scope, card):
+            action_calls.append((scope, card))
+            if scope is refreshed_scope and card is refreshed_card:
+                return refreshed_scope, menu_trigger, "menu"
+            return None
+
+        with patch(
+            "apple_account_flow.resolve_account_password_card_action",
+            side_effect=resolve_action,
+        ), patch(
+            "apple_account_flow.resolve_account_password_card",
+            return_value=(refreshed_scope, refreshed_card),
+        ) as refresh_card:
+            resolved = account_flow.wait_for_account_password_card_action(
+                initial_scope,
+                initial_card,
+                root_page=root_page,
+                timeout_s=1,
+                pause=lambda *_: None,
+            )
+
+        self.assertEqual(resolved, (refreshed_scope, menu_trigger, "menu"))
+        self.assertEqual(
+            action_calls,
+            [
+                (initial_scope, initial_card),
+                (refreshed_scope, refreshed_card),
+            ],
+        )
+        refresh_card.assert_called_once_with(root_page)
+
     def test_password_card_action_rejects_ambiguous_unlabeled_icon_buttons(self):
         """Never guess which unlabeled icon controls the password card."""
         icon_buttons = [

@@ -7443,12 +7443,40 @@ def wait_for_account_password_card_action(
     card: Any,
     timeout_s: float = ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S,
     pause: Callable[[int, int], None] = human_pause,
+    root_page: Any | None = None,
 ) -> tuple[Any, Any, str]:
+    """Wait for a live card-owned password action across React replacements.
+
+    The security route can first expose the Password card copy and then replace
+    that card while hydrating its overflow button.  Retrying against the stale
+    element wrapper would otherwise consume the whole action timeout even
+    though the current page owns a usable ellipsis button.
+    """
     deadline = time.monotonic() + max(0.0, timeout_s)
+    current_scope = card_scope
+    current_card = card
+    refresh_page = root_page if root_page is not None else card_scope
     while time.monotonic() < deadline:
-        resolved = resolve_account_password_card_action(card_scope, card)
+        resolved = resolve_account_password_card_action(current_scope, current_card)
         if resolved is not None:
             return resolved
+        # Re-resolve from the live top-level Account page after the stale-card
+        # probe.  This is a DOM query only; the eventual menu click still goes
+        # through ruyiPage's native human_click path.
+        try:
+            refreshed = resolve_account_password_card(refresh_page)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            refreshed_scope, refreshed_card = refreshed
+            if refreshed_scope is not current_scope or refreshed_card is not current_card:
+                current_scope, current_card = refreshed_scope, refreshed_card
+                resolved = resolve_account_password_card_action(
+                    current_scope,
+                    current_card,
+                )
+                if resolved is not None:
+                    return resolved
         pause(180, 420)
     raise RuntimeError("account password card action was not found")
 
@@ -8049,6 +8077,7 @@ def change_account_password(
             card_scope,
             card,
             pause=pause,
+            root_page=page,
         )
         if action_kind == "menu":
             emit(
