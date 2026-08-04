@@ -124,6 +124,34 @@ ACCOUNT_SECURITY_NAVIGATION_LABELS = frozenset(
 )
 ACCOUNT_SECURITY_NAVIGATION_WAIT_TIMEOUT_S = 15.0
 ACCOUNT_PASSWORD_CARD_SELECTORS = PROFILE_CARD_SELECTORS
+ACCOUNT_PASSWORD_CARD_CONTAINER_SELECTORS = (
+    "css:main section",
+    "css:main article",
+    "css:main [role='region']",
+    "css:main [role='group']",
+    "css:main [data-testid]",
+    "css:main div",
+)
+ACCOUNT_PASSWORD_CARD_ACTION_SELECTORS = (
+    "css:button[aria-haspopup='menu']",
+    "css:[role='button'][aria-haspopup='menu']",
+    "css:button",
+    "css:[role='button']",
+    "css:a",
+)
+ACCOUNT_PASSWORD_MENU_ROOT_SELECTORS = (
+    "css:[role='menu']",
+    "css:[role='listbox']",
+    "css:[data-popover]",
+    "css:[data-menu]",
+)
+ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS = (
+    "css:[role='menuitem']",
+    "css:button",
+    "css:[role='button']",
+    "css:a",
+)
+ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S = 12.0
 ACCOUNT_PASSWORD_FIELD_SELECTORS = (
     "css:input[type='password']",
     "css:input[autocomplete='current-password']",
@@ -7103,6 +7131,8 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
             this.getAttribute('aria-hidden') !== 'true';
           const text = String(this.innerText || this.textContent || '')
             .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
           const domIdentity = (() => {
             const parts = [];
             let current = this;
@@ -7120,6 +7150,9 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
             visible,
             passwordCard: /(?:^|\s)(?:password|\u5bc6\u7801|\u5bc6\u78bc)(?:\s|$)/.test(text),
             lastUpdated: /(?:last updated|\u4e0a\u6b21\u66f4\u65b0|\u4e0a\u6b21\u66f4\u65b0)/.test(text),
+            semanticActionTarget:
+              String(this.tagName || '').toLocaleLowerCase() === 'button' ||
+              normalize(this.getAttribute?.('role')) === 'button',
             domIdentity
           });
         }
@@ -7130,8 +7163,277 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
         "visible": result.get("visible") is True,
         "passwordCard": result.get("passwordCard") is True,
         "lastUpdated": result.get("lastUpdated") is True,
+        "semanticActionTarget": result.get("semanticActionTarget") is True,
         "domIdentity": str(result.get("domIdentity") or "").strip(),
     }
+
+
+def account_password_action_summary(element: Any) -> dict[str, Any]:
+    raw = element.run_js(
+        r"""
+        function () {
+          // ruyipage-account-password-action
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const tagName = String(this.tagName || '').toLowerCase();
+          const role = normalize(this.getAttribute('role'));
+          const label = normalize([
+            this.getAttribute('aria-label'),
+            this.getAttribute('title'),
+            this.innerText,
+            this.textContent,
+            this.getAttribute('data-testid'),
+            this.getAttribute('data-test-id')
+          ].filter(Boolean).join(' '));
+          const domIdentity = (() => {
+            const parts = [];
+            let current = this;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 14; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          return JSON.stringify({
+            visible,
+            enabled: !this.disabled &&
+              this.getAttribute('aria-disabled') !== 'true',
+            tagName,
+            role,
+            label,
+            hasPopup: normalize(this.getAttribute('aria-haspopup')),
+            expanded: normalize(this.getAttribute('aria-expanded')),
+            semanticActionTarget: [
+              'button', 'a', 'button', 'menuitem', 'option', 'link'
+            ].includes(tagName) || [
+              'button', 'link', 'menuitem', 'option'
+            ].includes(role),
+            domIdentity
+          });
+        }
+        """
+    )
+    result = parse_account_security_query_result(raw, "password action")
+    return {
+        "visible": result.get("visible") is True,
+        "enabled": result.get("enabled") is True,
+        "tagName": normalize_account_security_label(result.get("tagName")),
+        "role": normalize_account_security_label(result.get("role")),
+        "label": normalize_account_security_label(result.get("label")),
+        "hasPopup": normalize_account_security_label(result.get("hasPopup")),
+        "expanded": normalize_account_security_label(result.get("expanded")),
+        "semanticActionTarget": result.get("semanticActionTarget") is True,
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+    }
+
+
+def account_password_action_is_menu_trigger(summary: dict[str, Any]) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    label = normalize_account_security_label(summary.get("label"))
+    has_popup = normalize_account_security_label(summary.get("hasPopup"))
+    return bool(
+        summary.get("semanticActionTarget")
+        and (
+            has_popup in {"menu", "true", "listbox", "dialog"}
+            or any(
+                token in label
+                for token in (
+                    "more",
+                    "more actions",
+                    "options",
+                    "actions",
+                    "menu",
+                    "更多",
+                    "更多操作",
+                    "更多选项",
+                    "更多選項",
+                    "…",
+                    "...",
+                )
+            )
+        )
+    )
+
+
+def account_password_action_is_change_password(summary: dict[str, Any]) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    label = normalize_account_security_label(summary.get("label"))
+    return bool(
+        "change password" in label
+        or "modify password" in label
+        or "update password" in label
+        or "更改密码" in label
+        or "更改密碼" in label
+        or "修改密码" in label
+        or "修改密碼" in label
+        or "变更密码" in label
+        or "變更密碼" in label
+    )
+
+
+def resolve_account_password_card_action(
+    card_scope: Any,
+    card: Any,
+) -> tuple[Any, Any, str] | None:
+    """Resolve the card-owned menu trigger or a semantic direct action.
+
+    Apple currently renders the password card as a non-action container with
+    an independent ellipsis/menu button. Older account-page variants exposed
+    the whole card as a semantic button, so that route remains a narrow
+    compatibility fallback only when no card-owned action exists.
+    """
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add_candidate(element: Any) -> None:
+        if not element_is_interactable(element):
+            return
+        try:
+            summary = account_password_action_summary(element)
+            identity = (
+                scope_browsing_context_id(card_scope),
+                summary["domIdentity"] or element_stability_signature(card_scope, element),
+            )
+        except Exception:
+            return
+        if identity in seen:
+            return
+        seen.add(identity)
+        candidates.append((card_scope, element, summary))
+
+    try:
+        add_candidate(card)
+    except Exception:
+        pass
+    for selector in ACCOUNT_PASSWORD_CARD_ACTION_SELECTORS:
+        for element in safe_elements(card, selector, timeout_s=0):
+            add_candidate(element)
+
+    menu_candidates = [
+        candidate
+        for candidate in candidates
+        if account_password_action_is_menu_trigger(candidate[2])
+    ]
+    if len(menu_candidates) == 1:
+        scope, element, _summary = menu_candidates[0]
+        return scope, element, "menu"
+    if len(menu_candidates) > 1:
+        popup_candidates = [
+            candidate
+            for candidate in menu_candidates
+            if candidate[2].get("hasPopup") in {"menu", "true", "listbox", "dialog"}
+        ]
+        if len(popup_candidates) == 1:
+            scope, element, _summary = popup_candidates[0]
+            return scope, element, "menu"
+        return None
+
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2].get("semanticActionTarget")
+        and account_password_action_is_change_password(candidate[2])
+    ]
+    if len(direct_candidates) == 1:
+        scope, element, _summary = direct_candidates[0]
+        return scope, element, "direct"
+
+    card_summary = next(
+        (
+            candidate[2]
+            for candidate in candidates
+            if candidate[1] is card
+        ),
+        None,
+    )
+    if (
+        card_summary is not None
+        and card_summary.get("semanticActionTarget")
+        and len(candidates) == 1
+    ):
+        return card_scope, card, "direct"
+    return None
+
+
+def wait_for_account_password_card_action(
+    card_scope: Any,
+    card: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any, str]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_card_action(card_scope, card)
+        if resolved is not None:
+            return resolved
+        pause(180, 420)
+    raise RuntimeError("account password card action was not found")
+
+
+def resolve_account_password_change_action(page: Any) -> tuple[Any, Any] | None:
+    """Find the visible Change Password action after the card menu opens."""
+    candidates: list[tuple[Any, Any, dict[str, Any], bool]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add_candidate(scope: Any, element: Any, *, menu_owned: bool) -> None:
+        if not element_is_interactable(element):
+            return
+        try:
+            summary = account_password_action_summary(element)
+            identity = (
+                scope_browsing_context_id(scope),
+                summary["domIdentity"] or element_stability_signature(scope, element),
+            )
+        except Exception:
+            return
+        if identity in seen or not account_password_action_is_change_password(summary):
+            return
+        seen.add(identity)
+        candidates.append((scope, element, summary, menu_owned))
+
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for menu_selector in ACCOUNT_PASSWORD_MENU_ROOT_SELECTORS:
+            for menu in safe_elements(root, menu_selector, timeout_s=0):
+                for selector in ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS:
+                    for element in safe_elements(menu, selector, timeout_s=0):
+                        add_candidate(scope, element, menu_owned=True)
+        for selector in ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS:
+            for element in safe_elements(root, selector, timeout_s=0):
+                add_candidate(scope, element, menu_owned=False)
+
+    if len(candidates) == 1:
+        return candidates[0][0], candidates[0][1]
+    menu_candidates = [candidate for candidate in candidates if candidate[3]]
+    if len(menu_candidates) == 1:
+        return menu_candidates[0][0], menu_candidates[0][1]
+    return None
+
+
+def wait_for_account_password_change_action(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_change_action(page)
+        if resolved is not None:
+            return resolved
+        pause(180, 420)
+    raise RuntimeError("account password change menu action was not found")
 
 
 def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
@@ -7142,10 +7444,14 @@ def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
     for scope, root in current_element_search_roots(page):
         if scope is not page:
             continue
-        for selector in ACCOUNT_PASSWORD_CARD_SELECTORS:
+        selectors = tuple(
+            dict.fromkeys(
+                ACCOUNT_PASSWORD_CARD_SELECTORS
+                + ACCOUNT_PASSWORD_CARD_CONTAINER_SELECTORS
+            )
+        )
+        for selector in selectors:
             for card in safe_elements(root, selector, timeout_s=0):
-                if not element_is_interactable(card):
-                    continue
                 try:
                     summary = account_password_card_summary(card)
                     identity = (
@@ -7157,11 +7463,69 @@ def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                if summary["visible"] and summary["passwordCard"] and summary["lastUpdated"]:
+                if (
+                    summary["visible"]
+                    and summary["passwordCard"]
+                    and summary["lastUpdated"]
+                ):
                     candidates.append((scope, card, summary))
-    if len(candidates) != 1:
+
+    if not candidates:
         return None
-    return candidates[0][0], candidates[0][1]
+
+    # The visible password copy can be repeated by nested text wrappers. Do not
+    # take the generic leaf first: the leaf often owns no action while its card
+    # container owns the independent ellipsis menu. Instead, identify every
+    # candidate that owns a usable action and retain the deepest such container.
+    actionable_candidates = [
+        candidate
+        for candidate in candidates
+        if resolve_account_password_card_action(candidate[0], candidate[1]) is not None
+    ]
+    if actionable_candidates:
+        actionable_identities = [
+            (
+                scope_browsing_context_id(scope),
+                str(summary.get("domIdentity") or "").strip(),
+            )
+            for scope, _card, summary in actionable_candidates
+        ]
+        deepest_actionable_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+        for index, candidate in enumerate(actionable_candidates):
+            context_id, identity = actionable_identities[index]
+            has_matching_actionable_descendant = bool(identity) and any(
+                context_id == other_context_id
+                and other_identity
+                and profile_card_identity_is_ancestor(identity, other_identity)
+                for other_index, (other_context_id, other_identity) in enumerate(
+                    actionable_identities
+                )
+                if other_index != index
+            )
+            if not has_matching_actionable_descendant:
+                deepest_actionable_candidates.append(candidate)
+        if len(deepest_actionable_candidates) == 1:
+            scope, card, _summary = deepest_actionable_candidates[0]
+            return scope, card
+        semantic_candidates = [
+            candidate
+            for candidate in deepest_actionable_candidates
+            if candidate[2].get("semanticActionTarget") is True
+        ]
+        if len(semantic_candidates) == 1:
+            return semantic_candidates[0][0], semantic_candidates[0][1]
+        return None
+
+    # Keep a narrow direct-button compatibility path for older account-page
+    # variants, but never return a plain visible div as an action target.
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2].get("semanticActionTarget") is True
+    ]
+    if len(direct_candidates) == 1:
+        return direct_candidates[0][0], direct_candidates[0][1]
+    return None
 
 
 def wait_for_account_password_card(
@@ -7471,6 +7835,12 @@ def classify_account_password_change_failure(error: Exception) -> str:
     message = str(error).casefold()
     if "navigation" in message or "security" in message:
         return "password_change_navigation_failed"
+    if "menu action" in message:
+        return "password_change_menu_unconfirmed"
+    if "card action" in message or "change action" in message:
+        return "password_change_action_unavailable"
+    if "password card" in message:
+        return "password_change_card_unavailable"
     if "form" in message or "field" in message or "card" in message:
         return "password_change_form_unready"
     if "submit" in message:
@@ -7500,8 +7870,54 @@ def change_account_password(
         emit({"event": "status", "status": "password_change_page_ready"})
 
         set_browser_startup_stage("password_change")
+        emit({"event": "status", "status": "password_change_card_wait_started"})
         card_scope, card = wait_for_account_password_card(page, pause=pause)
-        human_click(card_scope, card, pause=pause)
+        emit({"event": "status", "status": "password_change_card_resolved"})
+        action_scope, action, action_kind = wait_for_account_password_card_action(
+            card_scope,
+            card,
+            pause=pause,
+        )
+        if action_kind == "menu":
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_menu_trigger_resolved",
+                }
+            )
+            human_click(action_scope, action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_menu_trigger_click_sent",
+                }
+            )
+            start_scope, start_action = wait_for_account_password_change_action(
+                page,
+                pause=pause,
+            )
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_start_action_resolved",
+                }
+            )
+            human_click(start_scope, start_action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_start_action_click_sent",
+                }
+            )
+        else:
+            human_click(action_scope, action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_card_click_sent",
+                }
+            )
+        emit({"event": "status", "status": "password_change_form_wait_started"})
         fields = wait_for_account_password_change_form(page, pause=pause)
         emit(
             {
@@ -10083,7 +10499,10 @@ def _browser_flow(args: argparse.Namespace) -> int:
                         preserve_on_success or preserve_on_failure
                     ),
                 }
-            if post_login_password_change["success"] is True:
+            # Password rotation is best-effort within the Account module. If it
+            # fails, keep the original in-memory credential and continue with
+            # the independent small-business tab/authentication flow.
+            if post_login_profile_capture["success"] is True:
                 try:
                     (
                         post_login_small_business_application,

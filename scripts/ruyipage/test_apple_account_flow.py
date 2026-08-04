@@ -1138,6 +1138,32 @@ class FakeElement:
             )
             summary.setdefault("domIdentity", f"password-card:{self.attrs.get('id') or id(self)}")
             return json.dumps(summary)
+        if "ruyipage-account-password-action" in script:
+            summary = dict(
+                self.attrs.get(
+                    "accountPasswordAction",
+                    {
+                        "visible": self.states.is_displayed,
+                        "enabled": self.states.is_enabled,
+                        "tagName": self.attrs.get("tagName", "div"),
+                        "role": self.attrs.get("role", ""),
+                        "label": self.text,
+                        "hasPopup": self.attrs.get("aria-haspopup", ""),
+                        "expanded": self.attrs.get("aria-expanded", ""),
+                        "semanticActionTarget": str(
+                            self.attrs.get("tagName", "")
+                        ).lower()
+                        in {"button", "a"}
+                        or str(self.attrs.get("role", "")).lower()
+                        in {"button", "link", "menuitem"},
+                    },
+                )
+            )
+            summary.setdefault(
+                "domIdentity",
+                f"password-action:{self.attrs.get('id') or id(self)}",
+            )
+            return json.dumps(summary)
         if "ruyipage-account-password-change-field" in script:
             summary = dict(
                 self.attrs.get(
@@ -4706,6 +4732,147 @@ class SafeFailureBoundaryTests(unittest.TestCase):
         self.assertFalse(result["postLoginProfileCapture"]["success"])
         statuses = [event.get("status") for event in events]
         self.assertNotIn("profile_capture_completed", statuses)
+
+    def test_password_change_failure_still_runs_small_business_application(self):
+        """Password rotation is best-effort after a completed profile capture.
+
+        The enrollment flow uses the rotated credential only after a successful
+        password change.  If the Account password card/menu path fails, the
+        original in-memory credential remains valid and must still be used to
+        open the independent small-business tab.
+        """
+        events = []
+
+        def password_change_failure(*_args, **_kwargs):
+            account_flow.set_browser_startup_stage("password_change")
+            account_flow.emit(
+                {
+                    "event": "status",
+                    "status": "password_change_failed",
+                    "failureStage": "password_change",
+                    "failureClass": "password_change_action_unavailable",
+                }
+            )
+            raise RuntimeError("account password card action was not found")
+
+        def small_business_success(*_args, **_kwargs):
+            account_flow.set_browser_startup_stage("small_business_application")
+            account_flow.emit(
+                {
+                    "event": "status",
+                    "status": "small_business_application_started",
+                }
+            )
+            return (
+                {
+                    "success": True,
+                    "attempted": True,
+                    "submitted": True,
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                None,
+                None,
+            )
+
+        password_change = Mock(
+            name="change_account_password",
+            side_effect=password_change_failure,
+        )
+        small_business = Mock(
+            name="apply_small_business_program",
+            side_effect=small_business_success,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_code = self.run_late_flow(
+                Path(temp_dir),
+                self.DiskScreenshotPage("redacted"),
+                {"trusted": True, "error": False},
+                {"name": "Given Family", "birthday": "2000-01-02"},
+                events,
+                password_change_side_effect=password_change,
+                small_business_side_effect=small_business,
+            )
+
+        self.assertEqual(result_code, 0)
+        password_change.assert_called_once()
+        small_business.assert_called_once()
+        # APPLE_PASSWORD from run_late_flow remains the authentication secret
+        # because password_change_failure did not return a rotated password.
+        self.assertEqual(small_business.call_args.args[2], "secret")
+
+        result = next(event for event in events if event.get("event") == "result")
+        self.assertTrue(result["postLoginProfileCapture"]["success"])
+        self.assertFalse(result["postLoginPasswordChange"]["success"])
+        self.assertEqual(
+            result["postLoginPasswordChange"]["failureClass"],
+            "password_change_action_unavailable",
+        )
+        self.assertTrue(result["postLoginSmallBusinessApplication"]["success"])
+
+        statuses = [event.get("status") for event in events]
+        self.assertLess(
+            statuses.index("password_change_failed"),
+            statuses.index("small_business_application_started"),
+        )
+
+    def test_password_change_success_uses_rotated_password_for_small_business_application(
+        self,
+    ):
+        """A confirmed rotation must replace the credential for the new tab."""
+        events = []
+        rotated_password = "RotatedA2!fixtrX"
+        small_business = Mock(
+            name="apply_small_business_program",
+            return_value=(
+                {
+                    "success": True,
+                    "attempted": True,
+                    "submitted": True,
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                None,
+                None,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_code = self.run_late_flow(
+                Path(temp_dir),
+                self.DiskScreenshotPage("redacted"),
+                {"trusted": True, "error": False},
+                {"name": "Given Family", "birthday": "2000-01-02"},
+                events,
+                password_change_result={
+                    "success": True,
+                    "attempted": True,
+                    "passwordStored": True,
+                    "passwordLength": len(rotated_password),
+                    "newPassword": rotated_password,
+                    "failureStage": "unknown",
+                    "failureClass": "unknown",
+                    "browserAlive": True,
+                    "browserPreserved": False,
+                    "browserPreservationRequested": False,
+                },
+                small_business_side_effect=small_business,
+            )
+
+        self.assertEqual(result_code, 0)
+        small_business.assert_called_once()
+        self.assertEqual(small_business.call_args.args[2], rotated_password)
+        result = next(event for event in events if event.get("event") == "result")
+        self.assertTrue(result["postLoginPasswordChange"]["success"])
+        self.assertTrue(result["postLoginSmallBusinessApplication"]["success"])
+        self.assertNotIn(rotated_password, json.dumps(events))
 
     def test_profile_capture_failure_keeps_personal_information_screenshot_and_browser(self):
         class PreservedProfilePage(self.DiskScreenshotPage):
@@ -16423,6 +16590,343 @@ process.stdout.write(query.call(modal));
             account_flow.resolve_account_password_change_submit(ambiguous_page)
         )
 
+    def test_password_card_container_requires_a_card_owned_action(self):
+        container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                },
+            }
+        )
+        page = FakePage(
+            {"css:main div": [container]},
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        self.assertIsNone(account_flow.resolve_account_password_card(page))
+
+    def test_password_card_resolver_keeps_deepest_action_owning_container(self):
+        menu_trigger = FakeElement(
+            attrs={
+                "id": "password-more-actions",
+                "tagName": "button",
+                "aria-haspopup": "menu",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "",
+                    "label": "More actions",
+                    "hasPopup": "menu",
+                    "expanded": "false",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        main_wrapper = FakeElement(
+            attrs={
+                "id": "password-page-wrapper",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "domIdentity": "html:0/body:0/main:0",
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [menu_trigger],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": [menu_trigger],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        card_container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "domIdentity": "html:0/body:0/main:0/div:1",
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [menu_trigger],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": [menu_trigger],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        text_wrapper = FakeElement(
+            attrs={
+                "id": "password-card-copy",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                    "domIdentity": "html:0/body:0/main:0/div:1/div:0",
+                },
+            }
+        )
+        page = FakePage(
+            {
+                "css:main div": [main_wrapper, card_container, text_wrapper],
+            },
+            state={"href": account_flow.ACCOUNT_SECURITY_URL},
+        )
+
+        resolved = account_flow.resolve_account_password_card(page)
+
+        self.assertIsNotNone(resolved)
+        self.assertIs(resolved[0], page)
+        self.assertIs(resolved[1], card_container)
+
+    def test_password_change_uses_card_menu_then_change_action_before_fields(self):
+        events = []
+        typed: list[tuple[str, str]] = []
+        click_order: list[str] = []
+        new_password = "Aa2!Bb3@Cc4#Dd5$"
+        link = FakeElement(
+            attrs={
+                "href": account_flow.ACCOUNT_SECURITY_URL,
+                "profileNavigationLink": {
+                    "visible": True,
+                    "href": account_flow.ACCOUNT_SECURITY_URL,
+                    "label": "Login and Security",
+                },
+            }
+        )
+        menu_trigger = FakeElement(
+            attrs={
+                "id": "password-more-actions",
+                "tagName": "button",
+                "aria-haspopup": "menu",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "",
+                    "label": "More actions",
+                    "hasPopup": "menu",
+                    "expanded": "false",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        container = FakeElement(
+            attrs={
+                "id": "password-card-container",
+                "tagName": "div",
+                "accountPasswordCard": {
+                    "visible": True,
+                    "passwordCard": True,
+                    "lastUpdated": True,
+                },
+                "elementsBySelector": {
+                    "css:button[aria-haspopup='menu']": [menu_trigger],
+                    "css:[role='button'][aria-haspopup='menu']": [],
+                    "css:button": [menu_trigger],
+                    "css:[role='button']": [],
+                    "css:a": [],
+                },
+            }
+        )
+        start_action = FakeElement(
+            attrs={
+                "id": "change-password-menu-item",
+                "tagName": "button",
+                "role": "menuitem",
+                "accountPasswordAction": {
+                    "visible": True,
+                    "enabled": True,
+                    "tagName": "button",
+                    "role": "menuitem",
+                    "label": "Change Password",
+                    "hasPopup": "",
+                    "expanded": "",
+                    "semanticActionTarget": True,
+                },
+            }
+        )
+        current = FakeElement(
+            attrs={
+                "id": "current-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["current-password"],
+                },
+            }
+        )
+        new = FakeElement(
+            attrs={
+                "id": "new-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["new-password"],
+                },
+            }
+        )
+        confirm = FakeElement(
+            attrs={
+                "id": "confirm-password",
+                "type": "password",
+                "passwordChangeField": {
+                    "visible": True,
+                    "editable": True,
+                    "inputType": "password",
+                    "signals": ["confirm-password"],
+                },
+            }
+        )
+        submit = FakeElement(
+            attrs={
+                "id": "change-password-submit",
+                "tagName": "button",
+                "accountPasswordSubmit": {
+                    "visible": True,
+                    "enabled": True,
+                    "label": "Change Password",
+                },
+            }
+        )
+
+        class SecurityPage(FakePage):
+            def __init__(self):
+                super().__init__(
+                    {
+                        "css:a[href]": [link],
+                        "css:main div": [container],
+                        "css:input[type='password']": [current, new, confirm],
+                    },
+                    buttons=[submit],
+                    state={
+                        "href": account_flow.ACCOUNT_INFORMATION_URL,
+                        "securityPage": False,
+                        "passwordCard": False,
+                        "passwordForm": False,
+                        "passwordFieldCount": 3,
+                        "passwordChanged": False,
+                    },
+                )
+                link.on_click = self.open_security
+                menu_trigger.on_click = self.open_password_menu
+                start_action.on_click = self.open_password_form
+                submit.on_click = self.complete_password_change
+
+            def open_security(self):
+                self.state["href"] = account_flow.ACCOUNT_SECURITY_URL
+                self.state["securityPage"] = True
+                self.state["passwordCard"] = True
+
+            def open_password_menu(self):
+                click_order.append("menu")
+                self.elements_by_selector["css:[role='menuitem']"] = [start_action]
+                self.elements_by_selector["css:button"] = [start_action]
+
+            def open_password_form(self):
+                click_order.append("start_action")
+                self.state["passwordForm"] = True
+
+            def complete_password_change(self):
+                click_order.append("submit")
+                self.state["passwordChanged"] = True
+
+        page = SecurityPage()
+
+        def fake_input(scope, field, value, label, keys, **kwargs):
+            self.assertIs(scope, page)
+            self.assertEqual(label, "password")
+            typed.append((field.attrs["id"], value))
+
+        with patch("apple_account_flow.emit", side_effect=events.append), patch(
+            "apple_account_flow.human_click",
+            side_effect=lambda scope, element, pause=None: scope.actions.human_click(element).perform(),
+        ), patch("apple_account_flow.wait_for_document_settle"), patch(
+            "apple_account_flow.generate_account_password",
+            return_value=new_password,
+        ), patch("apple_account_flow.input_and_verify", side_effect=fake_input), patch(
+            "apple_account_flow.human_pause", lambda *_: None
+        ):
+            result = account_flow.change_account_password(
+                page,
+                "OldPass123!",
+                FakeKeys,
+                pause=lambda *_: None,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(click_order, ["menu", "start_action", "submit"])
+        self.assertEqual(
+            typed,
+            [
+                ("current-password", "OldPass123!"),
+                ("new-password", new_password),
+                ("confirm-password", new_password),
+            ],
+        )
+        click_targets = [
+            call[1]
+            for call in page.actions.calls
+            if call[0] == "human_click"
+        ]
+        self.assertNotIn(container, click_targets)
+        self.assertIn(menu_trigger, click_targets)
+        self.assertIn(start_action, click_targets)
+        statuses = [
+            event["status"]
+            for event in events
+            if event.get("event") == "status"
+        ]
+        self.assertLess(
+            statuses.index("password_change_card_resolved"),
+            statuses.index("password_change_menu_trigger_resolved"),
+        )
+        self.assertLess(
+            statuses.index("password_change_menu_trigger_click_sent"),
+            statuses.index("password_change_start_action_resolved"),
+        )
+        self.assertLess(
+            statuses.index("password_change_start_action_click_sent"),
+            statuses.index("password_change_form_ready"),
+        )
+        self.assertNotIn("password_change_card_click_sent", statuses)
+        diagnostic_events = [
+            event
+            for event in events
+            if event.get("status") != "password_change_completed"
+        ]
+        self.assertNotIn("OldPass123!", json.dumps(diagnostic_events))
+        self.assertNotIn(new_password, json.dumps(diagnostic_events))
+
+    def test_password_card_missing_uses_its_own_failure_class(self):
+        self.assertEqual(
+            account_flow.classify_account_password_change_failure(
+                RuntimeError("account password card was not found")
+            ),
+            "password_change_card_unavailable",
+        )
+        self.assertEqual(
+            account_flow.classify_account_password_change_failure(
+                RuntimeError("account password change menu action was not found")
+            ),
+            "password_change_menu_unconfirmed",
+        )
+
     def test_change_account_password_runs_security_card_form_submit_and_success(self):
         events = []
         typed: list[tuple[str, str]] = []
@@ -16442,6 +16946,7 @@ process.stdout.write(query.call(modal));
             text="密码 上次更新：2026年7月30日",
             attrs={
                 "id": "password-card",
+                "tagName": "button",
                 "accountPasswordCard": {
                     "visible": True,
                     "passwordCard": True,
