@@ -124,6 +124,34 @@ ACCOUNT_SECURITY_NAVIGATION_LABELS = frozenset(
 )
 ACCOUNT_SECURITY_NAVIGATION_WAIT_TIMEOUT_S = 15.0
 ACCOUNT_PASSWORD_CARD_SELECTORS = PROFILE_CARD_SELECTORS
+ACCOUNT_PASSWORD_CARD_CONTAINER_SELECTORS = (
+    "css:main section",
+    "css:main article",
+    "css:main [role='region']",
+    "css:main [role='group']",
+    "css:main [data-testid]",
+    "css:main div",
+)
+ACCOUNT_PASSWORD_CARD_ACTION_SELECTORS = (
+    "css:button[aria-haspopup='menu']",
+    "css:[role='button'][aria-haspopup='menu']",
+    "css:button",
+    "css:[role='button']",
+    "css:a",
+)
+ACCOUNT_PASSWORD_MENU_ROOT_SELECTORS = (
+    "css:[role='menu']",
+    "css:[role='listbox']",
+    "css:[data-popover]",
+    "css:[data-menu]",
+)
+ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS = (
+    "css:[role='menuitem']",
+    "css:button",
+    "css:[role='button']",
+    "css:a",
+)
+ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S = 12.0
 ACCOUNT_PASSWORD_FIELD_SELECTORS = (
     "css:input[type='password']",
     "css:input[autocomplete='current-password']",
@@ -137,6 +165,7 @@ ACCOUNT_PASSWORD_SUBMIT_SELECTORS = (
 ACCOUNT_PASSWORD_CHANGE_WAIT_TIMEOUT_S = 35.0
 ACCOUNT_PASSWORD_CHANGE_SUCCESS_TIMEOUT_S = 25.0
 ACCOUNT_PASSWORD_LENGTH = 16
+APPLE_PASSWORD_PENDING_ENV_KEY = "APPLE_PASSWORD_PENDING"
 ACCOUNT_PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*_-+=?"
 ACCOUNT_PASSWORD_UPPERCASE = "ABCDEFGHJKMNPQRSTUVWXYZ"
 ACCOUNT_PASSWORD_LOWERCASE = "abcdefghjkmnpqrstuvwxyz"
@@ -1307,6 +1336,16 @@ def scope_browsing_context_id(scope: Any) -> str:
     if not context_id:
         raise RuntimeError("ruyiPage frame has no browsing-context id")
     return context_id
+
+
+def same_browsing_context(left: Any, right: Any) -> bool:
+    """Return true when two ruyiPage wrappers point at the same tab context."""
+    if left is right:
+        return True
+    try:
+        return scope_browsing_context_id(left) == scope_browsing_context_id(right)
+    except Exception:
+        return False
 
 
 def element_stability_signature(scope: Any, element: Any) -> tuple[str, tuple[str, ...]]:
@@ -7054,11 +7093,20 @@ def account_security_page_snapshot(page: Any) -> dict[str, Any]:
             .replace(/\s+/g, ' ')
             .trim()
             .toLocaleLowerCase();
-          const text = normalize(
-            document.querySelector('main')?.innerText ||
-            document.body?.innerText ||
-            ''
-          );
+          // Apple renders transient confirmations through portal/dialog roots
+          // that can live outside <main>. Do not use `main || body` here:
+          // ordinary page text makes main non-empty and hides the confirmation.
+          const visibleText = (element) => visible(element)
+            ? String(element.innerText || element.textContent || '')
+            : '';
+          const bodyText = visibleText(document.body);
+          const overlayText = [...document.querySelectorAll(
+            "[role='dialog'], [role='alert'], [role='status'], [aria-live]"
+          )]
+            .filter(visible)
+            .map((element) => String(element.innerText || element.textContent || ''))
+            .join(' ');
+          const text = normalize([bodyText, overlayText].join(' '));
           const fields = [...document.querySelectorAll('input[type="password"]')]
             .filter(visible)
             .filter((field) => !field.disabled && !field.readOnly);
@@ -7103,6 +7151,8 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
             this.getAttribute('aria-hidden') !== 'true';
           const text = String(this.innerText || this.textContent || '')
             .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
           const domIdentity = (() => {
             const parts = [];
             let current = this;
@@ -7120,6 +7170,9 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
             visible,
             passwordCard: /(?:^|\s)(?:password|\u5bc6\u7801|\u5bc6\u78bc)(?:\s|$)/.test(text),
             lastUpdated: /(?:last updated|\u4e0a\u6b21\u66f4\u65b0|\u4e0a\u6b21\u66f4\u65b0)/.test(text),
+            semanticActionTarget:
+              String(this.tagName || '').toLocaleLowerCase() === 'button' ||
+              normalize(this.getAttribute?.('role')) === 'button',
             domIdentity
           });
         }
@@ -7130,8 +7183,357 @@ def account_password_card_summary(card: Any) -> dict[str, Any]:
         "visible": result.get("visible") is True,
         "passwordCard": result.get("passwordCard") is True,
         "lastUpdated": result.get("lastUpdated") is True,
+        "semanticActionTarget": result.get("semanticActionTarget") is True,
         "domIdentity": str(result.get("domIdentity") or "").strip(),
     }
+
+
+def account_password_action_summary(element: Any) -> dict[str, Any]:
+    raw = element.run_js(
+        r"""
+        function () {
+          // ruyipage-account-password-action
+          const rect = this.getBoundingClientRect();
+          const style = window.getComputedStyle(this);
+          const visible = rect.width > 2 && rect.height > 2 &&
+            style.display !== 'none' && style.visibility !== 'hidden' &&
+            this.getAttribute('aria-hidden') !== 'true';
+          const normalize = (value) => String(value || '')
+            .replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+          const tagName = String(this.tagName || '').toLowerCase();
+          const role = normalize(this.getAttribute('role'));
+          const label = normalize([
+            this.getAttribute('aria-label'),
+            this.getAttribute('title'),
+            this.innerText,
+            this.textContent,
+            this.getAttribute('data-testid'),
+            this.getAttribute('data-test-id')
+          ].filter(Boolean).join(' '));
+          const domIdentity = (() => {
+            const parts = [];
+            let current = this;
+            for (let depth = 0; current && current.nodeType === 1 && depth < 14; depth += 1) {
+              const parent = current.parentElement;
+              const index = parent
+                ? Array.prototype.indexOf.call(parent.children, current)
+                : 0;
+              parts.push(`${String(current.tagName || '').toLowerCase()}:${index}`);
+              current = parent;
+            }
+            return parts.reverse().join('/');
+          })();
+          return JSON.stringify({
+            visible,
+            enabled: !this.disabled &&
+              this.getAttribute('aria-disabled') !== 'true',
+            tagName,
+            role,
+            label,
+            hasPopup: normalize(this.getAttribute('aria-haspopup')),
+            expanded: normalize(this.getAttribute('aria-expanded')),
+            semanticActionTarget: [
+              'button', 'a', 'button', 'menuitem', 'option', 'link'
+            ].includes(tagName) || [
+              'button', 'link', 'menuitem', 'option'
+            ].includes(role),
+            domIdentity
+          });
+        }
+        """
+    )
+    result = parse_account_security_query_result(raw, "password action")
+    return {
+        "visible": result.get("visible") is True,
+        "enabled": result.get("enabled") is True,
+        "tagName": normalize_account_security_label(result.get("tagName")),
+        "role": normalize_account_security_label(result.get("role")),
+        "label": normalize_account_security_label(result.get("label")),
+        "hasPopup": normalize_account_security_label(result.get("hasPopup")),
+        "expanded": normalize_account_security_label(result.get("expanded")),
+        "semanticActionTarget": result.get("semanticActionTarget") is True,
+        "domIdentity": str(result.get("domIdentity") or "").strip(),
+    }
+
+
+def account_password_action_is_menu_trigger(summary: dict[str, Any]) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    label = normalize_account_security_label(summary.get("label"))
+    has_popup = normalize_account_security_label(summary.get("hasPopup"))
+    return bool(
+        summary.get("semanticActionTarget")
+        and (
+            has_popup in {"menu", "true", "listbox", "dialog"}
+            or any(
+                token in label
+                for token in (
+                    "more",
+                    "more actions",
+                    "options",
+                    "actions",
+                    "menu",
+                    "\u66f4\u591a",
+                    "\u66f4\u591a\u64cd\u4f5c",
+                    "\u66f4\u591a\u9009\u9879",
+                    "\u66f4\u591a\u9078\u9805",
+                    "\u2026",
+                    "...",
+                )
+            )
+        )
+    )
+
+
+def account_password_action_is_change_password(summary: dict[str, Any]) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    label = normalize_account_security_label(summary.get("label"))
+    return bool(
+        "change password" in label
+        or "modify password" in label
+        or "update password" in label
+        or "\u66f4\u6539\u5bc6\u7801" in label
+        or "\u66f4\u6539\u5bc6\u78bc" in label
+        or "\u4fee\u6539\u5bc6\u7801" in label
+        or "\u4fee\u6539\u5bc6\u78bc" in label
+        or "\u53d8\u66f4\u5bc6\u7801" in label
+        or "\u8b8a\u66f4\u5bc6\u78bc" in label
+    )
+
+
+def account_password_action_is_semantic_button_or_link(
+    summary: dict[str, Any],
+) -> bool:
+    if not (summary.get("visible") and summary.get("enabled")):
+        return False
+    if not summary.get("semanticActionTarget"):
+        return False
+    tag_name = normalize_account_security_label(summary.get("tagName"))
+    role = normalize_account_security_label(summary.get("role"))
+    return tag_name in {"button", "a"} or role in {"button", "link"}
+
+
+def account_password_action_is_semantic_button(summary: dict[str, Any]) -> bool:
+    if not account_password_action_is_semantic_button_or_link(summary):
+        return False
+    tag_name = normalize_account_security_label(summary.get("tagName"))
+    role = normalize_account_security_label(summary.get("role"))
+    return tag_name == "button" or role == "button"
+
+
+def account_password_action_is_unlabeled_button(summary: dict[str, Any]) -> bool:
+    """Recognize one unlabeled semantic button without broadening the card.
+
+    The caller separately proves the card owns exactly one semantic control.
+    """
+    return bool(
+        account_password_action_is_semantic_button(summary)
+        and not normalize_account_security_label(summary.get("label"))
+    )
+
+
+def resolve_account_password_card_action(
+    card_scope: Any,
+    card: Any,
+) -> tuple[Any, Any, str] | None:
+    """Resolve the card-owned menu trigger or a semantic direct action.
+
+    Apple currently renders the password card as a non-action container with
+    an independent ellipsis/menu button. Older account-page variants exposed
+    the whole card as a semantic button, so that route remains a narrow
+    compatibility fallback only when no card-owned action exists.
+    """
+    candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add_candidate(element: Any) -> None:
+        if not element_is_interactable(element):
+            return
+        try:
+            summary = account_password_action_summary(element)
+            identity = (
+                scope_browsing_context_id(card_scope),
+                summary["domIdentity"] or element_stability_signature(card_scope, element),
+            )
+        except Exception:
+            return
+        if identity in seen:
+            return
+        seen.add(identity)
+        candidates.append((card_scope, element, summary))
+
+    try:
+        add_candidate(card)
+    except Exception:
+        pass
+    for selector in ACCOUNT_PASSWORD_CARD_ACTION_SELECTORS:
+        for element in safe_elements(card, selector, timeout_s=0):
+            add_candidate(element)
+
+    menu_candidates = [
+        candidate
+        for candidate in candidates
+        if account_password_action_is_menu_trigger(candidate[2])
+    ]
+    if len(menu_candidates) == 1:
+        scope, element, _summary = menu_candidates[0]
+        return scope, element, "menu"
+    if len(menu_candidates) > 1:
+        popup_candidates = [
+            candidate
+            for candidate in menu_candidates
+            if candidate[2].get("hasPopup") in {"menu", "true", "listbox", "dialog"}
+        ]
+        if len(popup_candidates) == 1:
+            scope, element, _summary = popup_candidates[0]
+            return scope, element, "menu"
+        return None
+
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2].get("semanticActionTarget")
+        and account_password_action_is_change_password(candidate[2])
+    ]
+    if len(direct_candidates) == 1:
+        scope, element, _summary = direct_candidates[0]
+        return scope, element, "direct"
+
+    card_summary = next(
+        (
+            candidate[2]
+            for candidate in candidates
+            if candidate[1] is card
+        ),
+        None,
+    )
+    card_owned_semantic_controls = [
+        candidate
+        for candidate in candidates
+        if candidate[1] is not card
+        and account_password_action_is_semantic_button_or_link(candidate[2])
+    ]
+    # The live Password card can expose a blue ellipsis button with no usable
+    # text or aria metadata. This is deliberately narrower than a generic
+    # card click: one card-owned semantic control total, and it must be a
+    # button rather than an unlabeled link.
+    if (
+        card_summary is not None
+        and not card_summary.get("semanticActionTarget")
+        and len(card_owned_semantic_controls) == 1
+        and account_password_action_is_unlabeled_button(
+            card_owned_semantic_controls[0][2]
+        )
+    ):
+        scope, element, _summary = card_owned_semantic_controls[0]
+        return scope, element, "menu"
+
+    if (
+        card_summary is not None
+        and card_summary.get("semanticActionTarget")
+        and len(candidates) == 1
+    ):
+        return card_scope, card, "direct"
+    return None
+
+
+def wait_for_account_password_card_action(
+    card_scope: Any,
+    card: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+    root_page: Any | None = None,
+) -> tuple[Any, Any, str]:
+    """Wait for a live card-owned password action across React replacements.
+
+    The security route can first expose the Password card copy and then replace
+    that card while hydrating its overflow button.  Retrying against the stale
+    element wrapper would otherwise consume the whole action timeout even
+    though the current page owns a usable ellipsis button.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    current_scope = card_scope
+    current_card = card
+    refresh_page = root_page if root_page is not None else card_scope
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_card_action(current_scope, current_card)
+        if resolved is not None:
+            return resolved
+        # Re-resolve from the live top-level Account page after the stale-card
+        # probe.  This is a DOM query only; the eventual menu click still goes
+        # through ruyiPage's native human_click path.
+        try:
+            refreshed = resolve_account_password_card(refresh_page)
+        except Exception:
+            refreshed = None
+        if refreshed is not None:
+            refreshed_scope, refreshed_card = refreshed
+            if refreshed_scope is not current_scope or refreshed_card is not current_card:
+                current_scope, current_card = refreshed_scope, refreshed_card
+                resolved = resolve_account_password_card_action(
+                    current_scope,
+                    current_card,
+                )
+                if resolved is not None:
+                    return resolved
+        pause(180, 420)
+    raise RuntimeError("account password card action was not found")
+
+
+def resolve_account_password_change_action(page: Any) -> tuple[Any, Any] | None:
+    """Find the visible Change Password action after the card menu opens."""
+    candidates: list[tuple[Any, Any, dict[str, Any], bool]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add_candidate(scope: Any, element: Any, *, menu_owned: bool) -> None:
+        if not element_is_interactable(element):
+            return
+        try:
+            summary = account_password_action_summary(element)
+            identity = (
+                scope_browsing_context_id(scope),
+                summary["domIdentity"] or element_stability_signature(scope, element),
+            )
+        except Exception:
+            return
+        if identity in seen or not account_password_action_is_change_password(summary):
+            return
+        seen.add(identity)
+        candidates.append((scope, element, summary, menu_owned))
+
+    for scope, root in current_element_search_roots(page):
+        if scope is not page:
+            continue
+        for menu_selector in ACCOUNT_PASSWORD_MENU_ROOT_SELECTORS:
+            for menu in safe_elements(root, menu_selector, timeout_s=0):
+                for selector in ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS:
+                    for element in safe_elements(menu, selector, timeout_s=0):
+                        add_candidate(scope, element, menu_owned=True)
+        for selector in ACCOUNT_PASSWORD_CHANGE_ACTION_SELECTORS:
+            for element in safe_elements(root, selector, timeout_s=0):
+                add_candidate(scope, element, menu_owned=False)
+
+    if len(candidates) == 1:
+        return candidates[0][0], candidates[0][1]
+    menu_candidates = [candidate for candidate in candidates if candidate[3]]
+    if len(menu_candidates) == 1:
+        return menu_candidates[0][0], menu_candidates[0][1]
+    return None
+
+
+def wait_for_account_password_change_action(
+    page: Any,
+    timeout_s: float = ACCOUNT_PASSWORD_ACTION_WAIT_TIMEOUT_S,
+    pause: Callable[[int, int], None] = human_pause,
+) -> tuple[Any, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        resolved = resolve_account_password_change_action(page)
+        if resolved is not None:
+            return resolved
+        pause(180, 420)
+    raise RuntimeError("account password change menu action was not found")
 
 
 def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
@@ -7142,10 +7544,14 @@ def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
     for scope, root in current_element_search_roots(page):
         if scope is not page:
             continue
-        for selector in ACCOUNT_PASSWORD_CARD_SELECTORS:
+        selectors = tuple(
+            dict.fromkeys(
+                ACCOUNT_PASSWORD_CARD_SELECTORS
+                + ACCOUNT_PASSWORD_CARD_CONTAINER_SELECTORS
+            )
+        )
+        for selector in selectors:
             for card in safe_elements(root, selector, timeout_s=0):
-                if not element_is_interactable(card):
-                    continue
                 try:
                     summary = account_password_card_summary(card)
                     identity = (
@@ -7157,11 +7563,69 @@ def resolve_account_password_card(page: Any) -> tuple[Any, Any] | None:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                if summary["visible"] and summary["passwordCard"] and summary["lastUpdated"]:
+                if (
+                    summary["visible"]
+                    and summary["passwordCard"]
+                    and summary["lastUpdated"]
+                ):
                     candidates.append((scope, card, summary))
-    if len(candidates) != 1:
+
+    if not candidates:
         return None
-    return candidates[0][0], candidates[0][1]
+
+    # The visible password copy can be repeated by nested text wrappers. Do not
+    # take the generic leaf first: the leaf often owns no action while its card
+    # container owns the independent ellipsis menu. Instead, identify every
+    # candidate that owns a usable action and retain the deepest such container.
+    actionable_candidates = [
+        candidate
+        for candidate in candidates
+        if resolve_account_password_card_action(candidate[0], candidate[1]) is not None
+    ]
+    if actionable_candidates:
+        actionable_identities = [
+            (
+                scope_browsing_context_id(scope),
+                str(summary.get("domIdentity") or "").strip(),
+            )
+            for scope, _card, summary in actionable_candidates
+        ]
+        deepest_actionable_candidates: list[tuple[Any, Any, dict[str, Any]]] = []
+        for index, candidate in enumerate(actionable_candidates):
+            context_id, identity = actionable_identities[index]
+            has_matching_actionable_descendant = bool(identity) and any(
+                context_id == other_context_id
+                and other_identity
+                and profile_card_identity_is_ancestor(identity, other_identity)
+                for other_index, (other_context_id, other_identity) in enumerate(
+                    actionable_identities
+                )
+                if other_index != index
+            )
+            if not has_matching_actionable_descendant:
+                deepest_actionable_candidates.append(candidate)
+        if len(deepest_actionable_candidates) == 1:
+            scope, card, _summary = deepest_actionable_candidates[0]
+            return scope, card
+        semantic_candidates = [
+            candidate
+            for candidate in deepest_actionable_candidates
+            if candidate[2].get("semanticActionTarget") is True
+        ]
+        if len(semantic_candidates) == 1:
+            return semantic_candidates[0][0], semantic_candidates[0][1]
+        return None
+
+    # Keep a narrow direct-button compatibility path for older account-page
+    # variants, but never return a plain visible div as an action target.
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2].get("semanticActionTarget") is True
+    ]
+    if len(direct_candidates) == 1:
+        return direct_candidates[0][0], direct_candidates[0][1]
+    return None
 
 
 def wait_for_account_password_card(
@@ -7467,10 +7931,116 @@ def generate_account_password(length: int = ACCOUNT_PASSWORD_LENGTH) -> str:
     return "".join(password)
 
 
+def format_pending_password_env_value(value: str) -> str:
+    """Format a single .env value without permitting line-oriented injection."""
+    if not isinstance(value, str) or not value or "\r" in value or "\n" in value or "\0" in value:
+        raise RuntimeError("account password backup value is invalid")
+    if re.search(r"[\s#\"'\\\\]", value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def resolve_pending_password_env_path() -> Path:
+    """Use the same project-local .env file as the Node flow runner."""
+    cwd_path = (Path.cwd() / ".env").expanduser()
+    if cwd_path.exists():
+        return cwd_path.resolve()
+    return (Path(__file__).resolve().parents[2] / ".env").resolve()
+
+
+def persist_pending_apple_password_to_env(password: str) -> Path:
+    """Atomically persist a recoverable password before browser input starts.
+
+    The pending key is intentionally separate from APPLE_PASSWORD. It stays in
+    place if the browser reports an ambiguous post-submit state, and Node
+    promotes it to APPLE_PASSWORD only after a confirmed successful change.
+    """
+    formatted_password = format_pending_password_env_value(password)
+    env_path = resolve_pending_password_env_path()
+    try:
+        if env_path.exists():
+            # Keep the existing line ending style. Path.read_text() uses universal
+            # newline conversion, which would turn CRLF into LF before the atomic
+            # rewrite and make a Windows/macOS backup silently change the file.
+            with env_path.open("r", encoding="utf-8", newline="") as stream:
+                original = stream.read()
+        else:
+            original = ""
+    except OSError as error:
+        raise RuntimeError("account password backup could not read .env") from error
+
+    line_ending = "\r\n" if "\r\n" in original else "\n"
+    updated_lines: list[str] = []
+    handled = False
+    for line in original.splitlines():
+        trimmed = line.strip()
+        if trimmed and not trimmed.startswith("#") and "=" in trimmed:
+            key = trimmed.split("=", 1)[0].strip()
+            if key == APPLE_PASSWORD_PENDING_ENV_KEY:
+                if not handled:
+                    updated_lines.append(
+                        f"{APPLE_PASSWORD_PENDING_ENV_KEY}={formatted_password}"
+                    )
+                    handled = True
+                continue
+        updated_lines.append(line)
+    if not handled:
+        if updated_lines and updated_lines[-1] != "":
+            updated_lines.append("")
+        updated_lines.append("# Pending Apple password recovery backup; do not commit this file.")
+        updated_lines.append(f"{APPLE_PASSWORD_PENDING_ENV_KEY}={formatted_password}")
+
+    content = line_ending.join(updated_lines)
+    if not content.endswith(line_ending):
+        content += line_ending
+    temporary: Path | None = None
+    descriptor: int | None = None
+    try:
+        env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = env_path.with_name(
+            f".{env_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            descriptor = None
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, env_path)
+        temporary = None
+        try:
+            env_path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as error:
+        raise RuntimeError("account password backup could not be saved") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return env_path
+
+
 def classify_account_password_change_failure(error: Exception) -> str:
     message = str(error).casefold()
+    if "password backup" in message:
+        return "password_change_backup_failed"
     if "navigation" in message or "security" in message:
         return "password_change_navigation_failed"
+    if "menu action" in message:
+        return "password_change_menu_unconfirmed"
+    if "card action" in message or "change action" in message:
+        return "password_change_action_unavailable"
+    if "password card" in message:
+        return "password_change_card_unavailable"
     if "form" in message or "field" in message or "card" in message:
         return "password_change_form_unready"
     if "submit" in message:
@@ -7500,8 +8070,55 @@ def change_account_password(
         emit({"event": "status", "status": "password_change_page_ready"})
 
         set_browser_startup_stage("password_change")
+        emit({"event": "status", "status": "password_change_card_wait_started"})
         card_scope, card = wait_for_account_password_card(page, pause=pause)
-        human_click(card_scope, card, pause=pause)
+        emit({"event": "status", "status": "password_change_card_resolved"})
+        action_scope, action, action_kind = wait_for_account_password_card_action(
+            card_scope,
+            card,
+            pause=pause,
+            root_page=page,
+        )
+        if action_kind == "menu":
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_menu_trigger_resolved",
+                }
+            )
+            human_click(action_scope, action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_menu_trigger_click_sent",
+                }
+            )
+            start_scope, start_action = wait_for_account_password_change_action(
+                page,
+                pause=pause,
+            )
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_start_action_resolved",
+                }
+            )
+            human_click(start_scope, start_action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_start_action_click_sent",
+                }
+            )
+        else:
+            human_click(action_scope, action, pause=pause)
+            emit(
+                {
+                    "event": "status",
+                    "status": "password_change_card_click_sent",
+                }
+            )
+        emit({"event": "status", "status": "password_change_form_wait_started"})
         fields = wait_for_account_password_change_form(page, pause=pause)
         emit(
             {
@@ -7511,6 +8128,16 @@ def change_account_password(
             }
         )
         new_password = generate_account_password()
+        add_diagnostic_secret(new_password)
+        persist_pending_apple_password_to_env(new_password)
+        emit(
+            {
+                "event": "status",
+                "status": "password_change_backup_saved",
+                "passwordLength": len(new_password),
+                "backupKey": APPLE_PASSWORD_PENDING_ENV_KEY,
+            }
+        )
         for kind, value in (
             ("current", current_password),
             ("new", new_password),
@@ -8175,18 +8802,70 @@ def wait_for_small_business_submission_success(
     raise RuntimeError("small business application submission confirmation was not found")
 
 
+def small_business_application_tab_is_enroll_url(page: Any) -> bool:
+    try:
+        return is_small_business_program_enroll_url(scope_location_url(page))
+    except Exception:
+        return False
+
+
+def small_business_application_tab_has_expected_navigation_url(page: Any) -> bool:
+    """Allow the verified enrollment target or Apple's pre-auth redirect chain.
+
+    The exact enrollment URL is the only terminal success condition after
+    authentication, but a fresh isolated tab can legitimately stop on a
+    verified Apple sign-in or Developer account route before that handoff.
+    """
+    try:
+        url = scope_location_url(page)
+    except Exception:
+        return False
+    return bool(
+        is_small_business_program_enroll_url(url)
+        or is_developer_account_url(url)
+        or is_apple_url(url)
+    )
+
+
 def open_small_business_application_tab(page: Any) -> Any:
     set_browser_startup_stage("small_business_application")
     emit({"event": "status", "status": "small_business_application_started"})
     try:
         small_business_page = page.new_tab(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
-    except Exception as error:
-        raise RuntimeError(
-            "new small business application tab could not be created"
-        ) from error
-    if small_business_page is None or not browser_connection_is_alive(small_business_page):
-        raise RuntimeError("new small business application tab could not be created")
-    emit({"event": "status", "status": "small_business_application_tab_created"})
+    except Exception:
+        small_business_page = None
+    # A ruyiPage tab factory must never alias the Account source page here.
+    # The enrollment workflow needs an independent tab so a failed direct tab
+    # creation cannot navigate away from the already-authenticated Account UI.
+    if (
+        small_business_page is None
+        or same_browsing_context(small_business_page, page)
+        or not browser_connection_is_alive(small_business_page)
+    ):
+        try:
+            blank_tab = page.new_tab("about:blank")
+        except Exception as error:
+            raise RuntimeError(
+                "new small business application tab could not be created"
+            ) from error
+        if (
+            blank_tab is None
+            or same_browsing_context(blank_tab, page)
+            or not browser_connection_is_alive(blank_tab)
+        ):
+            raise RuntimeError("new small business application tab could not be created")
+        small_business_page = blank_tab
+
+    # Some ruyiPage builds return a live, independent tab before its requested
+    # URL has committed. Reuse that same tab rather than opening another one.
+    if not small_business_application_tab_is_enroll_url(small_business_page):
+        try:
+            small_business_page.get(SMALL_BUSINESS_PROGRAM_ENROLL_URL)
+        except Exception as error:
+            raise RuntimeError(
+                "new small business application tab could not be opened"
+            ) from error
+
     try:
         small_business_page.wait.doc_loaded(timeout=20)
     except Exception:
@@ -8194,6 +8873,13 @@ def open_small_business_application_tab(page: Any) -> Any:
             raise RuntimeError(
                 "small business browser connection was lost while opening enrollment page"
             )
+    if not small_business_application_tab_has_expected_navigation_url(
+        small_business_page
+    ):
+        raise RuntimeError(
+            "new small business application tab did not reach an expected Apple navigation URL"
+        )
+    emit({"event": "status", "status": "small_business_application_tab_created"})
     human_pause(700, 1400)
     return small_business_page
 
@@ -10083,7 +10769,10 @@ def _browser_flow(args: argparse.Namespace) -> int:
                         preserve_on_success or preserve_on_failure
                     ),
                 }
-            if post_login_password_change["success"] is True:
+            # Password rotation is best-effort within the Account module. If it
+            # fails, keep the original in-memory credential and continue with
+            # the independent small-business tab/authentication flow.
+            if post_login_profile_capture["success"] is True:
                 try:
                     (
                         post_login_small_business_application,

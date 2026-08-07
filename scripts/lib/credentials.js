@@ -15,8 +15,10 @@ export const PACKAGE_ROOT = path.resolve(__dirname, "../..");
 const RUNTIME_ONLY_SMS_ENV_KEYS = new Set([
   "APPLE_AUTOMATION_MANUAL_SMS_CODE",
 ]);
+const APPLE_PASSWORD_PENDING_ENV_KEY = "APPLE_PASSWORD_PENDING";
 const ENV_FILE_IGNORED_KEYS = new Set([
   ...RUNTIME_ONLY_SMS_ENV_KEYS,
+  APPLE_PASSWORD_PENDING_ENV_KEY,
   "APPLE_AUTOMATION_SUPERVISED_GUI",
   "APPLE_AUTOMATION_TERMINAL_DEBUG",
 ]);
@@ -206,7 +208,9 @@ export function saveApplePasswordToEnv(password) {
   const { lines, lineEnding } = fs.existsSync(envPath)
     ? readEnvDocument(envPath)
     : { lines: [], lineEnding: "\n" };
-  const updated = upsertEnvLines(lines, {
+  const updated = upsertEnvLines(removeEnvLines(lines, new Set([
+    APPLE_PASSWORD_PENDING_ENV_KEY,
+  ])), {
     APPLE_PASSWORD: safePassword,
   });
   writePrivateEnvFile(envPath, updated, lineEnding);

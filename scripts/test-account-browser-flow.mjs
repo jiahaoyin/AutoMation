@@ -1724,6 +1724,364 @@ async function runPasswordChangePersistenceAndRedactionTest() {
   assert.equal(failureWarnings.join("\n").includes(rotatedPassword), false);
 }
 
+async function runPasswordPendingRecoveryAuditTest() {
+  const auditEntries = [];
+  const auditSecrets = [];
+  const flowAudit = {
+    addSecrets(values) {
+      auditSecrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      auditEntries.push({ source, event, details });
+    },
+  };
+  const storedPasswords = [];
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_backup_saved",
+      passwordLength: 16,
+      backupKey: "APPLE_PASSWORD_PENDING",
+      rawPassword: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "password_change_failed",
+      failureStage: "password_change",
+      failureClass: "password_change_confirmation_missing",
+      rawPassword: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: {
+        success: false,
+        attempted: true,
+        passwordStored: false,
+        passwordLength: 16,
+        failureStage: "password_change",
+        failureClass: "password_change_confirmation_missing",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: false,
+      },
+    };
+  }, {
+    saveApplePasswordToEnv(value) {
+      storedPasswords.push(value);
+      return "/tmp/test-password.env";
+    },
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase(
+        { ...params, flowAudit },
+        harness.runtime
+      );
+    });
+  });
+
+  assert.deepEqual(storedPasswords, []);
+  assert.equal(result.postLoginPasswordChange.success, false);
+  assert.equal(result.postLoginPasswordChange.attempted, true);
+  assert.equal(result.postLoginPasswordChange.passwordStored, false);
+  assert.equal(result.postLoginPasswordChange.passwordBackupStored, true);
+  assert.equal(result.postLoginPasswordChange.passwordLength, 16);
+  assert.equal(
+    result.postLoginPasswordChange.failureClass,
+    "password_change_confirmation_missing"
+  );
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "ruyipage" &&
+        entry.event === "status" &&
+        entry.details.status === "password_change_backup_saved" &&
+        entry.details.passwordLength === 16 &&
+        entry.details.backupKey === "APPLE_PASSWORD_PENDING" &&
+        !Object.hasOwn(entry.details, "rawPassword")
+    )
+  );
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_backup_saved" &&
+        entry.details.passwordLength === 16 &&
+        entry.details.backupKey === "APPLE_PASSWORD_PENDING"
+    )
+  );
+  const recoveryEntries = auditEntries.filter(
+    (entry) =>
+      entry.source === "account_browser" &&
+      entry.event === "password_change_recovery_available"
+  );
+  assert.deepEqual(recoveryEntries, [
+    {
+      source: "account_browser",
+      event: "password_change_recovery_available",
+      details: {
+        passwordLength: 16,
+        backupKey: "APPLE_PASSWORD_PENDING",
+        failureClass: "password_change_confirmation_missing",
+      },
+    },
+  ]);
+  assert.ok(
+    auditEntries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_partial" &&
+        entry.details.passwordBackupStored === true &&
+        entry.details.failureClass === "password_change_confirmation_missing"
+    )
+  );
+  assert.ok(logs.some((line) => line.includes(".env") && line.includes("16")));
+  assert.ok(
+    warnings.some(
+      (line) => line.includes("APPLE_PASSWORD_PENDING") && line.includes("16")
+    )
+  );
+  const allOutput = JSON.stringify({ result, auditEntries, auditSecrets, logs, warnings });
+  assert.equal(allOutput.includes(SECRET_FIXTURE), false);
+}
+
+async function runPasswordChangeMenuStatusSanitizationTest() {
+  const entries = [];
+  const secrets = [];
+  const flowAudit = {
+    addSecrets(values) {
+      secrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const menuStatuses = [
+    "password_change_card_wait_started",
+    "password_change_card_resolved",
+    "password_change_menu_trigger_resolved",
+    "password_change_menu_trigger_click_sent",
+    "password_change_start_action_resolved",
+    "password_change_start_action_click_sent",
+    "password_change_form_wait_started",
+  ];
+  const harness = createRuntime(async (options) => {
+    for (const status of menuStatuses) {
+      await options.onEvent({ event: "status", status, secret: SECRET_FIXTURE });
+    }
+    await options.onEvent({
+      event: "status",
+      status: "password_change_failed",
+      failureStage: "password_change",
+      failureClass: "password_change_action_unavailable",
+      secret: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: {
+        success: false,
+        attempted: true,
+        passwordStored: false,
+        passwordLength: 0,
+        failureStage: "password_change",
+        failureClass: "password_change_action_unavailable",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: false,
+      },
+    };
+  });
+
+  let result;
+  let logs;
+  const warnings = await captureConsole("warn", async () => {
+    logs = await captureConsole("log", async () => {
+      result = await runAccountBrowserPhase(
+        { ...params, flowAudit },
+        harness.runtime
+      );
+    });
+  });
+
+  assert.deepEqual(
+    entries
+      .filter(
+        (entry) =>
+          entry.source === "ruyipage" &&
+          entry.event === "status" &&
+          entry.details.status.startsWith("password_change_")
+      )
+      .map((entry) => entry.details),
+    [
+      ...menuStatuses.map((status) => ({ status })),
+      {
+        status: "password_change_failed",
+        failureStage: "password_change",
+        failureClass: "password_change_action_unavailable",
+      },
+    ]
+  );
+  assert.deepEqual(result.postLoginPasswordChange, {
+    success: false,
+    attempted: true,
+    passwordStored: false,
+    passwordLength: 0,
+    failureStage: "password_change",
+    failureClass: "password_change_action_unavailable",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: false,
+  });
+  assert.ok(logs.includes("[→] 正在定位密码卡片操作入口"));
+  assert.ok(logs.includes("[✓] 已定位密码卡片"));
+  assert.ok(logs.includes("[→] 正在打开密码卡片更多操作"));
+  assert.ok(logs.includes("[✓] 已打开密码卡片更多操作"));
+  assert.ok(logs.includes("[→] 正在定位更改密码操作"));
+  assert.ok(logs.includes("[✓] 已进入密码修改表单"));
+  assert.ok(logs.includes("[→] 正在等待密码修改表单加载"));
+  assert.ok(
+    warnings.includes(
+      "[!] Apple 账户密码修改未完成（阶段：password_change，原因：password_change_action_unavailable），详情已写入日志"
+    )
+  );
+  assert.equal(JSON.stringify({ entries, secrets, result, logs, warnings }).includes(SECRET_FIXTURE), false);
+}
+
+async function runPasswordChangeFailureContinuesSmallBusinessApplicationTest() {
+  const entries = [];
+  const secrets = [];
+  const flowAudit = {
+    addSecrets(values) {
+      secrets.push(...values);
+    },
+    write(source, event, details = {}) {
+      entries.push({ source, event, details });
+    },
+    writeError(source, event, _error, details = {}) {
+      entries.push({ source, event, details });
+    },
+  };
+  const harness = createRuntime(async (options) => {
+    await options.onEvent({
+      event: "status",
+      status: "password_change_failed",
+      failureStage: "password_change",
+      failureClass: "password_change_action_unavailable",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "small_business_application_started",
+      secret: SECRET_FIXTURE,
+    });
+    await options.onEvent({
+      event: "status",
+      status: "small_business_application_tab_created",
+      secret: SECRET_FIXTURE,
+    });
+    return {
+      ...successfulResult(),
+      postLoginPasswordChange: {
+        success: false,
+        attempted: true,
+        passwordStored: false,
+        passwordLength: 0,
+        failureStage: "password_change",
+        failureClass: "password_change_action_unavailable",
+        browserAlive: true,
+        browserPreserved: true,
+        browserPreservationRequested: false,
+      },
+      postLoginSmallBusinessApplication: {
+        success: true,
+        attempted: true,
+        submitted: true,
+        failureStage: "unknown",
+        failureClass: "unknown",
+        browserAlive: true,
+        browserPreserved: false,
+        browserPreservationRequested: false,
+      },
+    };
+  });
+
+  let result;
+  await captureConsole("warn", async () => {
+    result = await runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime);
+  });
+
+  assert.deepEqual(result.postLoginPasswordChange, {
+    success: false,
+    attempted: true,
+    passwordStored: false,
+    passwordLength: 0,
+    failureStage: "password_change",
+    failureClass: "password_change_action_unavailable",
+    browserAlive: true,
+    browserPreserved: true,
+    browserPreservationRequested: false,
+  });
+  assert.deepEqual(result.postLoginSmallBusinessApplication, {
+    success: true,
+    attempted: true,
+    submitted: true,
+    failureStage: "unknown",
+    failureClass: "unknown",
+    browserAlive: true,
+    browserPreserved: false,
+    browserPreservationRequested: false,
+  });
+  assert.deepEqual(
+    entries
+      .filter(
+        (entry) =>
+          entry.source === "ruyipage" &&
+          entry.event === "status" &&
+          [
+            "password_change_failed",
+            "small_business_application_started",
+            "small_business_application_tab_created",
+          ].includes(entry.details.status)
+      )
+      .map((entry) => entry.details),
+    [
+      {
+        status: "password_change_failed",
+        failureStage: "password_change",
+        failureClass: "password_change_action_unavailable",
+      },
+      { status: "small_business_application_started" },
+      { status: "small_business_application_tab_created" },
+    ]
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "password_change_partial" &&
+        entry.details.failureClass === "password_change_action_unavailable"
+    )
+  );
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.source === "account_browser" &&
+        entry.event === "small_business_application_completed" &&
+        entry.details.submitted === true
+    )
+  );
+  assert.equal(JSON.stringify({ entries, secrets, result }).includes(SECRET_FIXTURE), false);
+}
+
 async function runSmallBusinessApplicationSanitizationTest() {
   const rotatedPassword = "Aa2!Bb3@Cc4#Dd5$";
   const entries = [];
@@ -4056,6 +4414,7 @@ function runEnvDataParsingTest() {
     "APPLE_AUTOMATION_SMS_API_URL",
     "APPLE_AUTOMATION_SMS_RECONFIGURE",
     "APPLE_AUTOMATION_MANUAL_SMS_CODE",
+    "APPLE_PASSWORD_PENDING",
     "APPLE_AUTOMATION_SUPERVISED_GUI",
     "APPLE_AUTOMATION_TERMINAL_DEBUG",
   ];
@@ -4067,7 +4426,7 @@ function runEnvDataParsingTest() {
   try {
     fs.writeFileSync(
       envPath,
-      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nAPPLE_AUTOMATION_SUPERVISED_GUI=1\r\nAPPLE_AUTOMATION_TERMINAL_DEBUG=true\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
+      `${externalKey}=from-file\r\n${loadedKey}="a\\\\b\\\"c # $HOME"\r\nAPPLE_AUTOMATION_SMS_ENABLED=1\r\nAPPLE_AUTOMATION_SMS_PHONE=+8613800130051\r\nAPPLE_AUTOMATION_SMS_API_URL=https://example.test/record?token=private\r\nAPPLE_AUTOMATION_SMS_RECONFIGURE=1\r\nAPPLE_AUTOMATION_MANUAL_SMS_CODE=123456\r\nAPPLE_PASSWORD_PENDING=stale-password\r\nAPPLE_PASSWORD_PENDING=duplicate-password\r\nAPPLE_AUTOMATION_SUPERVISED_GUI=1\r\nAPPLE_AUTOMATION_TERMINAL_DEBUG=true\r\nname=old\r\nname=duplicate\r\nbirthday=1900-01-01\r\nbirthday=1900-01-02\r\n`,
       "utf8"
     );
     fs.chmodSync(envPath, 0o644);
@@ -4083,6 +4442,7 @@ function runEnvDataParsingTest() {
     assert.equal(process.env.APPLE_AUTOMATION_SMS_API_URL, "https://example.test/record?token=private");
     assert.equal(process.env.APPLE_AUTOMATION_SMS_RECONFIGURE, "1");
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_MANUAL_SMS_CODE"), false);
+    assert.equal(Object.hasOwn(process.env, "APPLE_PASSWORD_PENDING"), false);
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_SUPERVISED_GUI"), false);
     assert.equal(Object.hasOwn(process.env, "APPLE_AUTOMATION_TERMINAL_DEBUG"), false);
     assert.equal(
@@ -4133,6 +4493,7 @@ function runEnvDataParsingTest() {
     const saved = fs.readFileSync(envPath, "utf8");
     assert.match(saved, /^APPLE_PASSWORD=Nw2!SafePass_2026$/m);
     assert.equal((saved.match(/^APPLE_PASSWORD=/gm) ?? []).length, 1);
+    assert.equal((saved.match(/^APPLE_PASSWORD_PENDING=/gm) ?? []).length, 0);
     assert.match(saved, /^name="Test Given Test Family"$/m);
     assert.match(saved, /^birthday=2000-01-02$/m);
     assert.match(saved, /^developer_membership=未确认$/m);
@@ -4392,6 +4753,57 @@ function readEmbeddedRuyiPageJavaScript(pythonSource, functionName) {
     "__OTP_REJECTION_PATTERN__",
     "never-match"
   );
+}
+
+function readRawEmbeddedRuyiPageJavaScript(pythonSource, functionName) {
+  const functionStart = pythonSource.indexOf(`def ${functionName}(`);
+  assert.ok(functionStart >= 0, `missing Python function ${functionName}`);
+  const stringStart = pythonSource.indexOf('r"""', functionStart);
+  assert.ok(stringStart >= 0, `missing embedded JavaScript for ${functionName}`);
+  const bodyStart = pythonSource.indexOf("\n", stringStart) + 1;
+  const bodyEnd = pythonSource.indexOf('"""', bodyStart);
+  assert.ok(bodyEnd > bodyStart, `unterminated embedded JavaScript for ${functionName}`);
+  return pythonSource.slice(bodyStart, bodyEnd);
+}
+
+function runAccountPasswordCardSummaryJavaScriptTest() {
+  const pythonSource = fs.readFileSync(
+    new URL("./ruyipage/apple_account_flow.py", import.meta.url),
+    "utf8"
+  );
+  const cardSummaryScript = readRawEmbeddedRuyiPageJavaScript(
+    pythonSource,
+    "account_password_card_summary"
+  );
+  const style = { display: "block", visibility: "visible" };
+  const root = {
+    nodeType: 1,
+    tagName: "MAIN",
+    parentElement: null,
+    children: [],
+  };
+  const card = {
+    nodeType: 1,
+    tagName: "DIV",
+    innerText: "密码 上次更新：2026年7月18日",
+    textContent: "密码 上次更新：2026年7月18日",
+    parentElement: root,
+    children: [],
+    getBoundingClientRect: () => ({ width: 420, height: 120 }),
+    getAttribute: () => null,
+  };
+  root.children = [card];
+  const summarize = new Function("window", `return (${cardSummaryScript});`)({
+    getComputedStyle: () => style,
+  });
+  const summary = JSON.parse(summarize.call(card));
+
+  assert.equal(summary.visible, true);
+  assert.equal(summary.passwordCard, true);
+  assert.equal(summary.lastUpdated, true);
+  assert.equal(summary.semanticActionTarget, false);
+  assert.equal(typeof summary.domIdentity, "string");
+  assert.ok(summary.domIdentity.includes("div:0"));
 }
 
 function createAccountSecurityDetectorFixture({
@@ -4705,6 +5117,10 @@ const focusedTests = {
   },
   "profile-persistence": runProfilePersistenceAndAuditRedactionTest,
   "password-change": runPasswordChangePersistenceAndRedactionTest,
+  "password-pending-recovery": runPasswordPendingRecoveryAuditTest,
+  "password-change-menu-status": runPasswordChangeMenuStatusSanitizationTest,
+  "password-failure-small-business":
+    runPasswordChangeFailureContinuesSmallBusinessApplicationTest,
   "developer-membership": async () => {
     await runDeveloperMembershipPersistenceTest();
     await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
@@ -4750,6 +5166,7 @@ const focusedTests = {
   "settings-status": runSupervisedSettingsStatusWhitelistTest,
   "failure-stage": runFailureStageRetentionTest,
   "security-card-detector": runAccountManageSecurityCardDetectorTest,
+  "password-card-summary-js": runAccountPasswordCardSummaryJavaScriptTest,
   "failure-envelope": () => {
     runFlowFailureEnvelopeTest();
     runAccountBrowserCompletionSummaryTest();
@@ -4783,9 +5200,12 @@ await runSupervisedSettingsStatusWhitelistTest();
 await runFailureDisposalTest();
 await runMissingAccountHomeConfirmationTest();
 await runTrustedSessionDisposalTest();
-await runProfilePersistenceAndAuditRedactionTest();
-await runPasswordChangePersistenceAndRedactionTest();
-await runSmallBusinessApplicationSanitizationTest();
+  await runProfilePersistenceAndAuditRedactionTest();
+  await runPasswordChangePersistenceAndRedactionTest();
+  await runPasswordPendingRecoveryAuditTest();
+  await runPasswordChangeMenuStatusSanitizationTest();
+  await runPasswordChangeFailureContinuesSmallBusinessApplicationTest();
+  await runSmallBusinessApplicationSanitizationTest();
 await runDeveloperMembershipPersistenceTest();
 await runDeveloperMembershipEventSurvivesAccountTabFailureTest();
 await runDeveloperMembershipEventDoesNotDuplicateResultPersistenceTest();
@@ -4824,9 +5244,10 @@ runEnvDataParsingTest();
 runSmsRuntimeEnvMergeTest();
 runFlowReportPrivacyTest();
 runLauncherAuditArchiveTest();
-runFullFlowSourceContractTest();
-runAccountManageSecurityCardDetectorTest();
-runSupervisedCredentialConfirmationTest();
+  runFullFlowSourceContractTest();
+  runAccountManageSecurityCardDetectorTest();
+  runAccountPasswordCardSummaryJavaScriptTest();
+  runSupervisedCredentialConfirmationTest();
 runReportRootOverrideTest();
 runAcceptanceMarkerTest();
 runAcceptanceMarkerFailureIsNonfatalTest();
