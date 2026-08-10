@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""ruyiPage-only account.apple.com browser phase.
+"""Camoufox account.apple.com browser phase.
 
 The script speaks JSONL on stdout/stdin so Node can keep ownership of macOS
-2FA collection and top-level reporting. All browser lifecycle and page access
-remain inside ruyiPage.
+2FA collection and top-level reporting. Browser lifecycle uses Camoufox
+(Firefox) with a ruyiPage-compatible interaction surface.
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TextIO
 from urllib.parse import urljoin, urlsplit
+
+# Ensure sibling Camoufox modules resolve when Node launches this script by path.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 
 ACCOUNT_INFORMATION_URL = "https://account.apple.com/account/manage/section/information"
@@ -9176,13 +9181,15 @@ def ignore_signals_self_test() -> int:
 
 
 def import_ruyipage() -> tuple[Any, Any, Any]:
+    """Import the Camoufox runtime under the historical helper name."""
     try:
-        from ruyipage import FirefoxOptions, FirefoxPage, Keys  # type: ignore
+        from camoufox_compat import import_camoufox_runtime
 
-        return FirefoxOptions, FirefoxPage, Keys
+        return import_camoufox_runtime()
     except Exception as exc:  # pragma: no cover - exercised on macOS install machine
         raise RuntimeError(
-            "ruyipage is not installed. Run ./install.sh or install ruyiPage==1.2.45 in the selected Python environment"
+            "camoufox is not installed. Run ./install.sh or install camoufox[geoip] "
+            "in the project virtual environment"
         ) from exc
 
 
@@ -9626,48 +9633,9 @@ def attached_account_matches_apple_id(scope: Any, expected_apple_id: str) -> boo
 
 
 def try_attach_existing_browser(profile_dir: str = "") -> Any | None:
-    """Attach to one running Firefox through ruyiPage without changing its tabs."""
-    if not should_attach_existing_browser():
-        return None
-    try:
-        ruyipage = importlib.import_module("ruyipage")
-    except Exception:
-        return None
-
-    attach = getattr(ruyipage, "attach_exist_browser", None)
-    addresses = [
-        valid_browser_attach_address(os.environ.get(BROWSER_ATTACH_ADDRESS_ENV, "")),
-        read_browser_attach_address(profile_dir),
-    ]
-    attempted_addresses: set[str] = set()
-    for address in addresses:
-        if not address or address in attempted_addresses or not callable(attach):
-            continue
-        attempted_addresses.add(address)
-        try:
-            candidate = attach(address=address, latest_tab=True)
-        except Exception:
-            continue
-        if browser_connection_is_alive(candidate):
-            return candidate
-
-    attach_by_process = getattr(ruyipage, "auto_attach_exist_browser_by_process", None)
-    if not callable(attach_by_process):
-        return None
-    for attempt in range(3):
-        try:
-            candidate = attach_by_process(timeout=1.0, max_workers=64, latest_tab=True)
-        except TypeError:
-            try:
-                candidate = attach_by_process()
-            except Exception:
-                candidate = None
-        except Exception:
-            candidate = None
-        if browser_connection_is_alive(candidate):
-            return candidate
-        if attempt < 2:
-            time.sleep(0.35)
+    """Camoufox owns a fresh process; attaching to a live Firefox is unsupported."""
+    # Profile reuse still happens via the system Firefox default profile directory.
+    # A second process cannot open the same profile while Firefox is running.
     return None
 
 
@@ -9737,24 +9705,8 @@ def try_attach_existing_browser_for_flow(
 
 
 def construct_firefox_page(FirefoxPage: Any, opts: Any) -> Any:
-    if not browser_broker_mode_enabled() or sys.platform != "darwin":
-        return FirefoxPage(opts)
-
-    browser_module = importlib.import_module("ruyipage._base.browser")
-    runtime_subprocess = browser_module.subprocess
-    original_popen = runtime_subprocess.Popen
-
-    def inherit_broker_process_group(*args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("start_new_session") is True:
-            kwargs = dict(kwargs)
-            kwargs.pop("start_new_session")
-        return original_popen(*args, **kwargs)
-
-    runtime_subprocess.Popen = inherit_broker_process_group
-    try:
-        return FirefoxPage(opts)
-    finally:
-        runtime_subprocess.Popen = original_popen
+    """Launch Camoufox with the configured options (system profile + fingerprint)."""
+    return FirefoxPage(opts)
 
 
 def ensure_two_factor_preparation(
@@ -10395,8 +10347,18 @@ def _browser_flow(args: argparse.Namespace) -> int:
     if broker_mode:
         emit({"event": "status", "status": "browser_runtime_imported"})
     opts = FirefoxOptions()
+    # Prefer the system Firefox default profile (icon-launched profile).
+    # Node may still pass --profile-dir; empty means auto-detect.
     if args.firefox:
-        opts.set_browser_path(args.firefox)
+        # Camoufox ships its own Firefox binary; keep path only when explicitly forced.
+        force_system_firefox = os.environ.get("CAMOUFOX_USE_SYSTEM_FIREFOX", "").strip() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if force_system_firefox:
+            opts.set_browser_path(args.firefox)
     if args.profile_dir:
         opts.set_user_dir(args.profile_dir)
     opts.set_window_size(1280, 960)
@@ -10425,14 +10387,44 @@ def _browser_flow(args: argparse.Namespace) -> int:
     page, browser_route = try_attach_existing_browser_for_flow(apple_id, args.profile_dir)
     attached_existing_browser = browser_route == "account_session"
     if page is None:
-        if should_attach_existing_browser() and firefox_profile_has_active_lock(args.profile_dir):
+        profile_for_lock = args.profile_dir or ""
+        try:
+            from camoufox_session import resolve_default_firefox_profile
+
+            detected = resolve_default_firefox_profile(args.profile_dir or None)
+            if detected is not None:
+                profile_for_lock = str(detected)
+                if not opts.user_dir:
+                    opts.set_user_dir(profile_for_lock)
+        except Exception:
+            pass
+        if firefox_profile_has_active_lock(profile_for_lock):
             emit({"event": "status", "status": "browser_profile_attach_required"})
-            raise RuntimeError("active Firefox profile could not be attached through ruyiPage")
+            raise RuntimeError(
+                "Firefox default profile is locked by a running Firefox. "
+                "Close the Firefox window opened from the Dock/icon, then retry."
+            )
         page = construct_firefox_page(FirefoxPage, opts)
     persist_browser_attach_address(page, args.profile_dir)
     set_browser_startup_stage("browser_ready")
     try:
-        emit({"event": "ready", "mode": "ruyipage-only"})
+        emit({"event": "ready", "mode": "camoufox"})
+        fingerprint_token = ""
+        try:
+            fingerprint_token = str(
+                getattr(getattr(page, "browser", None), "fingerprint_token", "") or ""
+            )
+        except Exception:
+            fingerprint_token = ""
+        emit(
+            {
+                "event": "status",
+                "status": "camoufox_session_ready",
+                "fingerprintOs": "macos",
+                "fingerprintReuse": True,
+                "fingerprintTokenPresent": bool(fingerprint_token),
+            }
+        )
         authentication_context: dict[str, Any] = {
             "twofaPrepared": False,
             "nextGeneration": 1,
@@ -10471,7 +10463,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 authentication_context,
                 developer_screenshot_path,
                 page_holder=developer_page_holder,
-                open_in_new_tab=False,
+                open_in_new_tab=True,
             )
             if screenshots["developerMembership"] is not None:
                 generated_screenshot_paths.append(developer_screenshot_path)
@@ -10595,7 +10587,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                     "success": True,
                     "browserLogin": {
                         "success": False,
-                        "backend": "ruyipage",
+                        "backend": "camoufox",
                         "accountHomeConfirmed": False,
                         "skippedLogin": False,
                         "skipped2FA": False,
@@ -10911,7 +10903,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 "success": True,
                 "browserLogin": {
                     "success": True,
-                    "backend": "ruyipage",
+                    "backend": "camoufox",
                     "accountHomeConfirmed": True,
                     "skippedLogin": skipped_login,
                     "skipped2FA": skipped_2fa,

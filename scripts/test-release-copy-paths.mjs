@@ -110,6 +110,9 @@ for (const rel of [
   "scripts/lib/ruyipage-runtime.js",
   "scripts/lib/ruyipage-backend-runner.js",
   "scripts/ruyipage/apple_account_flow.py",
+  "scripts/ruyipage/camoufox_compat.py",
+  "scripts/ruyipage/camoufox_session.py",
+  "requirements.txt",
   "scripts/lib/2fa-audit.js",
   "scripts/lib/mac-2fa-allow.js",
   "scripts/lib/mac-2fa-ocr.js",
@@ -360,17 +363,17 @@ for (const helper of optionalSwiftHelpers) {
   );
 }
 assert.doesNotMatch(generatedInstallSh, /cliclick/);
-assert.match(generatedInstallSh, /setup-environment\.mjs --install-ruyipage/);
+assert.match(generatedInstallSh, /setup-environment\.mjs --install-camoufox/);
 assert.match(
   generatedInstallSh,
-  /setup-environment\.mjs --install-ruyipage[\s\S]*node scripts\/preflight-2fa-permissions\.mjs --all/,
+  /setup-environment\.mjs --install-camoufox[\s\S]*node scripts\/preflight-2fa-permissions\.mjs --all/,
   "install must confirm the required 2FA permissions after building the exact native helpers"
 );
 assert.match(generatedInstallSh, /bootstrap_macos_install_runtime/);
 const generatedRunSh = renderRunSh();
 assert.match(generatedRunSh, /--skip-browser/);
 assert.match(generatedRunSh, /--skip-mac/);
-assert.match(generatedRunSh, /--skip-firefox --skip-ruyipage/);
+assert.match(generatedRunSh, /--skip-firefox --skip-camoufox/);
 const launcherAuditStages = [
   "launcher_entered",
   "launcher_bootstrap_started",
@@ -519,7 +522,7 @@ assert.match(
 );
 assert.match(rootRunSh, /--skip-browser/);
 assert.match(rootRunSh, /--skip-mac/);
-assert.match(rootRunSh, /--skip-firefox --skip-ruyipage/);
+assert.match(rootRunSh, /--skip-firefox --skip-camoufox/);
 assert.match(
   rootRunSh,
   /if \[\[ "\$\{skip_mac\}" == "1" \]\]; then[\s\S]*setup_args\+=\(--skip-automation\)[\s\S]*fi/,
@@ -546,7 +549,8 @@ assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -v/);
 assert.match(bootstrapMacOS, /resolve_trusted_python_signer/);
 assert.doesNotMatch(bootstrapMacOS, /BMM5U3QVKW|DJ3H93M7VJ/);
 assert.match(bootstrapMacOS, /\/usr\/bin\/sudo -k/);
-assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)/);
+assert.match(setupEnvironment, /process\.argv\.includes\("--skip-ruyipage"\)|process\.argv\.includes\("--skip-camoufox"\)/);
+assert.match(setupEnvironment, /--install-camoufox|--install-ruyipage/);
 assert.match(setupEnvironment, /process\.argv\.includes\("--skip-automation"\)/);
 assert.match(
   setupEnvironment,
@@ -599,6 +603,7 @@ assert.match(
 for (const rel of [
   "docs/RUNTIME_RUNBOOK.md",
   "docs/PROJECT.md",
+  "docs/CAMOUFOX.md",
   "docs/2FA_HANDOFF_DIAGNOSTICS.md",
   "docs/MAC_CODEX_HANDOFF.md",
   "docs/WINDOWS_MAC_CODEX.md",
@@ -632,18 +637,20 @@ for (const [label, documentSource] of [
   assert.match(documentSource, /developer_membership/, `${label} must document membership persistence`);
   assert.match(documentSource, /03-developer-membership\.png/, `${label} must document active-member screenshot`);
   assert.match(documentSource, /02-account-information\.png/, `${label} must document information screenshot`);
-  assert.match(documentSource, /ruyiPage/, `${label} must preserve the ruyiPage-only browser contract`);
+  assert.match(documentSource, /Camoufox/, `${label} must document the Camoufox browser contract`);
 }
-assert.match(repositoryReadme, /Developer-first/);
+assert.match(repositoryReadme, /Developer/);
+assert.match(repositoryReadme, /DEVELOPER_MEMBERSHIP_GATE=0/);
 assert.match(environmentExample, /DEVELOPER_MEMBERSHIP_GATE=0/);
-assert.match(environmentExample, /BROWSER_ATTACH_EXISTING=1/);
+assert.match(environmentExample, /BROWSER_ATTACH_EXISTING=0/);
 assert.match(
   environmentExample,
-  /接管已有 Firefox 会话；仍先执行 Developer-first，再新建 Account 标签页/
+  /Camoufox 不接管外部 Firefox|请先关闭图标启动的 Firefox/
 );
 assert.doesNotMatch(environmentExample, /优先复用已打开的 account\.apple\.com 标签页/);
 assert.match(runtimeRunbook, /developer_membership_gate_blocked/);
 assert.match(projectReference, /recordAccountHomeAcceptanceMarker/);
+assert.ok(fs.existsSync(path.join(repositoryRoot, "docs", "CAMOUFOX.md")));
 assert.match(macHandoff, /Developer-first/);
 assert.match(macHandoff, /DEVELOPER_MEMBERSHIP_GATE=1/);
 assert.match(windowsMacGuide, /developer_membership_gate/);

@@ -159,7 +159,7 @@ if [[ "${SKIP_ENV_SETUP:-}" != "1" ]]; then
   launcher_stage launcher_env_setup_started
   setup_args=(--quiet)
   if [[ "${skip_browser}" == "1" ]]; then
-    setup_args+=(--skip-firefox --skip-ruyipage)
+    setup_args+=(--skip-firefox --skip-camoufox)
   fi
   if [[ "${skip_mac}" == "1" ]]; then
     setup_args+=(--skip-automation)

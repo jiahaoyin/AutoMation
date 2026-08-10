@@ -2,7 +2,7 @@
  * account.apple.com browser phase orchestration.
  *
  * Node owns credentials, reporting, and the macOS 2FA sidecar. Browser launch,
- * navigation, page reads, screenshots, and interaction are delegated to ruyiPage.
+ * navigation, page reads, screenshots, and interaction are delegated to Camoufox.
  */
 
 import { isAccessibilityGranted } from "./accessibility.js";
@@ -17,6 +17,7 @@ import { createMac2FACollector } from "./two-fa-sidecar.js";
 
 const ALLOWED_READY_MODES = new Set([
   "browser",
+  "camoufox",
   "ruyipage-only",
   "protocol-self-test",
   "node-self-test",
@@ -96,6 +97,7 @@ const RUYIPAGE_STATUS_TYPES = new Set([
   "browser_login_tab_created",
   "browser_profile_attach_required",
   "browser_session_preserved",
+  "camoufox_session_ready",
   "browser_finalization_started",
   "browser_finalization_completed",
   "browser_finalization_partial",
@@ -1152,7 +1154,10 @@ function sanitizeBrowserLoginMetadata(browserLogin) {
   const source = browserLogin && typeof browserLogin === "object" ? browserLogin : {};
   return {
     success: source.success === true,
-    backend: source.backend === "ruyipage" ? "ruyipage" : "unknown",
+    backend:
+      source.backend === "camoufox" || source.backend === "ruyipage"
+        ? "camoufox"
+        : "unknown",
     accountHomeConfirmed: source.accountHomeConfirmed === true,
     skippedLogin: source.skippedLogin === true,
     skipped2FA: source.skipped2FA === true,
@@ -1332,7 +1337,7 @@ function hasConfirmedAccountHome(result) {
   const browserLogin = sanitizeBrowserLoginMetadata(result?.browserLogin);
   return (
     browserLogin.success === true &&
-    browserLogin.backend === "ruyipage" &&
+    (browserLogin.backend === "camoufox" || browserLogin.backend === "ruyipage") &&
     browserLogin.accountHomeConfirmed === true
   );
 }
@@ -1427,7 +1432,7 @@ function createPostLoginRunnerPartialResult(failureCode, failureStage, runnerCon
     success: true,
     browserLogin: {
       success: true,
-      backend: "ruyipage",
+      backend: "camoufox",
       accountHomeConfirmed: true,
     },
     postLoginProfileCapture: {
@@ -2104,15 +2109,33 @@ export async function runAccountBrowserPhase(
           );
         }
         if (event.event === "ready") {
-          console.log("[✓] Firefox 浏览器已就绪");
+          console.log("[✓] Camoufox 浏览器已就绪");
           if (showTerminalDebug) {
             console.log(`[ruyipage] ready:mode:${sanitizeReadyMode(event.mode)}`);
+          }
+        } else if (
+          event.event === "status" &&
+          event.status === "camoufox_session_ready"
+        ) {
+          console.log("[✓] macOS 指纹会话已建立（同进程多 tab 复用）");
+          if (showTerminalDebug) {
+            console.log("[ruyipage] status:camoufox_session_ready");
           }
         } else if (
           event.event === "status" &&
           RUYIPAGE_STARTUP_STATUSES.has(event.status)
         ) {
           if (showTerminalDebug) console.log(`[ruyipage] status:${event.status}`);
+        } else if (
+          event.event === "status" &&
+          event.status === "developer_account_tab_created"
+        ) {
+          console.log("[→] 已新建 Developer 标签页");
+        } else if (
+          event.event === "status" &&
+          event.status === "account_module_tab_created"
+        ) {
+          console.log("[→] 已新建 Account 标签页");
         } else if (inputStatusLine) {
           if (showTerminalDebug) console.log(`[ruyipage] status:${inputStatusLine}`);
         } else if (twoFactorHandoffLine) {
@@ -2621,7 +2644,7 @@ export async function runAccountBrowserPhase(
   }
   const partialProfileResult = () => ({
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
-    antiAutomation: { backend: "ruyipage", delegated: true },
+    antiAutomation: { backend: "camoufox", delegated: true },
     postLoginProfileCapture,
     postLoginDeveloperAccount,
     postLoginPasswordChange,
@@ -2705,7 +2728,7 @@ export async function runAccountBrowserPhase(
 
   return {
     browserLogin: sanitizeBrowserLoginMetadata(result.browserLogin),
-    antiAutomation: { backend: "ruyipage", delegated: true },
+    antiAutomation: { backend: "camoufox", delegated: true },
     postLoginProfileCapture,
     postLoginDeveloperAccount,
     postLoginPasswordChange,

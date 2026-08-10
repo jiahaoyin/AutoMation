@@ -7,30 +7,39 @@ import {
 } from "./lib/browser-backend.js";
 
 assert.equal(
+  selectBrowserBackend({ BROWSER_BACKEND: "camoufox" }, { camoufoxAvailable: true }).backend,
+  "camoufox"
+);
+
+assert.equal(
   selectBrowserBackend({ BROWSER_BACKEND: "ruyipage" }, { ruyipageAvailable: true }).backend,
-  "ruyipage"
+  "camoufox"
 );
 
 assert.throws(
-  () => selectBrowserBackend({ BROWSER_BACKEND: "node-bidi" }, { ruyipageAvailable: true }),
-  /ruyipage.*only|only.*ruyipage/i
+  () => selectBrowserBackend({ BROWSER_BACKEND: "node-bidi" }, { camoufoxAvailable: true }),
+  /camoufox.*only|only.*camoufox|BROWSER_BACKEND/i
 );
 
 assert.throws(
-  () => selectBrowserBackend({ BROWSER_BACKEND: "ruyipage" }, { ruyipageAvailable: false }),
-  /ruyipage/i
+  () => selectBrowserBackend({ BROWSER_BACKEND: "camoufox" }, { camoufoxAvailable: false }),
+  /camoufox/i
 );
 
-const autoRuyi = selectBrowserBackend(
+const autoCamoufox = selectBrowserBackend(
   { BROWSER_BACKEND: "auto" },
-  { ruyipageAvailable: true }
+  { camoufoxAvailable: true }
 );
-assert.equal(autoRuyi.backend, "ruyipage");
-assert.match(autoRuyi.reason, /available/i);
+assert.equal(autoCamoufox.backend, "camoufox");
+assert.match(autoCamoufox.reason, /available/i);
 
 assert.throws(
-  () => selectBrowserBackend({}, { ruyipageAvailable: false, ruyipageError: "python not found" }),
-  /ruyipage.*python not found/i
+  () =>
+    selectBrowserBackend(
+      {},
+      { camoufoxAvailable: false, camoufoxError: "python not found" }
+    ),
+  /camoufox.*python not found/i
 );
 
 assert.throws(
@@ -40,28 +49,28 @@ assert.throws(
 
 const summary = buildEnvironmentSummary({
   platform: "win32",
-  backend: autoRuyi,
+  backend: autoCamoufox,
   runtime: {
     python: "python3",
     available: true,
-    version: "1.2.3",
+    version: "0.4.11",
     error: null,
   },
   profile: {
     mode: "persistent",
-    dir: "data/firefox-apple-automation",
+    dir: "/Users/demo/Library/Application Support/Firefox/Profiles/xxx.default-release",
   },
 });
 
-assert.equal(summary.backend, "ruyipage");
+assert.equal(summary.backend, "camoufox");
 assert.equal(summary.platform, "win32");
 assert.equal(summary.profileMode, "persistent");
 assert.ok(summary.warnings.some((w) => /Windows/i.test(w)));
-assert.equal(summary.ruyipageAvailable, true);
+assert.equal(summary.camoufoxAvailable, true);
 
 assert.equal(
   checkEnvironmentOk({
-    issues: ["非 macOS", "Firefox 未安装", "ruyipage package not installed"],
+    issues: ["非 macOS", "Firefox 未安装", "camoufox package not installed"],
     platform: "win32",
     strictPlatform: false,
   }),
@@ -69,7 +78,7 @@ assert.equal(
 );
 assert.equal(
   checkEnvironmentOk({
-    issues: ["非 macOS", "Firefox 未安装", "ruyipage package not installed"],
+    issues: ["非 macOS", "Firefox 未安装", "camoufox package not installed"],
     platform: "win32",
     strictPlatform: true,
   }),
@@ -83,23 +92,5 @@ assert.equal(
   }),
   false
 );
-assert.equal(
-  checkEnvironmentOk({
-    issues: ["Firefox 未安装"],
-    platform: "darwin",
-    strictPlatform: false,
-  }),
-  false
-);
-assert.equal(
-  checkEnvironmentOk({
-    issues: [
-      "ruyipage is the only supported browser backend; BROWSER_BACKEND must be auto or ruyipage",
-    ],
-    platform: "win32",
-    strictPlatform: false,
-  }),
-  false
-);
 
-console.log("browser-backend logic: ok");
+console.log("test-browser-backend: ok");

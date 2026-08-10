@@ -48,7 +48,7 @@ function createRuntime(runBackend, options = {}) {
   const runtime = {
     getBrowserEnvironmentSummary() {
       return {
-        backend: "ruyipage",
+        backend: "camoufox",
         backendReason: "test",
         warnings: options.environmentWarnings ?? [],
       };
@@ -129,7 +129,7 @@ function successfulResult() {
     success: true,
     browserLogin: {
       success: true,
-      backend: "ruyipage",
+      backend: "camoufox",
       accountHomeConfirmed: true,
     },
     postLoginProfileCapture: {
@@ -204,7 +204,7 @@ async function runTwoFactorLifecycleTest() {
   const result = await runAccountBrowserPhase(params, harness.runtime);
   assert.deepEqual(harness.calls, ["prepare", "getCode", "dispose"]);
   assert.equal(harness.collectorCount, 1);
-  assert.equal(result.browserLogin.backend, "ruyipage");
+  assert.equal(result.browserLogin.backend, "camoufox");
 }
 
 async function runProductionPopupPrimaryConfigurationTest() {
@@ -1135,7 +1135,7 @@ async function runFixedTwoFactorStatusPromptsTest() {
   assert.deepEqual(
     logs.filter((line) => !line.startsWith("[2FA]")),
     [
-      "[→] 浏览器自动化：ruyipage",
+      "[→] 浏览器自动化：camoufox",
       "[→] 正在启动 Firefox 浏览器",
     ]
   );
@@ -1464,7 +1464,7 @@ function runAccountBrowserCompletionSummaryTest() {
 async function runMissingAccountHomeConfirmationTest() {
   const harness = createRuntime(async () => ({
     success: true,
-    browserLogin: { success: true, backend: "ruyipage" },
+    browserLogin: { success: true, backend: "camoufox" },
     personalInfo: { name: "Test Given Test Family", birthday: "2000-01-02" },
     screenshots: {},
   }));
@@ -1481,7 +1481,7 @@ async function runTrustedSessionDisposalTest() {
     ...successfulResult(),
     browserLogin: {
       success: true,
-      backend: "ruyipage",
+      backend: "camoufox",
       accountHomeConfirmed: true,
       skippedLogin: true,
       skipped2FA: true,
@@ -2871,7 +2871,7 @@ async function runDeveloperMembershipGateStopTest() {
         success: true,
         browserLogin: {
           success: false,
-          backend: "ruyipage",
+          backend: "camoufox",
           accountHomeConfirmed: false,
           rawUrl: SECRET_FIXTURE,
         },
@@ -3029,7 +3029,7 @@ async function runBrowserResultMetadataAllowlistTest() {
     success: true,
     browserLogin: {
       success: true,
-      backend: "ruyipage",
+      backend: "camoufox",
       accountHomeConfirmed: true,
       skippedLogin: true,
       skipped2FA: false,
@@ -3110,7 +3110,7 @@ async function runBrowserResultMetadataAllowlistTest() {
 
   assert.deepEqual(result.browserLogin, {
     success: true,
-    backend: "ruyipage",
+    backend: "camoufox",
     accountHomeConfirmed: true,
     skippedLogin: true,
     skipped2FA: false,
@@ -3522,9 +3522,9 @@ async function runConciseBrowserProgressTest() {
     runAccountBrowserPhase({ ...params, flowAudit }, harness.runtime)
   );
   const expectedProgress = [
-    "[→] 浏览器自动化：ruyipage",
+    "[→] 浏览器自动化：camoufox",
     "[→] 正在启动 Firefox 浏览器",
-    "[✓] Firefox 浏览器已就绪",
+    "[✓] Camoufox 浏览器已就绪",
     "[→] 正在填写 Apple ID",
     "[✓] Apple ID 已填写",
     "[→] 正在填写 Apple 密码",
@@ -4284,7 +4284,7 @@ async function runPostLoginRunnerPartialTest() {
 
   assert.deepEqual(result.browserLogin, {
     success: true,
-    backend: "ruyipage",
+    backend: "camoufox",
     accountHomeConfirmed: true,
     skippedLogin: false,
     skipped2FA: false,

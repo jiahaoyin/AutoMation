@@ -2,7 +2,7 @@
   "name": "apple-id-automation",
   "version": "1.0.61",
   "private": true,
-  "description": "macOS Apple ID 系统设置登录 + ruyiPage-only account.apple.com 自动化",
+  "description": "macOS Apple ID 系统设置登录 + Camoufox account.apple.com 自动化",
   "type": "module",
   "engines": {
     "node": ">=18"

@@ -35,7 +35,7 @@ if (install) {
   if (process.platform === "darwin") {
     await ensureEnvironment({ quiet: false, installRuyiPage: true });
   } else {
-    console.log("  --install: 当前不是 macOS，跳过 macOS 权限与 ruyipage 自动安装");
+    console.log("  --install: 当前不是 macOS，跳过 macOS 权限与 Camoufox 自动安装");
   }
 }
 
@@ -50,6 +50,12 @@ console.log("  firefox path:", resolveFirefoxExecutable());
 try {
   const browser = getBrowserEnvironmentSummary();
   console.log("  browser backend:", `${browser.backend} (${browser.backendReason})`);
+  console.log(
+    "  python/camoufox:",
+    browser.camoufoxAvailable || browser.ruyipageAvailable
+      ? `${browser.python} / camoufox ${browser.camoufoxVersion ?? browser.ruyipageVersion ?? "unknown"}`
+      : "未就绪（请运行 ./install.sh）"
+  );
   console.log("  profile:", `${browser.profileMode} ${browser.profileDir}`);
 } catch (e) {
   console.log("  browser backend:", e instanceof Error ? e.message : String(e));

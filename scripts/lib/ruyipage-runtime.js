@@ -8,7 +8,17 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "../..");
 
-export const RUYIPAGE_PACKAGE_SPEC = "ruyiPage==1.2.45";
+/** @deprecated historical name; package is now Camoufox */
+export const RUYIPAGE_PACKAGE_SPEC = "camoufox[geoip]";
+export const CAMOUFOX_PACKAGE_SPEC = "camoufox[geoip]";
+/** Default browser channel: official FF152 dev/prerelease from https://github.com/daijro/camoufox */
+export const CAMOUFOX_BROWSER_CHANNEL = "official/prerelease";
+export const CAMOUFOX_PIP_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple";
+export const CAMOUFOX_TRUSTED_HOSTS = Object.freeze([
+  "pypi.tuna.tsinghua.edu.cn",
+  "files.pythonhosted.org",
+  "pypi.org",
+]);
 
 const PIP_TLS_OVERRIDE_ENV_NAMES = new Set([
   "CURL_CA_BUNDLE",
@@ -30,26 +40,37 @@ const PEM_CERTIFICATE_PATTERN =
   /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
 
 /**
- * Build the pinned ruyiPage installation command.  Python.org's macOS
- * runtime can otherwise miss roots trusted by the system Keychain, so the
- * project-managed venv explicitly asks a compatible pip to use its
- * truststore support. This keeps normal HTTPS certificate verification intact.
+ * Build the Camoufox pip install command.
+ * On macOS managed venvs, prefer truststore; callers may also pass
+ * --trusted-host + mirror as an SSL bypass fallback.
  *
  * @param {{
  *   platform?: NodeJS.Platform|string,
  *   managedVenv?: boolean,
- *   truststoreSupported?: boolean
+ *   truststoreSupported?: boolean,
+ *   useMirror?: boolean
  * }} [options]
  */
 export function buildRuyiPagePipInstallArgs(options = {}) {
+  return buildCamoufoxPipInstallArgs(options);
+}
+
+export function buildCamoufoxPipInstallArgs(options = {}) {
   const platform = options.platform ?? process.platform;
   const managedVenv = options.managedVenv ?? false;
   const truststoreSupported = options.truststoreSupported ?? false;
+  const useMirror = options.useMirror ?? false;
   const args = ["-m", "pip", "install"];
-  if (platform === "darwin" && managedVenv && truststoreSupported) {
+  if (platform === "darwin" && managedVenv && truststoreSupported && !useMirror) {
     args.push("--use-feature=truststore");
   }
-  args.push("--upgrade", RUYIPAGE_PACKAGE_SPEC);
+  if (useMirror) {
+    args.push("-i", CAMOUFOX_PIP_MIRROR);
+    for (const host of CAMOUFOX_TRUSTED_HOSTS) {
+      args.push("--trusted-host", host);
+    }
+  }
+  args.push("--upgrade", CAMOUFOX_PACKAGE_SPEC);
   return args;
 }
 
@@ -162,12 +183,6 @@ export function isMacOSTrustedSystemCACertificate(value, options = {}) {
   }
 }
 
-/**
- * Export trusted macOS roots into a private temporary CA bundle. Apple's
- * SystemRootCertificates keychain is authoritative. Additional certificates
- * from the administrator-controlled System keychain must be self-signed CAs
- * and pass macOS local trust evaluation before they can become pip anchors.
- */
 export function createMacOSSystemCABundle(options = {}) {
   const keychains = options.keychains ?? MACOS_SYSTEM_CA_KEYCHAINS;
   const existsSync = options.existsSync ?? fs.existsSync;
@@ -223,7 +238,7 @@ export function createMacOSSystemCABundle(options = {}) {
   if (certificates.size === 0) {
     if (exportFailures.length > 0) {
       throw new Error(
-        `[ruyipage-install:macos_ca_export] Unable to export certificates from the macOS System keychains: ${exportFailures
+        `[camoufox-install:macos_ca_export] Unable to export certificates from the macOS System keychains: ${exportFailures
           .map((error) => error.message)
           .join("; ")}`
       );
@@ -276,9 +291,21 @@ export function isSupportedPythonVersion(versionText) {
 }
 
 export function getLocalRuyiPagePython(root = ROOT, platform = process.platform) {
-  return platform === "win32"
-    ? path.join(root, ".runtime", "ruyipage-venv", "Scripts", "python.exe")
-    : path.join(root, ".runtime", "ruyipage-venv", "bin", "python");
+  return getLocalCamoufoxPython(root, platform);
+}
+
+export function getLocalCamoufoxPython(root = ROOT, platform = process.platform) {
+  const primary =
+    platform === "win32"
+      ? path.join(root, ".runtime", "camoufox-venv", "Scripts", "python.exe")
+      : path.join(root, ".runtime", "camoufox-venv", "bin", "python");
+  const legacy =
+    platform === "win32"
+      ? path.join(root, ".runtime", "ruyipage-venv", "Scripts", "python.exe")
+      : path.join(root, ".runtime", "ruyipage-venv", "bin", "python");
+  if (fs.existsSync(primary)) return primary;
+  if (fs.existsSync(legacy)) return legacy;
+  return primary;
 }
 
 /**
@@ -286,24 +313,19 @@ export function getLocalRuyiPagePython(root = ROOT, platform = process.platform)
  * @param {{ root?: string, platform?: string, commandWorks?: (command: string) => boolean }} [options]
  */
 export function resolvePythonCommand(env = process.env, options = {}) {
-  const requested = env.RUYIPAGE_PYTHON?.trim();
+  const requested = (env.CAMOUFOX_PYTHON || env.RUYIPAGE_PYTHON)?.trim();
   const root = options.root ?? ROOT;
   const platform = options.platform ?? process.platform;
   const commandWorks = options.commandWorks ?? defaultCommandWorks;
   if (requested) return commandWorks(requested) ? requested : null;
 
-  const localPython = getLocalRuyiPagePython(root, platform);
+  const localPython = getLocalCamoufoxPython(root, platform);
   if (commandWorks(localPython)) return localPython;
   if (commandWorks("python3")) return "python3";
   if (commandWorks("python")) return "python";
   return null;
 }
 
-/**
- * Resolve the base interpreter used only to create the project-local venv.
- * @param {NodeJS.ProcessEnv|Record<string,string|undefined>} [env]
- * @param {{ commandWorks?: (command: string) => boolean }} [options]
- */
 export function resolveBasePythonCommand(env = process.env, options = {}) {
   const commandWorks = options.commandWorks ?? defaultCommandWorks;
   const bootstrapPython = env.PYTHON_BOOTSTRAP_EXECUTABLE?.trim();
@@ -323,53 +345,78 @@ export function resolveBasePythonCommand(env = process.env, options = {}) {
  * }} [options]
  */
 export function detectRuyiPageRuntime(env = process.env, options = {}) {
+  return detectCamoufoxRuntime(env, options);
+}
+
+export function detectCamoufoxRuntime(env = process.env, options = {}) {
   const resolvePython = options.resolvePython ?? resolvePythonCommand;
   const runCommand = options.runCommand ?? run;
   const python = resolvePython(env);
   if (!python) {
-    const requested = env.RUYIPAGE_PYTHON?.trim();
+    const requested = (env.CAMOUFOX_PYTHON || env.RUYIPAGE_PYTHON)?.trim();
     return {
       python: null,
       available: false,
       version: null,
+      browserVersion: null,
       error: requested
-        ? `RUYIPAGE_PYTHON is missing or older than Python 3.10: ${requested}`
+        ? `CAMOUFOX_PYTHON/RUYIPAGE_PYTHON is missing or older than Python 3.10: ${requested}`
         : "python/python3 not found",
     };
   }
 
   const result = runCommand(python, [
     "-c",
-    "import ruyipage; import importlib.metadata as m; print(m.version('ruyipage'))",
+    "import camoufox; import importlib.metadata as m; print(m.version('camoufox'))",
   ]);
 
   if (result.status === 0) {
     const version = result.stdout.trim() || null;
-    const requiredVersion = RUYIPAGE_PACKAGE_SPEC.split("==")[1];
-    if (version !== requiredVersion) {
-      return {
-        python,
-        available: false,
-        version,
-        error: `ruyipage requires verified version ${requiredVersion}, found ${version || "unknown"}`,
-      };
+    let browserVersion = null;
+    const browserProbe = runCommand(python, ["-m", "camoufox", "version"], {
+      stdio: "pipe",
+    });
+    if (browserProbe.status === 0) {
+      const text = `${browserProbe.stdout || ""}\n${browserProbe.stderr || ""}`;
+      const match = text.match(/(\d+\.\d+(?:\.\d+)?(?:-beta\.\d+)?)/);
+      browserVersion = match ? match[1] : text.trim().split(/\r?\n/).find(Boolean) || null;
+    }
+    // geoip / playwright are pulled in by camoufox[geoip]; probe lightly.
+    const deps = runCommand(python, [
+      "-c",
+      "import importlib.util as u; print('geoip=' + str(u.find_spec('geoip2') is not None)); print('playwright=' + str(u.find_spec('playwright') is not None))",
+    ]);
+    if (deps.status === 0) {
+      const depText = deps.stdout || "";
+      if (/geoip=False/.test(depText) || /playwright=False/.test(depText)) {
+        return {
+          python,
+          available: false,
+          version,
+          browserVersion,
+          error:
+            "camoufox extras incomplete (need camoufox[geoip] + playwright). Re-run ./install.sh",
+        };
+      }
     }
     return {
       python,
       available: true,
       version,
+      browserVersion,
       error: null,
     };
   }
 
   const detail = (result.stderr || result.stdout || "").trim();
-  const error = /PackageNotFoundError|No package metadata was found|No module named ['\"]ruyipage['\"]/i.test(detail)
-    ? "ruyipage package not installed"
-    : detail || "ruyipage import failed";
+  const error = /PackageNotFoundError|No package metadata was found|No module named ['\"]camoufox['\"]/i.test(detail)
+    ? "camoufox package not installed"
+    : detail || "camoufox import failed";
   return {
     python,
     available: false,
     version: null,
+    browserVersion: null,
     error,
   };
 }
@@ -379,15 +426,16 @@ function commandFailure(command, args, result) {
   return new Error(`${command} ${args.join(" ")} failed: ${detail}`);
 }
 
-function ruyiPagePipInstallFailure(command, args, result, systemCABundleUsed) {
+function camoufoxPipInstallFailure(command, args, result, systemCABundleUsed) {
   const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
   if (isPipTLSCertificateFailure(detail)) {
     const trustSource = systemCABundleUsed
       ? "the exported macOS System keychains"
       : "Python's default trust configuration";
     return new Error(
-      `[ruyipage-install:tls_certificate] PyPI HTTPS certificate verification failed with ${trustSource}. ` +
-        "Install the active network or enterprise proxy root certificate in the macOS System keychain, then rerun ./install.sh.\n" +
+      `[camoufox-install:tls_certificate] PyPI HTTPS certificate verification failed with ${trustSource}. ` +
+        "install will retry with --trusted-host + Tsinghua mirror. " +
+        "If that also fails, install the active network or enterprise proxy root certificate.\n" +
         detail
     );
   }
@@ -405,13 +453,13 @@ function cleanupMacOSSystemCABundle(bundle, quiet) {
   try {
     if (bundle.cleanup() === false && !quiet) {
       process.stderr.write(
-        "[ruyipage-install:ca_cleanup] Temporary macOS CA bundle cleanup was incomplete.\n"
+        "[camoufox-install:ca_cleanup] Temporary macOS CA bundle cleanup was incomplete.\n"
       );
     }
   } catch (error) {
     if (!quiet) {
       process.stderr.write(
-        `[ruyipage-install:ca_cleanup] Temporary macOS CA bundle cleanup failed: ${
+        `[camoufox-install:ca_cleanup] Temporary macOS CA bundle cleanup failed: ${
           error?.message ?? error
         }\n`
       );
@@ -427,23 +475,47 @@ function pipTruststoreSupported(python, runCommand, env) {
   return result.status === 0 && isPipTruststoreSupported(result.stdout || result.stderr || "");
 }
 
+function resolveCamoufoxBrowserChannel(env = process.env) {
+  const configured = String(env.CAMOUFOX_CHANNEL || "").trim();
+  return configured || CAMOUFOX_BROWSER_CHANNEL;
+}
+
+function fetchCamoufoxDevChannel(python, runCommand, quiet, env = process.env) {
+  const channel = resolveCamoufoxBrowserChannel(env);
+  const syncResult = runCommand(python, ["-m", "camoufox", "sync"], {
+    stdio: "pipe",
+  });
+  forwardCommandOutput(syncResult, quiet);
+  const setResult = runCommand(
+    python,
+    ["-m", "camoufox", "set", channel],
+    { stdio: "pipe" }
+  );
+  forwardCommandOutput(setResult, quiet);
+  if (!quiet) {
+    process.stdout.write(
+      `[camoufox-install] browser channel: ${channel} (FF152 dev/prerelease from daijro/camoufox)\n`
+    );
+  }
+  const fetchResult = runCommand(python, ["-m", "camoufox", "fetch"], {
+    stdio: quiet ? "pipe" : "inherit",
+  });
+  if (fetchResult.status !== 0 && !quiet) {
+    process.stderr.write(
+      `[camoufox-install] warning: camoufox fetch (${channel}) did not complete; run \`python -m camoufox set ${channel} && python -m camoufox fetch\` later.\n`
+    );
+  }
+}
+
 /**
- * Install ruyiPage into an isolated project virtual environment unless
- * RUYIPAGE_PYTHON explicitly selects another Python environment.
- * @param {{
- *   quiet?: boolean,
- *   env?: NodeJS.ProcessEnv|Record<string,string|undefined>,
- *   platform?: NodeJS.Platform|string,
- *   root?: string,
- *   commandWorks?: (command: string) => boolean,
- *   resolveBasePython?: (env: NodeJS.ProcessEnv|Record<string,string|undefined>) => string|null,
- *   runCommand?: typeof run,
- *   mkdirSync?: typeof fs.mkdirSync,
- *   pipEnvironment?: NodeJS.ProcessEnv|Record<string,string|undefined>,
- *   createMacCABundle?: typeof createMacOSSystemCABundle
- * }} [options]
+ * Install Camoufox into the project virtual environment.
+ * macOS SSL failures automatically retry with --trusted-host + mirror.
  */
 export function installRuyiPage(options = {}) {
+  return installCamoufox(options);
+}
+
+export function installCamoufox(options = {}) {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const root = options.root ?? ROOT;
@@ -455,18 +527,20 @@ export function installRuyiPage(options = {}) {
   const resolveBasePython = options.resolveBasePython ?? ((candidateEnv) =>
     resolveBasePythonCommand(candidateEnv, { commandWorks })
   );
-  const requested = env.RUYIPAGE_PYTHON?.trim();
+  const requested = (env.CAMOUFOX_PYTHON || env.RUYIPAGE_PYTHON)?.trim();
   let python = requested || null;
 
   if (python && !commandWorks(python)) {
-    throw new Error(`RUYIPAGE_PYTHON is missing or older than Python 3.10: ${python}`);
+    throw new Error(
+      `CAMOUFOX_PYTHON/RUYIPAGE_PYTHON is missing or older than Python 3.10: ${python}`
+    );
   }
 
   if (!python) {
     const basePython = resolveBasePython(env);
     if (!basePython) throw new Error("python/python3 not found; install Python 3.10+ first");
 
-    const localPython = getLocalRuyiPagePython(root, platform);
+    const localPython = getLocalCamoufoxPython(root, platform);
     if (!commandWorks(localPython)) {
       const venvDir = path.dirname(path.dirname(localPython));
       mkdirSync(path.dirname(venvDir), { recursive: true });
@@ -484,35 +558,85 @@ export function installRuyiPage(options = {}) {
   let macCABundle = null;
   try {
     if (platform === "darwin" && managedVenv) {
-      macCABundle = createMacCABundle();
-      pipEnv = {
-        ...pipEnv,
-        PIP_CERT: macCABundle.path,
-        SSL_CERT_FILE: macCABundle.path,
-      };
+      try {
+        macCABundle = createMacCABundle();
+        pipEnv = {
+          ...pipEnv,
+          PIP_CERT: macCABundle.path,
+          SSL_CERT_FILE: macCABundle.path,
+        };
+      } catch (error) {
+        if (!options.quiet) {
+          process.stderr.write(
+            `[camoufox-install] macOS CA bundle unavailable (${error?.message ?? error}); will use mirror fallback if needed.\n`
+          );
+        }
+      }
     }
     const truststoreSupported =
       platform === "darwin" &&
       managedVenv &&
       pipTruststoreSupported(python, runCommand, pipEnv);
-    const args = buildRuyiPagePipInstallArgs({
+
+    let args = buildCamoufoxPipInstallArgs({
       platform,
       managedVenv,
       truststoreSupported,
+      useMirror: false,
     });
-    const result = runCommand(python, args, {
+    let result = runCommand(python, args, {
       stdio: "pipe",
       env: pipEnv,
     });
     forwardCommandOutput(result, options.quiet === true);
+
+    if (result.status !== 0 && isPipTLSCertificateFailure(result.stderr || result.stdout)) {
+      if (!options.quiet) {
+        process.stderr.write(
+          "[camoufox-install] SSL verify failed; retrying with --trusted-host + Tsinghua mirror.\n"
+        );
+      }
+      // Mirror retry: drop custom CA overrides that may still fail.
+      const mirrorEnv = buildVerifiedPipEnvironment(options.pipEnvironment ?? process.env);
+      args = buildCamoufoxPipInstallArgs({
+        platform,
+        managedVenv,
+        truststoreSupported: false,
+        useMirror: true,
+      });
+      result = runCommand(python, args, {
+        stdio: "pipe",
+        env: mirrorEnv,
+      });
+      forwardCommandOutput(result, options.quiet === true);
+    }
+
+    // Always offer mirror path when first attempt fails for any TLS-ish reason on darwin.
+    if (result.status !== 0 && platform === "darwin") {
+      const mirrorEnv = buildVerifiedPipEnvironment(options.pipEnvironment ?? process.env);
+      args = buildCamoufoxPipInstallArgs({
+        platform,
+        managedVenv,
+        truststoreSupported: false,
+        useMirror: true,
+      });
+      result = runCommand(python, args, {
+        stdio: "pipe",
+        env: mirrorEnv,
+      });
+      forwardCommandOutput(result, options.quiet === true);
+    }
+
     if (result.status !== 0) {
-      throw ruyiPagePipInstallFailure(
+      throw camoufoxPipInstallFailure(
         python,
         args,
         result,
         macCABundle !== null
       );
     }
+
+    fetchCamoufoxDevChannel(python, runCommand, options.quiet === true, env);
     return { python };
   } finally {
     cleanupMacOSSystemCABundle(macCABundle, options.quiet === true);

@@ -1,205 +1,84 @@
 # Apple-AutoMation 项目参考
 
-> 当前可运行方案：**Developer-first 会员判定 → Account 个人信息采集/改密 → 小开发者申请**。操作入口见 [运行手册](RUNTIME_RUNBOOK.md)。
+操作入口见 [运行手册](RUNTIME_RUNBOOK.md)；浏览器细节见 [Camoufox](CAMOUFOX.md)。
 
-## 1. 目标与非目标
+## 1. 目标
 
-| 能力 | 当前契约 |
+| 能力 | 契约 |
 | --- | --- |
-| macOS 系统设置阶段 | 可选的 Apple Account 登录与短信后置流程；--skip-mac 时完全跳过。 |
-| Firefox 浏览器阶段 | ruyiPage-only；初始 tab 先跑 Developer，再为 Account 新建 tab。 |
-| Apple 认证 | email、password、remember-account、OTP 和 trust 提示复用同一可信认证链。 |
-| Developer 判定 | active、not_enrolled、unknown 三态；仅 active 保存会员详情截图。 |
-| Account 采集与改密 | 稳定个人信息页后读取 birthday 与 name，并私有持久化；随后进入登录与安全性修改密码并更新私有 APPLE_PASSWORD。 |
-| 小开发者申请 | Account 改密成功后新建 Small Business Program 申请 tab，按中英文语义选择表单并确认提交。 |
-| 诊断 | 完整脱敏 JSONL + 简洁终端进度；不把秘密/页面正文混入报告。 |
-
-浏览器生命周期不使用 Playwright、Puppeteer、Selenium、Node BiDi 或 DOM synthetic input 回退。ruyiPage 对敏感输入使用 BiDi-native 行为；JavaScript 仅做无副作用的状态/文本查询。
+| macOS 系统设置 | 可选；`--skip-mac` 跳过 |
+| 浏览器 | Camoufox-only；Developer 初始 tab → Account 新 tab → Small Business 新 tab |
+| 认证 | email / password / remember / OTP / trust 同一可信链 |
+| Developer | `active` / `not_enrolled` / `unknown`；仅 active 保存会员截图 |
+| Account | 个人信息采集后改密，写回私有 `APPLE_PASSWORD` |
+| 诊断 | 脱敏 JSONL + 简洁终端进度 |
 
 ## 2. 模块架构
 
 ~~~mermaid
 flowchart LR
-    Launcher[run.sh] --> Main[scripts/apple-id-full-flow.mjs]
-    Main --> Browser[scripts/lib/account-browser-flow.js]
-    Browser --> Runner[scripts/lib/ruyipage-backend-runner.js]
-    Runner <--> Python[scripts/ruyipage/apple_account_flow.py]
-    Browser --> TwoFA[scripts/lib/two-fa-sidecar.js]
-    Browser --> Audit[flow-audit.jsonl]
-    Main --> Report[report.json]
-    Python --> Firefox[Firefox via ruyiPage]
-    Python --> Dev[developer.apple.com/account]
-    Python --> Account[account.apple.com/account/manage/section/information]
-    Python --> SmallBiz[developer.apple.com/app-store/small-business-program/enroll]
+    Launcher[run.sh] --> Main[apple-id-full-flow.mjs]
+    Main --> Settings[mac-settings-*.js]
+    Main --> Browser[account-browser-flow.js]
+    Browser --> Runner[ruyipage-backend-runner.js]
+    Runner <--> Python[apple_account_flow.py]
+    Python --> Compat[camoufox_compat.py]
+    Compat --> Camoufox[Camoufox Firefox]
 ~~~
 
-| 文件 | 所有权 |
+| 区域 | 文件 |
 | --- | --- |
-| scripts/apple-id-full-flow.mjs | 总流程、报告目录、最终 acceptance marker、用户可见结束摘要。 |
-| scripts/lib/account-browser-flow.js | Python runner、2FA collector、状态 sanitization、终端进度、私有结果持久化。 |
-| scripts/lib/ruyipage-backend-runner.js | JSONL framing、超时、子进程组与 bounded cleanup。 |
-| scripts/ruyipage/apple_account_flow.py | 唯一浏览器实现；Developer、Account、截图、profile、tab 和可信页面状态。 |
-| scripts/lib/two-fa-sidecar.js | popup → Settings → TTY 严格串行取码。 |
-| scripts/lib/mac-settings-login.js | System Settings 登录、动态 SMS/post-SMS 协调、人工接续和固定审计事件。 |
-| scripts/lib/mac-settings-sms-verification.js | 可选号码选择、稳定六码页检测、provider 轮询、写码与转场确认。 |
-| scripts/lib/mac-settings-post-sms-finalization.js | 单个可信后置页面的探测；条款/定位自动动作，Mac 密码/iPhone 解锁人工交接。 |
-| scripts/lib/flow-audit.js / scripts/lib/2fa-audit.js | 版本化、脱敏、runId 关联 audit。 |
-| scripts/build-release.mjs | 分发包和独立 README/.env.example；同时打包当前文档。 |
+| 总流程 | `scripts/apple-id-full-flow.mjs` |
+| 浏览器编排 | `scripts/lib/account-browser-flow.js` |
+| JSONL runner | `scripts/lib/ruyipage-backend-runner.js` |
+| 浏览器实现 | `scripts/ruyipage/apple_account_flow.py` |
+| Camoufox 适配 | `scripts/ruyipage/camoufox_compat.py`、`camoufox_session.py` |
+| 安装 / venv | `scripts/lib/ruyipage-runtime.js`、`requirements.txt` |
+| 系统设置 | `scripts/lib/mac-settings-*.js` + `scripts/swift/*` |
 
 ## 3. Browser 状态机
 
 ~~~text
-browser_ready
-  -> developer_account
-  -> developer_login
-  -> [Developer auth failure] browser failure / preserve policy
-  -> developer_membership
-  -> developer_membership_checked
-  -> [gate=1 && non-active] developer_membership_gate_blocked -> finalization
-  -> [otherwise] account_navigation
-  -> account authentication / shared 2FA
-  -> account_home_confirmed
-  -> account_information
-  -> profile capture
-  -> account_security
-  -> password_change
-  -> small_business_application
-  -> small_business_login
-  -> small_business_enrollment
+camoufox_session_ready  (macos fingerprint, reuse=true)
+  -> developer_account_tab_created
+  -> developer_login / developer_membership
+  -> [gate] account_module_tab_created | developer_membership_gate_blocked
+  -> account authentication / shared 2FA  (need_2fa -> 2fa_code -> fill_security_code)
+  -> account_home_confirmed -> profile -> password_change
+  -> small_business_application_tab_created -> enrollment
   -> finalization
 ~~~
 
-### Developer-first 与 gate
+`DEVELOPER_MEMBERSHIP_GATE=0`（默认）允许非 active 继续 Account；`=1` 时仅 active 继续。
 
-**DEVELOPER_MEMBERSHIP_GATE=0** 是测试默认。Developer 登录已确认后，它允许 active、not_enrolled、unknown 继续 Account，便于同一次浏览器运行覆盖双模块。Developer 登录失败、仍可见 Apple 登录控件或 2FA 未完成时，绝不创建 Account tab。
+## 4. 结果与 acceptance
 
-**DEVELOPER_MEMBERSHIP_GATE=1** 是业务 gate。只有 postLoginDeveloperAccount.authenticated=true、success=true 且 membershipStatus=active 才会创建 Account tab。已认证的非 active 路径发送 developer_membership_gate_blocked，返回浏览器阶段成功但 accountModule.skipped=true 的固定结果；登录失败不是 gate stop。
+`recordAccountHomeAcceptanceMarker()` 只在 `browserLogin.accountHomeConfirmed=true` 时写 marker。  
+Developer gate stop 的 marker 固定为 skipped。截图仅文件名元数据：`03-developer-membership.png`、`02-account-information.png`、`04-small-business-application.png`。
 
-Developer 会员状态在 developer_membership_checked 到达 Node 时立即私有持久化。只允许已认证后的 membership partial 持久化 unknown；Developer 登录失败不写 developer_membership。这样 Account tab 创建或后续 Account 认证失败不会丢失已完成的判定，也不会把失败登录冒充会员结果。
-
-## 4. 结果、截图与 acceptance
-
-报告只保留固定、可审计的 metadata：
-
-| 区域 | 关键字段语义 |
-| --- | --- |
-| browserLogin | backend、Account home 是否已确认、session 是否复用等布尔/固定字段。 |
-| postLoginDeveloperAccount | Developer 是否已检查、会员固定分类、失败 stage/class、保留状态。 |
-| accountModule | 是否尝试、是否跳过、gate 是否启用/通过、固定 skip reason。 |
-| postLoginProfileCapture | 个人资料是否成功、固定 failure stage/class、浏览器保留结果。 |
-| postLoginPasswordChange | 改密是否尝试/成功、密码是否已写入私有 .env、固定 failure stage/class。 |
-| postLoginSmallBusinessApplication | 小开发者申请是否尝试/提交成功、固定 failure stage/class。 |
-| screenshots | 仅文件名元数据，例如 03-developer-membership.png、02-account-information.png、04-small-business-application.png。 |
-
-截图规则：
-
-- 03-developer-membership.png：仅 active，且会员详情导航与内容确认后生成；
-- 02-account-information.png：仅 Account 个人信息路由和姓名/生日卡稳定后生成；
-- 04-small-business-application.png：仅小开发者申请提交确认后生成；
-- 认证页、OTP 页、OCR 过程不能成为成功截图；
-- 保留在报告目录的截图属于私有数据，绝不作为默认反馈附件。
-
-recordAccountHomeAcceptanceMarker() 只在 browserLogin.accountHomeConfirmed=true 时写 marker。Developer gate stop 的 marker 固定为 skipped，不能冒充为 Account 登录成功。
+私有 `.env` 写入 `developer_membership`、`name`、`birthday` 等；报告与 JSONL 不保存明文资料。
 
 ## 5. 配置边界
 
 | 配置 | 默认 | 含义 |
 | --- | --- | --- |
-| BROWSER_BACKEND | ruyiPage | 唯一浏览器后端；auto 仅兼容旧配置名。 |
-| BROWSER_PROFILE_MODE | persistent | persistent 复用 profile；fresh 每 run 隔离 profile。 |
-| BROWSER_ATTACH_EXISTING | 1 | 可接管已有 Firefox 会话，随后仍按 Developer-first 顺序推进。 |
-| DEVELOPER_MEMBERSHIP_GATE | 0 | 0 测试双模块；1 仅 active 继续 Account。 |
-| BROWSER_PRESERVE_ON_FAILURE | 1 | 直接运行失败后保留 Firefox 供人工核对。 |
-| BROWSER_PRESERVE_ON_SUCCESS | 1 | 直接运行后保留已登录窗口和标签页。 |
-| BROWSER_2FA_SETTINGS_AFTER_MS | 30000 | popup primary 窗口；Allow 确认后另有固定 OCR 宽限。 |
-| BROWSER_2FA_SETTINGS_FALLBACK | 1 | 是否允许 popup-primary 后的 Settings 来源。 |
-| BROWSER_2FA_MANUAL_FALLBACK | 1 | 是否允许 Settings 后真实 TTY 的隐藏手输。 |
-| APPLE_AUTOMATION_SMS_ENABLED | 1（未设置） | Mac 系统设置 SMS 自动处理；`1` 开启，`0` 关闭。 |
-| APPLE_AUTOMATION_POST_SMS_FINALIZATION_ENABLED | 1（未设置） | SMS 后置动态接续；`1` 开启，`0` 关闭，与 SMS provider 配置独立。 |
-| APPLE_AUTOMATION_SMS_RECONFIGURE | 0 | 号码与短信服务地址重新录入；`1` 开启重新配置，`0` 关闭并沿用已有配置。 |
+| `BROWSER_BACKEND` | camoufox | `auto` / `ruyipage` 为兼容别名 |
+| `BROWSER_PROFILE_MODE` | persistent | 系统 Firefox 默认 profile；`fresh` 用隔离目录 |
+| `CAMOUFOX_PROXY_SERVER` | `http://127.0.0.1:7890` | Clash + geoip |
+| `DEVELOPER_MEMBERSHIP_GATE` | 0 | 见上 |
+| `BROWSER_PRESERVE_ON_*` | 1 | 成功/失败后是否保留浏览器 |
 
-.env 为本地私有输入/输出面：输入凭据与成功采集的 developer_membership、developer_registration_identity、name、birthday；Account 改密成功后会覆盖 APPLE_PASSWORD。它不进入命令行、audit、report 或 Git，终端也不打印新密码明文。
+## 6. 安装契约
 
-## 6. System Settings 状态机与审计
+- Python ≥ 3.10，项目 venv：`.runtime/camoufox-venv`
+- 包：`camoufox[geoip]`；浏览器通道默认 `official/prerelease`（FF152 dev 源）
+- 安装顺序：`camoufox sync` → `set <channel>` → `fetch`
+- macOS pip SSL 失败时：`--trusted-host` + 清华镜像自动重试
 
-System Settings 只在受监督的 macOS 会话中处理，且不与网页 2FA 共享验证码。
-短信状态机把号码选择视为可选页面，把六位验证码页视为必经页面：只有同一稳定
-六码页连续被观测两次后才轮询 provider。写入后先等待 `code_pending` 消失，再
-要求两次 `waiting` 观察；随后还有最长 90 秒的后置页面初始观察窗口。这样动态
-加载、AX 短暂空白或网络抖动都不会被误当作完成。同一个已验证验证码只能在空的
-六码页重新确认后最多写入三次；仍未推进则进入人工接续。
+## 7. 测试入口
 
-后置状态机一次只处理一个绑定的页面。条款和定位页最多自动动作三次；同一
-PID/window/stage 超限后保留页面给人工。人工 Enter 只恢复探测，绝不重置该页面
-的动作额度。Mac 密码和 iPhone 解锁页不自动输入，始终停在人工接续点。每个
-成功动作都有 probe-only 转场宽限，避免同一按钮在慢网络下被重复点击。
-
-所有设置事件由 `runMacSettingsLoginPhase(..., { onEvent })` 汇总为
-`flow-audit.jsonl` 的 `source=mac_settings,event=event` 条目。sanitizer 只允许
-固定事件、阶段、原因、次数、超时和已验证的 PID/window 数字。以下事件是失败
-收口点，均带固定 `failureCode`（如果有）：
-
-~~~text
-sms_provider_config_failed
-sms_module_failed
-mac_settings_login_wait_failed
-~~~
-
-`report.json` 保留高层失败阶段；精确的设置模块根因在同一 run 的
-`flow-audit.jsonl` 中。事件 contract 的回归由
-`scripts/test-mac-settings-login-observability.mjs` 固定，任何新事件未加入
-allowlist 都会失败。
-
-## 7. 日志与脱敏
-
-| 通道 | 内容 |
-| --- | --- |
-| 普通终端 | [→]、[✓]、[!]、[×] 等少量业务进度。 |
-| APPLE_AUTOMATION_TERMINAL_DEBUG=1 | 额外镜像脱敏机器状态；不显示秘密、页面正文和个人资料。 |
-| flow-audit.jsonl | Browser、Developer、Account、mac_settings、screenshot、gate、finalization 与 flow completion 的完整固定状态。 |
-| 2fa-audit.jsonl | popup/AX/OCR/Settings/manual 的 provider 生命周期和固定失败分类。 |
-| launcher-audit.jsonl | 进入、bootstrap、环境、preflight、主流程、完成/失败阶段。 |
-| report.json | 脱敏结果汇总与固定截图文件名。 |
-
-每份 JSONL 单独使用从 1 递增的 sequence，同一 runId 将四类报告关联起来。新增状态必须同步允许列表、sanitizer、audit、report、文档与回归测试。
-
-## 8. 测试矩阵
-
-| 命令 | 覆盖面 |
-| --- | --- |
-| npm.cmd run -s test:account-browser-flow | Node 编排、Developer result 持久化、gate stop、Account completion、终端/audit sanitization。 |
-| npm.cmd run -s test:ruyipage-protocol | Python ↔ Node JSONL event/command schema。 |
-| npm.cmd run -s test:ruyipage-flow | Python ruyiPage 状态机、tab 顺序、成员判定、个人信息采集边界。 |
-| npm.cmd run -s test:flow-audit | audit schema、sequence、redaction。 |
-| npm.cmd run -s test:release-copy-paths | 分发包、release README、当前运行手册与关键文档合同。 |
-| git diff --check | 空白符与补丁基础检查。 |
-
-Windows 运行 Windows-safe 回归，不执行真实 Apple 登录。Mac `verify` 在当前精确 push 的 SHA 上做只读/受监督验证；Mac `implementation` 在受控 writer lock 下做 macOS 特定实现、测试、优化与 ruyiPage 页面注释，返回脱敏 diff/manifest/annotation。流程见 docs/WINDOWS_MAC_CODEX.md。
-
-## 9. 故障归属
-
-| 状态/现象 | 拥有模块 | 首个排查文件 |
-| --- | --- | --- |
-| Developer login / membership | Python browser state | scripts/ruyipage/apple_account_flow.py、flow-audit.jsonl。 |
-| developer_membership_gate_blocked | Python gate + Node summary | apple_account_flow.py、account-browser-flow.js。 |
-| Account tab / login / profile / password | Python Account stage | apple_account_flow.py、test-account-browser-flow.mjs。 |
-| 小开发者申请 | Python Small Business stage + Node summary | apple_account_flow.py、account-browser-flow.js、flow-audit.jsonl。 |
-| 2FA provider / timeout | Node collector | two-fa-sidecar.js、2fa-audit.jsonl。 |
-| OTP 到网页后的输入/提交 | Python owner-frame BiDi | 2FA_HANDOFF_DIAGNOSTICS.md。 |
-| 报告/acceptance marker | Main flow | apple-id-full-flow.mjs。 |
-| 分发文档偏离 | Release builder / static docs check | build-release.mjs、test-release-copy-paths.mjs。 |
-
-## 10. 文档治理
-
-- [README](../README.md)：最短的上手、模式、产物与入口。
-- [运行手册](RUNTIME_RUNBOOK.md)：当前行为、验收和排错唯一入口。
-- [Mac 交接](MAC_CODEX_HANDOFF.md)：Mac 安全验证与回传。
-- [Windows → Mac](WINDOWS_MAC_CODEX.md)：同步、sandbox、受监督 GUI 和证据。
-- docs/superpowers/plans/：历史实现决策；不替代当前运行手册。
-
-每次实现改变执行顺序、环境变量、截图、固定状态、报告字段或测试入口时，至少同步 README、运行手册、项目参考、release README 和静态文档合同测试。
-# Platform policy update (2026-08-02)
-
-Windows and Mac are both development hosts. Mac implementation work must use the controlled
-`--mac-mode implementation` writer flow; browser automation remains ruyiPage-only and secrets
-remain denied.
+- `npm run test:browser-backend`
+- `npm run test:account-browser-flow`
+- `npm run test:ruyipage-protocol`
+- `npm run test:flow-audit`
+- `npm run test:mac-settings-*`（设置链路）

@@ -96,6 +96,8 @@ function firefoxInstalled() {
 export function getBrowserEnvironmentSummary() {
   const runtime = detectRuyiPageRuntime();
   const backend = selectBrowserBackend(process.env, {
+    camoufoxAvailable: runtime.available,
+    camoufoxError: runtime.error,
     ruyipageAvailable: runtime.available,
     ruyipageError: runtime.error,
   });
@@ -130,39 +132,51 @@ export function ensureNode({ quiet } = {}) {
 
 export function ensureFirefox({ quiet } = {}) {
   if (firefoxInstalled()) {
-    log(`✓ Firefox: ${resolveFirefoxExecutable()}`, quiet);
+    log(
+      `✓ Firefox (系统安装，供默认 profile): ${resolveFirefoxExecutable()}`,
+      quiet
+    );
     return;
   }
 
   throw new Error(
-    "未检测到 Firefox。请从 https://www.mozilla.org/firefox/ 安装，或设置 FIREFOX_EXECUTABLE=/Applications/Firefox.app/Contents/MacOS/firefox"
+    "未检测到 Firefox。Camoufox 使用系统 Firefox 的默认 profile，请先从 https://www.mozilla.org/firefox/ 安装并手动打开一次后关闭，或设置 FIREFOX_EXECUTABLE=/Applications/Firefox.app/Contents/MacOS/firefox"
   );
 }
 
 export function ensureRuyiPage({ quiet, install = false } = {}) {
   let runtime = detectRuyiPageRuntime();
   if (runtime.available) {
-    log(`✓ ruyipage: ${runtime.version ?? "installed"} (${runtime.python})`, quiet);
+    log(`✓ camoufox: ${runtime.version ?? "installed"} (${runtime.python})`, quiet);
+    if (runtime.browserVersion) {
+      log(`✓ camoufox browser: ${runtime.browserVersion}`, quiet);
+    }
     return runtime;
   }
 
   if (!install) {
-    throw new Error(`ruyipage 未就绪: ${runtime.error}。请先运行 ./install.sh`);
+    throw new Error(`camoufox 未就绪: ${runtime.error}。请先运行 ./install.sh`);
   }
 
   if (process.platform !== "darwin") {
-    log("⚠ 当前不是 macOS，跳过 ruyipage 自动安装；Windows 仅用于逻辑测试", quiet);
+    log("⚠ 当前不是 macOS，跳过 camoufox 自动安装；Windows 仅用于逻辑测试", quiet);
     return runtime;
   }
 
-  log("==> 在项目隔离虚拟环境中安装 Python ruyiPage", quiet);
+  log(
+    "==> 安装 Python Camoufox：camoufox[geoip] → 项目 venv，再 sync/set/fetch official/prerelease（FF152 dev 源）",
+    quiet
+  );
   const installed = installRuyiPage({ quiet });
   if (installed?.python) log(`  Python: ${installed.python}`, quiet);
   runtime = detectRuyiPageRuntime();
   if (!runtime.available) {
-    throw new Error(`ruyipage 安装后仍不可用: ${runtime.error}`);
+    throw new Error(`camoufox 安装后仍不可用: ${runtime.error}`);
   }
-  log(`✓ ruyipage: ${runtime.version ?? "installed"} (${runtime.python})`, quiet);
+  log(`✓ camoufox: ${runtime.version ?? "installed"} (${runtime.python})`, quiet);
+  if (runtime.browserVersion) {
+    log(`✓ camoufox browser: ${runtime.browserVersion}`, quiet);
+  }
   return runtime;
 }
 
@@ -300,9 +314,9 @@ export async function checkEnvironment(options = {}) {
     if (browserSummary) {
       console.log("  browser backend:", `${browserSummary.backend} (${browserSummary.backendReason})`);
       console.log(
-        "  python/ruyipage:",
-        browserSummary.ruyipageAvailable
-          ? `${browserSummary.python} / ruyipage ${browserSummary.ruyipageVersion ?? "unknown"}`
+        "  python/camoufox:",
+        browserSummary.camoufoxAvailable || browserSummary.ruyipageAvailable
+          ? `${browserSummary.python} / camoufox ${browserSummary.camoufoxVersion ?? browserSummary.ruyipageVersion ?? "unknown"}`
           : "未就绪（请运行 ./install.sh）"
       );
       console.log("  profile:", `${browserSummary.profileMode} ${browserSummary.profileDir}`);

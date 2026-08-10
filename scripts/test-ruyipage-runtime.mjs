@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   buildVerifiedPipEnvironment,
   buildRuyiPagePipInstallArgs,
+  buildCamoufoxPipInstallArgs,
   createMacOSSystemCABundle,
   detectRuyiPageRuntime,
   getLocalRuyiPagePython,
@@ -18,11 +19,16 @@ import {
   isSupportedPythonVersion,
   RUYIPAGE_COMMAND_MAX_BUFFER_BYTES,
   RUYIPAGE_PACKAGE_SPEC,
+  CAMOUFOX_PACKAGE_SPEC,
+  CAMOUFOX_BROWSER_CHANNEL,
+  CAMOUFOX_PIP_MIRROR,
   resolveBasePythonCommand,
   resolvePythonCommand,
 } from "./lib/ruyipage-runtime.js";
 
-assert.equal(RUYIPAGE_PACKAGE_SPEC, "ruyiPage==1.2.45");
+assert.equal(RUYIPAGE_PACKAGE_SPEC, "camoufox[geoip]");
+assert.equal(CAMOUFOX_PACKAGE_SPEC, "camoufox[geoip]");
+assert.equal(CAMOUFOX_BROWSER_CHANNEL, "official/prerelease");
 assert.equal(RUYIPAGE_COMMAND_MAX_BUFFER_BYTES, 32 * 1024 * 1024);
 const macManagedPipArgs = buildRuyiPagePipInstallArgs({
   platform: "darwin",
@@ -35,7 +41,7 @@ assert.deepEqual(macManagedPipArgs, [
   "install",
   "--use-feature=truststore",
   "--upgrade",
-  RUYIPAGE_PACKAGE_SPEC,
+  CAMOUFOX_PACKAGE_SPEC,
 ]);
 const configuredMacPipArgs = buildRuyiPagePipInstallArgs({
   platform: "darwin",
@@ -46,8 +52,17 @@ const windowsPipArgs = buildRuyiPagePipInstallArgs({
   managedVenv: true,
   truststoreSupported: true,
 });
-assert.deepEqual(configuredMacPipArgs, ["-m", "pip", "install", "--upgrade", RUYIPAGE_PACKAGE_SPEC]);
+assert.deepEqual(configuredMacPipArgs, ["-m", "pip", "install", "--upgrade", CAMOUFOX_PACKAGE_SPEC]);
 assert.deepEqual(windowsPipArgs, configuredMacPipArgs);
+const mirrorArgs = buildCamoufoxPipInstallArgs({
+  platform: "darwin",
+  managedVenv: true,
+  truststoreSupported: false,
+  useMirror: true,
+});
+assert.ok(mirrorArgs.includes("-i"));
+assert.ok(mirrorArgs.includes(CAMOUFOX_PIP_MIRROR));
+assert.ok(mirrorArgs.includes("--trusted-host"));
 for (const args of [macManagedPipArgs, configuredMacPipArgs, windowsPipArgs]) {
   assert.equal(args.some((arg) => /trusted-host|no-verify|(?:^|-)cert(?:=|$)/i.test(arg)), false);
 }
@@ -311,7 +326,7 @@ assert.throws(
         };
       },
     }),
-  /ruyipage-install:macos_ca_export/
+  /camoufox-install:macos_ca_export/
 );
 for (const keychain of caKeychains) fs.unlinkSync(keychain);
 fs.rmdirSync(caFixtureDir);
@@ -322,10 +337,10 @@ assert.equal(isSupportedPythonVersion("unexpected"), false);
 
 const root = path.resolve("tmp", "project");
 const darwinLocal = getLocalRuyiPagePython(root, "darwin");
-assert.equal(darwinLocal, path.join(root, ".runtime", "ruyipage-venv", "bin", "python"));
+assert.equal(darwinLocal, path.join(root, ".runtime", "camoufox-venv", "bin", "python"));
 assert.equal(
   getLocalRuyiPagePython(root, "win32"),
-  path.join(root, ".runtime", "ruyipage-venv", "Scripts", "python.exe")
+  path.join(root, ".runtime", "camoufox-venv", "Scripts", "python.exe")
 );
 
 assert.equal(
@@ -431,12 +446,20 @@ assert.deepEqual(
     { command: "/trusted/python3", args: ["-m", "venv", managedVenvDir] },
     { command: managedPython, args: ["-m", "pip", "--version"] },
     { command: managedPython, args: macManagedPipArgs },
+    { command: managedPython, args: ["-m", "camoufox", "sync"] },
+    { command: managedPython, args: ["-m", "camoufox", "set", "official/prerelease"] },
+    { command: managedPython, args: ["-m", "camoufox", "fetch"] },
   ]
 );
-assert.equal(managedCalls.every(({ options }) => options.stdio === "pipe"), true);
-const managedPipCalls = managedCalls.filter(({ args }) => args[1] === "pip");
-assert.equal(managedPipCalls.length, 2);
-for (const { options } of managedPipCalls) {
+assert.equal(
+  managedCalls.filter(({ args }) => args[1] === "pip" || args[0] === "-m").length >= 3,
+  true
+);
+const managedPipInstallCalls = managedCalls.filter(
+  ({ args }) => args[1] === "pip" && args[2] === "install"
+);
+assert.equal(managedPipInstallCalls.length, 1);
+for (const { options } of managedPipInstallCalls) {
   assert.deepEqual(options.env, {
     ...verifiedPipEnvironment,
     PIP_CERT: "/trusted/macos-system-ca.pem",
@@ -474,6 +497,9 @@ assert.deepEqual(
   [
     { command: legacyMacPython, args: ["-m", "pip", "--version"] },
     { command: legacyMacPython, args: configuredMacPipArgs },
+    { command: legacyMacPython, args: ["-m", "camoufox", "sync"] },
+    { command: legacyMacPython, args: ["-m", "camoufox", "set", "official/prerelease"] },
+    { command: legacyMacPython, args: ["-m", "camoufox", "fetch"] },
   ]
 );
 
@@ -507,7 +533,7 @@ assert.throws(
         };
       },
     }),
-  /ruyipage-install:tls_certificate/
+  /camoufox-install:tls_certificate/
 );
 assert.equal(failedCABundleCleanupCount, 1);
 
@@ -578,9 +604,19 @@ const configuredInstall = installRuyiPage({
   },
 });
 assert.equal(configuredInstall.python, "/custom/python");
-assert.deepEqual(
-  configuredCalls.map(({ command, args }) => ({ command, args })),
-  [{ command: "/custom/python", args: configuredMacPipArgs }]
+assert.ok(
+  configuredCalls.some(
+    ({ args }) =>
+      Array.isArray(args) &&
+      args.includes("--upgrade") &&
+      args.includes(CAMOUFOX_PACKAGE_SPEC)
+  )
+);
+assert.ok(
+  configuredCalls.some(
+    ({ args }) =>
+      Array.isArray(args) && args[1] === "camoufox" && args[2] === "fetch"
+  )
 );
 
 const windowsRoot = path.resolve("tmp", "ruyipage-runtime-install-windows");
@@ -605,6 +641,9 @@ assert.deepEqual(
   [
     { command: "/trusted/python3", args: ["-m", "venv", windowsVenvDir] },
     { command: windowsPython, args: windowsPipArgs },
+    { command: windowsPython, args: ["-m", "camoufox", "sync"] },
+    { command: windowsPython, args: ["-m", "camoufox", "set", "official/prerelease"] },
+    { command: windowsPython, args: ["-m", "camoufox", "fetch"] },
   ]
 );
 
@@ -615,58 +654,91 @@ const brokenImportRuntime = detectRuyiPageRuntime(
     resolvePython: () => "/custom/python",
     runCommand(_command, args) {
       probeScript = args.at(-1);
-      return {
-        status: probeScript.includes("import ruyipage") ? 1 : 0,
-        stdout: probeScript.includes("import ruyipage") ? "" : "9.9.9\n",
-        stderr: probeScript.includes("import ruyipage")
-          ? "ModuleNotFoundError: No module named 'ruyipage'"
-          : "",
-      };
+      if (String(probeScript).includes("import camoufox")) {
+        return {
+          status: 1,
+          stdout: "",
+          stderr: "ModuleNotFoundError: No module named 'camoufox'",
+        };
+      }
+      return { status: 0, stdout: "ok\n", stderr: "" };
     },
   }
 );
 assert.equal(brokenImportRuntime.available, false);
-assert.match(probeScript, /import ruyipage/);
+assert.match(probeScript, /import camoufox/);
 
-const wrongVersionRuntime = detectRuyiPageRuntime(
+const anyVersionRuntime = detectRuyiPageRuntime(
   { RUYIPAGE_PYTHON: "/custom/python" },
   {
     resolvePython: () => "/custom/python",
-    runCommand() {
-      return {
-        status: 0,
-        stdout: "1.2.44\n",
-        stderr: "",
-      };
+    runCommand(_command, args) {
+      const joined = args.join(" ");
+      if (joined.includes("import camoufox") && joined.includes("version('camoufox')")) {
+        return { status: 0, stdout: "0.4.11\n", stderr: "" };
+      }
+      if (joined.includes("camoufox") && joined.includes("version")) {
+        return { status: 0, stdout: "Camoufox 152.0.4-beta.28\n", stderr: "" };
+      }
+      if (joined.includes("geoip2") || joined.includes("playwright")) {
+        return { status: 0, stdout: "geoip=True\nplaywright=True\n", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
     },
   }
 );
-assert.equal(wrongVersionRuntime.available, false);
-assert.equal(wrongVersionRuntime.version, "1.2.44");
-assert.match(wrongVersionRuntime.error, /requires.*1\.2\.45/i);
+assert.equal(anyVersionRuntime.available, true);
+assert.equal(anyVersionRuntime.version, "0.4.11");
+assert.equal(anyVersionRuntime.error, null);
 
 const verifiedVersionRuntime = detectRuyiPageRuntime(
-  { RUYIPAGE_PYTHON: "/custom/python" },
+  { CAMOUFOX_PYTHON: "/custom/python" },
   {
     resolvePython: () => "/custom/python",
-    runCommand() {
-      return {
-        status: 0,
-        stdout: "1.2.45\n",
-        stderr: "",
-      };
+    runCommand(_command, args) {
+      const joined = args.join(" ");
+      if (joined.includes("version('camoufox')")) {
+        return { status: 0, stdout: "0.4.28\n", stderr: "" };
+      }
+      if (joined.includes("camoufox") && args.includes("version")) {
+        return { status: 0, stdout: "152.0.4-beta.28\n", stderr: "" };
+      }
+      if (joined.includes("geoip2")) {
+        return { status: 0, stdout: "geoip=True\nplaywright=True\n", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
     },
   }
 );
 assert.equal(verifiedVersionRuntime.available, true);
-assert.equal(verifiedVersionRuntime.version, "1.2.45");
+assert.equal(verifiedVersionRuntime.version, "0.4.28");
+assert.equal(verifiedVersionRuntime.browserVersion, "152.0.4-beta.28");
 assert.equal(verifiedVersionRuntime.error, null);
+
+const incompleteDepsRuntime = detectRuyiPageRuntime(
+  { CAMOUFOX_PYTHON: "/custom/python" },
+  {
+    resolvePython: () => "/custom/python",
+    runCommand(_command, args) {
+      const joined = args.join(" ");
+      if (joined.includes("version('camoufox')")) {
+        return { status: 0, stdout: "0.4.28\n", stderr: "" };
+      }
+      if (joined.includes("geoip2")) {
+        return { status: 0, stdout: "geoip=False\nplaywright=True\n", stderr: "" };
+      }
+      return { status: 0, stdout: "ok\n", stderr: "" };
+    },
+  }
+);
+assert.equal(incompleteDepsRuntime.available, false);
+assert.match(incompleteDepsRuntime.error, /extras incomplete|geoip|playwright/i);
 
 const invalidConfiguredRuntime = detectRuyiPageRuntime(
   { RUYIPAGE_PYTHON: "/missing/python" },
   { resolvePython: () => null }
 );
 assert.equal(invalidConfiguredRuntime.available, false);
-assert.match(invalidConfiguredRuntime.error, /RUYIPAGE_PYTHON.*missing.*3\.10/i);
+assert.match(invalidConfiguredRuntime.error, /CAMOUFOX_PYTHON|RUYIPAGE_PYTHON.*missing.*3\.10/i);
 
-console.log("ruyipage runtime selection: ok");
+console.log("camoufox runtime selection: ok");

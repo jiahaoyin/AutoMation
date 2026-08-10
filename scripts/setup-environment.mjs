@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * 环境检测与自动安装
- *   node scripts/setup-environment.mjs           # 检测并自动安装缺失项
+ *   node scripts/setup-environment.mjs
  *   node scripts/setup-environment.mjs --check-only
- *   node scripts/setup-environment.mjs --quiet
+ *   node scripts/setup-environment.mjs --install-camoufox
+ *   node scripts/setup-environment.mjs --install-ruyipage   # 兼容旧旗标，等同安装 Camoufox
  */
 
 import { checkEnvironment, ensureEnvironment } from "./lib/env-setup.js";
@@ -11,17 +12,21 @@ import { checkEnvironment, ensureEnvironment } from "./lib/env-setup.js";
 const checkOnly = process.argv.includes("--check-only");
 const quiet = process.argv.includes("--quiet");
 const skipFirefox = process.argv.includes("--skip-firefox");
-const skipRuyiPage = process.argv.includes("--skip-ruyipage");
+const skipCamoufox =
+  process.argv.includes("--skip-camoufox") ||
+  process.argv.includes("--skip-ruyipage");
 const skipAccessibility = process.argv.includes("--skip-accessibility");
 const skipAutomation = process.argv.includes("--skip-automation");
-const installRuyiPage = process.argv.includes("--install-ruyipage");
+const installCamoufox =
+  process.argv.includes("--install-camoufox") ||
+  process.argv.includes("--install-ruyipage");
 
 async function main() {
   if (checkOnly) {
     const result = await checkEnvironment({
       quiet,
       skipFirefox,
-      skipRuyiPage,
+      skipRuyiPage: skipCamoufox,
       skipAutomation,
     });
     process.exit(result.ok ? 0 : 1);
@@ -30,15 +35,15 @@ async function main() {
   await ensureEnvironment({
     quiet,
     skipFirefox,
-    skipRuyiPage,
+    skipRuyiPage: skipCamoufox,
     skipAccessibility,
     skipAutomation,
-    installRuyiPage,
+    installRuyiPage: installCamoufox,
   });
   const result = await checkEnvironment({
     quiet,
     skipFirefox,
-    skipRuyiPage,
+    skipRuyiPage: skipCamoufox,
     skipAutomation,
   });
   if (!result.ok && result.issues.some((i) => !i.includes(".env"))) {

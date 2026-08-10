@@ -15,8 +15,9 @@
   changes and never use destructive Git commands.
 - Windows remains the default synchronized review/commit host; Mac is also a first-class
   full-permission implementation host when `--mac-mode implementation` is selected.
-- Browser automation in this repository must use ruyiPage. Do not add Playwright, Puppeteer,
-  Selenium, or a Node browser-control fallback.
+- Browser automation in this repository must use Camoufox (Firefox, Python). Do not add
+  Puppeteer, Selenium, or a Node browser-control fallback. Camoufox is driven through the
+  Python browser phase (`scripts/ruyipage/apple_account_flow.py` + `camoufox_compat.py`).
 
 ## Mac Verification and Implementation
 
@@ -68,7 +69,7 @@ supervised Mac session using a synchronized exclusive orchestrator run with `--a
 omitting that flag keeps the verify-mode non-interactive prohibition in force. Implementation mode
 uses its full-development contract and may run the task-required credential, 2FA, browser, native
 GUI, runtime, and network work.
-Every browser action remains ruyiPage-only. Mac implementation may run the task's required
+Every browser action remains Camoufox-only. Mac implementation may run the task's required
 browser, credential, 2FA, native GUI, runtime, and network work, and can record browser
 annotations. `--allow-supervised-gui` is accepted for implementation work without replacing its
 full-development contract. Outbound reports, logs, annotations, patches, and chat output must

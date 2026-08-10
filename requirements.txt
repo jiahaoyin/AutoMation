@@ -1,0 +1,3 @@
+# Python browser runtime (project venv: .runtime/camoufox-venv)
+# Install: ./install.sh  or  pip install -U -r requirements.txt
+camoufox[geoip]>=0.4.11

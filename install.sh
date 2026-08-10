@@ -319,6 +319,7 @@ validate_required_swift_sources
 compile_swift_helpers
 validate_required_swift_artifacts
 
-node scripts/setup-environment.mjs --install-ruyipage "$@"
+echo "==> 安装 Camoufox（Python venv + geoip + FF152 dev 源 official/prerelease）"
+node scripts/setup-environment.mjs --install-camoufox "$@"
 echo "==> 确认 2FA 自动取码权限"
 node scripts/preflight-2fa-permissions.mjs --all
