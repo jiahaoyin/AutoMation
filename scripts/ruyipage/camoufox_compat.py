@@ -211,7 +211,8 @@ def _click_with_retry(locator: Any, timeout: int = 15_000) -> None:
                 f"[camoufox-click] attempt {attempt+1}: {exc}\n"
             )
 
-        # Strategy 2: force click — bypasses actionability checks + mouse trajectory.
+        # Strategy 2: force click — bypasses actionability checks + mouse trajectory,
+        # but still isTrusted=true (CDP Input.dispatchMouseEvent). Safe for anti-detect.
         try:
             locator.click(force=True, timeout=5_000)
             return
@@ -220,17 +221,6 @@ def _click_with_retry(locator: Any, timeout: int = 15_000) -> None:
                 raise
             sys.stderr.write(
                 f"[camoufox-click] force click failed: {exc}\n"
-            )
-
-        # Strategy 3: JS dispatch — no mouse involvement at all.
-        try:
-            locator.dispatch_event("click")
-            return
-        except Exception as exc:
-            if _is_frame_lifecycle_error(exc):
-                raise
-            sys.stderr.write(
-                f"[camoufox-click] dispatch_event failed: {exc}\n"
             )
 
         if attempt < _MAX_CLICK_RETRIES - 1:
