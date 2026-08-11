@@ -2423,40 +2423,52 @@ def ensure_remember_checked(
                 emit_remember_progress("target_not_interactable")
                 continue
 
-            if scope is page:
-                action_scope = scope
-                action_target = click_target
-                route = "root"
-            else:
-                action_scope = page
-                action_target = prepare_frame_input_target(page, scope, click_target)
-                route = "root"
-            emit_remember_progress("click_started", route)
-            human_click(action_scope, action_target, pause=pause)
-            pause(180, 420)
-            try:
-                checked = bool(field.states.is_checked)
-            except Exception:
-                checked = False
-            if checked:
-                emit_remember_progress("checked", route)
-            if (
-                not checked
-                and scope is not page
-                and element_is_interactable(click_target)
-            ):
-                validate_apple_scope(scope)
-                emit_remember_progress("owner_fallback_started", "owner")
-                human_click(scope, click_target, pause=pause)
+            # Playwright handles iframe clicks natively via locator — try
+            # the owner-context click first (reliable), then fall back to
+            # coordinate-based click from the root page.
+            checked = False
+            if scope is not page and element_is_interactable(click_target):
+                try:
+                    validate_apple_scope(scope)
+                    emit_remember_progress("click_started", "owner")
+                    human_click(scope, click_target, pause=pause)
+                    pause(180, 420)
+                    try:
+                        checked = bool(field.states.is_checked)
+                    except Exception:
+                        checked = False
+                    if checked:
+                        emit_remember_progress("checked", "owner")
+                except Exception:
+                    checked = False
+            if not checked:
+                if scope is page:
+                    action_scope = scope
+                    action_target = click_target
+                    route = "root"
+                else:
+                    try:
+                        action_scope = page
+                        action_target = prepare_frame_input_target(
+                            page, scope, click_target
+                        )
+                        route = "root"
+                    except Exception:
+                        emit_remember_progress("coordinate_fallback_failed")
+                        action_scope = scope
+                        action_target = click_target
+                        route = "owner"
+                emit_remember_progress("click_started", route)
+                human_click(action_scope, action_target, pause=pause)
                 pause(180, 420)
                 try:
                     checked = bool(field.states.is_checked)
                 except Exception:
                     checked = False
                 if checked:
-                    emit_remember_progress("checked", "owner")
+                    emit_remember_progress("checked", route)
             if not checked:
-                emit_remember_progress("failed", route)
+                emit_remember_progress("failed", "owner")
                 raise RuntimeError("remember-account checkbox did not become checked")
             return True
     if state_found:

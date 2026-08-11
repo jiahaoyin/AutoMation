@@ -132,6 +132,21 @@ class _States:
     def is_enabled(self, value: bool) -> None:
         self._is_enabled = value
 
+    @property
+    def is_checked(self) -> bool:
+        """ruyiPage checkbox/radio checked state."""
+        if self._locator is not None:
+            try:
+                return bool(self._locator.is_checked(timeout=1_000))
+            except Exception:
+                try:
+                    return self._locator.evaluate(
+                        "el => Boolean(el.checked || el.getAttribute('aria-checked') === 'true')"
+                    )
+                except Exception:
+                    return False
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Click with auto-retry for Apple hydration races
@@ -308,6 +323,17 @@ class CamoufoxElement:
             )
         except Exception:
             return None
+
+    # -- ruyiPage .text (visible text content) --------------------------------
+    @property
+    def text(self) -> str:
+        try:
+            return str(self._locator.inner_text(timeout=3_000) or "")
+        except Exception:
+            try:
+                return str(self._locator.text_content(timeout=3_000) or "")
+            except Exception:
+                return ""
 
     # -- .attr(name) --------------------------------------------------------
     def attr(self, name: str) -> str | None:
