@@ -2044,7 +2044,8 @@ def focus_keyboard_target(
     pause: Callable[[int, int], None] = human_pause,
     two_factor_scope: bool = False,
 ) -> Any:
-    """Focus a field through the top context, then fall back to its owner context."""
+    """Focus a field through its owner context first (Playwright handles iframes
+    natively via locators), then fall back to coordinate-based root-page click."""
     if two_factor_scope:
         validate_two_factor_scope(scope)
     else:
@@ -2056,24 +2057,32 @@ def focus_keyboard_target(
         require_keyboard_target_ready(field)
         return scope
 
-    validate_apple_scope(root_page)
-    if two_factor_scope and is_opaque_two_factor_frame_url(scope_location_url(scope)):
+    # Camoufox / Playwright: owner-context click works across iframes natively.
+    # Try it first — it avoids the fragile viewport-coordinate computation that
+    # depends on ruyiPage-specific element.location / iframe.location geometry.
+    try:
         return focus_keyboard_target_in_owner_context(
             scope,
             field,
             pause=pause,
-            two_factor_scope=True,
+            two_factor_scope=two_factor_scope,
         )
-    click_target = prepare_frame_input_target(root_page, scope, field)
-    human_click(root_page, click_target, pause=pause)
-    pause(180, 480)
-    if not element_is_interactable(field):
-        raise RuntimeError("ruyiPage input target is not interactable")
-    if element_focus_is_confirmed(field):
-        return root_page
+    except Exception:
+        pass
 
-    # A shadow-root target can reject a top-context coordinate focus even when
-    # its owning frame context can target the same element directly.
+    # Fallback: coordinate-based click on the root page (original ruyiPage path).
+    validate_apple_scope(root_page)
+    try:
+        click_target = prepare_frame_input_target(root_page, scope, field)
+        human_click(root_page, click_target, pause=pause)
+        pause(180, 480)
+        if element_is_interactable(field) and element_focus_is_confirmed(field):
+            return root_page
+    except Exception:
+        pass
+
+    # Last resort: retry owner context once more after a longer settle.
+    pause(400, 900)
     return focus_keyboard_target_in_owner_context(
         scope,
         field,

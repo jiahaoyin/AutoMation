@@ -256,10 +256,35 @@ class CamoufoxElement:
         self._locator = locator
         self._handle = handle
         self.states = _States(
-            is_alive=True, is_displayed=True, is_enabled=True,
-            _page=None, _locator=locator,
+            is_alive=True,
+            is_displayed=True,
+            is_enabled=True,
+            _page=None,
+            _locator=locator,
         )
         self.scroll = _ScrollApi(locator)
+
+    @property
+    def location(self) -> dict[str, float]:
+        """ruyiPage compat: element bounding-box top-left in viewport coords."""
+        try:
+            box = self._locator.bounding_box(timeout=5_000)
+            if box:
+                return {"x": box["x"], "y": box["y"]}
+        except Exception:
+            pass
+        return {"x": 0, "y": 0}
+
+    @property
+    def size(self) -> dict[str, float]:
+        """ruyiPage compat: element width/height."""
+        try:
+            box = self._locator.bounding_box(timeout=5_000)
+            if box:
+                return {"width": box["width"], "height": box["height"]}
+        except Exception:
+            pass
+        return {"width": 0, "height": 0}
 
     def attr(self, name: str) -> str | None:
         try:
@@ -352,7 +377,11 @@ class CamoufoxScope:
         return target
 
     def run_js(self, script: str) -> Any:
-        """Run JS on the page/frame scope."""
+        """Run JS on the page/frame scope.
+
+        Cross-origin iframes reject evaluate(); fall back to Playwright
+        frame.url for the most common pattern.
+        """
         body = str(script or "").strip()
         if not body:
             return None
@@ -365,7 +394,15 @@ class CamoufoxScope:
                     return str(target.url or "")
                 except Exception:
                     return ""
-        return target.evaluate(wrap_return_script(body))
+        try:
+            return target.evaluate(wrap_return_script(body))
+        except Exception:
+            if body.startswith("return "):
+                try:
+                    return str(target.url or "")
+                except Exception:
+                    pass
+            return None
 
     def eles(
         self, selector: str, timeout: float | int | None = None
