@@ -22,6 +22,25 @@ from camoufox_session import build_camoufox_launch_kwargs
 _MAX_CLICK_RETRIES = 3
 _CLICK_RETRY_DELAY = (0.4, 1.0)
 
+_FRAME_LIFECYCLE_KEYWORDS = (
+    "context was destroyed",
+    "execution context",
+    "frame was detached",
+    "frame has been detached",
+    "target closed",
+    "page has been closed",
+    "object has been collected",
+    "disposed",
+    "navigation",
+    "frame.evaluate",
+)
+
+
+def _is_frame_lifecycle_error(exc: Exception) -> bool:
+    """Return True for transient Playwright errors caused by frame navigation."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _FRAME_LIFECYCLE_KEYWORDS)
+
 
 # ---------------------------------------------------------------------------
 # Keys (ruyiPage.Keys → Playwright key names)
@@ -348,19 +367,21 @@ class CamoufoxElement:
         body = str(script or "").strip()
         if not body:
             return None
-        # Fast path: this.value — use Playwright native input_value().
         if body in ("return this.value", "this.value"):
             return self.value
-        # function() { ... } → el => (function(){...}).call(el)
-        if body.startswith("function"):
-            return self._locator.evaluate(f"el => ({body}).call(el)")
-        # Statements using this → wrap and bind
-        if "this." in body or "this " in body or "this," in body:
-            inner = body if "return" in body else f"return ({body})"
-            return self._locator.evaluate(
-                f"el => (function(){{ {inner} }}).call(el)"
-            )
-        return self._locator.evaluate(wrap_return_script(body))
+        try:
+            if body.startswith("function"):
+                return self._locator.evaluate(f"el => ({body}).call(el)")
+            if "this." in body or "this " in body or "this," in body:
+                inner = body if "return" in body else f"return ({body})"
+                return self._locator.evaluate(
+                    f"el => (function(){{ {inner} }}).call(el)"
+                )
+            return self._locator.evaluate(wrap_return_script(body))
+        except Exception as exc:
+            if _is_frame_lifecycle_error(exc):
+                return None
+            raise
 
     # -- .input(value, clear=True) — trusted element fill -------------------
     def input(self, value: str, clear: bool = True) -> None:
@@ -457,9 +478,7 @@ class CamoufoxScope:
         try:
             return target.evaluate(wrap_return_script(body))
         except Exception as exc:
-            msg = str(exc).lower()
-            # Execution context destroyed = frame navigated; not an error.
-            if "context" in msg or "detach" in msg or "disposed" in msg:
+            if _is_frame_lifecycle_error(exc):
                 return None
             if body.startswith("return "):
                 return None
@@ -479,6 +498,12 @@ class CamoufoxScope:
             else (int(timeout_s) if timeout_s >= 300 else 0)
         )
         root = self._page_like()
+        try:
+            # Skip detached/navigating frames entirely.
+            if hasattr(root, "url") and not root.url:
+                return []
+        except Exception:
+            return []
         locator = root.locator(css)
         try:
             if wait_ms > 0:
