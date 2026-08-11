@@ -171,25 +171,70 @@ class _States:
 # Click with auto-retry for Apple hydration races
 # ---------------------------------------------------------------------------
 def _click_with_retry(locator: Any, timeout: int = 15_000) -> None:
-    last_error: Exception | None = None
-    for attempt in range(_MAX_CLICK_RETRIES):
+    """Click with escalating strategies to handle Camoufox humanize hangs.
+
+    Strategy 1: normal click (humanized mouse trajectory)
+    Strategy 2: click with force=True (skip actionability, no trajectory)
+    Strategy 3: dispatch_event("click") (pure JS, no mouse at all)
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
+
+    click_timeout_s = max(5, timeout // 1000) + 3
+
+    def _try_scroll(loc: Any) -> None:
         try:
-            locator.scroll_into_view_if_needed(timeout=5_000)
-            time.sleep(random.uniform(0.05, 0.18))
-            locator.click(timeout=timeout, delay=random.randint(20, 80))
+            loc.scroll_into_view_if_needed(timeout=5_000)
+        except Exception:
+            pass
+
+    for attempt in range(_MAX_CLICK_RETRIES):
+        _try_scroll(locator)
+        time.sleep(random.uniform(0.05, 0.18))
+
+        # Strategy 1: normal click — humanized mouse path.
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    locator.click, timeout=timeout, delay=random.randint(20, 80)
+                )
+                future.result(timeout=click_timeout_s)
+            return
+        except _FTimeout:
+            sys.stderr.write(
+                f"[camoufox-click] humanize click hung ({click_timeout_s}s), "
+                f"falling back to force click\n"
+            )
+        except Exception as exc:
+            if _is_frame_lifecycle_error(exc):
+                raise
+            sys.stderr.write(
+                f"[camoufox-click] attempt {attempt+1}: {exc}\n"
+            )
+
+        # Strategy 2: force click — bypasses actionability checks + mouse trajectory.
+        try:
+            locator.click(force=True, timeout=5_000)
             return
         except Exception as exc:
-            last_error = exc
-            msg = str(exc).lower()
-            if "closed" in msg or "disposed" in msg or "target closed" in msg:
+            if _is_frame_lifecycle_error(exc):
                 raise
-            if attempt < _MAX_CLICK_RETRIES - 1:
-                sys.stderr.write(
-                    f"[camoufox-click] retry {attempt+1}/{_MAX_CLICK_RETRIES}: {exc}\n"
-                )
-                time.sleep(random.uniform(*_CLICK_RETRY_DELAY))
-    if last_error is not None:
-        raise last_error
+            sys.stderr.write(
+                f"[camoufox-click] force click failed: {exc}\n"
+            )
+
+        # Strategy 3: JS dispatch — no mouse involvement at all.
+        try:
+            locator.dispatch_event("click")
+            return
+        except Exception as exc:
+            if _is_frame_lifecycle_error(exc):
+                raise
+            sys.stderr.write(
+                f"[camoufox-click] dispatch_event failed: {exc}\n"
+            )
+
+        if attempt < _MAX_CLICK_RETRIES - 1:
+            time.sleep(random.uniform(*_CLICK_RETRY_DELAY))
 
 
 # ---------------------------------------------------------------------------
