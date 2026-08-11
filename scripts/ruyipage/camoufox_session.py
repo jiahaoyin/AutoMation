@@ -85,16 +85,44 @@ def resolve_default_firefox_profile(override: str | None = None) -> Path | None:
     return None
 
 
+def _probe_proxy_reachable(server: str, timeout: float = 3.0) -> bool:
+    """Quick TCP probe to check if a proxy port is accepting connections."""
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(server)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (1080 if "socks" in (parsed.scheme or "") else 7890)
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        return True
+    except (OSError, socket.timeout, ValueError):
+        return False
+
+
 def resolve_clash_proxy(env: dict[str, str] | None = None) -> dict[str, str] | None:
+    import sys
+
     source = env if env is not None else os.environ
     disabled = str(source.get("CAMOUFOX_PROXY_ENABLED", "1")).strip().lower()
     if disabled in {"0", "false", "no", "off"}:
+        sys.stderr.write("[camoufox-proxy] proxy disabled by CAMOUFOX_PROXY_ENABLED=0\n")
         return None
 
     server = str(source.get("CAMOUFOX_PROXY_SERVER") or "").strip()
     if not server:
         server = DEFAULT_CLASH_PROXY["server"]
 
+    if not _probe_proxy_reachable(server):
+        sys.stderr.write(
+            f"[camoufox-proxy] WARNING: proxy {server} is not reachable, "
+            f"disabling proxy+geoip to avoid startup failure. "
+            f"Set CAMOUFOX_PROXY_ENABLED=0 to silence this.\n"
+        )
+        return None
+
+    sys.stderr.write(f"[camoufox-proxy] using proxy {server}\n")
     proxy: dict[str, str] = {"server": server}
     username = str(source.get("CAMOUFOX_PROXY_USERNAME") or "").strip()
     password = str(source.get("CAMOUFOX_PROXY_PASSWORD") or "").strip()

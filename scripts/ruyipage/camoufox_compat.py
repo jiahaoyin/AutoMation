@@ -49,21 +49,59 @@ def normalize_selector(selector: str) -> str:
 
 
 def wrap_return_script(script: str) -> str:
+    """Convert ruyiPage-style JS snippets to Playwright evaluate expressions.
+
+    ruyiPage's run_js accepts bare ``return ...`` statements as well as full
+    function bodies and arrow expressions.  Playwright's evaluate expects either
+    an expression or a ``() => { ... }`` wrapper.
+    """
     body = str(script or "").strip()
     if not body:
         return "() => undefined"
-    if body.startswith("function") or body.startswith("(") or body.startswith("async"):
+    # Already a callable — pass through.
+    if body.startswith("(") or body.startswith("async"):
         return body
-    if "return " in body or body.startswith("return"):
-        return f"() => {{ {body if body.startswith('return') else body} }}"
+    # Full function declaration — wrap in IIFE so evaluate() can call it.
+    if body.startswith("function"):
+        return f"({body})()"
+    # Bare "return expr" — wrap in arrow.
+    if body.startswith("return "):
+        expr = body[len("return "):].rstrip(";").strip()
+        return f"() => {{ return ({expr}); }}"
+    if "return " in body:
+        return f"() => {{ {body} }}"
+    # Plain expression.
     return f"() => {{ return ({body}); }}"
 
 
-@dataclass
 class _States:
-    is_alive: bool = True
-    is_displayed: bool = True
-    is_enabled: bool = True
+    """Observable state container.  For scope-level states, ``is_alive`` dynamically
+    checks whether the underlying Playwright page is still open."""
+
+    def __init__(
+        self,
+        is_alive: bool = True,
+        is_displayed: bool = True,
+        is_enabled: bool = True,
+        _page: Any = None,
+    ) -> None:
+        self._is_alive = is_alive
+        self.is_displayed = is_displayed
+        self.is_enabled = is_enabled
+        self._page = _page
+
+    @property
+    def is_alive(self) -> bool:
+        if self._page is not None:
+            try:
+                return not self._page.is_closed()
+            except Exception:
+                return False
+        return self._is_alive
+
+    @is_alive.setter
+    def is_alive(self, value: bool) -> None:
+        self._is_alive = value
 
 
 class _ActionChain:
@@ -138,7 +176,11 @@ class _WaitApi:
         self._scope = scope
 
     def doc_loaded(self, timeout: float | int | None = None) -> None:
-        timeout_ms = int((timeout or 30) * 1000) if timeout and timeout < 1000 else int(timeout or 30_000)
+        """Wait for DOMContentLoaded.  ``timeout`` is in seconds (ruyiPage convention)."""
+        if timeout is not None and timeout > 0:
+            timeout_ms = int(float(timeout) * 1000)
+        else:
+            timeout_ms = 30_000
         try:
             self._scope._page_like().wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         except Exception:
@@ -156,7 +198,7 @@ class CamoufoxElement:
         self._scope = scope
         self._locator = locator
         self._handle = handle
-        self.states = _States(is_alive=True, is_displayed=True, is_enabled=True)
+        self.states = _States(is_alive=True, is_displayed=True, is_enabled=True, _page=None)
         self._refresh_states()
 
     def _refresh_states(self) -> None:
@@ -178,13 +220,25 @@ class CamoufoxElement:
             return None
 
     def run_js(self, script: str) -> Any:
+        """Run JS in the element context.  ruyiPage binds ``this`` to the element."""
         body = str(script or "").strip()
-        # Support ruyiPage element scripts that use `this`.
-        if "this." in body or "this " in body or body.startswith("function"):
-            fn = body
-            if not fn.startswith("function") and not fn.startswith("("):
-                fn = f"function() {{ {fn if 'return' in fn else 'return (' + fn + ')'} }}"
-            return self._locator.evaluate(f"el => ({fn}).call(el)")
+        if not body:
+            return None
+        # Playwright evaluate on a locator passes the element as the first arg.
+        # We need to map ruyiPage's ``this`` → Playwright's ``el``.
+        if body.startswith("function"):
+            # function() { ... }  →  el => (function(){...}).call(el)
+            return self._locator.evaluate(f"el => ({body}).call(el)")
+        if "this." in body or "this " in body or "this," in body:
+            # Bare statements using ``this`` — wrap in function and bind.
+            if "return" not in body:
+                inner = f"return ({body})"
+            else:
+                inner = body
+            return self._locator.evaluate(
+                f"el => (function(){{ {inner} }}).call(el)"
+            )
+        # No ``this`` reference — plain expression on the page.
         return self._locator.evaluate(wrap_return_script(body))
 
     def input(self, value: str, clear: bool = True) -> None:
@@ -197,6 +251,9 @@ class CamoufoxElement:
         locator.fill(str(value))
 
     def screenshot(self, path: str) -> None:
+        from pathlib import Path as P
+
+        P(path).parent.mkdir(parents=True, exist_ok=True)
         self._locator.screenshot(path=path)
 
     def scroll_into_view(self) -> None:
@@ -221,7 +278,7 @@ class CamoufoxScope:
         self._page = page
         self._frame = frame
         self.parent = parent
-        self.states = _States(is_alive=True)
+        self.states = _States(is_alive=True, _page=page)
         self.wait = _WaitApi(self)
         self.actions = _ActionChain(self)
         self.browser = session
@@ -262,15 +319,31 @@ class CamoufoxScope:
         return target
 
     def run_js(self, script: str) -> Any:
-        return self._page_like().evaluate(wrap_return_script(script))
+        """Run JS on the page/frame scope.  Handles ruyiPage's ``return ...`` style."""
+        body = str(script or "").strip()
+        if not body:
+            return None
+        target = self._page_like()
+        # Fast path: ``return location.href`` — the most called pattern.
+        if body == "return location.href":
+            try:
+                return target.evaluate("() => location.href")
+            except Exception:
+                try:
+                    return str(target.url or "")
+                except Exception:
+                    return ""
+        return target.evaluate(wrap_return_script(body))
 
     def eles(self, selector: str, timeout: float | int | None = None) -> list[CamoufoxElement]:
         css = normalize_selector(selector)
         if not css:
             return []
-        timeout_s = 0.0 if timeout is None else float(timeout)
-        # ruyiPage timeout is seconds; 0 means non-blocking poll.
-        wait_ms = max(0, int(timeout_s * 1000)) if timeout_s < 1000 else int(timeout_s)
+        # ruyiPage timeout is in seconds; 0 / None means instant poll.
+        timeout_s = float(timeout) if timeout is not None else 0.0
+        wait_ms = max(0, int(timeout_s * 1000)) if 0 < timeout_s < 300 else (
+            int(timeout_s) if timeout_s >= 300 else 0
+        )
         root = self._page_like()
         locator = root.locator(css)
         try:
@@ -280,11 +353,10 @@ class CamoufoxScope:
         except Exception:
             return []
         elements: list[CamoufoxElement] = []
-        for index in range(count):
+        for index in range(min(count, 200)):
             item = locator.nth(index)
             element = CamoufoxElement(self, item)
-            if element.states.is_alive:
-                elements.append(element)
+            elements.append(element)
         return elements
 
     def get_frames(self) -> list["CamoufoxScope"]:
@@ -315,18 +387,30 @@ class CamoufoxScope:
 
     def get(self, url: str) -> "CamoufoxScope":
         """ruyiPage-compatible navigation on the current tab."""
+        import sys
+
         target = str(url or "").strip() or "about:blank"
-        self._page.goto(target, wait_until="domcontentloaded")
+        sys.stderr.write(f"[camoufox-nav] get {target[:80]}\n")
         try:
-            self._page.wait_for_load_state("domcontentloaded", timeout=90_000)
+            self._page.goto(target, wait_until="domcontentloaded", timeout=90_000)
+        except Exception as exc:
+            sys.stderr.write(f"[camoufox-nav] goto error: {exc}\n")
+            if self._page.is_closed():
+                raise
+        try:
+            self._page.wait_for_load_state("load", timeout=30_000)
         except Exception:
             pass
+        sys.stderr.write(f"[camoufox-nav] loaded url={self._page.url[:100]}\n")
         return self
 
     def get_tabs(self, url: str | None = None) -> list["CamoufoxScope"]:
         return self._session.get_tabs(url=url)
 
     def screenshot(self, path: str, full_page: bool = True) -> None:
+        from pathlib import Path as P
+
+        P(path).parent.mkdir(parents=True, exist_ok=True)
         self._page.screenshot(path=path, full_page=full_page)
 
     def quit(self) -> None:
@@ -376,6 +460,9 @@ class CamoufoxSession:
         return self._fingerprint_token
 
     def launch(self, opts: "FirefoxOptions") -> CamoufoxScope:
+        import sys
+        import traceback as tb
+
         from camoufox.sync_api import Camoufox
 
         kwargs = build_camoufox_launch_kwargs(
@@ -388,14 +475,42 @@ class CamoufoxSession:
         preserve = bool(kwargs.pop("_preserve_process", False))
         self._close_on_exit = opts.close_on_exit_flag and not preserve
 
-        self._camoufox_cm = Camoufox(**kwargs)
-        self._context = self._camoufox_cm.__enter__()
-        # persistent_context returns BrowserContext directly.
+        safe_kwargs = {k: v for k, v in kwargs.items() if k != "proxy"}
+        proxy_server = kwargs.get("proxy", {}).get("server", "none") if "proxy" in kwargs else "none"
+        sys.stderr.write(
+            f"[camoufox-launch] fingerprint_preset={safe_kwargs.get('fingerprint_preset')} "
+            f"os={safe_kwargs.get('os')} humanize={safe_kwargs.get('humanize')} "
+            f"geoip={safe_kwargs.get('geoip', False)} proxy={proxy_server} "
+            f"persistent_context={safe_kwargs.get('persistent_context')} "
+            f"user_data_dir={safe_kwargs.get('user_data_dir', 'none')}\n"
+        )
+
+        try:
+            self._camoufox_cm = Camoufox(**kwargs)
+            self._context = self._camoufox_cm.__enter__()
+        except Exception as exc:
+            sys.stderr.write(f"[camoufox-launch] FAILED to start Camoufox: {exc}\n")
+            sys.stderr.write(tb.format_exc())
+            raise
+
         context = self._context
-        if hasattr(context, "new_page"):
+        # persistent_context returns BrowserContext directly — it already has
+        # one blank page open. Reuse it instead of opening yet another tab.
+        existing_pages = []
+        try:
+            existing_pages = context.pages if hasattr(context, "pages") else []
+        except Exception:
+            existing_pages = []
+
+        if existing_pages:
+            page = existing_pages[0]
+            sys.stderr.write(
+                f"[camoufox-launch] reusing existing page from persistent context "
+                f"(total pages={len(existing_pages)})\n"
+            )
+        elif hasattr(context, "new_page"):
             page = context.new_page()
         else:
-            # Non-persistent Browser fallback.
             context = context.new_context()
             self._context = context
             page = context.new_page()
@@ -403,29 +518,37 @@ class CamoufoxSession:
         scope = CamoufoxScope(self, page)
         self._tabs = [scope]
         self.latest_tab = scope
-        # Emit once via page attribute so the flow can report fingerprint reuse.
         try:
             page._camoufox_fingerprint_os = "macos"
             page._camoufox_fingerprint_token = self._fingerprint_token
         except Exception:
             pass
+        sys.stderr.write(f"[camoufox-launch] session ready, page url={page.url}\n")
         return scope
 
     def new_tab(self, url: str = "about:blank") -> CamoufoxScope:
+        import sys
+
         if self._context is None:
             raise RuntimeError("Camoufox session is not started")
         page = self._context.new_page()
         scope = CamoufoxScope(self, page)
         self._tabs.append(scope)
         self.latest_tab = scope
-        target = str(url or "about:blank")
+        target = str(url or "about:blank").strip()
         if target and target != "about:blank":
-            page.goto(target, wait_until="domcontentloaded")
-        else:
+            sys.stderr.write(f"[camoufox-tab] navigating new tab to {target[:80]}\n")
             try:
-                page.goto("about:blank", wait_until="domcontentloaded")
+                page.goto(target, wait_until="domcontentloaded", timeout=90_000)
+            except Exception as exc:
+                sys.stderr.write(f"[camoufox-tab] goto failed: {exc}\n")
+                if page.is_closed():
+                    raise
+            try:
+                page.wait_for_load_state("load", timeout=30_000)
             except Exception:
                 pass
+            sys.stderr.write(f"[camoufox-tab] loaded url={page.url[:100]}\n")
         return scope
 
     def get_tabs(self, url: str | None = None) -> list[CamoufoxScope]:
@@ -438,28 +561,31 @@ class CamoufoxSession:
             except Exception:
                 tab.states.is_alive = False
                 continue
-            tab.states.is_alive = True
             if url:
                 try:
                     href = str(tab._page.url or "")
                 except Exception:
                     href = ""
-                if url not in href:
+                if url.lower() not in href.lower():
                     continue
             alive.append(tab)
-        self._tabs = alive
+        self._tabs = [t for t in self._tabs if not t._page.is_closed()]
         if alive:
             self.latest_tab = alive[-1]
         return list(alive)
 
     def close(self) -> None:
+        import sys
+
         if not self._close_on_exit:
+            sys.stderr.write("[camoufox-close] preserve requested, skipping close\n")
             return
         try:
             if self._camoufox_cm is not None:
+                sys.stderr.write("[camoufox-close] closing Camoufox context manager\n")
                 self._camoufox_cm.__exit__(None, None, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            sys.stderr.write(f"[camoufox-close] error during close: {exc}\n")
         self._camoufox_cm = None
         self._context = None
         self._tabs = []

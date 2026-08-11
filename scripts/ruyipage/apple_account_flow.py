@@ -10463,7 +10463,7 @@ def _browser_flow(args: argparse.Namespace) -> int:
                 authentication_context,
                 developer_screenshot_path,
                 page_holder=developer_page_holder,
-                open_in_new_tab=True,
+                open_in_new_tab=False,
             )
             if screenshots["developerMembership"] is not None:
                 generated_screenshot_paths.append(developer_screenshot_path)

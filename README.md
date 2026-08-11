@@ -15,7 +15,7 @@ Node 只做编排、2FA sidecar、脱敏 JSONL 与报告；浏览器生命周期
 
 ~~~mermaid
 flowchart TD
-    A[启动 Camoufox<br/>系统 Firefox 默认 profile<br/>macOS 指纹一套 + Clash geoip] --> B[新建 tab：Developer]
+    A[启动 Camoufox<br/>系统 Firefox 默认 profile<br/>macOS 指纹一套 + Clash geoip] --> B[初始页导航：Developer]
     B --> C[登录 / 共享 2FA]
     C --> D[会员判定]
     D -->|gate=0 或 active| E[新建 tab：Account]
@@ -27,7 +27,7 @@ flowchart TD
 ~~~
 
 1. **启动内核**：Camoufox **FF152 dev 源**（默认 `official/prerelease`，[daijro/camoufox](https://github.com/daijro/camoufox) 最新预发布）；`fingerprint_preset` + `os=macos`；`humanize`；Clash `127.0.0.1:7890` + `geoip`；`--allow-downgrade` 打开系统默认 profile。同一 persistent context，后续 tab **复用同一套指纹**。
-2. **新建 Developer tab** → 登录与 2FA → 会员状态。
+2. **初始页面导航** Developer 站点（不新开 tab）→ 登录与 2FA → 会员状态。
 3. **新建 Account tab**（仅 Developer 已认证且 gate 允许）→ 登录与共享 2FA。
 4. **同一 Account tab** 采集个人信息并改密（新密码写回私有 `.env`）。
 5. **新建 Small Business tab** → 提交申请。
@@ -59,7 +59,9 @@ Camoufox 发出 need_2fa + generation
 ./run.sh --skip-mac
 ~~~
 
-启动前请关闭由 Dock/图标打开的 Firefox（默认 profile 不能双开）。需本机 Clash 监听 `7890`（可用 `CAMOUFOX_PROXY_ENABLED=0` 关闭代理）。
+启动前请关闭由 Dock/图标打开的 Firefox（默认 profile 不能双开）。
+
+代理默认走 Clash `127.0.0.1:7890` + geoip；如果 Clash 未运行，启动时会自动检测并跳过代理（避免卡住）。也可手动设 `CAMOUFOX_PROXY_ENABLED=0` 关闭。
 
 ## install / run 自检
 

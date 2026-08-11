@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import configparser
 import os
 import tempfile
 import unittest
@@ -11,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from camoufox_session import (
+    _probe_proxy_reachable,
     build_camoufox_launch_kwargs,
     resolve_clash_proxy,
     resolve_default_firefox_profile,
@@ -18,13 +18,19 @@ from camoufox_session import (
 
 
 class CamoufoxSessionTests(unittest.TestCase):
-    def test_resolve_clash_proxy_default(self) -> None:
+    @mock.patch("camoufox_session._probe_proxy_reachable", return_value=True)
+    def test_resolve_clash_proxy_default(self, _probe: mock.Mock) -> None:
         proxy = resolve_clash_proxy({"CAMOUFOX_PROXY_ENABLED": "1"})
         assert proxy is not None
         self.assertEqual(proxy["server"], "http://127.0.0.1:7890")
 
     def test_resolve_clash_proxy_disabled(self) -> None:
         self.assertIsNone(resolve_clash_proxy({"CAMOUFOX_PROXY_ENABLED": "0"}))
+
+    @mock.patch("camoufox_session._probe_proxy_reachable", return_value=False)
+    def test_resolve_clash_proxy_unreachable_returns_none(self, _probe: mock.Mock) -> None:
+        result = resolve_clash_proxy({"CAMOUFOX_PROXY_ENABLED": "1"})
+        self.assertIsNone(result)
 
     def test_resolve_default_profile_from_ini(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,7 +56,8 @@ class CamoufoxSessionTests(unittest.TestCase):
                 resolved = resolve_default_firefox_profile(None)
             self.assertEqual(resolved, profile)
 
-    def test_launch_kwargs_include_allow_downgrade_and_fingerprint(self) -> None:
+    @mock.patch("camoufox_session._probe_proxy_reachable", return_value=True)
+    def test_launch_kwargs_include_allow_downgrade_and_fingerprint(self, _probe: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile = Path(tmp) / "profile"
             profile.mkdir()
@@ -61,11 +68,22 @@ class CamoufoxSessionTests(unittest.TestCase):
             self.assertTrue(kwargs["fingerprint_preset"])
             self.assertEqual(kwargs["os"], "macos")
             self.assertTrue(kwargs["humanize"])
-            self.assertTrue(kwargs["geoip"])
-            self.assertEqual(kwargs["proxy"]["server"], "http://127.0.0.1:7890")
+            self.assertTrue(kwargs.get("geoip", False))
             self.assertIn("--allow-downgrade", kwargs["args"])
             self.assertTrue(kwargs["persistent_context"])
             self.assertEqual(kwargs["user_data_dir"], str(profile))
+
+    @mock.patch("camoufox_session._probe_proxy_reachable", return_value=False)
+    def test_launch_kwargs_no_proxy_when_unreachable(self, _probe: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "profile"
+            profile.mkdir()
+            kwargs = build_camoufox_launch_kwargs(
+                profile_dir=profile,
+                env={"CAMOUFOX_PROXY_ENABLED": "1"},
+            )
+            self.assertNotIn("proxy", kwargs)
+            self.assertFalse(kwargs.get("geoip", False))
 
 
 if __name__ == "__main__":
