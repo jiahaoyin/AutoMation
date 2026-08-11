@@ -445,15 +445,25 @@ class CamoufoxScope:
                     return str(target.url or "")
                 except Exception:
                     return ""
+        # Ensure the frame is still attached and loaded before evaluating.
+        try:
+            if hasattr(target, "url"):
+                url = str(target.url or "")
+                if not url or url == "about:blank":
+                    # Frame hasn't navigated yet — JS eval would be meaningless.
+                    return None
+        except Exception:
+            return None
         try:
             return target.evaluate(wrap_return_script(body))
-        except Exception:
+        except Exception as exc:
+            msg = str(exc).lower()
+            # Execution context destroyed = frame navigated; not an error.
+            if "context" in msg or "detach" in msg or "disposed" in msg:
+                return None
             if body.startswith("return "):
-                try:
-                    return str(target.url or "")
-                except Exception:
-                    pass
-            return None
+                return None
+            raise
 
     # -- scope.eles ---------------------------------------------------------
     def eles(
@@ -489,13 +499,17 @@ class CamoufoxScope:
             current = self._frame if self._frame is not None else main
             for frame in list(self._page.frames):
                 try:
-                    if frame.parent_frame == current:
-                        frames.append(
-                            CamoufoxScope(
-                                self._session, self._page,
-                                frame=frame, parent=self,
-                            )
+                    if frame.parent_frame != current:
+                        continue
+                    url = str(frame.url or "")
+                    if url == "about:blank" or url == "about:srcdoc":
+                        continue
+                    frames.append(
+                        CamoufoxScope(
+                            self._session, self._page,
+                            frame=frame, parent=self,
                         )
+                    )
                 except Exception:
                     continue
         except Exception:
@@ -553,6 +567,7 @@ class CamoufoxSession:
         self.latest_tab: CamoufoxScope | None = None
         self.address = "camoufox:local"
         self._close_on_exit = True
+        self._preserved = False
         self._fingerprint_token = (
             f"camoufox-{int(time.time())}-{random.randint(1000, 9999)}"
         )
@@ -574,6 +589,7 @@ class CamoufoxSession:
         )
         preserve = bool(kwargs.pop("_preserve_process", False))
         self._close_on_exit = opts.close_on_exit_flag and not preserve
+        self._preserved = False
 
         proxy_server = kwargs.get("proxy", {}).get("server", "none") if "proxy" in kwargs else "none"
         sys.stderr.write(
@@ -659,7 +675,14 @@ class CamoufoxSession:
 
     def close(self) -> None:
         if not self._close_on_exit:
-            sys.stderr.write("[camoufox-close] preserve, skipping\n")
+            sys.stderr.write(
+                "[camoufox-close] preserve requested — detaching browser\n"
+            )
+            self._preserved = True
+            # Detach ALL references so Python's GC/atexit cannot trigger
+            # Playwright cleanup.  The Camoufox Firefox process survives.
+            self._camoufox_cm = None
+            self._context = None
             return
         try:
             if self._camoufox_cm is not None:
